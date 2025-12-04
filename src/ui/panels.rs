@@ -186,3 +186,4 @@ fn truncate_text(text: &str, max_len: usize) -> String {
     }
 }
 
+

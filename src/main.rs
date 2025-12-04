@@ -34,6 +34,10 @@ struct Args {
     /// Minimum days for a file to be considered dusty (default: 90)
     #[arg(short = 's', long, default_value = "90")]
     stale_days: i64,
+
+    /// Print mood summary and exit (no TUI)
+    #[arg(short, long)]
+    check: bool,
 }
 
 fn main() -> Result<()> {
@@ -72,6 +76,12 @@ fn main() -> Result<()> {
         add_delete_ratio,
     );
     let mood = MoodEngine::calculate(&metrics);
+
+    // Check mode: print summary and exit
+    if args.check {
+        print_summary(&mood, &metrics, &repo_name, &branch_name, &todo_entries);
+        return Ok(());
+    }
 
     eprintln!("  ✨ Done! Launching dashboard...\n");
 
@@ -153,5 +163,49 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> 
             return Ok(());
         }
     }
+}
+
+fn print_summary(
+    mood: &mood::Mood,
+    metrics: &mood::RepoMetrics,
+    repo_name: &str,
+    branch_name: &str,
+    todos: &[analysis::TodoEntry],
+) {
+    let total_todos = metrics.todo_count + metrics.fixme_count + metrics.hack_count;
+    
+    println!();
+    println!("┌─────────────────────────────────────────────────────────┐");
+    println!("│  {} {}                                              │", mood.symbol(), mood.name());
+    println!("│  \"{}\"{}│", mood.tagline(), " ".repeat(33 - mood.tagline().len()));
+    println!("│                                                         │");
+    println!("│  {} @ {}{}│", repo_name, branch_name, " ".repeat(46 - repo_name.len() - branch_name.len()));
+    println!("├─────────────────────────────────────────────────────────┤");
+    println!("│  📁 {} files  │  📝 {} changed  │  📌 {} TODOs  │  🕸️  {} dusty │",
+        metrics.total_files,
+        metrics.files_changed_recently,
+        total_todos,
+        metrics.dusty_file_count
+    );
+    println!("└─────────────────────────────────────────────────────────┘");
+    
+    if !todos.is_empty() {
+        println!();
+        println!("Top TODOs/FIXMEs:");
+        for (i, todo) in todos.iter().take(5).enumerate() {
+            println!("  {}. [{}] {}:{} - {}", 
+                i + 1, 
+                todo.kind.as_str(), 
+                todo.path, 
+                todo.line_number,
+                if todo.text.len() > 50 { 
+                    format!("{}...", &todo.text[..47]) 
+                } else { 
+                    todo.text.clone() 
+                }
+            );
+        }
+    }
+    println!();
 }
 

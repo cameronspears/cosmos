@@ -46,7 +46,9 @@ pub struct TodoScanner {
 
 impl TodoScanner {
     pub fn new() -> Self {
-        let pattern = Regex::new(r"(?i)\b(TODO|HACK|FIXME|XXX)\b[:\s]*(.*)").unwrap();
+        // Match TODO/HACK/FIXME/XXX in comment contexts (after // or # or within /* */)
+        // Also matches standalone markers followed by colon or text
+        let pattern = Regex::new(r"(?:\/\/|#|/\*|\*)\s*(?i)(TODO|HACK|FIXME|XXX)\b[:\s]*(.*)").unwrap();
         let ignore_dirs = vec![
             ".git".to_string(),
             "node_modules".to_string(),
