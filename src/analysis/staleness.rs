@@ -6,6 +6,7 @@ use std::path::Path;
 use walkdir::WalkDir;
 
 /// Represents a file that hasn't been touched in a while
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DustyFile {
     pub path: String,
@@ -181,5 +182,6 @@ impl StalenessAnalyzer {
             .unwrap_or(false)
     }
 }
+
 
 

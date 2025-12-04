@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Represents a file's churn statistics
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ChurnEntry {
     pub path: String,
@@ -140,6 +141,7 @@ impl GitAnalyzer {
     }
 
     /// Calculate the add/delete ratio for recent commits
+    #[allow(dead_code)]
     pub fn add_delete_ratio(&self, days: i64) -> Result<f64> {
         let cutoff = Utc::now() - Duration::days(days);
         let mut total_additions = 0usize;
@@ -183,10 +185,12 @@ impl GitAnalyzer {
     }
 
     /// Get the number of unique files changed in recent commits
+    #[allow(dead_code)]
     pub fn files_changed_count(&self, days: i64) -> Result<usize> {
         let churn = self.analyze_churn(days)?;
         Ok(churn.len())
     }
 }
+
 
 

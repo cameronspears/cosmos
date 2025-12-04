@@ -1,4 +1,4 @@
-use crate::analysis::{ChurnEntry, DustyFile, TodoEntry};
+use crate::analysis::{ChurnEntry, DangerZone, DustyFile, TodoEntry};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -111,6 +111,82 @@ impl Panel {
             .collect();
 
         let title = format!(" TODOs & HACKs ({} items) ", entries.len());
+
+        List::new(items)
+            .block(
+                Block::default()
+                    .title(title)
+                    .title_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(51, 65, 85)))
+                    .style(Style::default().bg(Color::Rgb(15, 23, 42))),
+            )
+    }
+
+    /// Create the danger zones panel showing high-churn + high-complexity files
+    pub fn danger_zones(zones: &[DangerZone], scroll_offset: usize, accent: Color) -> impl Widget + '_ {
+        let items: Vec<ListItem> = zones
+            .iter()
+            .skip(scroll_offset)
+            .enumerate()
+            .flat_map(|(idx, zone)| {
+                // Color based on danger score
+                let danger_color = if zone.danger_score >= 70.0 {
+                    Color::Rgb(248, 113, 113) // Red - critical
+                } else if zone.danger_score >= 50.0 {
+                    Color::Rgb(251, 146, 60) // Orange - high
+                } else {
+                    Color::Rgb(250, 204, 21) // Yellow - medium
+                };
+
+                let risk_label = if zone.danger_score >= 70.0 {
+                    "!!"
+                } else if zone.danger_score >= 50.0 {
+                    "! "
+                } else {
+                    ". "
+                };
+
+                let base_style = if idx == 0 {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+
+                // Main line with file path
+                let main_line = Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", risk_label),
+                        base_style.fg(danger_color),
+                    ),
+                    Span::styled(
+                        truncate_path(&zone.path, 50),
+                        base_style.fg(Color::Rgb(226, 232, 240)),
+                    ),
+                ]);
+
+                // Detail line with stats and reason
+                let detail_line = Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(
+                        format!("{} changes", zone.change_count),
+                        Style::default().fg(Color::Rgb(96, 165, 250)),
+                    ),
+                    Span::styled(
+                        format!(" | complexity {:.1}", zone.complexity_score),
+                        Style::default().fg(Color::Rgb(148, 163, 184)),
+                    ),
+                    Span::styled(
+                        format!(" | {}", zone.reason),
+                        Style::default().fg(Color::Rgb(134, 239, 172)),
+                    ),
+                ]);
+
+                vec![ListItem::new(main_line), ListItem::new(detail_line)]
+            })
+            .collect();
+
+        let title = format!(" Danger Zones ({} files) - high churn + high complexity ", zones.len());
 
         List::new(items)
             .block(

@@ -1,7 +1,9 @@
+pub mod complexity;
 pub mod git;
 pub mod scanner;
 pub mod staleness;
 
+pub use complexity::{ComplexityAnalyzer, DangerZone};
 pub use git::{ChurnEntry, GitAnalyzer};
 pub use scanner::{TodoEntry, TodoScanner};
 pub use staleness::{DustyFile, StalenessAnalyzer};
