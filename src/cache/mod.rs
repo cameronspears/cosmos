@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 const CACHE_DIR: &str = ".cosmos";
 const INDEX_CACHE_FILE: &str = "index.json";
 const SUGGESTIONS_CACHE_FILE: &str = "suggestions.json";
+const SUMMARIES_CACHE_FILE: &str = "summaries.json";
 const SETTINGS_FILE: &str = "settings.json";
 
 /// Cache validity duration (24 hours for index, 7 days for suggestions)
@@ -103,6 +104,38 @@ impl SuggestionsCache {
             .filter(|s| !changed_files.contains(&s.file))
             .cloned()
             .collect()
+    }
+}
+
+/// Cached file summaries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummariesCache {
+    pub summaries: HashMap<PathBuf, crate::index::FileSummary>,
+    pub cached_at: DateTime<Utc>,
+}
+
+impl SummariesCache {
+    /// Create from file index
+    pub fn from_index(index: &CodebaseIndex) -> Self {
+        let summaries = index.files.iter()
+            .map(|(path, file_index)| (path.clone(), file_index.summary.clone()))
+            .collect();
+        
+        Self {
+            summaries,
+            cached_at: Utc::now(),
+        }
+    }
+    
+    /// Check if the cache is still valid
+    pub fn is_valid(&self) -> bool {
+        let age = Utc::now() - self.cached_at;
+        age < Duration::days(SUGGESTIONS_CACHE_DAYS)
+    }
+    
+    /// Get summary for a file
+    pub fn get(&self, path: &PathBuf) -> Option<&crate::index::FileSummary> {
+        self.summaries.get(path)
     }
 }
 
@@ -200,6 +233,32 @@ impl Cache {
     pub fn save_suggestions_cache(&self, cache: &SuggestionsCache) -> anyhow::Result<()> {
         self.ensure_dir()?;
         let path = self.cache_dir.join(SUGGESTIONS_CACHE_FILE);
+        let content = serde_json::to_string_pretty(cache)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+    
+    /// Load cached file summaries
+    pub fn load_summaries_cache(&self) -> Option<SummariesCache> {
+        let path = self.cache_dir.join(SUMMARIES_CACHE_FILE);
+        if !path.exists() {
+            return None;
+        }
+
+        let content = fs::read_to_string(&path).ok()?;
+        let cache: SummariesCache = serde_json::from_str(&content).ok()?;
+        
+        if cache.is_valid() {
+            Some(cache)
+        } else {
+            None
+        }
+    }
+
+    /// Save file summaries cache
+    pub fn save_summaries_cache(&self, cache: &SummariesCache) -> anyhow::Result<()> {
+        self.ensure_dir()?;
+        let path = self.cache_dir.join(SUMMARIES_CACHE_FILE);
         let content = serde_json::to_string_pretty(cache)?;
         fs::write(path, content)?;
         Ok(())

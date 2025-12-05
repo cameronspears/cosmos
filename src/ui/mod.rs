@@ -40,6 +40,73 @@ pub enum ActivePanel {
     Suggestions,
 }
 
+/// Sort mode for file explorer
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    #[default]
+    Name,
+    Priority,
+    Size,
+    Modified,
+    Complexity,
+}
+
+impl SortMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SortMode::Name => "name",
+            SortMode::Priority => "priority",
+            SortMode::Size => "size",
+            SortMode::Modified => "modified",
+            SortMode::Complexity => "complexity",
+        }
+    }
+    
+    pub fn next(&self) -> Self {
+        match self {
+            SortMode::Name => SortMode::Priority,
+            SortMode::Priority => SortMode::Size,
+            SortMode::Size => SortMode::Modified,
+            SortMode::Modified => SortMode::Complexity,
+            SortMode::Complexity => SortMode::Name,
+        }
+    }
+}
+
+/// Input mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputMode {
+    #[default]
+    Normal,
+    Search,
+}
+
+/// Loading state for background tasks
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoadingState {
+    #[default]
+    None,
+    GeneratingSuggestions,
+    GeneratingSummaries,
+}
+
+impl LoadingState {
+    pub fn message(&self) -> &'static str {
+        match self {
+            LoadingState::None => "",
+            LoadingState::GeneratingSuggestions => "Analyzing codebase with Opus 4.5",
+            LoadingState::GeneratingSummaries => "Generating file summaries",
+        }
+    }
+    
+    pub fn is_loading(&self) -> bool {
+        !matches!(self, LoadingState::None)
+    }
+}
+
+/// Spinner animation frames (braille pattern)
+pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 /// Overlay state
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Overlay {
@@ -57,6 +124,10 @@ pub enum Overlay {
     ApplyConfirm {
         suggestion_id: uuid::Uuid,
         diff_preview: String,
+        scroll: usize,
+    },
+    FileDetail {
+        path: PathBuf,
         scroll: usize,
     },
 }
@@ -97,8 +168,26 @@ pub struct App {
     pub toast: Option<Toast>,
     pub should_quit: bool,
     
+    // Search and sort state
+    pub input_mode: InputMode,
+    pub search_query: String,
+    pub sort_mode: SortMode,
+    
+    // Loading state for background tasks
+    pub loading: LoadingState,
+    pub loading_frame: usize,
+    
+    // LLM-generated file summaries
+    pub llm_summaries: std::collections::HashMap<PathBuf, String>,
+    
+    // Cost tracking
+    pub session_cost: f64,          // Total USD spent this session
+    pub session_tokens: u32,        // Total tokens used this session
+    pub active_model: Option<String>, // Current/last model used
+    
     // Cached data for display
     pub file_tree: Vec<FlatTreeEntry>,
+    pub filtered_tree: Vec<FlatTreeEntry>,
     pub repo_path: PathBuf,
 }
 
@@ -109,7 +198,8 @@ impl App {
         suggestions: SuggestionEngine,
         context: WorkContext,
     ) -> Self {
-        let file_tree = build_file_tree(&index);
+        let file_tree = build_file_tree(&index, SortMode::Name);
+        let filtered_tree = file_tree.clone();
         let repo_path = index.root.clone();
         
         Self {
@@ -124,8 +214,100 @@ impl App {
             overlay: Overlay::None,
             toast: None,
             should_quit: false,
+            input_mode: InputMode::Normal,
+            search_query: String::new(),
+            sort_mode: SortMode::Name,
+            loading: LoadingState::None,
+            loading_frame: 0,
+            llm_summaries: std::collections::HashMap::new(),
+            session_cost: 0.0,
+            session_tokens: 0,
+            active_model: None,
             file_tree,
+            filtered_tree,
             repo_path,
+        }
+    }
+    
+    /// Tick the loading animation
+    pub fn tick_loading(&mut self) {
+        if self.loading.is_loading() {
+            self.loading_frame = self.loading_frame.wrapping_add(1);
+        }
+    }
+    
+    /// Update file summaries from LLM
+    pub fn update_summaries(&mut self, summaries: std::collections::HashMap<PathBuf, String>) {
+        self.llm_summaries = summaries;
+    }
+    
+    /// Get LLM summary for a file
+    pub fn get_llm_summary(&self, path: &PathBuf) -> Option<&String> {
+        self.llm_summaries.get(path)
+    }
+    
+    /// Enter search mode
+    pub fn start_search(&mut self) {
+        self.input_mode = InputMode::Search;
+        self.search_query.clear();
+    }
+    
+    /// Exit search mode
+    pub fn exit_search(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.search_query.clear();
+        self.apply_filter();
+    }
+    
+    /// Add character to search query
+    pub fn search_push(&mut self, c: char) {
+        self.search_query.push(c);
+        self.apply_filter();
+    }
+    
+    /// Remove last character from search query
+    pub fn search_pop(&mut self) {
+        self.search_query.pop();
+        self.apply_filter();
+    }
+    
+    /// Apply search filter to file tree
+    fn apply_filter(&mut self) {
+        if self.search_query.is_empty() {
+            self.filtered_tree = self.file_tree.clone();
+        } else {
+            let query = self.search_query.to_lowercase();
+            self.filtered_tree = self.file_tree.iter()
+                .filter(|entry| {
+                    entry.name.to_lowercase().contains(&query) ||
+                    entry.path.to_string_lossy().to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect();
+        }
+        
+        // Reset selection if it's out of bounds
+        if self.project_selected >= self.filtered_tree.len() {
+            self.project_selected = self.filtered_tree.len().saturating_sub(1);
+        }
+        self.project_scroll = 0;
+    }
+    
+    /// Cycle to next sort mode
+    pub fn cycle_sort(&mut self) {
+        self.sort_mode = self.sort_mode.next();
+        self.file_tree = build_file_tree(&self.index, self.sort_mode);
+        self.apply_filter();
+        self.show_toast(&format!("Sort: {}", self.sort_mode.label()));
+    }
+    
+    /// Show file detail overlay for currently selected file
+    pub fn show_file_detail(&mut self) {
+        if let Some(entry) = self.filtered_tree.get(self.project_selected) {
+            self.overlay = Overlay::FileDetail {
+                path: entry.path.clone(),
+                scroll: 0,
+            };
         }
     }
 
@@ -141,7 +323,7 @@ impl App {
     pub fn navigate_down(&mut self) {
         match self.active_panel {
             ActivePanel::Project => {
-                let max = self.file_tree.len().saturating_sub(1);
+                let max = self.filtered_tree.len().saturating_sub(1);
                 self.project_selected = (self.project_selected + 1).min(max);
                 self.ensure_project_visible();
             }
@@ -185,7 +367,12 @@ impl App {
 
     /// Get currently selected file
     pub fn selected_file(&self) -> Option<&PathBuf> {
-        self.file_tree.get(self.project_selected).map(|e| &e.path)
+        self.filtered_tree.get(self.project_selected).map(|e| &e.path)
+    }
+    
+    /// Get the FileIndex for the currently selected file
+    pub fn selected_file_index(&self) -> Option<&crate::index::FileIndex> {
+        self.selected_file().and_then(|path| self.index.files.get(path))
     }
 
     /// Get currently selected suggestion
@@ -270,14 +457,39 @@ impl App {
     }
 }
 
-/// Build a flat file tree for display
-fn build_file_tree(index: &CodebaseIndex) -> Vec<FlatTreeEntry> {
-    let mut entries: Vec<_> = index.files.keys().cloned().collect();
-    entries.sort();
+/// Build a flat file tree for display with sorting
+fn build_file_tree(index: &CodebaseIndex, sort_mode: SortMode) -> Vec<FlatTreeEntry> {
+    let mut entries: Vec<_> = index.files.iter().collect();
     
-    entries.into_iter().map(|path| {
-        let file_index = index.files.get(&path);
-        let priority = file_index.map(|f| f.priority_indicator()).unwrap_or(' ');
+    // Sort based on mode
+    match sort_mode {
+        SortMode::Name => {
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+        }
+        SortMode::Priority => {
+            entries.sort_by(|a, b| {
+                b.1.suggestion_density()
+                    .partial_cmp(&a.1.suggestion_density())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        SortMode::Size => {
+            entries.sort_by(|a, b| b.1.loc.cmp(&a.1.loc));
+        }
+        SortMode::Modified => {
+            entries.sort_by(|a, b| b.1.last_modified.cmp(&a.1.last_modified));
+        }
+        SortMode::Complexity => {
+            entries.sort_by(|a, b| {
+                b.1.complexity
+                    .partial_cmp(&a.1.complexity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+    }
+    
+    entries.into_iter().map(|(path, file_index)| {
+        let priority = file_index.priority_indicator();
         let depth = path.components().count().saturating_sub(1);
         let name = path.file_name()
             .and_then(|n| n.to_str())
@@ -286,7 +498,7 @@ fn build_file_tree(index: &CodebaseIndex) -> Vec<FlatTreeEntry> {
         
         FlatTreeEntry {
             name,
-            path,
+            path: path.clone(),
             is_dir: false,
             depth,
             priority,
@@ -319,6 +531,11 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_main(frame, layout[1], app);
     render_footer(frame, layout[2], app);
 
+    // Loading overlay (shown when background tasks are running)
+    if app.loading.is_loading() {
+        render_loading_overlay(frame, &app.loading, app.loading_frame);
+    }
+
     // Overlays
     match &app.overlay {
         Overlay::Help => render_help(frame),
@@ -332,6 +549,11 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
         Overlay::ApplyConfirm { diff_preview, scroll, .. } => {
             render_apply_confirm(frame, diff_preview, *scroll);
+        }
+        Overlay::FileDetail { path, scroll } => {
+            if let Some(file_index) = app.index.files.get(path) {
+                render_file_detail(frame, path, file_index, app.get_llm_summary(path), *scroll);
+            }
         }
         Overlay::None => {}
     }
@@ -392,20 +614,39 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_project_panel(frame: &mut Frame, area: Rect, app: &App) {
     let is_active = app.active_panel == ActivePanel::Project;
-    let border_style = if is_active {
+    let is_searching = app.input_mode == InputMode::Search;
+    
+    let border_style = if is_searching {
+        Style::default().fg(Theme::WHITE)  // Bright border when searching
+    } else if is_active {
         Style::default().fg(Theme::GREY_300)  // Bright active border
     } else {
         Style::default().fg(Theme::GREY_600)  // Visible inactive border
     };
 
-    let visible_height = area.height.saturating_sub(4) as usize; // Account for borders and padding
+    // Account for search bar if searching
+    let search_height = if is_searching || !app.search_query.is_empty() { 2 } else { 0 };
+    let visible_height = area.height.saturating_sub(4 + search_height as u16) as usize;
     
     let mut lines = vec![];
     
-    // Top padding for breathing room
-    lines.push(Line::from(""));
+    // Search bar
+    if is_searching || !app.search_query.is_empty() {
+        let search_text = if is_searching {
+            format!(" / {}_", app.search_query)
+        } else {
+            format!(" / {} (Esc to clear)", app.search_query)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(search_text, Style::default().fg(Theme::WHITE)),
+        ]));
+        lines.push(Line::from(""));
+    } else {
+        // Top padding for breathing room
+        lines.push(Line::from(""));
+    }
     
-    let total_files = app.file_tree.len();
+    let total_files = app.filtered_tree.len();
     let scroll_indicator = if total_files > visible_height {
         let current = app.project_scroll + 1;
         format!(" ↕ {}/{} ", current, total_files)
@@ -413,7 +654,7 @@ fn render_project_panel(frame: &mut Frame, area: Rect, app: &App) {
         String::new()
     };
     
-    for (i, entry) in app.file_tree.iter()
+    for (i, entry) in app.filtered_tree.iter()
         .enumerate()
         .skip(app.project_scroll)
         .take(visible_height)
@@ -444,8 +685,12 @@ fn render_project_panel(frame: &mut Frame, area: Rect, app: &App) {
         ]));
     }
 
+    // Build title with sort indicator
+    let sort_indicator = format!(" [{}]", app.sort_mode.label());
+    let title = format!(" {}{}{}", Theme::SECTION_PROJECT, sort_indicator, scroll_indicator);
+
     let block = Block::default()
-        .title(format!(" {} {}", Theme::SECTION_PROJECT, scroll_indicator))
+        .title(title)
         .title_style(Style::default().fg(Theme::GREY_200))  // Legible title
         .borders(Borders::ALL)
         .border_style(border_style)
@@ -597,15 +842,32 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    // Model indicator
+    if let Some(model) = &app.active_model {
+        spans.push(Span::styled("  ·  ", Style::default().fg(Theme::GREY_500)));
+        spans.push(Span::styled(
+            model.clone(),
+            Style::default().fg(Theme::GREY_300),
+        ));
+    }
+    
+    // Cost meter (show if any cost has been incurred)
+    if app.session_cost > 0.0 {
+        spans.push(Span::styled("  ·  ", Style::default().fg(Theme::GREY_500)));
+        spans.push(Span::styled(
+            format!("${:.4}", app.session_cost),
+            Style::default().fg(Theme::GREY_200),
+        ));
+    }
+
     spans.push(Span::styled("  ·  ", Style::default().fg(Theme::GREY_500)));
     
     // Key hints with elegant styling - high contrast
     let hints = [
+        ("/", "𝘴𝘦𝘢𝘳𝘤𝘩"),
+        ("𝘴", "𝘴𝘰𝘳𝘵"),
         ("?", "𝘩𝘦𝘭𝘱"),
-        ("⇥", "𝘴𝘸𝘪𝘵𝘤𝘩"),
         ("↵", "𝘷𝘪𝘦𝘸"),
-        ("𝘢", "𝘢𝘱𝘱𝘭𝘺"),
-        ("𝘥", "𝘥𝘪𝘴𝘮𝘪𝘴𝘴"),
         ("𝘲", "𝘲𝘶𝘪𝘵"),
     ];
     
@@ -626,7 +888,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn render_help(frame: &mut Frame) {
-    let area = centered_rect(45, 65, frame.area());
+    let area = centered_rect(50, 80, frame.area());
     frame.render_widget(Clear, area);
 
     let help_text = vec![
@@ -650,7 +912,28 @@ fn render_help(frame: &mut Frame) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("     ─────────────────────────", Style::default().fg(Theme::GREY_500))
+            Span::styled("     ─────────────────────────────", Style::default().fg(Theme::GREY_500))
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("     𝒇𝒊𝒍𝒆 𝒆𝒙𝒑𝒍𝒐𝒓𝒆𝒓", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD))
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("     /", Style::default().fg(Theme::WHITE)),
+            Span::styled("                 search files", Style::default().fg(Theme::GREY_300)),
+        ]),
+        Line::from(vec![
+            Span::styled("     𝘴", Style::default().fg(Theme::WHITE)),
+            Span::styled("                 cycle sort mode", Style::default().fg(Theme::GREY_300)),
+        ]),
+        Line::from(vec![
+            Span::styled("     Esc", Style::default().fg(Theme::WHITE)),
+            Span::styled("               clear search", Style::default().fg(Theme::GREY_300)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("     ─────────────────────────────", Style::default().fg(Theme::GREY_500))
         ]),
         Line::from(""),
         Line::from(vec![
@@ -658,8 +941,8 @@ fn render_help(frame: &mut Frame) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("     ?", Style::default().fg(Theme::WHITE)),
-            Span::styled("                 inquiry", Style::default().fg(Theme::GREY_300)),
+            Span::styled("     𝘪", Style::default().fg(Theme::WHITE)),
+            Span::styled("                 AI inquiry", Style::default().fg(Theme::GREY_300)),
         ]),
         Line::from(vec![
             Span::styled("     𝘢", Style::default().fg(Theme::WHITE)),
@@ -675,12 +958,12 @@ fn render_help(frame: &mut Frame) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("     ─────────────────────────", Style::default().fg(Theme::GREY_500))
+            Span::styled("     ─────────────────────────────", Style::default().fg(Theme::GREY_500))
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("     Esc", Style::default().fg(Theme::WHITE)),
-            Span::styled("               close", Style::default().fg(Theme::GREY_300)),
+            Span::styled("     ?", Style::default().fg(Theme::WHITE)),
+            Span::styled("                 toggle help", Style::default().fg(Theme::GREY_300)),
         ]),
         Line::from(vec![
             Span::styled("     𝘲", Style::default().fg(Theme::WHITE)),
@@ -962,6 +1245,193 @@ fn render_apply_confirm(frame: &mut Frame, diff_preview: &str, scroll: usize) {
             .style(Style::default().bg(Theme::GREY_900)));
     
     frame.render_widget(block, area);
+}
+
+fn render_file_detail(frame: &mut Frame, path: &PathBuf, file_index: &crate::index::FileIndex, llm_summary: Option<&String>, _scroll: usize) {
+    let area = centered_rect(75, 80, frame.area());
+    frame.render_widget(Clear, area);
+
+    let inner_width = area.width.saturating_sub(10) as usize;
+    
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(""),
+    ];
+    
+    // File name header
+    let filename = path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    
+    lines.push(Line::from(vec![
+        Span::styled(format!("     {}", filename), 
+            Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
+    ]));
+    
+    // Full path
+    lines.push(Line::from(vec![
+        Span::styled(format!("     {}", path.display()), 
+            Style::default().fg(Theme::GREY_400)),
+    ]));
+    
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("     ─────────────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
+    ]));
+    lines.push(Line::from(""));
+    
+    // LLM Summary (rich paragraph) - prioritize this if available
+    if let Some(summary) = llm_summary {
+        // Wrap the summary paragraph
+        let wrapped = wrap_text(summary, inner_width.saturating_sub(10));
+        for line in wrapped {
+            lines.push(Line::from(vec![
+                Span::styled(format!("     {}", line), 
+                    Style::default().fg(Theme::GREY_50)),
+            ]));
+        }
+    } else {
+        // Fallback to static summary
+        lines.push(Line::from(vec![
+            Span::styled(format!("     {}", file_index.summary.purpose), 
+                Style::default().fg(Theme::GREY_100)),
+        ]));
+    }
+    
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("     ─────────────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
+    ]));
+    lines.push(Line::from(""));
+    
+    // Metrics
+    let func_count = file_index.symbols.iter()
+        .filter(|s| matches!(s.kind, crate::index::SymbolKind::Function | crate::index::SymbolKind::Method))
+        .count();
+    let struct_count = file_index.symbols.iter()
+        .filter(|s| matches!(s.kind, crate::index::SymbolKind::Struct | crate::index::SymbolKind::Class))
+        .count();
+    
+    lines.push(Line::from(vec![
+        Span::styled(format!("     {} LOC  ·  {} functions  ·  {} structs  ·  {}", 
+            file_index.loc, func_count, struct_count, file_index.language.icon()), 
+            Style::default().fg(Theme::GREY_300)),
+    ]));
+    
+    lines.push(Line::from(""));
+    
+    // Exports
+    if !file_index.summary.exports.is_empty() {
+        let exports_str = if file_index.summary.exports.len() > 6 {
+            format!("{}, +{} more", file_index.summary.exports[..6].join(", "), file_index.summary.exports.len() - 6)
+        } else {
+            file_index.summary.exports.join(", ")
+        };
+        
+        let wrapped = wrap_text(&format!("Exports: {}", exports_str), inner_width.saturating_sub(10));
+        for line in wrapped {
+            lines.push(Line::from(vec![
+                Span::styled(format!("     {}", line), Style::default().fg(Theme::GREY_300)),
+            ]));
+        }
+    }
+    
+    // Used by
+    if !file_index.summary.used_by.is_empty() {
+        let used_by_str: Vec<_> = file_index.summary.used_by.iter()
+            .take(5)
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        let suffix = if file_index.summary.used_by.len() > 5 {
+            format!(", +{} more", file_index.summary.used_by.len() - 5)
+        } else {
+            String::new()
+        };
+        
+        lines.push(Line::from(vec![
+            Span::styled(format!("     Used by: {}{}", used_by_str.join(", "), suffix), 
+                Style::default().fg(Theme::GREY_300)),
+        ]));
+    }
+    
+    // Depends on
+    if !file_index.summary.depends_on.is_empty() {
+        let deps_str: Vec<_> = file_index.summary.depends_on.iter()
+            .take(5)
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        let suffix = if file_index.summary.depends_on.len() > 5 {
+            format!(", +{} more", file_index.summary.depends_on.len() - 5)
+        } else {
+            String::new()
+        };
+        
+        lines.push(Line::from(vec![
+            Span::styled(format!("     Depends: {}{}", deps_str.join(", "), suffix), 
+                Style::default().fg(Theme::GREY_300)),
+        ]));
+    }
+    
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("     ─────────────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("     Esc", Style::default().fg(Theme::WHITE)),
+        Span::styled(" close", Style::default().fg(Theme::GREY_400)),
+    ]));
+    lines.push(Line::from(""));
+
+    let block = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::default()
+            .title(" ✧ 𝘧𝘪𝘭𝘦 𝘥𝘦𝘵𝘢𝘪𝘭 ")
+            .title_style(Style::default().fg(Theme::GREY_100))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Theme::GREY_400))
+            .style(Style::default().bg(Theme::GREY_900)));
+    
+    frame.render_widget(block, area);
+}
+
+fn render_loading_overlay(frame: &mut Frame, state: &LoadingState, anim_frame: usize) {
+    let area = frame.area();
+    
+    // Calculate overlay dimensions
+    let message = state.message();
+    let width = (message.len() + 12) as u16;
+    let height = 5u16;
+    
+    let overlay_area = Rect {
+        x: (area.width.saturating_sub(width)) / 2,
+        y: (area.height.saturating_sub(height)) / 2,
+        width: width.min(area.width),
+        height,
+    };
+    
+    frame.render_widget(Clear, overlay_area);
+    
+    // Get spinner frame
+    let spinner = SPINNER_FRAMES[anim_frame % SPINNER_FRAMES.len()];
+    
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("   {} ", spinner), Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
+            Span::styled(message, Style::default().fg(Theme::GREY_100)),
+            Span::styled("   ", Style::default()),
+        ]),
+        Line::from(""),
+    ];
+    
+    let block = Paragraph::new(lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Theme::GREY_400))
+            .style(Style::default().bg(Theme::GREY_800)));
+    
+    frame.render_widget(block, overlay_area);
 }
 
 fn render_toast(frame: &mut Frame, toast: &Toast) {

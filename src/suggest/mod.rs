@@ -178,19 +178,28 @@ pub struct SuggestionEngine {
 }
 
 impl SuggestionEngine {
-    /// Create a new suggestion engine from a codebase index
+    /// Create a new suggestion engine from a codebase index (with static suggestions)
     pub fn new(index: CodebaseIndex) -> Self {
         let mut engine = Self {
             suggestions: Vec::new(),
             index,
         };
         
-        // Generate static suggestions (free)
+        // Generate static suggestions (free) - kept for fallback
         engine.generate_static_suggestions();
         engine
     }
+    
+    /// Create an empty suggestion engine (populated by LLM later)
+    pub fn new_empty(index: CodebaseIndex) -> Self {
+        Self {
+            suggestions: Vec::new(),
+            index,
+        }
+    }
 
-    /// Generate suggestions from static analysis (no LLM)
+    /// Generate suggestions from static analysis (no LLM) - kept for fallback
+    #[allow(dead_code)]
     fn generate_static_suggestions(&mut self) {
         // Use static rules to generate suggestions
         for (path, file_index) in &self.index.files {

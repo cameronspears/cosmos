@@ -9,9 +9,9 @@ const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 #[derive(Debug, Clone, Copy)]
 pub enum Model {
-    Claude,    // anthropic/claude-opus-4 - for complex refactoring
-    DeepSeek,  // deepseek/deepseek-chat-v3-0324 - for simpler analysis
-    GrokFast,  // x-ai/grok-3-fast - for quick summaries
+    Claude,    // anthropic/claude-opus-4.5 - for complex refactoring
+    DeepSeek,  // deepseek/deepseek-v3.2 - for simpler analysis
+    GrokFast,  // x-ai/grok-4.1-fast - for quick summaries
 }
 
 impl Model {
