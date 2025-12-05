@@ -88,6 +88,7 @@ pub enum LoadingState {
     None,
     GeneratingSuggestions,
     GeneratingSummaries,
+    GeneratingFix,
 }
 
 impl LoadingState {
@@ -96,12 +97,22 @@ impl LoadingState {
             LoadingState::None => "",
             LoadingState::GeneratingSuggestions => "Analyzing codebase with Opus 4.5",
             LoadingState::GeneratingSummaries => "Generating file summaries",
+            LoadingState::GeneratingFix => "Generating fix with Opus 4.5",
         }
     }
     
     pub fn is_loading(&self) -> bool {
         !matches!(self, LoadingState::None)
     }
+}
+
+/// Mode for the apply confirmation overlay
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ApplyMode {
+    #[default]
+    View,   // Default: review diff, y/n to apply
+    Edit,   // Inline editing of diff text
+    Chat,   // Chat input to refine suggestion
 }
 
 /// Spinner animation frames (braille pattern)
@@ -125,6 +136,11 @@ pub enum Overlay {
         suggestion_id: uuid::Uuid,
         diff_preview: String,
         scroll: usize,
+        mode: ApplyMode,
+        edit_buffer: Option<String>,
+        chat_input: String,
+        file_path: PathBuf,
+        summary: String,
     },
     FileDetail {
         path: PathBuf,
@@ -409,6 +425,108 @@ impl App {
         self.overlay = Overlay::Inquiry { response, scroll: 0 };
     }
 
+    /// Show apply confirmation overlay with generated fix
+    pub fn show_apply_confirm(&mut self, suggestion_id: uuid::Uuid, diff_preview: String, file_path: PathBuf, summary: String) {
+        self.overlay = Overlay::ApplyConfirm {
+            suggestion_id,
+            diff_preview,
+            scroll: 0,
+            mode: ApplyMode::View,
+            edit_buffer: None,
+            chat_input: String::new(),
+            file_path,
+            summary,
+        };
+    }
+
+    /// Get mutable access to apply confirm edit buffer
+    pub fn apply_edit_push(&mut self, c: char) {
+        if let Overlay::ApplyConfirm { edit_buffer, .. } = &mut self.overlay {
+            if let Some(buf) = edit_buffer {
+                buf.push(c);
+            }
+        }
+    }
+
+    /// Remove character from apply edit buffer
+    pub fn apply_edit_pop(&mut self) {
+        if let Overlay::ApplyConfirm { edit_buffer, .. } = &mut self.overlay {
+            if let Some(buf) = edit_buffer {
+                buf.pop();
+            }
+        }
+    }
+
+    /// Push character to chat input
+    pub fn apply_chat_push(&mut self, c: char) {
+        if let Overlay::ApplyConfirm { chat_input, .. } = &mut self.overlay {
+            chat_input.push(c);
+        }
+    }
+
+    /// Pop character from chat input
+    pub fn apply_chat_pop(&mut self) {
+        if let Overlay::ApplyConfirm { chat_input, .. } = &mut self.overlay {
+            chat_input.pop();
+        }
+    }
+
+    /// Set apply mode
+    pub fn set_apply_mode(&mut self, new_mode: ApplyMode) {
+        if let Overlay::ApplyConfirm { mode, edit_buffer, diff_preview, .. } = &mut self.overlay {
+            // When entering edit mode, populate the edit buffer with the current diff
+            if new_mode == ApplyMode::Edit && edit_buffer.is_none() {
+                *edit_buffer = Some(diff_preview.clone());
+            }
+            *mode = new_mode;
+        }
+    }
+
+    /// Get current apply mode
+    pub fn get_apply_mode(&self) -> Option<&ApplyMode> {
+        if let Overlay::ApplyConfirm { mode, .. } = &self.overlay {
+            Some(mode)
+        } else {
+            None
+        }
+    }
+
+    /// Commit edit buffer back to diff preview
+    pub fn commit_apply_edit(&mut self) {
+        if let Overlay::ApplyConfirm { edit_buffer, diff_preview, mode, .. } = &mut self.overlay {
+            if let Some(buf) = edit_buffer.take() {
+                *diff_preview = buf;
+            }
+            *mode = ApplyMode::View;
+        }
+    }
+
+    /// Discard edit buffer and return to view mode
+    pub fn discard_apply_edit(&mut self) {
+        if let Overlay::ApplyConfirm { edit_buffer, mode, .. } = &mut self.overlay {
+            *edit_buffer = None;
+            *mode = ApplyMode::View;
+        }
+    }
+
+    /// Get chat input for refinement
+    pub fn get_apply_chat_input(&self) -> Option<&str> {
+        if let Overlay::ApplyConfirm { chat_input, .. } = &self.overlay {
+            Some(chat_input.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// Update diff preview (after refinement)
+    pub fn update_apply_diff(&mut self, new_diff: String) {
+        if let Overlay::ApplyConfirm { diff_preview, mode, chat_input, .. } = &mut self.overlay {
+            *diff_preview = new_diff;
+            *mode = ApplyMode::View;
+            chat_input.clear();
+        }
+    }
+
     /// Clear expired toast
     pub fn clear_expired_toast(&mut self) {
         if let Some(ref toast) = self.toast {
@@ -547,8 +665,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         Overlay::Inquiry { response, scroll } => {
             render_inquiry(frame, response, *scroll);
         }
-        Overlay::ApplyConfirm { diff_preview, scroll, .. } => {
-            render_apply_confirm(frame, diff_preview, *scroll);
+        Overlay::ApplyConfirm { diff_preview, scroll, mode, edit_buffer, chat_input, file_path, summary, .. } => {
+            render_apply_confirm(frame, diff_preview, *scroll, mode, edit_buffer, chat_input, file_path, summary);
         }
         Overlay::FileDetail { path, scroll } => {
             if let Some(file_index) = app.index.files.get(path) {
@@ -1171,26 +1289,61 @@ fn render_inquiry(frame: &mut Frame, response: &str, scroll: usize) {
     frame.render_widget(block, area);
 }
 
-fn render_apply_confirm(frame: &mut Frame, diff_preview: &str, scroll: usize) {
+fn render_apply_confirm(
+    frame: &mut Frame, 
+    diff_preview: &str, 
+    scroll: usize,
+    mode: &ApplyMode,
+    edit_buffer: &Option<String>,
+    chat_input: &str,
+    file_path: &PathBuf,
+    summary: &str,
+) {
     let area = centered_rect(85, 85, frame.area());
     frame.render_widget(Clear, area);
 
-    let visible_height = area.height.saturating_sub(12) as usize;
+    let visible_height = area.height.saturating_sub(16) as usize;
+    let inner_width = area.width.saturating_sub(12) as usize;
+    
+    // File info header
+    let file_name = file_path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
     
     let mut lines = vec![
         Line::from(""),
         Line::from(""),
         Line::from(vec![
-            Span::styled("     𝘢𝘱𝘱𝘭𝘺 𝘵𝘩𝘦𝘴𝘦 𝘤𝘩𝘢𝘯𝘨𝘦𝘴?", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
+            Span::styled("     ✧ ", Style::default().fg(Theme::WHITE)),
+            Span::styled(file_name, Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
         ]),
-        Line::from(""),
         Line::from(vec![
-            Span::styled("     ─────────────────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
+            Span::styled(format!("     {}", file_path.display()), Style::default().fg(Theme::GREY_400)),
         ]),
         Line::from(""),
     ];
+    
+    // Summary - wrapped
+    let summary_wrapped = wrap_text(summary, inner_width.saturating_sub(10));
+    for wrapped_line in &summary_wrapped {
+        lines.push(Line::from(vec![
+            Span::styled(format!("     {}", wrapped_line), Style::default().fg(Theme::GREY_200).add_modifier(Modifier::ITALIC)),
+        ]));
+    }
+    
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("     ─────────────────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
+    ]));
+    lines.push(Line::from(""));
 
-    let diff_lines: Vec<&str> = diff_preview.lines().collect();
+    // Determine what to display based on mode
+    let display_content = match mode {
+        ApplyMode::Edit => edit_buffer.as_deref().unwrap_or(diff_preview),
+        _ => diff_preview,
+    };
+
+    let diff_lines: Vec<&str> = display_content.lines().collect();
     
     for line in diff_lines.iter().skip(scroll).take(visible_height) {
         let style = if line.starts_with('+') && !line.starts_with("+++") {
@@ -1226,19 +1379,63 @@ fn render_apply_confirm(frame: &mut Frame, diff_preview: &str, scroll: usize) {
         Span::styled("     ─────────────────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
     ]));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("     𝘺", Style::default().fg(Theme::WHITE)),
-        Span::styled(" apply   ", Style::default().fg(Theme::GREY_400)),
-        Span::styled("𝘯", Style::default().fg(Theme::WHITE)),
-        Span::styled(" cancel   ", Style::default().fg(Theme::GREY_400)),
-        Span::styled("↑↓", Style::default().fg(Theme::WHITE)),
-        Span::styled(" scroll", Style::default().fg(Theme::GREY_400)),
-    ]));
+    
+    // Mode-specific footer
+    match mode {
+        ApplyMode::View => {
+            lines.push(Line::from(vec![
+                Span::styled("     𝘺", Style::default().fg(Theme::WHITE)),
+                Span::styled(" apply   ", Style::default().fg(Theme::GREY_400)),
+                Span::styled("𝘦", Style::default().fg(Theme::WHITE)),
+                Span::styled(" edit   ", Style::default().fg(Theme::GREY_400)),
+                Span::styled("𝘤", Style::default().fg(Theme::WHITE)),
+                Span::styled(" chat   ", Style::default().fg(Theme::GREY_400)),
+                Span::styled("Esc", Style::default().fg(Theme::WHITE)),
+                Span::styled(" cancel   ", Style::default().fg(Theme::GREY_400)),
+                Span::styled("↑↓", Style::default().fg(Theme::WHITE)),
+                Span::styled(" scroll", Style::default().fg(Theme::GREY_400)),
+            ]));
+        }
+        ApplyMode::Edit => {
+            lines.push(Line::from(vec![
+                Span::styled("     [EDIT MODE] ", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
+                Span::styled("type to modify · ", Style::default().fg(Theme::GREY_300)),
+                Span::styled("F2", Style::default().fg(Theme::WHITE)),
+                Span::styled(" save   ", Style::default().fg(Theme::GREY_400)),
+                Span::styled("Esc", Style::default().fg(Theme::WHITE)),
+                Span::styled(" cancel   ", Style::default().fg(Theme::GREY_400)),
+                Span::styled("↑↓", Style::default().fg(Theme::WHITE)),
+                Span::styled(" scroll", Style::default().fg(Theme::GREY_400)),
+            ]));
+        }
+        ApplyMode::Chat => {
+            // Show chat input field
+            lines.push(Line::from(vec![
+                Span::styled("     › ", Style::default().fg(Theme::WHITE)),
+                Span::styled(chat_input, Style::default().fg(Theme::GREY_100)),
+                Span::styled("_", Style::default().fg(Theme::WHITE).add_modifier(Modifier::SLOW_BLINK)),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("     [CHAT] ", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
+                Span::styled("Enter", Style::default().fg(Theme::WHITE)),
+                Span::styled(" send   ", Style::default().fg(Theme::GREY_400)),
+                Span::styled("Esc", Style::default().fg(Theme::WHITE)),
+                Span::styled(" cancel", Style::default().fg(Theme::GREY_400)),
+            ]));
+        }
+    }
     lines.push(Line::from(""));
+
+    let title = match mode {
+        ApplyMode::View => " ✧ 𝘢𝘱𝘱𝘭𝘺 𝘤𝘩𝘢𝘯𝘨𝘦𝘴 ",
+        ApplyMode::Edit => " ✧ 𝘦𝘥𝘪𝘵 𝘥𝘪𝘧𝘧 ",
+        ApplyMode::Chat => " ✧ 𝘳𝘦𝘧𝘪𝘯𝘦 𝘧𝘪𝘹 ",
+    };
 
     let block = Paragraph::new(lines)
         .block(Block::default()
-            .title(" ✧ 𝘤𝘰𝘯𝘧𝘪𝘳𝘮 ")
+            .title(title)
             .title_style(Style::default().fg(Theme::GREY_100))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Theme::GREY_400))

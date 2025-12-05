@@ -107,7 +107,7 @@ impl SuggestionsCache {
     }
 }
 
-/// Cached file summaries
+/// Cached file summaries (static analysis)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummariesCache {
     pub summaries: HashMap<PathBuf, crate::index::FileSummary>,
@@ -137,6 +137,140 @@ impl SummariesCache {
     pub fn get(&self, path: &PathBuf) -> Option<&crate::index::FileSummary> {
         self.summaries.get(path)
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  LLM SUMMARY CACHE - Persistent storage for AI-generated summaries
+// ═══════════════════════════════════════════════════════════════════════════
+
+const LLM_SUMMARIES_CACHE_FILE: &str = "llm_summaries.json";
+const LLM_SUMMARY_CACHE_DAYS: i64 = 30;
+
+/// A single LLM-generated summary entry with hash for change detection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmSummaryEntry {
+    /// The AI-generated summary text
+    pub summary: String,
+    /// Hash of file content (LOC + symbols + mtime) for change detection
+    pub file_hash: String,
+    /// When this summary was generated
+    pub generated_at: DateTime<Utc>,
+}
+
+/// Cached LLM-generated file summaries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmSummaryCache {
+    /// Map of file paths to their summary entries
+    pub summaries: HashMap<PathBuf, LlmSummaryEntry>,
+    /// Cached project context (from README, etc.)
+    pub project_context: Option<String>,
+    /// When the cache was last updated
+    pub cached_at: DateTime<Utc>,
+}
+
+impl LlmSummaryCache {
+    /// Create a new empty cache
+    pub fn new() -> Self {
+        Self {
+            summaries: HashMap::new(),
+            project_context: None,
+            cached_at: Utc::now(),
+        }
+    }
+
+    /// Check if a file's summary is still valid (not changed and not too old)
+    pub fn is_file_valid(&self, path: &PathBuf, current_hash: &str) -> bool {
+        if let Some(entry) = self.summaries.get(path) {
+            // Check if hash matches (file unchanged)
+            if entry.file_hash != current_hash {
+                return false;
+            }
+            // Check if not too old
+            let age = Utc::now() - entry.generated_at;
+            age < Duration::days(LLM_SUMMARY_CACHE_DAYS)
+        } else {
+            false
+        }
+    }
+
+    /// Get summary for a file if valid
+    pub fn get_valid_summary(&self, path: &PathBuf, current_hash: &str) -> Option<&str> {
+        if self.is_file_valid(path, current_hash) {
+            self.summaries.get(path).map(|e| e.summary.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// Update or insert a summary
+    pub fn set_summary(&mut self, path: PathBuf, summary: String, file_hash: String) {
+        self.summaries.insert(path, LlmSummaryEntry {
+            summary,
+            file_hash,
+            generated_at: Utc::now(),
+        });
+        self.cached_at = Utc::now();
+    }
+
+    /// Set the project context
+    pub fn set_project_context(&mut self, context: String) {
+        self.project_context = Some(context);
+    }
+
+    /// Get all valid summaries as a HashMap for the UI
+    pub fn get_all_valid_summaries(&self, file_hashes: &HashMap<PathBuf, String>) -> HashMap<PathBuf, String> {
+        self.summaries.iter()
+            .filter(|(path, _)| {
+                if let Some(current_hash) = file_hashes.get(*path) {
+                    self.is_file_valid(path, current_hash)
+                } else {
+                    false
+                }
+            })
+            .map(|(path, entry)| (path.clone(), entry.summary.clone()))
+            .collect()
+    }
+
+    /// Get files that need regeneration (changed or missing)
+    pub fn get_files_needing_summary(&self, file_hashes: &HashMap<PathBuf, String>) -> Vec<PathBuf> {
+        file_hashes.iter()
+            .filter(|(path, hash)| !self.is_file_valid(path, hash))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// Count stats
+    pub fn stats(&self) -> (usize, usize) {
+        let total = self.summaries.len();
+        let valid = self.summaries.iter()
+            .filter(|(_, entry)| {
+                let age = Utc::now() - entry.generated_at;
+                age < Duration::days(LLM_SUMMARY_CACHE_DAYS)
+            })
+            .count();
+        (total, valid)
+    }
+}
+
+impl Default for LlmSummaryCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compute file hashes for change detection
+pub fn compute_file_hashes(index: &CodebaseIndex) -> HashMap<PathBuf, String> {
+    index.files.iter()
+        .map(|(path, file_index)| {
+            let hash = format!(
+                "{}-{}-{}",
+                file_index.loc,
+                file_index.symbols.len(),
+                file_index.last_modified.timestamp()
+            );
+            (path.clone(), hash)
+        })
+        .collect()
 }
 
 /// User settings
@@ -259,6 +393,26 @@ impl Cache {
     pub fn save_summaries_cache(&self, cache: &SummariesCache) -> anyhow::Result<()> {
         self.ensure_dir()?;
         let path = self.cache_dir.join(SUMMARIES_CACHE_FILE);
+        let content = serde_json::to_string_pretty(cache)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+
+    /// Load LLM-generated summaries cache
+    pub fn load_llm_summaries_cache(&self) -> Option<LlmSummaryCache> {
+        let path = self.cache_dir.join(LLM_SUMMARIES_CACHE_FILE);
+        if !path.exists() {
+            return None;
+        }
+
+        let content = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    /// Save LLM-generated summaries cache
+    pub fn save_llm_summaries_cache(&self, cache: &LlmSummaryCache) -> anyhow::Result<()> {
+        self.ensure_dir()?;
+        let path = self.cache_dir.join(LLM_SUMMARIES_CACHE_FILE);
         let content = serde_json::to_string_pretty(cache)?;
         fs::write(path, content)?;
         Ok(())

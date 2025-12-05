@@ -333,6 +333,41 @@ Be precise. Only change what's necessary."#;
     call_llm(system, &user, Model::Opus).await
 }
 
+/// Refine a fix based on user feedback via chat
+pub async fn refine_fix(
+    path: &PathBuf,
+    content: &str,
+    suggestion: &Suggestion,
+    current_diff: &str,
+    user_feedback: &str,
+) -> anyhow::Result<String> {
+    let system = r#"You are a code improvement assistant. The user wants to modify a proposed fix based on their feedback.
+
+OUTPUT FORMAT:
+1. Brief explanation (2-3 sentences)
+2. Updated code changes in unified diff format:
+   --- a/filepath
+   +++ b/filepath
+   @@ context @@
+    unchanged
+   -removed
+   +added
+
+Incorporate the user's feedback into the fix. Be precise. Only change what's necessary."#;
+
+    let user = format!(
+        "File: {}\n\nOriginal Issue: {}\n{}\n\nCurrent Proposed Fix:\n{}\n\nUser Feedback: {}\n\nOriginal Code:\n```\n{}\n```\n\nPlease update the fix based on the user's feedback.",
+        path.display(),
+        suggestion.summary,
+        suggestion.detail.as_deref().unwrap_or(""),
+        current_diff,
+        user_feedback,
+        truncate_content(content, 4000)
+    );
+
+    call_llm(system, &user, Model::Opus).await
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  UNIFIED CODEBASE ANALYSIS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -673,6 +708,277 @@ fn truncate_content(content: &str, max_chars: usize) -> String {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  PROJECT CONTEXT DISCOVERY
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Discover project context from README, package files, and structure.
+/// Returns a concise description to help the LLM understand file purposes.
+pub fn discover_project_context(index: &CodebaseIndex) -> String {
+    let project_name = index.root.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project");
+    
+    let mut context_parts = Vec::new();
+    
+    // 1. Try to read README.md
+    let readme_content = try_read_readme(&index.root);
+    if let Some(readme) = readme_content {
+        context_parts.push(readme);
+    }
+    
+    // 2. Try to read package description from Cargo.toml, package.json, etc.
+    let package_desc = try_read_package_description(&index.root);
+    if let Some(desc) = package_desc {
+        context_parts.push(desc);
+    }
+    
+    // 3. Analyze file structure for domain hints
+    let structure_hints = analyze_project_structure(index);
+    if !structure_hints.is_empty() {
+        context_parts.push(structure_hints);
+    }
+    
+    // Combine and truncate
+    if context_parts.is_empty() {
+        format!("Project: {}", project_name)
+    } else {
+        let combined = context_parts.join("\n\n");
+        // Truncate to ~1000 chars to keep prompt size manageable
+        if combined.len() > 1000 {
+            format!("{}...", &combined[..1000])
+        } else {
+            combined
+        }
+    }
+}
+
+/// Try to read and extract key info from README.md
+fn try_read_readme(root: &std::path::Path) -> Option<String> {
+    // Try common README filenames
+    let readme_names = ["README.md", "readme.md", "README.MD", "README", "readme"];
+    
+    for name in readme_names {
+        let path = root.join(name);
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                return Some(extract_readme_summary(&content));
+            }
+        }
+    }
+    None
+}
+
+/// Extract the first meaningful section from README
+fn extract_readme_summary(content: &str) -> String {
+    let mut result = Vec::new();
+    let mut in_code_block = false;
+    let mut found_header = false;
+    let mut line_count = 0;
+    
+    for line in content.lines() {
+        // Skip code blocks
+        if line.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+        
+        // Skip badges and empty lines at the start
+        if !found_header && (line.trim().is_empty() || line.contains("![") || line.contains("[![")) {
+            continue;
+        }
+        
+        // Found meaningful content
+        found_header = true;
+        
+        // Skip table of contents style lines
+        if line.starts_with("- [") || line.starts_with("* [") {
+            continue;
+        }
+        
+        // Add line
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            result.push(trimmed.to_string());
+            line_count += 1;
+        }
+        
+        // Get first ~10 meaningful lines
+        if line_count >= 10 {
+            break;
+        }
+    }
+    
+    if result.is_empty() {
+        return String::new();
+    }
+    
+    format!("README:\n{}", result.join("\n"))
+}
+
+/// Try to read project description from package files
+fn try_read_package_description(root: &std::path::Path) -> Option<String> {
+    // Try Cargo.toml
+    let cargo_path = root.join("Cargo.toml");
+    if cargo_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&cargo_path) {
+            if let Some(desc) = extract_cargo_description(&content) {
+                return Some(desc);
+            }
+        }
+    }
+    
+    // Try package.json
+    let package_path = root.join("package.json");
+    if package_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&package_path) {
+            if let Some(desc) = extract_package_json_description(&content) {
+                return Some(desc);
+            }
+        }
+    }
+    
+    // Try pyproject.toml
+    let pyproject_path = root.join("pyproject.toml");
+    if pyproject_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pyproject_path) {
+            if let Some(desc) = extract_pyproject_description(&content) {
+                return Some(desc);
+            }
+        }
+    }
+    
+    None
+}
+
+fn extract_cargo_description(content: &str) -> Option<String> {
+    let mut name = None;
+    let mut description = None;
+    
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with("name = ") {
+            name = line.split('"').nth(1).map(|s| s.to_string());
+        }
+        if line.starts_with("description = ") {
+            description = line.split('"').nth(1).map(|s| s.to_string());
+        }
+    }
+    
+    match (name, description) {
+        (Some(n), Some(d)) => Some(format!("Package: {} - {}", n, d)),
+        (Some(n), None) => Some(format!("Package: {}", n)),
+        (None, Some(d)) => Some(format!("Description: {}", d)),
+        _ => None,
+    }
+}
+
+fn extract_package_json_description(content: &str) -> Option<String> {
+    // Simple JSON parsing for name and description
+    let mut name = None;
+    let mut description = None;
+    
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with("\"name\"") {
+            name = line.split(':').nth(1)
+                .and_then(|s| s.trim().trim_matches(|c| c == '"' || c == ',').split('"').next())
+                .map(|s| s.to_string());
+        }
+        if line.starts_with("\"description\"") {
+            description = line.split(':').nth(1)
+                .and_then(|s| s.trim().trim_matches(|c| c == '"' || c == ',').split('"').next())
+                .map(|s| s.to_string());
+        }
+    }
+    
+    match (name, description) {
+        (Some(n), Some(d)) => Some(format!("Package: {} - {}", n, d)),
+        (Some(n), None) => Some(format!("Package: {}", n)),
+        (None, Some(d)) => Some(format!("Description: {}", d)),
+        _ => None,
+    }
+}
+
+fn extract_pyproject_description(content: &str) -> Option<String> {
+    let mut name = None;
+    let mut description = None;
+    
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with("name = ") {
+            name = line.split('"').nth(1).map(|s| s.to_string());
+        }
+        if line.starts_with("description = ") {
+            description = line.split('"').nth(1).map(|s| s.to_string());
+        }
+    }
+    
+    match (name, description) {
+        (Some(n), Some(d)) => Some(format!("Project: {} - {}", n, d)),
+        (Some(n), None) => Some(format!("Project: {}", n)),
+        (None, Some(d)) => Some(format!("Description: {}", d)),
+        _ => None,
+    }
+}
+
+/// Analyze project structure for domain hints
+fn analyze_project_structure(index: &CodebaseIndex) -> String {
+    let mut hints = Vec::new();
+    
+    // Count files by directory
+    let mut dir_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for path in index.files.keys() {
+        if let Some(parent) = path.parent() {
+            let dir = parent.to_string_lossy().to_string();
+            *dir_counts.entry(dir).or_insert(0) += 1;
+        }
+    }
+    
+    // Identify key directories
+    let key_dirs: Vec<_> = dir_counts.iter()
+        .filter(|(_, count)| **count > 2)
+        .map(|(dir, count)| format!("{} ({} files)", dir, count))
+        .take(5)
+        .collect();
+    
+    if !key_dirs.is_empty() {
+        hints.push(format!("Key directories: {}", key_dirs.join(", ")));
+    }
+    
+    // Identify technologies
+    let mut technologies = Vec::new();
+    let files: Vec<_> = index.files.keys().collect();
+    
+    if files.iter().any(|p| p.extension().map(|e| e == "rs").unwrap_or(false)) {
+        technologies.push("Rust");
+    }
+    if files.iter().any(|p| p.extension().map(|e| e == "ts" || e == "tsx").unwrap_or(false)) {
+        technologies.push("TypeScript");
+    }
+    if files.iter().any(|p| p.extension().map(|e| e == "js" || e == "jsx").unwrap_or(false)) {
+        technologies.push("JavaScript");
+    }
+    if files.iter().any(|p| p.extension().map(|e| e == "py").unwrap_or(false)) {
+        technologies.push("Python");
+    }
+    if files.iter().any(|p| p.extension().map(|e| e == "go").unwrap_or(false)) {
+        technologies.push("Go");
+    }
+    
+    if !technologies.is_empty() {
+        hints.push(format!("Technologies: {}", technologies.join(", ")));
+    }
+    
+    // File count summary
+    hints.push(format!("Total: {} files, {} symbols", index.files.len(), index.symbols.len()));
+    
+    hints.join("\n")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  FILE SUMMARIES GENERATION
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -686,17 +992,29 @@ pub struct SummaryBatchResult {
 /// 
 /// Uses batched approach (4 files per call) for reliability.
 /// Returns all summaries and total usage stats.
+/// 
+/// DEPRECATED: Use generate_file_summaries_incremental instead for caching support.
 pub async fn generate_file_summaries(
     index: &CodebaseIndex,
 ) -> anyhow::Result<(HashMap<PathBuf, String>, Option<Usage>)> {
+    let project_context = discover_project_context(index);
     let files: Vec<_> = index.files.keys().cloned().collect();
+    generate_summaries_for_files(index, &files, &project_context).await
+}
+
+/// Generate summaries for a specific list of files with project context
+pub async fn generate_summaries_for_files(
+    index: &CodebaseIndex,
+    files: &[PathBuf],
+    project_context: &str,
+) -> anyhow::Result<(HashMap<PathBuf, String>, Option<Usage>)> {
     let batch_size = 4;
     
     let mut all_summaries = HashMap::new();
     let mut total_usage = Usage::default();
     
     for batch in files.chunks(batch_size) {
-        match generate_summary_batch(index, batch).await {
+        match generate_summary_batch(index, batch, project_context).await {
             Ok(result) => {
                 all_summaries.extend(result.summaries);
                 if let Some(usage) = result.usage {
@@ -721,22 +1039,83 @@ pub async fn generate_file_summaries(
     Ok((all_summaries, final_usage))
 }
 
+/// Priority tier for file summarization
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryPriority {
+    /// Tier 1: Changed files, high complexity - summarize immediately
+    High,
+    /// Tier 2: Files with suggestions, focus directories - summarize soon  
+    Medium,
+    /// Tier 3: Everything else - background processing
+    Low,
+}
+
+/// Categorize files by priority for smart summarization
+pub fn prioritize_files_for_summary(
+    index: &CodebaseIndex,
+    context: &crate::context::WorkContext,
+    files_needing_summary: &[PathBuf],
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let mut high_priority = Vec::new();
+    let mut medium_priority = Vec::new();
+    let mut low_priority = Vec::new();
+    
+    let changed_files: std::collections::HashSet<_> = context.all_changed_files().into_iter().collect();
+    
+    for path in files_needing_summary {
+        // Check if file is in the index
+        let file_index = match index.files.get(path) {
+            Some(fi) => fi,
+            None => {
+                low_priority.push(path.clone());
+                continue;
+            }
+        };
+        
+        // Tier 1: Changed files or high complexity
+        if changed_files.contains(path) || file_index.complexity > 20.0 || file_index.loc > 500 {
+            high_priority.push(path.clone());
+            continue;
+        }
+        
+        // Tier 2: Recent modification or in focus area
+        let is_recent = file_index.last_modified.timestamp() > 
+            (chrono::Utc::now() - chrono::Duration::days(7)).timestamp();
+        let in_focus = context.inferred_focus.as_ref()
+            .map(|focus| path.to_string_lossy().contains(focus))
+            .unwrap_or(false);
+        
+        if is_recent || in_focus {
+            medium_priority.push(path.clone());
+            continue;
+        }
+        
+        // Tier 3: Everything else
+        low_priority.push(path.clone());
+    }
+    
+    (high_priority, medium_priority, low_priority)
+}
+
 /// Generate summaries for a single batch of files
 async fn generate_summary_batch(
     index: &CodebaseIndex,
     files: &[PathBuf],
+    project_context: &str,
 ) -> anyhow::Result<SummaryBatchResult> {
     let system = r#"You are a senior developer writing documentation. For each file, write a 2-6 sentence summary explaining:
 - What this file IS (its purpose/role)
 - What it DOES (key functionality, main exports)
 - How it FITS (relationships to other parts)
 
+IMPORTANT: Use the PROJECT CONTEXT provided to understand what this codebase is for. 
+Write definitive statements like "This file handles X" not vague guesses like "This seems to be related to Y".
 Be specific and technical. Reference actual function/struct names.
 
 OUTPUT: A JSON object mapping file paths to summary strings. Example:
 {"src/main.rs": "This is the application entry point..."}"#;
 
-    let user_prompt = build_batch_context(index, files);
+    let user_prompt = build_batch_context(index, files, project_context);
     
     let response = call_llm_with_usage(system, &user_prompt, Model::Opus, true).await?;
     
@@ -749,13 +1128,19 @@ OUTPUT: A JSON object mapping file paths to summary strings. Example:
 }
 
 /// Build context for a batch of files
-fn build_batch_context(index: &CodebaseIndex, files: &[PathBuf]) -> String {
+fn build_batch_context(index: &CodebaseIndex, files: &[PathBuf], project_context: &str) -> String {
     let project_name = index.root.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("project");
     
     let mut sections = Vec::new();
-    sections.push(format!("PROJECT: {}\n\nFILES TO SUMMARIZE:", project_name));
+    
+    // Include project context at the top
+    sections.push(format!(
+        "PROJECT: {}\n\n=== PROJECT CONTEXT (use this to understand file purposes) ===\n{}\n=== END PROJECT CONTEXT ===\n\nFILES TO SUMMARIZE:",
+        project_name,
+        project_context
+    ));
     
     for path in files {
         if let Some(file_index) = index.files.get(path) {
