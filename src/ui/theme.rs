@@ -38,8 +38,14 @@ impl Theme {
     /// Near black - main background
     pub const GREY_800: Color = Color::Rgb(28, 28, 28);
 
+    /// Dark grey - overlay backgrounds
+    pub const GREY_700: Color = Color::Rgb(35, 35, 35);
+
     /// True black - deepest background
     pub const GREY_900: Color = Color::Rgb(18, 18, 18);
+
+    /// Background color alias
+    pub const BG: Color = Self::GREY_900;
 
     // ─────────────────────────────────────────────────────────────────────
     // Semantic colors (still greyscale, but with meaning)
@@ -56,6 +62,16 @@ impl Theme {
 
     /// Info/neutral - standard
     pub const INFO: Color = Self::GREY_300;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Accent colors for diffs and special UI
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Green for additions
+    pub const GREEN: Color = Color::Rgb(100, 200, 100);
+
+    /// Red for removals
+    pub const RED: Color = Color::Rgb(200, 100, 100);
 
     // ─────────────────────────────────────────────────────────────────────
     // Pre-built styles for common UI elements

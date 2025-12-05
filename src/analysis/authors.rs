@@ -385,3 +385,4 @@ impl AuthorAnalyzer {
             .unwrap_or(false)
     }
 }
+

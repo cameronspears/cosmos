@@ -1,6 +1,8 @@
-# codecosmos
+# codecosmos 🌟
 
-A sophisticated terminal health dashboard for your codebase. Get an instant health score (0-100) for any git repo—see complexity hotspots, danger zones, bus factor risks, test coverage gaps, and track improvements over time.
+A beautiful terminal health dashboard for your codebase. Get an instant health score (0-100) for any git repo—see complexity hotspots, danger zones, bus factor risks, test coverage gaps, and track improvements over time.
+
+**Screenshot-worthy output. AI-powered fixes. Developer-friendly.**
 
 ```
 ┌────────────────────────┬──────────────────────────────────┬────────────────────────────┐
@@ -30,18 +32,17 @@ A sophisticated terminal health dashboard for your codebase. Get an instant heal
 
 ## Features
 
-- **Health Score (0-100)** with letter grades and trend tracking
+- **Health Score (0-100)** with letter grades, witty comments, and trend tracking
 - **6 Analysis Panels**: Danger Zones, Hotspots, Dusty Files, TODOs, Bus Factor, Test Coverage
-- **🆕 AI Prompt Builder** - Generate contextual prompts for AI coding assistants (copy to clipboard)
-- **🆕 Action Menu** - Quick actions for each file with context-aware suggestions
-- **🆕 Animated Analysis** - Beautiful unicode spinners during repository scanning
-- **Greyscale TUI** with sophisticated typography
-- **Score Breakdown** visual bars for each component
-- **Trend Sparkline** showing score history over time
-- **Search/Filter** across all panels
-- **Bus Factor Analysis** identifying single-author risks
-- **Test Coverage Detection** correlating source and test files
-- **CI/CD Ready** with JSON output and threshold checks
+- **🤖 AI Fix Workflow** - Generate diff patches with Claude, apply with one key
+- **🧪 Test Runner** - Detect and run tests (Rust, Node.js, Python, Go)
+- **🔍 AI Review** - Get code review from DeepSeek before committing
+- **📦 Git Integration** - Create branches, commit, push, and open PRs from the TUI
+- **📋 AI Prompt Builder** - Generate rich contextual prompts for any AI assistant
+- **Beautiful CLI Output** - Screenshot-worthy report cards for sharing
+- **Clean TUI** - Minimal, intuitive interface with great keyboard navigation
+- **Greyscale Aesthetic** - Sophisticated monochrome design
+- **CI/CD Ready** - JSON output and threshold checks for pipelines
 
 ## Installation
 
@@ -87,27 +88,66 @@ codecosmos --days 7 --stale-days 60
 
 ## Keyboard Controls
 
+### Navigation
 | Key | Action |
 |-----|--------|
+| `↑/k` `↓/j` | Navigate up/down |
 | `1-6` | Switch panels |
-| `Tab` / `Shift+Tab` | Next/previous panel |
-| `j` / `↓` | Move down |
-| `k` / `↑` | Move up |
-| `d` / `PgDn` | Page down |
-| `u` / `PgUp` | Page up |
-| `g` / `G` | Go to top/bottom |
-| `/` | Search/filter |
-| `Enter` | Open action menu |
-| `p` | **Generate AI prompt** (copy to clipboard) |
-| `P` | **Batch prompt** for top 10 items in panel |
-| `c` | Copy file path to clipboard |
-| `?` | Toggle help |
-| `Esc` | Close overlay/cancel |
+| `Tab` | Next panel |
+| `Enter` | View file details |
+| `/` | Search |
+| `?` | Help |
 | `q` | Quit |
+
+### Fix Workflow
+| Key | Action |
+|-----|--------|
+| `a` | AI fix - generates a diff patch (Claude) |
+| `t` | Run tests for selected file |
+| `r` | AI review (DeepSeek) |
+
+### Git Workflow
+| Key | Action |
+|-----|--------|
+| `b` | Create and checkout new branch |
+| `C` | Stage all and commit |
+| `P` | Push branch and create PR |
+
+### Other
+| Key | Action |
+|-----|--------|
+| `p` | Copy AI prompt to clipboard |
+| `c` | Copy file path |
+
+## AI Integration
+
+Press `a` on any file to get AI-powered fix suggestions via [OpenRouter](https://openrouter.ai).
+
+**One-time setup:**
+```bash
+codecosmos --setup
+```
+
+This will:
+1. Guide you to get a free API key from https://openrouter.ai/keys
+2. Save it locally to `~/.config/codecosmos/config.json`
+3. You're ready to use AI features!
+
+**Alternative:** Set `OPENROUTER_API_KEY` environment variable (useful for CI).
+
+**How it works:**
+1. Navigate to any problematic file (danger zone, missing tests, etc.)
+2. Press `a` to ask AI for a fix
+3. Claude analyzes the file with full context (metrics, complexity, test coverage)
+4. Get actionable refactoring suggestions
+
+**Models used:**
+- **Claude Sonnet 4** - For complex refactoring analysis
+- **DeepSeek** - For quick analysis (cost-effective)
 
 ## AI Prompt Builder
 
-The killer feature: press `p` on any file to generate a rich, contextual prompt for your AI coding assistant.
+Press `p` to copy a rich, contextual prompt to your clipboard for use with any AI assistant.
 
 **What gets included:**
 - File path and issue type (danger zone, missing tests, etc.)
@@ -305,6 +345,7 @@ Options:
       --json               Output results as JSON
       --save               Save score to history for trend tracking
       --skip-authors       Skip bus factor analysis (faster)
+      --setup              Configure OpenRouter API key for AI features
   -h, --help               Print help
   -V, --version            Print version
 ```

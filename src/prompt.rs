@@ -202,6 +202,42 @@ impl FileContext {
         self.todo_line = Some(todo.line_number);
         self
     }
+
+    /// Generate a summary of the issue for AI fix generation
+    pub fn issue_summary(&self) -> String {
+        let issue_type = self.issue_type.as_ref()
+            .map(|t| format!("{:?}", t))
+            .unwrap_or_else(|| "Unknown issue".to_string());
+        
+        let mut parts = vec![issue_type];
+        
+        if let Some(score) = self.danger_score {
+            parts.push(format!("danger score: {:.0}", score));
+        }
+        if let Some(count) = self.change_count {
+            parts.push(format!("changed {} times", count));
+        }
+        if let Some(complexity) = self.complexity_score {
+            parts.push(format!("complexity: {:.1}", complexity));
+        }
+        if let Some(loc) = self.loc {
+            parts.push(format!("{} lines", loc));
+        }
+        if let Some(ref reason) = self.danger_reason {
+            parts.push(reason.clone());
+        }
+        if let Some(ref reason) = self.bus_risk_reason {
+            parts.push(reason.clone());
+        }
+        if let Some(days) = self.days_since_change {
+            parts.push(format!("not changed in {} days", days));
+        }
+        if let Some(ref text) = self.todo_text {
+            parts.push(format!("TODO: {}", text));
+        }
+        
+        parts.join(", ")
+    }
 }
 
 /// Prompt builder that generates AI-ready prompts

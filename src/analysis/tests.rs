@@ -322,3 +322,4 @@ mod tests {
         assert_eq!(analyzer.extract_source_name("foo.spec"), "foo");
     }
 }
+
