@@ -10,41 +10,41 @@ pub struct Theme;
 
 impl Theme {
     // ═══════════════════════════════════════════════════════════════════════
-    //  CORE PALETTE - Shades of cosmic grey
+    //  CORE PALETTE - High contrast cosmic greys
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Starlight white - maximum emphasis, celestial highlights
     pub const WHITE: Color = Color::Rgb(255, 255, 255);
 
     /// Moonlight - headers, selected items, primary focus
-    pub const GREY_50: Color = Color::Rgb(250, 250, 250);
+    pub const GREY_50: Color = Color::Rgb(252, 252, 252);
 
     /// Dawn grey - primary text, important content
-    pub const GREY_100: Color = Color::Rgb(220, 220, 220);
+    pub const GREY_100: Color = Color::Rgb(240, 240, 240);
 
     /// Twilight - secondary text, active elements
-    pub const GREY_200: Color = Color::Rgb(180, 180, 180);
+    pub const GREY_200: Color = Color::Rgb(220, 220, 220);
 
     /// Dusk - muted text, less important info
-    pub const GREY_300: Color = Color::Rgb(140, 140, 140);
+    pub const GREY_300: Color = Color::Rgb(190, 190, 190);
 
     /// Evening - subtle elements, inactive tabs
-    pub const GREY_400: Color = Color::Rgb(100, 100, 100);
+    pub const GREY_400: Color = Color::Rgb(155, 155, 155);
 
     /// Night - borders, separators
-    pub const GREY_500: Color = Color::Rgb(70, 70, 70);
+    pub const GREY_500: Color = Color::Rgb(120, 120, 120);
 
-    /// Deep night - panel backgrounds
-    pub const GREY_600: Color = Color::Rgb(45, 45, 45);
+    /// Deep night - panel backgrounds, dimmer borders
+    pub const GREY_600: Color = Color::Rgb(70, 70, 70);
 
     /// Void - overlay backgrounds
-    pub const GREY_700: Color = Color::Rgb(35, 35, 35);
+    pub const GREY_700: Color = Color::Rgb(45, 45, 45);
 
-    /// Abyss - main background
+    /// Abyss - panel background
     pub const GREY_800: Color = Color::Rgb(28, 28, 28);
 
     /// Deep space - deepest background
-    pub const GREY_900: Color = Color::Rgb(18, 18, 18);
+    pub const GREY_900: Color = Color::Rgb(16, 16, 16);
 
     /// Background color alias
     pub const BG: Color = Self::GREY_900;
@@ -69,11 +69,11 @@ impl Theme {
     // Accent colors for diffs and special UI
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Green for additions
-    pub const GREEN: Color = Color::Rgb(100, 200, 100);
+    /// Green for additions - brighter for contrast
+    pub const GREEN: Color = Color::Rgb(130, 220, 130);
 
-    /// Red for removals
-    pub const RED: Color = Color::Rgb(200, 100, 100);
+    /// Red for removals - brighter for contrast  
+    pub const RED: Color = Color::Rgb(230, 120, 120);
 
     // ─────────────────────────────────────────────────────────────────────
     // Pre-built styles for common UI elements
@@ -89,19 +89,19 @@ impl Theme {
         Style::default().bg(Self::GREY_800)
     }
 
-    /// Primary text style
+    /// Primary text style - bright for readability
     pub fn text() -> Style {
-        Style::default().fg(Self::GREY_100)
+        Style::default().fg(Self::GREY_50)
     }
 
-    /// Secondary/muted text
+    /// Secondary/muted text - still readable
     pub fn text_muted() -> Style {
-        Style::default().fg(Self::GREY_300)
+        Style::default().fg(Self::GREY_200)
     }
 
-    /// Dimmed text for less important items
+    /// Dimmed text for less important items - now more legible
     pub fn text_dim() -> Style {
-        Style::default().fg(Self::GREY_400)
+        Style::default().fg(Self::GREY_300)
     }
 
     /// Bold emphasis
@@ -118,14 +118,14 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
-    /// Border style for panels
+    /// Border style for panels - visible but subtle
     pub fn border() -> Style {
-        Style::default().fg(Self::GREY_500)
+        Style::default().fg(Self::GREY_400)
     }
 
-    /// Active border (focused panel)
+    /// Active border (focused panel) - prominent
     pub fn border_active() -> Style {
-        Style::default().fg(Self::GREY_300)
+        Style::default().fg(Self::GREY_200)
     }
 
     /// Title style
@@ -306,14 +306,15 @@ impl Theme {
     //  COSMOS UI STRINGS
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// The Cosmos header/branding
-    pub const COSMOS_HEADER: &'static str = "☽ C O S M O S ✦";
-    pub const COSMOS_TAGLINE: &'static str = "a contemplative companion for your codebase";
+    /// The Cosmos header/branding - elegant italic
+    pub const COSMOS_LOGO: &'static str = "𝘤 𝘰 𝘴 𝘮 𝘰 𝘴";
+    
+    pub const COSMOS_TAGLINE: &'static str = "𝘢 𝘤𝘰𝘯𝘵𝘦𝘮𝘱𝘭𝘢𝘵𝘪𝘷𝘦 𝘤𝘰𝘮𝘱𝘢𝘯𝘪𝘰𝘯 𝘧𝘰𝘳 𝘺𝘰𝘶𝘳 𝘤𝘰𝘥𝘦𝘣𝘢𝘴𝘦";
 
-    /// Section headers
-    pub const SECTION_PROJECT: &'static str = "PROJECT";
-    pub const SECTION_SUGGESTIONS: &'static str = "SUGGESTIONS";
-    pub const SECTION_CONTEXT: &'static str = "CONTEXT";
+    /// Section headers - elegant serif style
+    pub const SECTION_PROJECT: &'static str = "𝘱𝘳𝘰𝘫𝘦𝘤𝘵";
+    pub const SECTION_SUGGESTIONS: &'static str = "𝘴𝘶𝘨𝘨𝘦𝘴𝘵𝘪𝘰𝘯𝘴";
+    pub const SECTION_CONTEXT: &'static str = "𝘤𝘰𝘯𝘵𝘦𝘹𝘵";
 
     /// Tree drawing characters
     pub const TREE_BRANCH: &'static str = "├── ";
@@ -370,14 +371,14 @@ impl Theme {
             .bg(Self::GREY_800)
     }
 
-    /// Style for key hints
+    /// Style for key hints - visible enough to read
     pub fn key_hint() -> Style {
-        Style::default().fg(Self::GREY_500)
+        Style::default().fg(Self::GREY_300)
     }
 
-    /// Style for key highlight
+    /// Style for key highlight - prominent
     pub fn key_highlight() -> Style {
-        Style::default().fg(Self::GREY_200)
+        Style::default().fg(Self::GREY_100)
     }
 }
 

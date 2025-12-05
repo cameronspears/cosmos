@@ -305,13 +305,13 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Clear with dark background
     frame.render_widget(Block::default().style(Style::default().bg(Theme::BG)), area);
 
-    // Main layout
+    // Main layout - clean and minimal
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),   // Header
+            Constraint::Length(6),   // Header (logo + tagline)
             Constraint::Min(10),     // Main content
-            Constraint::Length(2),   // Footer
+            Constraint::Length(3),   // Footer
         ])
         .split(area);
 
@@ -342,21 +342,23 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 }
 
-fn render_header(frame: &mut Frame, area: Rect, app: &App) {
+fn render_header(frame: &mut Frame, area: Rect, _app: &App) {
     let lines = vec![
+        Line::from(""),
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                format!("   {} ", Theme::COSMOS_HEADER),
+                format!("   {}", Theme::COSMOS_LOGO),
                 Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)
             ),
         ]),
         Line::from(vec![
             Span::styled(
                 format!("   {}", Theme::COSMOS_TAGLINE),
-                Style::default().fg(Theme::GREY_500).add_modifier(Modifier::ITALIC)
+                Style::default().fg(Theme::GREY_300)  // More legible tagline
             ),
         ]),
+        Line::from(""),
     ];
 
     let header = Paragraph::new(lines).style(Style::default().bg(Theme::BG));
@@ -364,30 +366,52 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_main(frame: &mut Frame, area: Rect, app: &App) {
-    // Split into two panels
+    // Add horizontal padding for breathing room
+    let padded = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(2),       // Left padding
+            Constraint::Min(10),         // Main content
+            Constraint::Length(2),       // Right padding
+        ])
+        .split(area);
+    
+    // Split into two panels with gap
     let panels = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(40),  // Project tree
-            Constraint::Percentage(60),  // Suggestions
+            Constraint::Percentage(38),  // Project tree
+            Constraint::Length(2),       // Gap between panels
+            Constraint::Percentage(62),  // Suggestions (wider for wrapped text)
         ])
-        .split(area);
+        .split(padded[1]);
 
     render_project_panel(frame, panels[0], app);
-    render_suggestions_panel(frame, panels[1], app);
+    render_suggestions_panel(frame, panels[2], app);
 }
 
 fn render_project_panel(frame: &mut Frame, area: Rect, app: &App) {
     let is_active = app.active_panel == ActivePanel::Project;
     let border_style = if is_active {
-        Style::default().fg(Theme::GREY_300)
+        Style::default().fg(Theme::GREY_300)  // Bright active border
     } else {
-        Style::default().fg(Theme::GREY_600)
+        Style::default().fg(Theme::GREY_600)  // Visible inactive border
     };
 
-    let visible_height = area.height.saturating_sub(2) as usize;
+    let visible_height = area.height.saturating_sub(4) as usize; // Account for borders and padding
     
     let mut lines = vec![];
+    
+    // Top padding for breathing room
+    lines.push(Line::from(""));
+    
+    let total_files = app.file_tree.len();
+    let scroll_indicator = if total_files > visible_height {
+        let current = app.project_scroll + 1;
+        format!(" ↕ {}/{} ", current, total_files)
+    } else {
+        String::new()
+    };
     
     for (i, entry) in app.file_tree.iter()
         .enumerate()
@@ -396,38 +420,33 @@ fn render_project_panel(frame: &mut Frame, area: Rect, app: &App) {
     {
         let is_selected = i == app.project_selected && is_active;
         let indent = "  ".repeat(entry.depth);
-        let prefix = if entry.is_dir {
-            Theme::TREE_FOLDER_OPEN.to_string()
-        } else {
-            Theme::TREE_FILE.to_string()
-        };
         
         let name_style = if is_selected {
             Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)
         } else if entry.priority == Theme::PRIORITY_HIGH {
-            Style::default().fg(Theme::GREY_100)
+            Style::default().fg(Theme::GREY_50)  // Bright for high priority
         } else {
-            Style::default().fg(Theme::GREY_400)
+            Style::default().fg(Theme::GREY_200)  // Legible for regular files
         };
         
-        let cursor = if is_selected { "›" } else { " " };
-        let priority_indicator = if entry.priority != ' ' {
-            format!(" {}", entry.priority)
+        let cursor = if is_selected { " ›" } else { "  " };
+        let priority_indicator = if entry.priority == Theme::PRIORITY_HIGH {
+            "  ●"
         } else {
-            "  ".to_string()
+            ""
         };
         
         lines.push(Line::from(vec![
-            Span::styled(cursor, Style::default().fg(Theme::WHITE)),
-            Span::styled(format!(" {}{} ", indent, prefix), Style::default().fg(Theme::GREY_600)),
+            Span::styled(cursor, Style::default().fg(Theme::GREY_100)),  // Bright cursor
+            Span::styled(format!(" {}", indent), Style::default().fg(Theme::GREY_600)),
             Span::styled(&entry.name, name_style),
-            Span::styled(priority_indicator, Style::default().fg(Theme::GREY_500)),
+            Span::styled(priority_indicator, Style::default().fg(Theme::GREY_200)),  // Visible indicator
         ]));
     }
 
     let block = Block::default()
-        .title(format!(" {} ", Theme::SECTION_PROJECT))
-        .title_style(Style::default().fg(Theme::GREY_300))
+        .title(format!(" {} {}", Theme::SECTION_PROJECT, scroll_indicator))
+        .title_style(Style::default().fg(Theme::GREY_200))  // Legible title
         .borders(Borders::ALL)
         .border_style(border_style)
         .style(Style::default().bg(Theme::GREY_800));
@@ -439,115 +458,166 @@ fn render_project_panel(frame: &mut Frame, area: Rect, app: &App) {
 fn render_suggestions_panel(frame: &mut Frame, area: Rect, app: &App) {
     let is_active = app.active_panel == ActivePanel::Suggestions;
     let border_style = if is_active {
-        Style::default().fg(Theme::GREY_300)
+        Style::default().fg(Theme::GREY_300)  // Bright active border
     } else {
-        Style::default().fg(Theme::GREY_600)
+        Style::default().fg(Theme::GREY_600)  // Visible inactive border
     };
 
-    let visible_height = area.height.saturating_sub(2) as usize;
+    let visible_height = area.height.saturating_sub(4) as usize; // Account for borders and padding
+    let inner_width = area.width.saturating_sub(6) as usize; // Account for borders and padding
     let suggestions = app.suggestions.active_suggestions();
     
     let mut lines = vec![];
     
+    // Top padding for breathing room
+    lines.push(Line::from(""));
+    
     if suggestions.is_empty() {
+        lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled(
-                "  No suggestions - your code looks contemplative ",
-                Style::default().fg(Theme::GREY_500).add_modifier(Modifier::ITALIC)
+                "   ✧ 𝑛𝑜 𝑠𝑢𝑔𝑔𝑒𝑠𝑡𝑖𝑜𝑛𝑠 · 𝑐𝑜𝑑𝑒𝑏𝑎𝑠𝑒 𝑖𝑠 𝑠𝑒𝑟𝑒𝑛𝑒",
+                Style::default().fg(Theme::GREY_300).add_modifier(Modifier::ITALIC)
             ),
         ]));
     } else {
-        for (i, suggestion) in suggestions.iter()
-            .enumerate()
-            .skip(app.suggestion_scroll)
-            .take(visible_height)
-        {
+        let mut line_count = 1; // Start at 1 for top padding
+        
+        for (i, suggestion) in suggestions.iter().enumerate().skip(app.suggestion_scroll) {
+            if line_count >= visible_height {
+                break;
+            }
+            
             let is_selected = i == app.suggestion_selected && is_active;
             
-            let priority_style = match suggestion.priority {
-                Priority::High => Style::default().fg(Theme::WHITE),
-                Priority::Medium => Style::default().fg(Theme::GREY_300),
-                Priority::Low => Style::default().fg(Theme::GREY_500),
+            let file_style = if is_selected {
+                Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Theme::GREY_100)  // Bright file names
             };
             
             let text_style = if is_selected {
-                Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)
+                Style::default().fg(Theme::GREY_100)  // Bright selected text
             } else {
-                Style::default().fg(Theme::GREY_200)
+                Style::default().fg(Theme::GREY_300)  // Legible suggestion text
             };
             
-            let cursor = if is_selected { "›" } else { " " };
+            let cursor = if is_selected { " ›" } else { "  " };
             let file_name = suggestion.file.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("?");
             
+            // File name line with cursor
             lines.push(Line::from(vec![
-                Span::styled(cursor, Style::default().fg(Theme::WHITE)),
-                Span::styled(format!(" {} ", suggestion.priority.icon()), priority_style),
-                Span::styled(format!("{}: ", suggestion.kind.label()), Style::default().fg(Theme::GREY_400)),
-                Span::styled(truncate(&suggestion.summary, 40), text_style),
+                Span::styled(cursor, Style::default().fg(Theme::GREY_100)),  // Bright cursor
+                Span::styled(format!(" {}", file_name), file_style),
             ]));
+            line_count += 1;
             
-            // Second line: file info
-            lines.push(Line::from(vec![
-                Span::styled("     ", Style::default()),
-                Span::styled(format!("in {}", file_name), Style::default().fg(Theme::GREY_600)),
-            ]));
+            // Wrap the summary text
+            let summary = &suggestion.summary;
+            let wrapped = wrap_text(summary, inner_width.saturating_sub(6));
+            
+            for (j, wrapped_line) in wrapped.iter().enumerate() {
+                if line_count >= visible_height {
+                    break;
+                }
+                
+                let prefix = if j == 0 { "     " } else { "     " };
+                let line_text = if j == 0 && wrapped.len() > 1 {
+                    format!("{}{}", prefix, wrapped_line)
+                } else if j == wrapped.len() - 1 && wrapped.len() > 1 {
+                    format!("{}{}", prefix, wrapped_line)
+                } else {
+                    format!("{}{}", prefix, wrapped_line)
+                };
+                
+                lines.push(Line::from(vec![
+                    Span::styled(line_text, text_style),
+                ]));
+                line_count += 1;
+            }
+            
+            // Add spacing between suggestions
+            if line_count < visible_height {
+                lines.push(Line::from(""));
+                line_count += 1;
+            }
         }
     }
 
     let counts = app.suggestions.counts();
-    let title = format!(
-        " {} ({} {} {} {}) ",
-        Theme::SECTION_SUGGESTIONS,
-        counts.high, Theme::PRIORITY_HIGH,
-        counts.medium, Theme::PRIORITY_MED,
-    );
+    let scroll_indicator = if suggestions.len() > visible_height / 3 {
+        let total = suggestions.len();
+        let current = app.suggestion_scroll + 1;
+        format!(" ↕ {}/{} ", current, total)
+    } else {
+        String::new()
+    };
+    
+    let title = if counts.total > 0 {
+        format!(" {} · {}{}", Theme::SECTION_SUGGESTIONS, counts.total, scroll_indicator)
+    } else {
+        format!(" {} ", Theme::SECTION_SUGGESTIONS)
+    };
 
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(Theme::GREY_300))
+        .title_style(Style::default().fg(Theme::GREY_200))  // Legible title
         .borders(Borders::ALL)
         .border_style(border_style)
         .style(Style::default().bg(Theme::GREY_800));
 
-    let paragraph = Paragraph::new(lines).block(block);
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    // Top line - subtle separator
+    let separator = Line::from(vec![
+        Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(Theme::GREY_500)  // Visible separator
+        ),
+    ]);
+    
+    // Bottom line - status and hints
     let mut spans = vec![
-        Span::styled(" ", Style::default()),
-        Span::styled(&app.context.branch, Style::default().fg(Theme::GREY_400)),
+        Span::styled("  ", Style::default()),
+        Span::styled(&app.context.branch, Style::default().fg(Theme::GREY_100)),  // Bright branch
     ];
 
     if app.context.has_changes() {
-        spans.push(Span::styled(" │ ", Style::default().fg(Theme::GREY_600)));
+        spans.push(Span::styled("  ·  ", Style::default().fg(Theme::GREY_500)));
         spans.push(Span::styled(
-            format!("{} changed", app.context.modified_count),
-            Style::default().fg(Theme::GREY_300),
+            format!("{} 𝘤𝘩𝘢𝘯𝘨𝘦𝘥", app.context.modified_count),
+            Style::default().fg(Theme::GREY_200),  // Visible count
         ));
     }
 
-    spans.push(Span::styled(" │ ", Style::default().fg(Theme::GREY_600)));
+    spans.push(Span::styled("  ·  ", Style::default().fg(Theme::GREY_500)));
     
-    // Key hints
+    // Key hints with elegant styling - high contrast
     let hints = [
-        ("?", "help"),
-        ("Tab", "switch"),
-        ("↵", "view"),
-        ("a", "apply"),
-        ("d", "dismiss"),
-        ("q", "quit"),
+        ("?", "𝘩𝘦𝘭𝘱"),
+        ("⇥", "𝘴𝘸𝘪𝘵𝘤𝘩"),
+        ("↵", "𝘷𝘪𝘦𝘸"),
+        ("𝘢", "𝘢𝘱𝘱𝘭𝘺"),
+        ("𝘥", "𝘥𝘪𝘴𝘮𝘪𝘴𝘴"),
+        ("𝘲", "𝘲𝘶𝘪𝘵"),
     ];
     
     for (key, action) in hints {
-        spans.push(Span::styled(key, Style::default().fg(Theme::GREY_300)));
-        spans.push(Span::styled(format!(" {} ", action), Style::default().fg(Theme::GREY_600)));
+        spans.push(Span::styled(key, Style::default().fg(Theme::WHITE)));  // White keys
+        spans.push(Span::styled(format!(" {} ", action), Style::default().fg(Theme::GREY_400)));  // Legible action
     }
 
-    let footer = Paragraph::new(Line::from(spans))
-        .style(Style::default().bg(Theme::GREY_800));
+    let footer_line = Line::from(spans);
+    
+    let footer = Paragraph::new(vec![separator, footer_line])
+        .style(Style::default().bg(Theme::BG));
     frame.render_widget(footer, area);
 }
 
@@ -556,100 +626,123 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn render_help(frame: &mut Frame) {
-    let area = centered_rect(50, 70, frame.area());
+    let area = centered_rect(45, 65, frame.area());
     frame.render_widget(Clear, area);
 
     let help_text = vec![
         Line::from(""),
+        Line::from(""),
         Line::from(vec![
-            Span::styled("  NAVIGATION", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD))
+            Span::styled("     𝒏𝒂𝒗𝒊𝒈𝒂𝒕𝒊𝒐𝒏", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD))
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  ↑/k ↓/j   ", Style::default().fg(Theme::GREY_300)),
-            Span::styled("Navigate", Style::default().fg(Theme::GREY_500)),
+            Span::styled("     ↑ ↓  𝘰𝘳  𝘬 𝘫", Style::default().fg(Theme::WHITE)),
+            Span::styled("      navigate", Style::default().fg(Theme::GREY_300)),
         ]),
         Line::from(vec![
-            Span::styled("  Tab       ", Style::default().fg(Theme::GREY_300)),
-            Span::styled("Switch panels", Style::default().fg(Theme::GREY_500)),
+            Span::styled("     ⇥  Tab", Style::default().fg(Theme::WHITE)),
+            Span::styled("           switch panels", Style::default().fg(Theme::GREY_300)),
         ]),
         Line::from(vec![
-            Span::styled("  Enter     ", Style::default().fg(Theme::GREY_300)),
-            Span::styled("View details", Style::default().fg(Theme::GREY_500)),
+            Span::styled("     ↵  Enter", Style::default().fg(Theme::WHITE)),
+            Span::styled("         view details", Style::default().fg(Theme::GREY_300)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  ACTIONS", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD))
+            Span::styled("     ─────────────────────────", Style::default().fg(Theme::GREY_500))
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  ?         ", Style::default().fg(Theme::GREY_300)),
-            Span::styled("Inquiry - ask for suggestions", Style::default().fg(Theme::GREY_500)),
-        ]),
-        Line::from(vec![
-            Span::styled("  a         ", Style::default().fg(Theme::GREY_300)),
-            Span::styled("Apply suggestion", Style::default().fg(Theme::GREY_500)),
-        ]),
-        Line::from(vec![
-            Span::styled("  d         ", Style::default().fg(Theme::GREY_300)),
-            Span::styled("Dismiss suggestion", Style::default().fg(Theme::GREY_500)),
-        ]),
-        Line::from(vec![
-            Span::styled("  r         ", Style::default().fg(Theme::GREY_300)),
-            Span::styled("Refresh index", Style::default().fg(Theme::GREY_500)),
+            Span::styled("     𝒂𝒄𝒕𝒊𝒐𝒏𝒔", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD))
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Esc       ", Style::default().fg(Theme::GREY_300)),
-            Span::styled("Close / Back", Style::default().fg(Theme::GREY_500)),
+            Span::styled("     ?", Style::default().fg(Theme::WHITE)),
+            Span::styled("                 inquiry", Style::default().fg(Theme::GREY_300)),
         ]),
         Line::from(vec![
-            Span::styled("  q         ", Style::default().fg(Theme::GREY_300)),
-            Span::styled("Quit", Style::default().fg(Theme::GREY_500)),
+            Span::styled("     𝘢", Style::default().fg(Theme::WHITE)),
+            Span::styled("                 apply suggestion", Style::default().fg(Theme::GREY_300)),
         ]),
+        Line::from(vec![
+            Span::styled("     𝘥", Style::default().fg(Theme::WHITE)),
+            Span::styled("                 dismiss", Style::default().fg(Theme::GREY_300)),
+        ]),
+        Line::from(vec![
+            Span::styled("     𝘳", Style::default().fg(Theme::WHITE)),
+            Span::styled("                 refresh", Style::default().fg(Theme::GREY_300)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("     ─────────────────────────", Style::default().fg(Theme::GREY_500))
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("     Esc", Style::default().fg(Theme::WHITE)),
+            Span::styled("               close", Style::default().fg(Theme::GREY_300)),
+        ]),
+        Line::from(vec![
+            Span::styled("     𝘲", Style::default().fg(Theme::WHITE)),
+            Span::styled("                 quit cosmos", Style::default().fg(Theme::GREY_300)),
+        ]),
+        Line::from(""),
         Line::from(""),
     ];
 
     let block = Paragraph::new(help_text)
         .block(Block::default()
-            .title(" Help ")
+            .title(" ✧ 𝘩𝘦𝘭𝘱 ")
+            .title_style(Style::default().fg(Theme::GREY_100))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Theme::GREY_500))
-            .style(Style::default().bg(Theme::GREY_800)));
+            .border_style(Style::default().fg(Theme::GREY_400))
+            .style(Style::default().bg(Theme::GREY_900)));
     
     frame.render_widget(block, area);
 }
 
 fn render_suggestion_detail(frame: &mut Frame, suggestion: &Suggestion, scroll: usize) {
-    let area = centered_rect(70, 75, frame.area());
+    let area = centered_rect(75, 80, frame.area());
     frame.render_widget(Clear, area);
 
-    let visible_height = area.height.saturating_sub(8) as usize;
+    let visible_height = area.height.saturating_sub(12) as usize;
+    let inner_width = area.width.saturating_sub(8) as usize;
     
     let mut lines = vec![
         Line::from(""),
+        Line::from(""),
         Line::from(vec![
-            Span::styled(format!("  {} ", suggestion.priority.icon()), 
+            Span::styled(format!("     {} ", suggestion.priority.icon()), 
                 Style::default().fg(Theme::WHITE)),
             Span::styled(suggestion.kind.label(), 
-                Style::default().fg(Theme::GREY_300)),
+                Style::default().fg(Theme::GREY_200).add_modifier(Modifier::ITALIC)),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(format!("  {}", suggestion.summary), 
-                Style::default().fg(Theme::GREY_100)),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(format!("  File: {}", suggestion.file.display()), 
-                Style::default().fg(Theme::GREY_400)),
-        ]),
     ];
+    
+    // Wrap the summary
+    let summary_wrapped = wrap_text(&suggestion.summary, inner_width.saturating_sub(10));
+    for wrapped_line in &summary_wrapped {
+        lines.push(Line::from(vec![
+            Span::styled(format!("     {}", wrapped_line), 
+                Style::default().fg(Theme::GREY_50)),
+        ]));
+    }
+    
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("     ─────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(format!("     𝘧𝘪𝘭𝘦   {}", suggestion.file.display()), 
+            Style::default().fg(Theme::GREY_300)),
+    ]));
 
     if let Some(line) = suggestion.line {
         lines.push(Line::from(vec![
-            Span::styled(format!("  Line: {}", line), 
-                Style::default().fg(Theme::GREY_400)),
+            Span::styled(format!("     𝘭𝘪𝘯𝘦   {}", line), 
+                Style::default().fg(Theme::GREY_300)),
         ]));
     }
 
@@ -657,136 +750,234 @@ fn render_suggestion_detail(frame: &mut Frame, suggestion: &Suggestion, scroll: 
 
     if let Some(detail) = &suggestion.detail {
         lines.push(Line::from(vec![
-            Span::styled("  DETAILS", Style::default().fg(Theme::GREY_300).add_modifier(Modifier::BOLD)),
+            Span::styled("     ─────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
         ]));
         lines.push(Line::from(""));
         
-        for line in detail.lines().skip(scroll).take(visible_height) {
+        // Wrap each line of detail text
+        let detail_lines: Vec<&str> = detail.lines().collect();
+        let mut wrapped_detail_lines = Vec::new();
+        
+        for line in &detail_lines {
+            let wrapped = wrap_text(line, inner_width.saturating_sub(10));
+            for w in wrapped {
+                wrapped_detail_lines.push(w);
+            }
+        }
+        
+        for line in wrapped_detail_lines.iter().skip(scroll).take(visible_height) {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {}", line), Style::default().fg(Theme::GREY_200)),
+                Span::styled(format!("     {}", line), Style::default().fg(Theme::GREY_100)),
+            ]));
+        }
+        
+        // Scroll indicator
+        if wrapped_detail_lines.len() > visible_height {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("     ↕ {}/{} ", scroll + 1, wrapped_detail_lines.len().saturating_sub(visible_height) + 1), 
+                    Style::default().fg(Theme::GREY_400)
+                ),
             ]));
         }
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  a", Style::default().fg(Theme::GREY_300)),
-        Span::styled(" apply  ", Style::default().fg(Theme::GREY_500)),
-        Span::styled("d", Style::default().fg(Theme::GREY_300)),
-        Span::styled(" dismiss  ", Style::default().fg(Theme::GREY_500)),
-        Span::styled("Esc", Style::default().fg(Theme::GREY_300)),
-        Span::styled(" close", Style::default().fg(Theme::GREY_500)),
+        Span::styled("     ─────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
     ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("     𝘢", Style::default().fg(Theme::WHITE)),
+        Span::styled(" apply   ", Style::default().fg(Theme::GREY_400)),
+        Span::styled("𝘥", Style::default().fg(Theme::WHITE)),
+        Span::styled(" dismiss   ", Style::default().fg(Theme::GREY_400)),
+        Span::styled("Esc", Style::default().fg(Theme::WHITE)),
+        Span::styled(" close", Style::default().fg(Theme::GREY_400)),
+    ]));
+    lines.push(Line::from(""));
 
     let block = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
         .block(Block::default()
-            .title(" Suggestion ")
+            .title(" ✧ 𝘥𝘦𝘵𝘢𝘪𝘭 ")
+            .title_style(Style::default().fg(Theme::GREY_100))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Theme::WHITE))
-            .style(Style::default().bg(Theme::GREY_800)));
+            .border_style(Style::default().fg(Theme::GREY_400))
+            .style(Style::default().bg(Theme::GREY_900)));
     
     frame.render_widget(block, area);
 }
 
 fn render_inquiry(frame: &mut Frame, response: &str, scroll: usize) {
-    let area = centered_rect(75, 80, frame.area());
+    let area = centered_rect(80, 85, frame.area());
     frame.render_widget(Clear, area);
 
-    let visible_height = area.height.saturating_sub(6) as usize;
+    let visible_height = area.height.saturating_sub(10) as usize;
+    let inner_width = area.width.saturating_sub(10) as usize;
     
     let mut lines = vec![
         Line::from(""),
+        Line::from(""),
         Line::from(vec![
-            Span::styled("  ✦ ", Style::default().fg(Theme::WHITE)),
-            Span::styled("Cosmos suggests...", Style::default().fg(Theme::GREY_200).add_modifier(Modifier::ITALIC)),
+            Span::styled("     ✧ ", Style::default().fg(Theme::WHITE)),
+            Span::styled("𝘤𝘰𝘴𝘮𝘰𝘴 𝘴𝘶𝘨𝘨𝘦𝘴𝘵𝘴...", Style::default().fg(Theme::GREY_200).add_modifier(Modifier::ITALIC)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("     ─────────────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
         ]),
         Line::from(""),
     ];
 
-    for line in response.lines().skip(scroll).take(visible_height) {
+    // Wrap each line of the response
+    let response_lines: Vec<&str> = response.lines().collect();
+    let mut wrapped_lines = Vec::new();
+    
+    for line in &response_lines {
+        if line.is_empty() {
+            wrapped_lines.push(String::new());
+        } else {
+            let wrapped = wrap_text(line, inner_width.saturating_sub(10));
+            for w in wrapped {
+                wrapped_lines.push(w);
+            }
+        }
+    }
+    
+    for line in wrapped_lines.iter().skip(scroll).take(visible_height) {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {}", line), Style::default().fg(Theme::GREY_200)),
+            Span::styled(format!("     {}", line), Style::default().fg(Theme::GREY_100)),
+        ]));
+    }
+    
+    // Scroll indicator
+    if wrapped_lines.len() > visible_height {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("     ↕ {}/{} ", scroll + 1, wrapped_lines.len().saturating_sub(visible_height) + 1), 
+                Style::default().fg(Theme::GREY_400)
+            ),
         ]));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  ↑↓ scroll  Esc close", Style::default().fg(Theme::GREY_500)),
+        Span::styled("     ─────────────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
     ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("     ↑↓", Style::default().fg(Theme::WHITE)),
+        Span::styled(" 𝘴𝘤𝘳𝘰𝘭𝘭   ", Style::default().fg(Theme::GREY_400)),
+        Span::styled("Esc", Style::default().fg(Theme::WHITE)),
+        Span::styled(" 𝘤𝘭𝘰𝘴𝘦", Style::default().fg(Theme::GREY_400)),
+    ]));
+    lines.push(Line::from(""));
 
     let block = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .block(Block::default()
-            .title(" Inquiry ")
+            .title(" ✧ 𝘪𝘯𝘲𝘶𝘪𝘳𝘺 ")
+            .title_style(Style::default().fg(Theme::GREY_100))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Theme::WHITE))
-            .style(Style::default().bg(Theme::GREY_800)));
+            .border_style(Style::default().fg(Theme::GREY_400))
+            .style(Style::default().bg(Theme::GREY_900)));
     
     frame.render_widget(block, area);
 }
 
 fn render_apply_confirm(frame: &mut Frame, diff_preview: &str, scroll: usize) {
-    let area = centered_rect(80, 85, frame.area());
+    let area = centered_rect(85, 85, frame.area());
     frame.render_widget(Clear, area);
 
-    let visible_height = area.height.saturating_sub(8) as usize;
+    let visible_height = area.height.saturating_sub(12) as usize;
     
     let mut lines = vec![
         Line::from(""),
+        Line::from(""),
         Line::from(vec![
-            Span::styled("  Apply these changes?", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
+            Span::styled("     𝘢𝘱𝘱𝘭𝘺 𝘵𝘩𝘦𝘴𝘦 𝘤𝘩𝘢𝘯𝘨𝘦𝘴?", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("     ─────────────────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
         ]),
         Line::from(""),
     ];
 
-    for line in diff_preview.lines().skip(scroll).take(visible_height) {
-        let style = if line.starts_with('+') {
+    let diff_lines: Vec<&str> = diff_preview.lines().collect();
+    
+    for line in diff_lines.iter().skip(scroll).take(visible_height) {
+        let style = if line.starts_with('+') && !line.starts_with("+++") {
             Style::default().fg(Theme::GREEN)
-        } else if line.starts_with('-') {
+        } else if line.starts_with('-') && !line.starts_with("---") {
             Style::default().fg(Theme::RED)
         } else if line.starts_with("@@") {
-            Style::default().fg(Theme::GREY_400)
-        } else {
+            Style::default().fg(Theme::GREY_400).add_modifier(Modifier::ITALIC)
+        } else if line.starts_with("+++") || line.starts_with("---") {
             Style::default().fg(Theme::GREY_300)
+        } else {
+            Style::default().fg(Theme::GREY_200)
         };
         
         lines.push(Line::from(vec![
-            Span::styled(format!("  {}", line), style),
+            Span::styled(format!("     {}", line), style),
+        ]));
+    }
+    
+    // Scroll indicator
+    if diff_lines.len() > visible_height {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("     ↕ {}/{} ", scroll + 1, diff_lines.len().saturating_sub(visible_height) + 1), 
+                Style::default().fg(Theme::GREY_400)
+            ),
         ]));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  y", Style::default().fg(Theme::GREEN)),
-        Span::styled(" apply  ", Style::default().fg(Theme::GREY_500)),
-        Span::styled("n", Style::default().fg(Theme::RED)),
-        Span::styled(" cancel", Style::default().fg(Theme::GREY_500)),
+        Span::styled("     ─────────────────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
     ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("     𝘺", Style::default().fg(Theme::WHITE)),
+        Span::styled(" apply   ", Style::default().fg(Theme::GREY_400)),
+        Span::styled("𝘯", Style::default().fg(Theme::WHITE)),
+        Span::styled(" cancel   ", Style::default().fg(Theme::GREY_400)),
+        Span::styled("↑↓", Style::default().fg(Theme::WHITE)),
+        Span::styled(" scroll", Style::default().fg(Theme::GREY_400)),
+    ]));
+    lines.push(Line::from(""));
 
     let block = Paragraph::new(lines)
         .block(Block::default()
-            .title(" Confirm ")
+            .title(" ✧ 𝘤𝘰𝘯𝘧𝘪𝘳𝘮 ")
+            .title_style(Style::default().fg(Theme::GREY_100))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Theme::WHITE))
-            .style(Style::default().bg(Theme::GREY_800)));
+            .border_style(Style::default().fg(Theme::GREY_400))
+            .style(Style::default().bg(Theme::GREY_900)));
     
     frame.render_widget(block, area);
 }
 
 fn render_toast(frame: &mut Frame, toast: &Toast) {
     let area = frame.area();
-    let width = (toast.message.len() + 6) as u16;
+    let width = (toast.message.len() + 10) as u16;
     let toast_area = Rect {
         x: (area.width.saturating_sub(width)) / 2,
-        y: area.height.saturating_sub(4),
+        y: area.height.saturating_sub(5),
         width: width.min(area.width),
         height: 1,
     };
 
     let content = Paragraph::new(Line::from(vec![
-        Span::styled(" ✓ ", Style::default().fg(Theme::WHITE)),
-        Span::styled(&toast.message, Style::default().fg(Theme::GREY_200)),
-        Span::styled(" ", Style::default()),
+        Span::styled("  ✧ ", Style::default().fg(Theme::WHITE)),
+        Span::styled(&toast.message, Style::default().fg(Theme::GREY_100).add_modifier(Modifier::ITALIC)),
+        Span::styled("  ", Style::default()),
     ]))
     .style(Style::default().bg(Theme::GREY_700));
 
@@ -823,4 +1014,55 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}...", &s[..max - 3])
     }
+}
+
+/// Wrap text to fit within a given width
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+    
+    for word in text.split_whitespace() {
+        if current_line.is_empty() {
+            if word.len() > width {
+                // Word is longer than width, force break it
+                let mut remaining = word;
+                while remaining.len() > width {
+                    lines.push(remaining[..width].to_string());
+                    remaining = &remaining[width..];
+                }
+                current_line = remaining.to_string();
+            } else {
+                current_line = word.to_string();
+            }
+        } else if current_line.len() + 1 + word.len() <= width {
+            current_line.push(' ');
+            current_line.push_str(word);
+        } else {
+            lines.push(current_line);
+            if word.len() > width {
+                let mut remaining = word;
+                while remaining.len() > width {
+                    lines.push(remaining[..width].to_string());
+                    remaining = &remaining[width..];
+                }
+                current_line = remaining.to_string();
+            } else {
+                current_line = word.to_string();
+            }
+        }
+    }
+    
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+    
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    
+    lines
 }

@@ -4,7 +4,7 @@
 //! without any API calls, making them completely free.
 
 use super::{Priority, Suggestion, SuggestionKind, SuggestionSource};
-use crate::index::{FileIndex, Language, PatternKind, PatternSeverity, Symbol, SymbolKind};
+use crate::index::{FileIndex, PatternKind, Symbol, SymbolKind};
 use std::path::PathBuf;
 
 /// Analyze a file and generate static suggestions
@@ -34,98 +34,78 @@ pub fn analyze_file(path: &PathBuf, file_index: &FileIndex) -> Vec<Suggestion> {
     suggestions
 }
 
-/// Check for overly large files
+/// Check for overly large files - only flag truly problematic files
 fn check_file_size(path: &PathBuf, file_index: &FileIndex) -> Vec<Suggestion> {
     let mut suggestions = Vec::new();
 
-    if file_index.loc > 1000 {
+    // Only flag files that are genuinely too large (2000+ lines)
+    if file_index.loc > 2000 {
         suggestions.push(
             Suggestion::new(
                 SuggestionKind::Improvement,
                 Priority::High,
                 path.clone(),
-                format!("Large file ({} lines) - consider splitting into modules", file_index.loc),
+                format!("File has {} lines - split into modules", file_index.loc),
                 SuggestionSource::Static,
             )
             .with_detail(format!(
-                "Files over 1000 lines become difficult to maintain. \
-                 This file has {} lines of code ({} non-blank). \
-                 Consider extracting related functionality into separate modules.",
-                file_index.loc, file_index.sloc
+                "This file has grown to {} lines. Consider extracting \
+                 distinct functionality into separate modules for maintainability.",
+                file_index.loc
             )),
-        );
-    } else if file_index.loc > 500 {
-        suggestions.push(
-            Suggestion::new(
-                SuggestionKind::Quality,
-                Priority::Medium,
-                path.clone(),
-                format!("Growing file ({} lines) - monitor complexity", file_index.loc),
-                SuggestionSource::Static,
-            )
-            .with_detail(
-                "This file is approaching the 500+ line threshold where \
-                 maintainability starts to decline. Consider if any \
-                 functionality could be extracted."
-                    .to_string(),
-            ),
         );
     }
 
     suggestions
 }
 
-/// Check overall file complexity
+/// Check overall file complexity - only flag severe cases
 fn check_complexity(path: &PathBuf, file_index: &FileIndex) -> Vec<Suggestion> {
     let mut suggestions = Vec::new();
 
-    // High average complexity
     let function_count = file_index
         .symbols
         .iter()
         .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
         .count();
 
+    // Only flag very high average complexity (25+)
     if function_count > 0 {
         let avg_complexity = file_index.complexity / function_count as f64;
 
-        if avg_complexity > 15.0 {
+        if avg_complexity > 25.0 {
             suggestions.push(
                 Suggestion::new(
                     SuggestionKind::Improvement,
                     Priority::High,
                     path.clone(),
                     format!(
-                        "High average complexity ({:.1}) - functions may be too complex",
+                        "Very high complexity ({:.0}) - refactor needed",
                         avg_complexity
                     ),
                     SuggestionSource::Static,
                 )
                 .with_detail(
-                    "High cyclomatic complexity makes code harder to test and maintain. \
-                     Consider breaking complex functions into smaller, focused units."
+                    "This file has exceptionally high cyclomatic complexity. \
+                     Break complex functions into smaller, focused units."
                         .to_string(),
                 ),
             );
         }
     }
 
-    // Too many functions in one file
-    if function_count > 30 {
+    // Only flag files with 50+ functions
+    if function_count > 50 {
         suggestions.push(
             Suggestion::new(
-                SuggestionKind::Quality,
-                Priority::Medium,
+                SuggestionKind::Improvement,
+                Priority::High,
                 path.clone(),
-                format!(
-                    "Many functions ({}) - consider organizing into modules",
-                    function_count
-                ),
+                format!("{} functions - split into modules", function_count),
                 SuggestionSource::Static,
             )
             .with_detail(
-                "Having many functions in a single file can indicate mixed responsibilities. \
-                 Group related functions into separate modules for better organization."
+                "This file has too many functions. Split into focused modules."
                     .to_string(),
             ),
         );
@@ -134,7 +114,7 @@ fn check_complexity(path: &PathBuf, file_index: &FileIndex) -> Vec<Suggestion> {
     suggestions
 }
 
-/// Check individual function length
+/// Check individual function length - only flag very long functions
 fn check_function_length(path: &PathBuf, symbol: &Symbol) -> Vec<Suggestion> {
     let mut suggestions = Vec::new();
 
@@ -144,36 +124,20 @@ fn check_function_length(path: &PathBuf, symbol: &Symbol) -> Vec<Suggestion> {
 
     let lines = symbol.line_count();
 
-    if lines > 100 {
+    // Only flag functions over 200 lines
+    if lines > 200 {
         suggestions.push(
             Suggestion::new(
                 SuggestionKind::Improvement,
                 Priority::High,
                 path.clone(),
-                format!("`{}` is {} lines - strongly consider refactoring", symbol.name, lines),
+                format!("`{}` is {} lines - needs refactoring", symbol.name, lines),
                 SuggestionSource::Static,
             )
             .with_line(symbol.line)
             .with_detail(format!(
-                "The function `{}` spans {} lines, which is very long. \
-                 Long functions are harder to understand, test, and maintain. \
-                 Consider extracting logical sections into helper functions.",
-                symbol.name, lines
-            )),
-        );
-    } else if lines > 50 {
-        suggestions.push(
-            Suggestion::new(
-                SuggestionKind::Quality,
-                Priority::Medium,
-                path.clone(),
-                format!("`{}` is {} lines - consider splitting", symbol.name, lines),
-                SuggestionSource::Static,
-            )
-            .with_line(symbol.line)
-            .with_detail(format!(
-                "The function `{}` is getting long at {} lines. \
-                 Functions over 50 lines often benefit from being broken down.",
+                "The function `{}` is {} lines. Extract logical sections \
+                 into helper functions.",
                 symbol.name, lines
             )),
         );
@@ -182,7 +146,7 @@ fn check_function_length(path: &PathBuf, symbol: &Symbol) -> Vec<Suggestion> {
     suggestions
 }
 
-/// Check function complexity
+/// Check function complexity - only flag very complex functions
 fn check_function_complexity(path: &PathBuf, symbol: &Symbol) -> Vec<Suggestion> {
     let mut suggestions = Vec::new();
 
@@ -190,133 +154,86 @@ fn check_function_complexity(path: &PathBuf, symbol: &Symbol) -> Vec<Suggestion>
         return suggestions;
     }
 
-    if symbol.complexity > 20.0 {
+    // Only flag very high complexity (30+)
+    if symbol.complexity > 30.0 {
         suggestions.push(
             Suggestion::new(
                 SuggestionKind::Improvement,
                 Priority::High,
                 path.clone(),
                 format!(
-                    "`{}` has high complexity ({:.0}) - simplify logic",
+                    "`{}` complexity is {:.0} - simplify",
                     symbol.name, symbol.complexity
                 ),
                 SuggestionSource::Static,
             )
             .with_line(symbol.line)
             .with_detail(format!(
-                "The function `{}` has a cyclomatic complexity of {:.0}. \
-                 High complexity often indicates too many code paths. \
-                 Consider using early returns, extracting conditions, or \
-                 breaking into smaller functions.",
+                "The function `{}` has cyclomatic complexity of {:.0}. \
+                 Use early returns and extract conditions.",
                 symbol.name, symbol.complexity
             )),
-        );
-    } else if symbol.complexity > 10.0 {
-        suggestions.push(
-            Suggestion::new(
-                SuggestionKind::Quality,
-                Priority::Low,
-                path.clone(),
-                format!(
-                    "`{}` has moderate complexity ({:.0})",
-                    symbol.name, symbol.complexity
-                ),
-                SuggestionSource::Static,
-            )
-            .with_line(symbol.line),
         );
     }
 
     suggestions
 }
 
-/// Convert a detected pattern to a suggestion
+/// Convert a detected pattern to a suggestion - only high priority items
 fn pattern_to_suggestion(path: &PathBuf, pattern: &crate::index::Pattern) -> Option<Suggestion> {
     let (kind, priority, summary, detail) = match pattern.kind {
-        PatternKind::LongFunction => (
-            SuggestionKind::Improvement,
-            Priority::from_severity(pattern.kind.severity()),
-            pattern.description.clone(),
-            Some(
-                "Long functions are harder to understand and test. \
-                 Break them into smaller, focused functions."
-                    .to_string(),
-            ),
-        ),
+        // Skip long function - handled by check_function_length
+        PatternKind::LongFunction => return None,
+        
+        // Deep nesting is important
         PatternKind::DeepNesting => (
             SuggestionKind::Improvement,
             Priority::High,
-            "Deep nesting detected - flatten with early returns".to_string(),
-            Some(
-                "Deeply nested code is hard to follow. Use early returns, \
-                 guard clauses, or extract nested logic into helper functions."
-                    .to_string(),
-            ),
+            "Deep nesting - flatten with early returns".to_string(),
+            Some("Use early returns or extract nested logic.".to_string()),
         ),
-        PatternKind::ManyParameters => (
-            SuggestionKind::Quality,
-            Priority::Medium,
-            "Function has many parameters - consider using a struct".to_string(),
-            Some(
-                "Functions with many parameters are hard to call correctly. \
-                 Consider grouping related parameters into a struct or builder."
-                    .to_string(),
-            ),
-        ),
+        
+        // Skip many parameters - not critical
+        PatternKind::ManyParameters => return None,
+        
+        // God module is important
         PatternKind::GodModule => (
             SuggestionKind::Improvement,
             Priority::High,
             format!("Large module - {}", pattern.description),
-            Some(
-                "This module has grown large and likely has multiple responsibilities. \
-                 Consider splitting into focused sub-modules."
-                    .to_string(),
-            ),
+            Some("Split into focused sub-modules.".to_string()),
         ),
-        PatternKind::DuplicatePattern => (
-            SuggestionKind::Improvement,
-            Priority::Medium,
-            "Potential code duplication detected".to_string(),
-            Some(
-                "Similar code patterns found. Consider extracting to a shared \
-                 function or using abstractions to reduce duplication."
-                    .to_string(),
-            ),
-        ),
+        
+        // Skip duplicate pattern - not critical enough
+        PatternKind::DuplicatePattern => return None,
+        
+        // Missing error handling is important
         PatternKind::MissingErrorHandling => (
             SuggestionKind::BugFix,
             Priority::High,
-            "Error handling may be missing".to_string(),
-            Some(
-                "This code path may not properly handle errors. \
-                 Add appropriate error handling to prevent runtime failures."
-                    .to_string(),
-            ),
+            "Missing error handling".to_string(),
+            Some("Add error handling to prevent runtime failures.".to_string()),
         ),
-        PatternKind::UnusedImport => (
-            SuggestionKind::Quality,
-            Priority::Low,
-            "Unused import detected".to_string(),
-            Some("Remove unused imports to keep the code clean.".to_string()),
-        ),
+        
+        // Skip unused imports - not critical
+        PatternKind::UnusedImport => return None,
+        
+        // Only show FIXME/BUG markers
         PatternKind::TodoMarker => {
             let todo_text = &pattern.description;
-            let priority = if todo_text.to_uppercase().contains("FIXME")
-                || todo_text.to_uppercase().contains("BUG")
-            {
-                Priority::High
-            } else if todo_text.to_uppercase().contains("HACK") {
-                Priority::Medium
+            let upper = todo_text.to_uppercase();
+            
+            // Only show FIXME and BUG markers
+            if upper.contains("FIXME") || upper.contains("BUG") {
+                (
+                    SuggestionKind::BugFix,
+                    Priority::High,
+                    format!("FIXME: {}", truncate(todo_text, 50)),
+                    Some(format!("Found: {}", todo_text)),
+                )
             } else {
-                Priority::Low
-            };
-
-            (
-                SuggestionKind::Quality,
-                priority,
-                format!("TODO marker: {}", truncate(todo_text, 50)),
-                Some(format!("Found: {}", todo_text)),
-            )
+                return None;
+            }
         }
     };
 
@@ -330,66 +247,11 @@ fn pattern_to_suggestion(path: &PathBuf, pattern: &crate::index::Pattern) -> Opt
     Some(suggestion)
 }
 
-/// Language-specific static checks
-fn language_specific_checks(path: &PathBuf, file_index: &FileIndex) -> Vec<Suggestion> {
-    let mut suggestions = Vec::new();
-
-    match file_index.language {
-        Language::Rust => {
-            // Check for unwrap() usage
-            // This would require content analysis
-        }
-        Language::JavaScript | Language::TypeScript => {
-            // Check for console.log
-            // Check for var usage
-        }
-        Language::Python => {
-            // Check for except: (bare except)
-        }
-        Language::Go => {
-            // Check for ignored error returns
-        }
-        Language::Unknown => {}
-    }
-
-    // Check for missing tests based on file naming
-    let path_str = path.to_string_lossy();
-    if !path_str.contains("test")
-        && !path_str.contains("spec")
-        && !path_str.contains("_test")
-        && file_index.symbols.len() > 3
-    {
-        let public_functions = file_index
-            .symbols
-            .iter()
-            .filter(|s| {
-                matches!(s.kind, SymbolKind::Function | SymbolKind::Method)
-                    && matches!(s.visibility, crate::index::Visibility::Public)
-            })
-            .count();
-
-        if public_functions >= 3 {
-            suggestions.push(
-                Suggestion::new(
-                    SuggestionKind::Testing,
-                    Priority::Medium,
-                    path.clone(),
-                    format!(
-                        "{} public functions without apparent tests",
-                        public_functions
-                    ),
-                    SuggestionSource::Static,
-                )
-                .with_detail(
-                    "This file has several public functions but no visible test file. \
-                     Consider adding tests to ensure correctness."
-                        .to_string(),
-                ),
-            );
-        }
-    }
-
-    suggestions
+/// Language-specific static checks - currently minimal, reserved for critical issues
+fn language_specific_checks(_path: &PathBuf, _file_index: &FileIndex) -> Vec<Suggestion> {
+    // Reserved for critical language-specific issues only
+    // We don't surface low-priority items like missing tests
+    Vec::new()
 }
 
 /// Truncate a string for display
@@ -404,16 +266,17 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{Pattern, Symbol, SymbolKind, Visibility};
+    use crate::index::{Symbol, SymbolKind, Visibility};
 
     #[test]
     fn test_function_length_check() {
+        // Only functions over 200 lines are flagged now
         let symbol = Symbol {
-            name: "long_function".to_string(),
+            name: "very_long_function".to_string(),
             kind: SymbolKind::Function,
             file: PathBuf::from("test.rs"),
             line: 1,
-            end_line: 120,
+            end_line: 250,
             complexity: 5.0,
             visibility: Visibility::Public,
         };
@@ -426,7 +289,27 @@ mod tests {
     }
 
     #[test]
-    fn test_todo_pattern_suggestion() {
+    fn test_moderate_function_not_flagged() {
+        // Functions under 200 lines should not be flagged
+        let symbol = Symbol {
+            name: "moderate_function".to_string(),
+            kind: SymbolKind::Function,
+            file: PathBuf::from("test.rs"),
+            line: 1,
+            end_line: 100,
+            complexity: 5.0,
+            visibility: Visibility::Public,
+        };
+
+        let path = PathBuf::from("test.rs");
+        let suggestions = check_function_length(&path, &symbol);
+
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_todo_not_shown() {
+        // Regular TODOs should not be shown
         let pattern = crate::index::Pattern {
             kind: PatternKind::TodoMarker,
             file: PathBuf::from("test.rs"),
@@ -437,12 +320,11 @@ mod tests {
         let path = PathBuf::from("test.rs");
         let suggestion = pattern_to_suggestion(&path, &pattern);
 
-        assert!(suggestion.is_some());
-        assert!(suggestion.unwrap().priority == Priority::Low);
+        assert!(suggestion.is_none());
     }
 
     #[test]
-    fn test_fixme_is_high_priority() {
+    fn test_fixme_is_shown() {
         let pattern = crate::index::Pattern {
             kind: PatternKind::TodoMarker,
             file: PathBuf::from("test.rs"),
