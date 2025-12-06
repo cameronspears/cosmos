@@ -4,7 +4,7 @@
 //! - Layer 1: Static rules (FREE)
 //! - Layer 2: Cached suggestions (ONE-TIME)
 //! - Layer 3: Grok Fast for categorization (~$0.0001/call)
-//! - Layer 4: Opus 4.5 for deep analysis (on-demand only)
+//! - Layer 4: LLM for deep analysis (Grok for analysis, Opus for code gen)
 
 pub mod llm;
 pub mod static_rules;
@@ -24,7 +24,7 @@ pub enum SuggestionSource {
     Cached,
     /// Grok Fast for quick categorization
     LlmFast,
-    /// Opus 4.5 for detailed analysis
+    /// LLM for detailed analysis
     LlmDeep,
 }
 

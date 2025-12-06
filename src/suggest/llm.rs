@@ -1,6 +1,6 @@
 //! LLM-powered suggestions via OpenRouter
 //!
-//! Single Opus 4.5 call for high-quality codebase-wide analysis.
+//! Uses Grok 4.1 Fast for analysis/summaries, Opus 4.5 for code generation.
 //! Uses smart context building to maximize insight per token.
 
 use super::{Priority, Suggestion, SuggestionKind, SuggestionSource};
@@ -14,17 +14,17 @@ use std::path::PathBuf;
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 // Model pricing per million tokens (as of 2024)
-const OPUS_INPUT_COST: f64 = 15.0;   // $15 per 1M input tokens
-const OPUS_OUTPUT_COST: f64 = 75.0;  // $75 per 1M output tokens
 const GROK_INPUT_COST: f64 = 5.0;    // $5 per 1M input tokens  
 const GROK_OUTPUT_COST: f64 = 15.0;  // $15 per 1M output tokens
+const OPUS_INPUT_COST: f64 = 15.0;   // $15 per 1M input tokens
+const OPUS_OUTPUT_COST: f64 = 75.0;  // $75 per 1M output tokens
 
 /// Models available for suggestions
 #[derive(Debug, Clone, Copy)]
 pub enum Model {
-    /// Grok Fast - for quick categorization
+    /// Grok 4.1 Fast - for analysis and summaries
     GrokFast,
-    /// Opus 4.5 - for deep analysis
+    /// Opus 4.5 - for code generation
     Opus,
 }
 
@@ -38,7 +38,7 @@ impl Model {
 
     pub fn max_tokens(&self) -> u32 {
         match self {
-            Model::GrokFast => 1024,
+            Model::GrokFast => 4096,
             Model::Opus => 8192,
         }
     }
@@ -224,7 +224,7 @@ Output exactly 1-2 sentences. Be specific and technical."#;
     call_llm(system, &user, Model::GrokFast).await
 }
 
-/// Deep analysis using Opus 4.5 (on-demand only)
+/// Deep analysis (on-demand only)
 pub async fn analyze_file_deep(
     path: &PathBuf,
     content: &str,
@@ -265,7 +265,7 @@ GUIDELINES:
         truncate_content(content, 8000)
     );
 
-    let response = call_llm(system, &user, Model::Opus).await?;
+    let response = call_llm(system, &user, Model::GrokFast).await?;
 
     parse_suggestions(&response, path)
 }
@@ -653,7 +653,7 @@ Incorporate the user's feedback into the fix. Be precise. Only change what's nec
 //  UNIFIED CODEBASE ANALYSIS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Analyze entire codebase with a single Opus 4.5 call
+/// Analyze entire codebase with Grok 4.1 Fast
 /// 
 /// This is the main entry point for generating high-quality suggestions.
 /// Uses smart context building to pack maximum insight into the prompt.
@@ -687,7 +687,7 @@ GUIDELINES:
 
     let user_prompt = build_codebase_context(index, context);
     
-    let response = call_llm_with_usage(system, &user_prompt, Model::Opus, true).await?;
+    let response = call_llm_with_usage(system, &user_prompt, Model::GrokFast, true).await?;
     
     let suggestions = parse_codebase_suggestions(&response.content)?;
     Ok((suggestions, response.usage))
@@ -835,19 +835,35 @@ fn build_codebase_context(index: &CodebaseIndex, context: &WorkContext) -> Strin
 
 /// Parse suggestions from codebase-wide analysis
 fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<Suggestion>> {
+    // Strip markdown code fences if present
+    let trimmed = response.trim();
+    let clean = if trimmed.starts_with("```json") {
+        trimmed.strip_prefix("```json").unwrap_or(trimmed)
+    } else if trimmed.starts_with("```") {
+        trimmed.strip_prefix("```").unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    let clean = if clean.ends_with("```") {
+        clean.strip_suffix("```").unwrap_or(clean)
+    } else {
+        clean
+    };
+    let clean = clean.trim();
+
     // Try to extract JSON array from response
-    let json_str = if let Some(start) = response.find('[') {
-        if let Some(end) = response.rfind(']') {
-            &response[start..=end]
+    let json_str = if let Some(start) = clean.find('[') {
+        if let Some(end) = clean.rfind(']') {
+            &clean[start..=end]
         } else {
-            response
+            clean
         }
     } else {
-        response
+        clean
     };
 
     let parsed: Vec<CodebaseSuggestionJson> = serde_json::from_str(json_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse suggestions: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse suggestions: {} | Response preview: {}", e, truncate_str(json_str, 200)))?;
 
     let suggestions = parsed
         .into_iter()
@@ -911,19 +927,35 @@ fn truncate_str(s: &str, max: usize) -> &str {
 
 /// Parse JSON suggestions from LLM response
 fn parse_suggestions(response: &str, path: &PathBuf) -> anyhow::Result<Vec<Suggestion>> {
+    // Strip markdown code fences if present
+    let trimmed = response.trim();
+    let clean = if trimmed.starts_with("```json") {
+        trimmed.strip_prefix("```json").unwrap_or(trimmed)
+    } else if trimmed.starts_with("```") {
+        trimmed.strip_prefix("```").unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    let clean = if clean.ends_with("```") {
+        clean.strip_suffix("```").unwrap_or(clean)
+    } else {
+        clean
+    };
+    let clean = clean.trim();
+
     // Try to extract JSON array from response
-    let json_str = if let Some(start) = response.find('[') {
-        if let Some(end) = response.rfind(']') {
-            &response[start..=end]
+    let json_str = if let Some(start) = clean.find('[') {
+        if let Some(end) = clean.rfind(']') {
+            &clean[start..=end]
         } else {
-            response
+            clean
         }
     } else {
-        response
+        clean
     };
 
     let parsed: Vec<SuggestionJson> = serde_json::from_str(json_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse suggestions: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse suggestions: {} | Response preview: {}", e, truncate_str(json_str, 200)))?;
 
     let suggestions = parsed
         .into_iter()
@@ -1691,7 +1723,7 @@ pub struct PRFileReview {
     pub comment: String,
 }
 
-/// Review changes using Sonnet 4 for thorough code review
+/// Review changes using LLM for thorough code review
 pub async fn review_changes(
     files_changed: &[(PathBuf, String)], // (file_path, diff)
 ) -> anyhow::Result<(Vec<crate::ui::PRReviewComment>, Usage)> {
@@ -1724,8 +1756,8 @@ Be constructive and focused. Skip trivial issues. Highlight the most important p
 
     let user_prompt = format!("Review these changes:\n{}", changes_text);
     
-    // Use Opus for thorough review
-    let response = call_llm_with_usage(system_prompt, &user_prompt, Model::Opus, true).await?;
+    // Use Grok Fast for thorough review
+    let response = call_llm_with_usage(system_prompt, &user_prompt, Model::GrokFast, true).await?;
     
     let usage = response.usage.unwrap_or_default();
     
@@ -1742,13 +1774,29 @@ fn parse_review_response(
 ) -> anyhow::Result<Vec<crate::ui::PRReviewComment>> {
     use crate::ui::{PRReviewComment, ReviewSeverity};
     
+    // Strip markdown code fences if present
+    let trimmed = content.trim();
+    let clean = if trimmed.starts_with("```json") {
+        trimmed.strip_prefix("```json").unwrap_or(trimmed)
+    } else if trimmed.starts_with("```") {
+        trimmed.strip_prefix("```").unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    let clean = if clean.ends_with("```") {
+        clean.strip_suffix("```").unwrap_or(clean)
+    } else {
+        clean
+    };
+    let clean = clean.trim();
+
     // Extract JSON from response
-    let json_start = content.find('[').unwrap_or(0);
-    let json_end = content.rfind(']').map(|i| i + 1).unwrap_or(content.len());
-    let json_str = &content[json_start..json_end];
+    let json_start = clean.find('[').unwrap_or(0);
+    let json_end = clean.rfind(']').map(|i| i + 1).unwrap_or(clean.len());
+    let json_str = &clean[json_start..json_end];
     
     let reviews: Vec<PRFileReview> = serde_json::from_str(json_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse review JSON: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse review JSON: {} | Response preview: {}", e, truncate_str(json_str, 200)))?;
     
     // Convert to PRReviewComment
     let mut comments = Vec::new();

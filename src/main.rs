@@ -318,7 +318,7 @@ async fn run_tui(
     
     if has_api_key {
         app.loading = LoadingState::GeneratingSuggestions;
-        app.show_toast("Analyzing codebase with Opus 4.5...");
+        app.show_toast("Analyzing codebase...");
     }
     
     eprintln!();
@@ -344,7 +344,7 @@ async fn run_tui(
                     let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                         suggestions,
                         usage,
-                        model: "opus-4.5".to_string(),
+                        model: "grok-4.1-fast".to_string(),
                     });
                 }
                 Err(e) => {
@@ -480,7 +480,7 @@ fn run_loop<B: Backend>(
                     
                     // Track cost
                     if let Some(u) = usage {
-                        let cost = u.calculate_cost(suggest::llm::Model::Opus);
+                        let cost = u.calculate_cost(suggest::llm::Model::GrokFast);
                         app.session_cost += cost;
                         app.session_tokens += u.total_tokens;
                     }
@@ -538,7 +538,7 @@ fn run_loop<B: Backend>(
                 BackgroundMessage::FixReady { suggestion_id, diff_preview, file_path, summary, usage } => {
                     // Track cost
                     if let Some(u) = usage {
-                        let cost = u.calculate_cost(suggest::llm::Model::Opus);
+                        let cost = u.calculate_cost(suggest::llm::Model::GrokFast);
                         app.session_cost += cost;
                         app.session_tokens += u.total_tokens;
                     }
@@ -553,7 +553,7 @@ fn run_loop<B: Backend>(
                 BackgroundMessage::RefinedFixReady { diff_preview, usage } => {
                     // Track cost
                     if let Some(u) = usage {
-                        let cost = u.calculate_cost(suggest::llm::Model::Opus);
+                        let cost = u.calculate_cost(suggest::llm::Model::GrokFast);
                         app.session_cost += cost;
                         app.session_tokens += u.total_tokens;
                     }
@@ -569,7 +569,7 @@ fn run_loop<B: Backend>(
                 BackgroundMessage::DirectFixApplied { suggestion_id, file_path, description, modified_areas, backup_path, usage } => {
                     // Track cost
                     if let Some(u) = usage {
-                        let cost = u.calculate_cost(suggest::llm::Model::Opus);
+                        let cost = u.calculate_cost(suggest::llm::Model::GrokFast);
                         app.session_cost += cost;
                         app.session_tokens += u.total_tokens;
                     }

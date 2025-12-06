@@ -1,6 +1,6 @@
 //! AI integration via OpenRouter
 //!
-//! Uses Claude Opus 4 for complex analysis and DeepSeek for simpler tasks.
+//! Uses Grok 4.1 Fast for analysis/summaries, Opus 4.5 for code generation.
 
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
@@ -9,25 +9,22 @@ const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 #[derive(Debug, Clone, Copy)]
 pub enum Model {
-    Claude,    // anthropic/claude-opus-4.5 - for complex refactoring
-    DeepSeek,  // deepseek/deepseek-v3.2 - for simpler analysis
-    GrokFast,  // x-ai/grok-4.1-fast - for quick summaries
+    GrokFast,  // x-ai/grok-4.1-fast - for analysis and summaries
+    Opus,      // anthropic/claude-opus-4.5 - for code generation
 }
 
 impl Model {
     pub fn id(&self) -> &'static str {
         match self {
-            Model::Claude => "anthropic/claude-opus-4.5",
-            Model::DeepSeek => "deepseek/deepseek-v3.2",
             Model::GrokFast => "x-ai/grok-4.1-fast",
+            Model::Opus => "anthropic/claude-opus-4.5",
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
-            Model::Claude => "Claude Opus 4.5",
-            Model::DeepSeek => "DeepSeek V3.2",
             Model::GrokFast => "Grok 4.1 Fast",
+            Model::Opus => "Opus 4.5",
         }
     }
 }
@@ -122,15 +119,14 @@ pub async fn chat(prompt: &str, model: Model) -> Result<String, String> {
         .ok_or_else(|| "No response from AI".to_string())
 }
 
-/// Generate a fix suggestion for a file issue (prose analysis)
+/// Generate a fix suggestion for a file issue (code generation)
 pub async fn suggest_fix(prompt: &str) -> Result<String, String> {
-    // Use Claude for complex refactoring suggestions
-    chat(prompt, Model::Claude).await
+    chat(prompt, Model::Opus).await
 }
 
-/// Quick analysis using cheaper model
+/// Quick analysis
 pub async fn quick_analysis(prompt: &str) -> Result<String, String> {
-    chat(prompt, Model::DeepSeek).await
+    chat(prompt, Model::GrokFast).await
 }
 
 /// Generate a fix for an issue - AI explains what it found and proposes changes
@@ -185,7 +181,7 @@ RULES:
         file_path, loc, fn_count, issue, content
     );
 
-    chat_with_system(system_prompt, &user_prompt, Model::Claude).await
+    chat_with_system(system_prompt, &user_prompt, Model::Opus).await
 }
 
 /// Parse AI response into explanation and changes
@@ -313,7 +309,7 @@ impl IssueSeverity {
     }
 }
 
-/// Review code changes using DeepSeek (cheaper model)
+/// Review code changes
 pub async fn review_changes(original: &str, modified: &str, file_path: &str) -> Result<ReviewResult, String> {
     let system_prompt = r#"You are a senior code reviewer. Review the changes and provide feedback.
 
@@ -340,7 +336,7 @@ Be concise. Only flag real issues, not style preferences."#;
         file_path, original, modified
     );
 
-    let response = chat_with_system(system_prompt, &user_prompt, Model::DeepSeek).await?;
+    let response = chat_with_system(system_prompt, &user_prompt, Model::GrokFast).await?;
     
     // Parse the JSON response
     parse_review_response(&response)
@@ -422,7 +418,7 @@ fix(api): handle null user preferences correctly"#;
         file_path, diff
     );
 
-    let response = chat_with_system(system_prompt, &user_prompt, Model::DeepSeek).await?;
+    let response = chat_with_system(system_prompt, &user_prompt, Model::GrokFast).await?;
     
     // Clean up the response - extract just the commit message
     let message = response.lines()
@@ -459,7 +455,7 @@ Be concise and informative."#;
         commits_text, files_text
     );
 
-    chat_with_system(system_prompt, &user_prompt, Model::DeepSeek).await
+    chat_with_system(system_prompt, &user_prompt, Model::GrokFast).await
 }
 
 /// Result of file summary generation
@@ -615,7 +611,7 @@ RULES:
         content.lines().take(150).collect::<Vec<_>>().join("\n")
     );
 
-    let response = chat_with_system(system_prompt, &user_prompt, Model::GrokFast).await?;
+    let response = chat_with_system(system_prompt, &user_prompt, Model::Opus).await?;
     parse_enhancements(&response)
 }
 
@@ -679,9 +675,8 @@ mod tests {
 
     #[test]
     fn test_model_ids() {
-        assert!(Model::Claude.id().contains("claude"));
-        assert!(Model::DeepSeek.id().contains("deepseek"));
         assert!(Model::GrokFast.id().contains("grok"));
+        assert!(Model::Opus.id().contains("opus"));
     }
     
     #[test]
