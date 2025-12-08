@@ -6,8 +6,10 @@
 //! - Current branch
 //! - Work-in-progress detection
 
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
-use git2::{Repository, Status, StatusOptions};
+use git2::{Repository, StatusOptions};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

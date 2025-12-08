@@ -18,24 +18,6 @@ pub struct GitStatus {
     pub behind: usize,
 }
 
-impl GitStatus {
-    pub fn has_changes(&self) -> bool {
-        !self.staged.is_empty() || !self.modified.is_empty()
-    }
-    
-    pub fn is_clean(&self) -> bool {
-        self.staged.is_empty() && self.modified.is_empty() && self.untracked.is_empty()
-    }
-}
-
-/// Count modified files (for status bar display)
-pub fn count_modified_files(repo_path: &Path) -> usize {
-    match current_status(repo_path) {
-        Ok(status) => status.modified.len() + status.staged.len(),
-        Err(_) => 0,
-    }
-}
-
 /// Get the current git status
 pub fn current_status(repo_path: &Path) -> Result<GitStatus> {
     let repo = Repository::open(repo_path)?;
@@ -186,30 +168,6 @@ pub fn push_branch(repo_path: &Path, branch: &str) -> Result<String> {
     }
 }
 
-/// Get current branch name
-pub fn current_branch(repo_path: &Path) -> Result<String> {
-    let repo = Repository::open(repo_path)?;
-    let head = repo.head()?;
-    Ok(head.shorthand().unwrap_or("detached").to_string())
-}
-
-/// Check if there are uncommitted changes
-pub fn has_uncommitted_changes(repo_path: &Path) -> Result<bool> {
-    let status = current_status(repo_path)?;
-    Ok(!status.modified.is_empty() || !status.staged.is_empty())
-}
-
-/// Get the diff of staged changes as a string
-pub fn staged_diff(repo_path: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .current_dir(repo_path)
-        .args(["diff", "--cached"])
-        .output()
-        .context("Failed to get staged diff")?;
-    
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
 /// Reset a file to HEAD (discard changes)
 pub fn reset_file(repo_path: &Path, file_path: &str) -> Result<()> {
     let output = Command::new("git")
@@ -226,22 +184,6 @@ pub fn reset_file(repo_path: &Path, file_path: &str) -> Result<()> {
             String::from_utf8_lossy(&output.stderr)
         ))
     }
-}
-
-/// Get list of branches
-pub fn list_branches(repo_path: &Path) -> Result<Vec<String>> {
-    let repo = Repository::open(repo_path)?;
-    let branches = repo.branches(Some(git2::BranchType::Local))?;
-    
-    let mut result = Vec::new();
-    for branch in branches {
-        let (branch, _) = branch?;
-        if let Some(name) = branch.name()? {
-            result.push(name.to_string());
-        }
-    }
-    
-    Ok(result)
 }
 
 // ============================================================================
@@ -294,44 +236,6 @@ pub fn create_pr(repo_path: &Path, title: &str, body: &str) -> Result<String> {
     }
 }
 
-/// Create PR with draft option
-pub fn create_draft_pr(repo_path: &Path, title: &str, body: &str) -> Result<String> {
-    if !gh_available() {
-        return Err(anyhow::anyhow!("gh CLI not installed"));
-    }
-    
-    let output = Command::new("gh")
-        .current_dir(repo_path)
-        .args(["pr", "create", "--draft", "--title", title, "--body", body])
-        .output()
-        .context("Failed to create draft PR")?;
-    
-    if output.status.success() {
-        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(url)
-    } else {
-        Err(anyhow::anyhow!(
-            "Failed to create draft PR: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
-}
-
-/// Get the URL of the current repository
-pub fn repo_url(repo_path: &Path) -> Result<String> {
-    let output = Command::new("gh")
-        .current_dir(repo_path)
-        .args(["repo", "view", "--json", "url", "-q", ".url"])
-        .output()
-        .context("Failed to get repo URL")?;
-    
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err(anyhow::anyhow!("Failed to get repo URL"))
-    }
-}
-
 /// Open a URL in the default browser
 pub fn open_url(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -367,11 +271,12 @@ mod tests {
     use std::env;
 
     #[test]
-    fn test_current_branch() {
+    fn test_current_status() {
         // Test on the codecosmos repo itself
         let repo_path = env::current_dir().unwrap();
-        let branch = current_branch(&repo_path);
-        assert!(branch.is_ok());
+        let status = current_status(&repo_path);
+        assert!(status.is_ok());
+        assert!(!status.unwrap().branch.is_empty());
     }
 }
 

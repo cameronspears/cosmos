@@ -2,6 +2,8 @@
 //!
 //! Helper functions for rendering panels, buttons, and collapsible sections.
 
+#![allow(dead_code)]
+
 use crate::ui::theme::Theme;
 use ratatui::{
     style::{Modifier, Style},
@@ -166,7 +168,7 @@ pub fn card_line<'a>(content: &str, width: usize, style: Style) -> Line<'a> {
     ])
 }
 
-pub fn card_line_raw<'a>(spans: Vec<Span<'a>>, width: usize) -> Line<'a> {
+pub fn card_line_raw<'a>(spans: Vec<Span<'a>>, _width: usize) -> Line<'a> {
     let mut all_spans = vec![
         Span::styled("     │ ", Style::default().fg(Theme::GREY_600)),
     ];
@@ -183,9 +185,9 @@ pub fn card_line_raw<'a>(spans: Vec<Span<'a>>, width: usize) -> Line<'a> {
 /// Create a priority badge
 pub fn priority_badge<'a>(priority: char) -> Span<'a> {
     let (icon, style) = match priority {
-        '●' | '\u{25CF}' => ("●", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
-        '◐' | '\u{25D0}' => ("◐", Style::default().fg(Theme::GREY_200)),
-        '○' | '\u{25CB}' => ("○", Style::default().fg(Theme::GREY_400)),
+        '●' => ("●", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
+        '◐' => ("◐", Style::default().fg(Theme::GREY_200)),
+        '○' => ("○", Style::default().fg(Theme::GREY_400)),
         _ => ("·", Style::default().fg(Theme::GREY_500)),
     };
     Span::styled(icon.to_string(), style)

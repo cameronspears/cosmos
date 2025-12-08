@@ -3,6 +3,8 @@
 //! Persists suggestions and index data to .cosmos/ directory
 //! to avoid redundant LLM calls and speed up startup.
 
+#![allow(dead_code)]
+
 use crate::index::CodebaseIndex;
 use crate::suggest::Suggestion;
 use chrono::{DateTime, Duration, Utc};
@@ -262,11 +264,11 @@ impl Default for LlmSummaryCache {
 pub fn compute_file_hashes(index: &CodebaseIndex) -> HashMap<PathBuf, String> {
     index.files.iter()
         .map(|(path, file_index)| {
+            // Use only content-based metrics, not mtime (which changes on git checkout, copy, etc.)
             let hash = format!(
-                "{}-{}-{}",
+                "{}-{}",
                 file_index.loc,
-                file_index.symbols.len(),
-                file_index.last_modified.timestamp()
+                file_index.symbols.len()
             );
             (path.clone(), hash)
         })

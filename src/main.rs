@@ -14,18 +14,8 @@ mod suggest;
 mod ui;
 
 // Keep these for compatibility during transition
-mod ai;
-mod analysis;
 mod diff;
 mod git_ops;
-mod history;
-mod mascot;
-mod prompt;
-mod refactor;
-mod score;
-mod spinner;
-mod testing;
-mod workflow;
 
 use anyhow::Result;
 use clap::Parser;
@@ -80,6 +70,12 @@ pub enum BackgroundMessage {
     SummariesReady {
         summaries: std::collections::HashMap<PathBuf, String>,
         usage: Option<suggest::llm::Usage>,
+    },
+    /// Incremental summary progress update
+    SummaryProgress {
+        completed: usize,
+        total: usize,
+        summaries: std::collections::HashMap<PathBuf, String>,
     },
     SummariesError(String),
     /// Quick preview ready (Phase 1 - fast)
@@ -138,12 +134,6 @@ async fn main() -> Result<()> {
     }
 
     let path = args.path.canonicalize()?;
-
-    // Show startup message
-    eprintln!();
-    eprintln!("  ☽ C O S M O S ✦");
-    eprintln!("  a contemplative companion for your codebase");
-    eprintln!();
 
     // Initialize cache
     let cache_manager = cache::Cache::new(&path);
@@ -318,7 +308,6 @@ async fn run_tui(
     
     if has_api_key {
         app.loading = LoadingState::GeneratingSuggestions;
-        app.show_toast("Analyzing codebase...");
     }
     
     eprintln!();
@@ -344,7 +333,7 @@ async fn run_tui(
                     let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                         suggestions,
                         usage,
-                        model: "grok-4.1-fast".to_string(),
+                        model: "opus-4.5".to_string(),
                     });
                 }
                 Err(e) => {
@@ -370,6 +359,9 @@ async fn run_tui(
                 app.show_toast(&format!("{}/{} cached · generating {}", cached_count, total_files, needs_summary_count));
             }
             
+            // Calculate total file count for progress
+            let total_to_process = high_priority.len() + medium_priority.len() + low_priority.len();
+            
             tokio::spawn(async move {
                 let cache = cache::Cache::new(&cache_path);
                 
@@ -379,6 +371,7 @@ async fn run_tui(
                 
                 let mut all_summaries = HashMap::new();
                 let mut total_usage = suggest::llm::Usage::default();
+                let mut completed_count = 0usize;
                 
                 // Process all priority tiers with parallel batching within each tier
                 let priority_tiers = [
@@ -410,6 +403,15 @@ async fn run_tui(
                             // Save cache incrementally after each batch
                             let _ = cache.save_llm_summaries_cache(&llm_cache);
                             
+                            completed_count += summaries.len();
+                            
+                            // Send progress update with new summaries
+                            let _ = tx_summaries.send(BackgroundMessage::SummaryProgress {
+                                completed: completed_count,
+                                total: total_to_process,
+                                summaries: summaries.clone(),
+                            });
+                            
                             all_summaries.extend(summaries);
                             if let Some(u) = usage {
                                 total_usage.prompt_tokens += u.prompt_tokens;
@@ -426,8 +428,9 @@ async fn run_tui(
                     None
                 };
                 
+                // Send final message (summaries already sent via progress, so send empty)
                 let _ = tx_summaries.send(BackgroundMessage::SummariesReady { 
-                    summaries: all_summaries, 
+                    summaries: HashMap::new(), 
                     usage: final_usage 
                 });
             });
@@ -488,9 +491,9 @@ fn run_loop<B: Backend>(
                         app.suggestions.add_llm_suggestion(s);
                     }
                     
-                    // Track cost
+                    // Track cost (Opus for suggestions)
                     if let Some(u) = usage {
-                        let cost = u.calculate_cost(suggest::llm::Model::GrokFast);
+                        let cost = u.calculate_cost(suggest::llm::Model::Opus);
                         app.session_cost += cost;
                         app.session_tokens += u.total_tokens;
                     }
@@ -527,14 +530,22 @@ fn run_loop<B: Backend>(
                     }
                     
                     app.loading = LoadingState::None;
+                    app.summary_progress = None;
                     if new_count > 0 {
                         app.show_toast(&format!("{} new summaries · ${:.4}", new_count, app.session_cost));
                     } else {
                         app.show_toast("All summaries loaded from cache");
                     }
                 }
+                BackgroundMessage::SummaryProgress { completed, total, summaries } => {
+                    // Update progress display
+                    app.summary_progress = Some((completed, total));
+                    // Merge new summaries
+                    app.update_summaries(summaries);
+                }
                 BackgroundMessage::SummariesError(e) => {
                     app.loading = LoadingState::None;
+                    app.summary_progress = None;
                     app.show_toast(&format!("Summary error: {}", truncate(&e, 30)));
                 }
                 BackgroundMessage::PreviewReady { suggestion_id, file_path, summary, preview } => {
@@ -674,8 +685,7 @@ fn run_loop<B: Backend>(
                                 let context_clone = app.context.clone();
                                 let tx_question = tx.clone();
                                 
-                                app.loading = LoadingState::GeneratingSuggestions;
-                                app.show_toast("Thinking...");
+                                app.loading = LoadingState::Answering;
                                 
                                 tokio::spawn(async move {
                                     match suggest::llm::ask_question(&index_clone, &context_clone, &question).await {

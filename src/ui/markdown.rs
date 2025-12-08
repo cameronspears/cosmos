@@ -2,6 +2,9 @@
 //!
 //! Parses common markdown elements and renders them with appropriate styles.
 
+#![allow(dead_code)]
+#![allow(unused_mut)]
+
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
@@ -189,7 +192,7 @@ fn wrap_text_simple(text: &str, max_width: usize) -> Vec<String> {
 /// Parse inline markdown elements (bold, italic, code)
 fn parse_inline_markdown(text: &str) -> Line<'static> {
     let mut spans = Vec::new();
-    let mut chars: Vec<char> = text.chars().collect();
+    let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
     let mut current_text = String::new();
     
@@ -329,3 +332,4 @@ mod tests {
         assert_eq!(lines.len(), 2);
     }
 }
+

@@ -3,6 +3,8 @@
 //! A contemplative, high-contrast palette with celestial motifs.
 //! "Where code meets the cosmos"
 
+#![allow(dead_code)]
+
 use ratatui::style::{Color, Modifier, Style};
 
 /// The Cosmos theme - monochromatic with meaning

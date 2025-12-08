@@ -6,10 +6,12 @@
 //! - Layer 3: Grok Fast for categorization (~$0.0001/call)
 //! - Layer 4: LLM for deep analysis (Grok for analysis, Opus for code gen)
 
+#![allow(dead_code)]
+
 pub mod llm;
 pub mod static_rules;
 
-use crate::index::{CodebaseIndex, FileIndex, Pattern, PatternKind, PatternSeverity};
+use crate::index::{CodebaseIndex, PatternSeverity};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

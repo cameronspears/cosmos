@@ -3,6 +3,8 @@
 //! Organizes codebase files into architectural layers (Frontend, Backend, API, etc.)
 //! and feature clusters for a more intuitive project explorer.
 
+#![allow(dead_code)]
+
 pub mod heuristics;
 pub mod features;
 
@@ -366,3 +368,4 @@ impl GroupedTreeEntry {
         }
     }
 }
+

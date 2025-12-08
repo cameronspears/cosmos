@@ -15,12 +15,14 @@
 //! ║  main ● 5 changed │ ? inquiry  ↵ view  a apply  q quit      ║
 //! ╚══════════════════════════════════════════════════════════════╝
 
+#![allow(dead_code)]
+
 pub mod markdown;
 pub mod panels;
 pub mod theme;
 
 use crate::context::WorkContext;
-use crate::index::{CodebaseIndex, FileIndex, FlatTreeEntry};
+use crate::index::{CodebaseIndex, FlatTreeEntry};
 use crate::suggest::{Priority, Suggestion, SuggestionEngine};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -116,16 +118,18 @@ pub enum LoadingState {
     GeneratingSummaries,
     GeneratingPreview,  // Fast preview generation (<1s)
     GeneratingFix,      // Full fix generation (slower)
+    Answering,          // For question answering
 }
 
 impl LoadingState {
     pub fn message(&self) -> &'static str {
         match self {
             LoadingState::None => "",
-            LoadingState::GeneratingSuggestions => "Analyzing codebase with Grok",
-            LoadingState::GeneratingSummaries => "Summarizing files with Grok",
+            LoadingState::GeneratingSuggestions => "Generating suggestions",
+            LoadingState::GeneratingSummaries => "Summarizing files",
             LoadingState::GeneratingPreview => "Previewing fix...",
-            LoadingState::GeneratingFix => "Generating fix with Opus",
+            LoadingState::GeneratingFix => "Generating fix...",
+            LoadingState::Answering => "Thinking...",
         }
     }
     
@@ -325,6 +329,9 @@ pub struct App {
     // Track if summaries need generation (to avoid showing loading state when all cached)
     pub needs_summary_generation: bool,
     
+    // Summary generation progress (completed, total)
+    pub summary_progress: Option<(usize, usize)>,
+    
     // Cached data for display
     pub file_tree: Vec<FlatTreeEntry>,
     pub filtered_tree: Vec<FlatTreeEntry>,
@@ -380,6 +387,7 @@ impl App {
             session_tokens: 0,
             active_model: None,
             needs_summary_generation: false,
+            summary_progress: None,
             file_tree,
             filtered_tree,
             repo_path,
@@ -1556,7 +1564,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     // Loading overlay (shown when background tasks are running)
     if app.loading.is_loading() {
-        render_loading_overlay(frame, &app.loading, app.loading_frame);
+        render_loading_overlay(frame, &app.loading, app.loading_frame, app.summary_progress);
     }
 
     // Overlays
@@ -1903,7 +1911,7 @@ fn render_suggestions_panel(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(vec![
             Span::styled("    ", Style::default()),
             Span::styled(" r ", Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400)),
-            Span::styled(" refresh analysis", Style::default().fg(Theme::GREY_400)),
+            Span::styled(" refresh status", Style::default().fg(Theme::GREY_400)),
         ]));
     } else {
         let mut line_count = 0;
@@ -2264,7 +2272,7 @@ fn render_help(frame: &mut Frame) {
     help_text.push(key_row("i", "Ask cosmos a question"));
     help_text.push(key_row("a", "Apply/fix suggestion"));
     help_text.push(key_row("d", "Dismiss suggestion"));
-    help_text.push(key_row("r", "Refresh analysis"));
+    help_text.push(key_row("r", "Refresh status"));
     help_text.push(section_spacer());
     help_text.push(section_end());
     
@@ -2569,7 +2577,7 @@ fn render_inquiry(frame: &mut Frame, response: &str, scroll: usize) {
 fn render_fix_preview(
     frame: &mut Frame,
     file_path: &PathBuf,
-    summary: &str,
+    _summary: &str,
     preview: &crate::suggest::llm::FixPreview,
     modifier_input: &str,
 ) {
@@ -3063,7 +3071,7 @@ fn render_git_status(
         ]));
         lines.push(Line::from(""));
         
-        for (i, file) in staged.iter().enumerate() {
+        for file in staged.iter() {
             lines.push(render_file(file, "✓", Theme::GREEN, current_idx, selected));
             current_idx += 1;
         }
@@ -3080,7 +3088,7 @@ fn render_git_status(
         ]));
         lines.push(Line::from(""));
         
-        for (i, file) in modified.iter().enumerate() {
+        for file in modified.iter() {
             lines.push(render_file(file, "●", Theme::BADGE_DOCS, current_idx, selected));
             current_idx += 1;
         }
@@ -3097,7 +3105,7 @@ fn render_git_status(
         ]));
         lines.push(Line::from(""));
         
-        for (i, file) in untracked.iter().enumerate() {
+        for file in untracked.iter() {
             lines.push(render_file(file, "?", Theme::GREY_400, current_idx, selected));
             current_idx += 1;
         }
@@ -3395,11 +3403,21 @@ fn render_pr_review(
     frame.render_widget(block, area);
 }
 
-fn render_loading_overlay(frame: &mut Frame, state: &LoadingState, anim_frame: usize) {
+fn render_loading_overlay(frame: &mut Frame, state: &LoadingState, anim_frame: usize, summary_progress: Option<(usize, usize)>) {
     let area = frame.area();
     
+    // Build message with progress if available
+    let message = if *state == LoadingState::GeneratingSummaries {
+        if let Some((completed, total)) = summary_progress {
+            format!("Summarizing files {}/{}", completed, total)
+        } else {
+            state.message().to_string()
+        }
+    } else {
+        state.message().to_string()
+    };
+    
     // Calculate overlay dimensions
-    let message = state.message();
     let width = (message.len() + 12) as u16;
     let height = 5u16;
     
@@ -3419,7 +3437,7 @@ fn render_loading_overlay(frame: &mut Frame, state: &LoadingState, anim_frame: u
         Line::from(""),
         Line::from(vec![
             Span::styled(format!("   {} ", spinner), Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
-            Span::styled(message, Style::default().fg(Theme::GREY_100)),
+            Span::styled(&message, Style::default().fg(Theme::GREY_100)),
             Span::styled("   ", Style::default()),
         ]),
         Line::from(""),

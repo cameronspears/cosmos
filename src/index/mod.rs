@@ -3,6 +3,8 @@
 //! Uses tree-sitter for multi-language AST parsing to build
 //! semantic understanding of the codebase.
 
+#![allow(dead_code)]
+
 pub mod parser;
 
 use chrono::{DateTime, Utc};
@@ -719,7 +721,7 @@ impl FileTree {
 
     fn insert_recursive(
         &mut self,
-        entries: &mut Vec<FileTreeEntry>,
+        _entries: &mut Vec<FileTreeEntry>,
         components: &[std::path::Component],
         depth: usize,
         file_index: &FileIndex,

@@ -5,10 +5,12 @@
 //! - File naming patterns
 //! - Import analysis
 
+#![allow(dead_code)]
+
 use super::{CodebaseGrouping, Layer};
 use crate::index::{CodebaseIndex, Dependency, FileIndex};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Categorize all files in a codebase using heuristics
 pub fn categorize_codebase(index: &CodebaseIndex) -> CodebaseGrouping {
@@ -473,3 +475,4 @@ mod tests {
         );
     }
 }
+

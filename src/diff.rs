@@ -14,6 +14,7 @@ pub enum DiffLine {
 }
 
 impl DiffLine {
+    #[allow(dead_code)]
     pub fn content(&self) -> &str {
         match self {
             DiffLine::Context(s) => s,
@@ -35,6 +36,7 @@ pub struct DiffHunk {
 
 impl DiffHunk {
     /// Get a summary of changes in this hunk
+    #[allow(dead_code)]
     pub fn summary(&self) -> (usize, usize) {
         let adds = self.lines.iter().filter(|l| matches!(l, DiffLine::Add(_))).count();
         let removes = self.lines.iter().filter(|l| matches!(l, DiffLine::Remove(_))).count();
@@ -52,6 +54,7 @@ pub struct UnifiedDiff {
 
 impl UnifiedDiff {
     /// Get total additions and deletions
+    #[allow(dead_code)]
     pub fn stats(&self) -> (usize, usize) {
         self.hunks.iter().fold((0, 0), |acc, h| {
             let (a, r) = h.summary();
@@ -299,5 +302,6 @@ mod tests {
         assert!(!result.contains("console.log(\"old\")"));
     }
 }
+
 
 

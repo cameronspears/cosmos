@@ -3,6 +3,8 @@
 //! Uses Grok 4.1 Fast for analysis/summaries, Opus 4.5 for code generation.
 //! Uses smart context building to maximize insight per token.
 
+#![allow(dead_code)]
+
 use super::{Priority, Suggestion, SuggestionKind, SuggestionSource};
 use crate::config::Config;
 use crate::context::WorkContext;
@@ -653,7 +655,7 @@ Incorporate the user's feedback into the fix. Be precise. Only change what's nec
 //  UNIFIED CODEBASE ANALYSIS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Analyze entire codebase with Grok 4.1 Fast
+/// Analyze entire codebase with Claude Opus 4.5
 /// 
 /// This is the main entry point for generating high-quality suggestions.
 /// Uses smart context building to pack maximum insight into the prompt.
@@ -687,7 +689,7 @@ GUIDELINES:
 
     let user_prompt = build_codebase_context(index, context);
     
-    let response = call_llm_with_usage(system, &user_prompt, Model::GrokFast, true).await?;
+    let response = call_llm_with_usage(system, &user_prompt, Model::Opus, true).await?;
     
     let suggestions = parse_codebase_suggestions(&response.content)?;
     Ok((suggestions, response.usage))

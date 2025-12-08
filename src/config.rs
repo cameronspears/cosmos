@@ -2,6 +2,8 @@
 //!
 //! Stores settings in ~/.config/codecosmos/config.json
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -127,5 +129,6 @@ mod tests {
         assert!(config.openrouter_api_key.is_none());
     }
 }
+
 
 
