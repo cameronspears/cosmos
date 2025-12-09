@@ -2232,8 +2232,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled("│ ", Style::default().fg(Theme::GREY_600)));
     }
     
-    // Branch with icon
-    spans.push(Span::styled("⎇ ", Style::default().fg(Theme::GREY_500)));
+    // Project name and branch with icon
+    let project_name = app.context.repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    spans.push(Span::styled(project_name, Style::default().fg(Theme::GREY_400)));
+    spans.push(Span::styled(" ⎇ ", Style::default().fg(Theme::GREY_500)));
     spans.push(Span::styled(&app.context.branch, Style::default().fg(Theme::GREY_100)));
 
     // Show pending changes count with prominent action hints
