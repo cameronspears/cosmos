@@ -1554,7 +1554,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),   // Header (logo + tagline)
+            Constraint::Length(3),   // Header (logo)
             Constraint::Min(10),     // Main content
             Constraint::Length(3),   // Footer
         ])
@@ -1613,20 +1613,12 @@ pub fn render(frame: &mut Frame, app: &App) {
 fn render_header(frame: &mut Frame, area: Rect, _app: &App) {
     let lines = vec![
         Line::from(""),
-        Line::from(""),
         Line::from(vec![
             Span::styled(
                 format!("   {}", Theme::COSMOS_LOGO),
                 Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)
             ),
         ]),
-        Line::from(vec![
-            Span::styled(
-                format!("   {}", Theme::COSMOS_TAGLINE),
-                Style::default().fg(Theme::GREY_300)  // More legible tagline
-            ),
-        ]),
-        Line::from(""),
     ];
 
     let header = Paragraph::new(lines).style(Style::default().bg(Theme::BG));

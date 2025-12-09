@@ -333,7 +333,7 @@ impl Theme {
     /// The Cosmos header/branding - elegant italic
     pub const COSMOS_LOGO: &'static str = "𝘤 𝘰 𝘴 𝘮 𝘰 𝘴";
     
-    pub const COSMOS_TAGLINE: &'static str = "𝘢 𝘤𝘰𝘯𝘵𝘦𝘮𝘱𝘭𝘢𝘵𝘪𝘷𝘦 𝘤𝘰𝘮𝘱𝘢𝘯𝘪𝘰𝘯 𝘧𝘰𝘳 𝘺𝘰𝘶𝘳 𝘤𝘰𝘥𝘦𝘣𝘢𝘴𝘦";
+    pub const COSMOS_TAGLINE: &'static str = "a contemplative companion for your codebase";
 
     /// Section headers - elegant serif style
     pub const SECTION_PROJECT: &'static str = "𝘱𝘳𝘰𝘫𝘦𝘤𝘵";
