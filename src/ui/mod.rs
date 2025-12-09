@@ -2011,14 +2011,18 @@ fn render_suggestions_panel(frame: &mut Frame, area: Rect, app: &App) {
         // When loading, panel stays empty - footer shows "Generating suggestions"
     } else {
         let mut line_count = 0;
+        let text_width = inner_width.saturating_sub(6);
+        
+        // Top padding
+        lines.push(Line::from(""));
+        line_count += 1;
         
         for (i, suggestion) in suggestions.iter().enumerate().skip(app.suggestion_scroll) {
-            if line_count >= visible_height.saturating_sub(2) {
+            if line_count >= visible_height.saturating_sub(1) {
                 break;
             }
             
             let is_selected = i == app.suggestion_selected && is_active;
-            let card_width = inner_width.saturating_sub(4);
             
             // Get badge color based on suggestion kind
             let badge_color = match suggestion.kind {
@@ -2031,102 +2035,78 @@ fn render_suggestions_panel(frame: &mut Frame, area: Rect, app: &App) {
                 crate::suggest::SuggestionKind::Testing => Theme::BADGE_QUALITY,
             };
             
-            // Card top border (rounded)
-            let card_border_color = if is_selected { Theme::GREY_400 } else { Theme::GREY_700 };
-            let card_inner = "─".repeat(card_width);
-            lines.push(Line::from(vec![
-                Span::styled(if is_selected { " › " } else { "   " }, Style::default().fg(Theme::WHITE)),
-                Span::styled("╭", Style::default().fg(card_border_color)),
-                Span::styled(card_inner.clone(), Style::default().fg(card_border_color)),
-                Span::styled("╮", Style::default().fg(card_border_color)),
-            ]));
-            line_count += 1;
-            
-            // File name with badge
+            // File name
             let file_name = suggestion.file.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("?");
             let kind_label = suggestion.kind.label();
-            let file_style = if is_selected {
-                Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)
+            
+            // Selection indicator and styling
+            let (prefix, file_style, summary_style) = if is_selected {
+                ("› ", 
+                 Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD),
+                 Style::default().fg(Theme::GREY_100))
             } else {
-                Style::default().fg(Theme::GREY_100)
+                ("  ", 
+                 Style::default().fg(Theme::GREY_200),
+                 Style::default().fg(Theme::GREY_400))
             };
             
+            // Line 1: Badge + File + Priority
             lines.push(Line::from(vec![
-                Span::styled("   │ ", Style::default().fg(card_border_color)),
+                Span::styled(prefix, Style::default().fg(Theme::WHITE)),
                 Span::styled(format!(" {} ", kind_label), Style::default().fg(Theme::GREY_900).bg(badge_color)),
                 Span::styled(" ", Style::default()),
                 Span::styled(file_name.to_string(), file_style),
                 Span::styled(" ", Style::default()),
-                Span::styled(format!("{}", panels::priority_badge(suggestion.priority.icon()).content), 
+                Span::styled(format!("{}", suggestion.priority.icon()), 
                     Style::default().fg(match suggestion.priority {
                         Priority::High => Theme::WHITE,
-                        Priority::Medium => Theme::GREY_300,
-                        Priority::Low => Theme::GREY_500,
+                        Priority::Medium => Theme::GREY_400,
+                        Priority::Low => Theme::GREY_600,
                     })),
             ]));
             line_count += 1;
             
-            // Summary text (wrapped)
+            // Summary text (wrapped, limit to 2 lines)
             let summary = &suggestion.summary;
-            let text_style = if is_selected {
-                Style::default().fg(Theme::GREY_100)
-            } else {
-                Style::default().fg(Theme::GREY_300)
-            };
-            
-            let wrapped = wrap_text(summary, card_width.saturating_sub(4));
-            for wrapped_line in wrapped.iter().take(3) { // Limit to 3 lines for compactness
-                if line_count >= visible_height.saturating_sub(2) {
+            let wrapped = wrap_text(summary, text_width);
+            for wrapped_line in wrapped.iter().take(2) {
+                if line_count >= visible_height.saturating_sub(1) {
                     break;
                 }
                 lines.push(Line::from(vec![
-                    Span::styled("   │ ", Style::default().fg(card_border_color)),
-                    Span::styled(format!(" {}", wrapped_line), text_style),
+                    Span::styled("    ", Style::default()),
+                    Span::styled(wrapped_line.clone(), summary_style),
                 ]));
                 line_count += 1;
             }
-            if wrapped.len() > 3 && line_count < visible_height.saturating_sub(2) {
-                lines.push(Line::from(vec![
-                    Span::styled("   │ ", Style::default().fg(card_border_color)),
-                    Span::styled(" ...", Style::default().fg(Theme::GREY_500)),
-                    Span::styled("  ↵ for more", Style::default().fg(Theme::GREY_600)),
-                ]));
-                line_count += 1;
+            if wrapped.len() > 2 {
+                // Show ellipsis on the last line if truncated
+                if let Some(last_line) = lines.last_mut() {
+                    *last_line = Line::from(vec![
+                        Span::styled("    ", Style::default()),
+                        Span::styled(format!("{}…", wrapped[1].trim_end()), summary_style),
+                    ]);
+                }
             }
             
-            // Action buttons (only for selected)
-            if is_selected && line_count < visible_height.saturating_sub(2) {
+            // Actions (only for selected) - compact inline
+            if is_selected && line_count < visible_height.saturating_sub(1) {
                 lines.push(Line::from(vec![
-                    Span::styled("   │ ", Style::default().fg(card_border_color)),
-                ]));
-                line_count += 1;
-                
-                lines.push(Line::from(vec![
-                    Span::styled("   │ ", Style::default().fg(card_border_color)),
-                    Span::styled(" a ", Style::default().fg(Theme::GREY_900).bg(Theme::GREEN).add_modifier(Modifier::BOLD)),
-                    Span::styled(" Fix ", Style::default().fg(Theme::GREEN)),
-                    Span::styled("  ", Style::default()),
-                    Span::styled(" ↵ ", Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300)),
-                    Span::styled(" Details ", Style::default().fg(Theme::GREY_300)),
-                    Span::styled("  ", Style::default()),
-                    Span::styled(" d ", Style::default().fg(Theme::GREY_900).bg(Theme::GREY_500)),
-                    Span::styled(" Skip ", Style::default().fg(Theme::GREY_500)),
+                    Span::styled("    ", Style::default()),
+                    Span::styled("a", Style::default().fg(Theme::GREEN).add_modifier(Modifier::BOLD)),
+                    Span::styled(" fix  ", Style::default().fg(Theme::GREY_500)),
+                    Span::styled("↵", Style::default().fg(Theme::GREY_300).add_modifier(Modifier::BOLD)),
+                    Span::styled(" details  ", Style::default().fg(Theme::GREY_500)),
+                    Span::styled("d", Style::default().fg(Theme::GREY_500).add_modifier(Modifier::BOLD)),
+                    Span::styled(" skip", Style::default().fg(Theme::GREY_600)),
                 ]));
                 line_count += 1;
             }
             
-            // Card bottom border
-            lines.push(Line::from(vec![
-                Span::styled("   ╰", Style::default().fg(card_border_color)),
-                Span::styled(card_inner.clone(), Style::default().fg(card_border_color)),
-                Span::styled("╯", Style::default().fg(card_border_color)),
-            ]));
-            line_count += 1;
-            
-            // Spacing between cards
-            if line_count < visible_height.saturating_sub(2) {
+            // Spacing between suggestions
+            if line_count < visible_height.saturating_sub(1) {
                 lines.push(Line::from(""));
                 line_count += 1;
             }

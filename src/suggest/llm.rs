@@ -506,7 +506,7 @@ pub async fn analyze_codebase(
     index: &CodebaseIndex,
     context: &WorkContext,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>)> {
-    let system = r#"You are a friendly code reviewer helping a developer improve their codebase. Your goal is to find impactful improvements and explain them in plain, human terms.
+    let system = r#"You are a senior developer reviewing a codebase. Your job is to find genuinely useful improvements - things that will make the app better, not just cleaner.
 
 OUTPUT FORMAT (JSON array, 5-10 suggestions):
 [
@@ -514,30 +514,33 @@ OUTPUT FORMAT (JSON array, 5-10 suggestions):
     "file": "relative/path/to/file.rs",
     "kind": "improvement|bugfix|feature|optimization|quality|documentation|testing",
     "priority": "high|medium|low",
-    "summary": "Friendly, plain-English explanation - lead with the human impact, put metrics in parentheses at the end",
-    "detail": "Conversational explanation of why this matters and what to do about it",
+    "summary": "One-line description of what to do and why it matters",
+    "detail": "Brief explanation with specific guidance",
     "line": null or specific line number if applicable
   }
 ]
 
-TONE GUIDELINES:
-- Write like a helpful colleague, not a linter
-- Lead with the problem or benefit, not technical jargon
-- Say "this file is getting hard to work with" not "violates single responsibility principle"
-- Say "this function is doing too much" not "extract into composable pipeline functions"
-- Say "this could be tricky to debug" not "high cyclomatic complexity"
-- Put metrics (line counts, complexity scores) in parentheses at the END of the summary
-- Examples:
-  - "This file has grown pretty big - might be time to split it up (848 lines)"
-  - "processItemData is doing a lot - consider breaking it into smaller pieces (550 lines, complexity 88)"
-  - "This nested code is hard to follow - early returns could help"
+WHAT TO LOOK FOR (aim for variety across these categories):
+- **Bugs & Edge Cases**: Race conditions, off-by-one errors, null/None handling, error swallowing
+- **Security**: Hardcoded secrets, SQL injection, XSS, path traversal, insecure defaults
+- **Performance**: N+1 queries, unnecessary allocations, blocking in async, missing caching opportunities
+- **API Design**: Confusing function signatures, missing validation, inconsistent return types
+- **User Experience**: Error messages that don't help, missing loading states, accessibility gaps
+- **Reliability**: Missing retries for network calls, no timeouts, silent failures
+- **Feature Gaps**: Obvious missing functionality, half-implemented features, TODO items worth addressing
+- **Testing Blind Spots**: Critical paths without tests, brittle test setups
 
-CONTENT GUIDELINES:
-- Focus on HIGH-VALUE changes: bugs, security issues, major refactors, performance wins
-- Be specific: mention exact function names and patterns
-- Prioritize files the developer is actively working on (marked CHANGED)
-- Don't suggest trivial style changes or obvious fixes
-- Each suggestion should be actionable and provide clear value"#;
+AVOID:
+- "Split this file" or "break this function up" unless it's genuinely causing problems
+- Generic advice like "add more comments" or "improve naming"
+- Suggestions that would just make the code "cleaner" without real benefit
+- Anything a linter would catch
+
+PRIORITIZE:
+- Files marked [CHANGED] - the developer is actively working there
+- Things that could cause bugs or outages
+- Quick wins that provide immediate value
+- Suggestions specific to THIS codebase, not generic best practices"#;
 
     let user_prompt = build_codebase_context(index, context);
     
@@ -559,130 +562,102 @@ fn build_codebase_context(index: &CodebaseIndex, context: &WorkContext) -> Strin
     
     // Header with overview
     sections.push(format!(
-        "CODEBASE: {} ({} files, {} LOC, {} symbols)\n\
-         BRANCH: {} | FOCUS: {} | CHANGED FILES: {}",
+        "CODEBASE: {} ({} files, {} LOC)\nBRANCH: {} | FOCUS: {}",
         project_name,
         stats.file_count,
         stats.total_loc,
-        stats.symbol_count,
         context.branch,
         context.inferred_focus.as_deref().unwrap_or("general"),
-        context.modified_count
     ));
     
-    // Files by priority (most important first)
-    let mut files_section = String::from("\n\nFILES (by priority):");
-    let files_by_priority = index.files_by_priority();
-    
-    for (path, file_index) in files_by_priority.iter().take(30) {
-        let is_changed = context.all_changed_files().iter().any(|f| f == path);
-        let changed_marker = if is_changed { " [CHANGED]" } else { "" };
-        
-        let func_count = file_index.symbols.iter()
-            .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
-            .count();
-        
-        let top_symbols: Vec<_> = file_index.symbols.iter()
-            .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
-            .take(5)
-            .map(|s| s.name.as_str())
-            .collect();
-        
-        files_section.push_str(&format!(
-            "\n- {}: {} LOC, {} funcs, complexity {:.0}{}",
-            path.display(),
-            file_index.loc,
-            func_count,
-            file_index.complexity,
-            changed_marker
-        ));
-        
-        if !top_symbols.is_empty() {
-            files_section.push_str(&format!("\n  symbols: {}", top_symbols.join(", ")));
+    // Uncommitted changes FIRST (highest priority)
+    if !context.uncommitted_files.is_empty() || !context.staged_files.is_empty() {
+        let mut changes_section = String::from("\n\nACTIVELY WORKING ON [CHANGED]:");
+        for file in context.uncommitted_files.iter().chain(context.staged_files.iter()).take(15) {
+            // Include file details if we have them
+            if let Some(file_index) = index.files.get(file) {
+                let exports: Vec<_> = file_index.symbols.iter()
+                    .filter(|s| s.visibility == crate::index::Visibility::Public)
+                    .take(5)
+                    .map(|s| s.name.as_str())
+                    .collect();
+                let exports_str = if exports.is_empty() { String::new() } else { format!(" exports: {}", exports.join(", ")) };
+                changes_section.push_str(&format!("\n- {} ({} LOC){}",
+                    file.display(), file_index.loc, exports_str));
+            } else {
+                changes_section.push_str(&format!("\n- {}", file.display()));
+            }
         }
-    }
-    sections.push(files_section);
-    
-    // Detected patterns (code smells, issues)
-    if !index.patterns.is_empty() {
-        let mut patterns_section = String::from("\n\nDETECTED PATTERNS:");
-        
-        // Group patterns by severity
-        let high_patterns: Vec<_> = index.patterns.iter()
-            .filter(|p| matches!(p.kind, PatternKind::GodModule | PatternKind::DeepNesting | PatternKind::MissingErrorHandling))
-            .take(10)
-            .collect();
-        
-        for pattern in &high_patterns {
-            patterns_section.push_str(&format!(
-                "\n- {:?} at {}:{} - {}",
-                pattern.kind,
-                pattern.file.display(),
-                pattern.line,
-                truncate_str(&pattern.description, 60)
-            ));
-        }
-        
-        // Add other patterns summary
-        let other_count = index.patterns.len() - high_patterns.len();
-        if other_count > 0 {
-            patterns_section.push_str(&format!("\n- ... and {} more patterns", other_count));
-        }
-        
-        sections.push(patterns_section);
+        sections.push(changes_section);
     }
     
-    // High complexity functions (potential refactor targets)
-    let mut complex_funcs: Vec<_> = index.symbols.iter()
-        .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
-        .filter(|s| s.complexity > 15.0 || s.line_count() > 50)
-        .collect();
-    complex_funcs.sort_by(|a, b| b.complexity.partial_cmp(&a.complexity).unwrap_or(std::cmp::Ordering::Equal));
-    
-    if !complex_funcs.is_empty() {
-        let mut funcs_section = String::from("\n\nHIGH COMPLEXITY FUNCTIONS:");
-        for func in complex_funcs.iter().take(15) {
-            funcs_section.push_str(&format!(
-                "\n- {}::{} ({}:{}) - {} lines, complexity {:.0}",
-                func.file.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                func.name,
-                func.file.display(),
-                func.line,
-                func.line_count(),
-                func.complexity
-            ));
-        }
-        sections.push(funcs_section);
-    }
-    
-    // Recent changes context (what's being worked on)
+    // Recent commits for understanding what's being worked on
     if !context.recent_commits.is_empty() {
-        let mut commits_section = String::from("\n\nRECENT ACTIVITY:");
+        let mut commits_section = String::from("\n\nRECENT COMMITS:");
         for commit in context.recent_commits.iter().take(5) {
             commits_section.push_str(&format!(
-                "\n- {}: {} ({})",
+                "\n- {}: {}",
                 commit.short_sha,
-                truncate_str(&commit.message, 50),
-                commit.files_changed.len()
+                truncate_str(&commit.message, 60),
             ));
         }
         sections.push(commits_section);
     }
     
-    // Uncommitted changes (highest priority for review)
-    if !context.uncommitted_files.is_empty() || !context.staged_files.is_empty() {
-        let mut changes_section = String::from("\n\nUNCOMMITTED CHANGES (prioritize these):");
-        for file in context.uncommitted_files.iter().chain(context.staged_files.iter()).take(10) {
-            changes_section.push_str(&format!("\n- {}", file.display()));
+    // Key files with their purpose (not just metrics)
+    let mut files_section = String::from("\n\nKEY FILES:");
+    let files_by_priority = index.files_by_priority();
+    
+    for (path, file_index) in files_by_priority.iter().take(25) {
+        let is_changed = context.all_changed_files().iter().any(|f| f == path);
+        if is_changed { continue; } // Already listed above
+        
+        // Get public exports to understand what this file does
+        let exports: Vec<_> = file_index.symbols.iter()
+            .filter(|s| s.visibility == crate::index::Visibility::Public)
+            .take(4)
+            .map(|s| s.name.as_str())
+            .collect();
+        
+        let exports_str = if exports.is_empty() { 
+            String::new() 
+        } else { 
+            format!(" → {}", exports.join(", ")) 
+        };
+        
+        files_section.push_str(&format!(
+            "\n- {} ({} LOC){}",
+            path.display(),
+            file_index.loc,
+            exports_str
+        ));
+    }
+    sections.push(files_section);
+    
+    // TODOs and FIXMEs found in code (actionable items from the developer)
+    let todos: Vec<_> = index.patterns.iter()
+        .filter(|p| matches!(p.kind, PatternKind::TodoMarker))
+        .take(10)
+        .collect();
+    
+    if !todos.is_empty() {
+        let mut todos_section = String::from("\n\nTODO/FIXME MARKERS IN CODE:");
+        for todo in &todos {
+            todos_section.push_str(&format!(
+                "\n- {}:{} - {}",
+                todo.file.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                todo.line,
+                truncate_str(&todo.description, 70)
+            ));
         }
-        sections.push(changes_section);
+        sections.push(todos_section);
     }
     
-    // Final instruction
+    // Final instruction - open-ended
     sections.push(String::from(
-        "\n\nAnalyze this codebase and provide 5-10 high-value suggestions. \
-         Focus on bugs, security issues, performance problems, and major refactoring opportunities. \
-         Prioritize changed files and high-complexity areas."
+        "\n\nLook for bugs, security issues, performance problems, missing error handling, \
+         UX improvements, and feature opportunities. Prioritize the [CHANGED] files. \
+         Give me varied, specific suggestions - not just code organization advice."
     ));
     
     sections.join("")

@@ -180,16 +180,15 @@ pub struct SuggestionEngine {
 }
 
 impl SuggestionEngine {
-    /// Create a new suggestion engine from a codebase index (with static suggestions)
+    /// Create a new suggestion engine from a codebase index
+    /// 
+    /// By default, starts empty - LLM suggestions are generated separately.
+    /// Static rules are available as fallback but not auto-generated.
     pub fn new(index: CodebaseIndex) -> Self {
-        let mut engine = Self {
+        Self {
             suggestions: Vec::new(),
             index,
-        };
-        
-        // Generate static suggestions (free) - kept for fallback
-        engine.generate_static_suggestions();
-        engine
+        }
     }
     
     /// Create an empty suggestion engine (populated by LLM later)
@@ -199,11 +198,14 @@ impl SuggestionEngine {
             index,
         }
     }
-
-    /// Generate suggestions from static analysis (no LLM) - kept for fallback
+    
+    /// Generate suggestions from static analysis (no LLM)
+    /// 
+    /// Only used as fallback when LLM is unavailable (no API key).
+    /// These are intentionally minimal - we trust the LLM for real suggestions.
     #[allow(dead_code)]
-    fn generate_static_suggestions(&mut self) {
-        // Use static rules to generate suggestions
+    pub fn generate_static_suggestions(&mut self) {
+        // Only generate static suggestions for truly critical issues
         for (path, file_index) in &self.index.files {
             let static_suggestions = static_rules::analyze_file(path, file_index);
             self.suggestions.extend(static_suggestions);
