@@ -98,6 +98,56 @@ pub fn create_and_checkout_branch(repo_path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Create a new branch from main (or master) and check it out
+/// Used for creating fix branches before applying changes
+pub fn create_fix_branch_from_main(repo_path: &Path, branch_name: &str) -> Result<String> {
+    let repo = Repository::open(repo_path)?;
+    
+    // Try to find main or master branch
+    let main_branch = repo.find_branch("main", git2::BranchType::Local)
+        .or_else(|_| repo.find_branch("master", git2::BranchType::Local))
+        .context("Could not find 'main' or 'master' branch")?;
+    
+    let main_commit = main_branch.get().peel_to_commit()
+        .context("Failed to get commit from main branch")?;
+    
+    // Create the new branch from main
+    repo.branch(branch_name, &main_commit, false)
+        .context(format!("Failed to create branch '{}' from main", branch_name))?;
+    
+    // Checkout the new branch
+    checkout_branch(repo_path, branch_name)?;
+    
+    Ok(branch_name.to_string())
+}
+
+/// Generate a branch name from a suggestion summary
+pub fn generate_fix_branch_name(suggestion_id: &str, summary: &str) -> String {
+    // Take first 8 chars of UUID
+    let short_id = &suggestion_id[..8.min(suggestion_id.len())];
+    
+    // Slugify the summary: lowercase, replace spaces/special chars with dashes
+    let slug: String = summary
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .take(5) // Limit to first 5 words
+        .collect::<Vec<_>>()
+        .join("-");
+    
+    // Truncate slug to reasonable length
+    let slug = if slug.len() > 40 {
+        slug[..40].trim_end_matches('-').to_string()
+    } else {
+        slug
+    };
+    
+    format!("fix/{}-{}", short_id, slug)
+}
+
 /// Stage a specific file
 pub fn stage_file(repo_path: &Path, file_path: &str) -> Result<()> {
     let repo = Repository::open(repo_path)?;

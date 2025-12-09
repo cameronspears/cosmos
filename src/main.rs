@@ -93,6 +93,7 @@ pub enum BackgroundMessage {
         modified_areas: Vec<String>,
         backup_path: PathBuf,
         usage: Option<suggest::llm::Usage>,
+        branch_name: String,
     },
     DirectFixError(String),
     /// AI code review completed
@@ -533,7 +534,7 @@ fn run_loop<B: Backend>(
                     app.loading = LoadingState::None;
                     app.show_toast(&format!("Preview error: {}", truncate(&e, 40)));
                 }
-                BackgroundMessage::DirectFixApplied { suggestion_id, file_path, description, modified_areas, backup_path, usage } => {
+                BackgroundMessage::DirectFixApplied { suggestion_id, file_path, description, modified_areas, backup_path, usage, branch_name } => {
                     // Track cost
                     if let Some(u) = usage {
                         let cost = u.calculate_cost(suggest::llm::Model::Speed);
@@ -549,17 +550,13 @@ fn run_loop<B: Backend>(
                     let diff = format!("Modified areas: {}", modified_areas.join(", "));
                     app.add_pending_change(suggestion_id, file_path.clone(), description.clone(), diff);
                     
-                    // Show success with hint about pending changes
+                    // Show success with branch name and hint about pending changes
                     let pending = app.pending_change_count();
-                    let areas_str = if modified_areas.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", modified_areas.join(", "))
-                    };
+                    let short_branch = branch_name.split('/').last().unwrap_or(&branch_name);
                     if pending > 1 {
-                        app.show_toast(&format!("✓ {}{} · {} pending", truncate(&description, 30), areas_str, pending));
+                        app.show_toast(&format!("✓ {} on {} · {} pending", truncate(&description, 25), short_branch, pending));
                     } else {
-                        app.show_toast(&format!("✓ {}{}", truncate(&description, 40), areas_str));
+                        app.show_toast(&format!("✓ {} on {}", truncate(&description, 30), short_branch));
                     }
                     
                     // Store backup info for potential undo (TODO: implement undo)
@@ -698,6 +695,23 @@ fn run_loop<B: Backend>(
                                     app.close_overlay();
                                     
                                     tokio::spawn(async move {
+                                        // Create a new branch from main before applying the fix
+                                        let branch_name = git_ops::generate_fix_branch_name(
+                                            &suggestion_clone.id.to_string(),
+                                            &suggestion_clone.summary
+                                        );
+                                        
+                                        // Try to create and checkout the fix branch from main
+                                        let created_branch = match git_ops::create_fix_branch_from_main(&repo_path_clone, &branch_name) {
+                                            Ok(name) => name,
+                                            Err(e) => {
+                                                let _ = tx_fix.send(BackgroundMessage::DirectFixError(
+                                                    format!("Failed to create fix branch: {}. Please ensure you have no uncommitted changes and 'main' or 'master' branch exists.", e)
+                                                ));
+                                                return;
+                                            }
+                                        };
+                                        
                                         let full_path = repo_path_clone.join(&file_path_clone);
                                         let content = match std::fs::read_to_string(&full_path) {
                                             Ok(c) => c,
@@ -727,6 +741,7 @@ fn run_loop<B: Backend>(
                                                             modified_areas: applied_fix.modified_areas,
                                                             backup_path,
                                                             usage: applied_fix.usage,
+                                                            branch_name: created_branch,
                                                         });
                                                     }
                                                     Err(e) => {
