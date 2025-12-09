@@ -1575,7 +1575,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         Overlay::Help => render_help(frame),
         Overlay::SuggestionDetail { suggestion_id, scroll } => {
             if let Some(suggestion) = app.suggestions.suggestions.iter().find(|s| &s.id == suggestion_id) {
-                render_suggestion_detail(frame, suggestion, *scroll);
+                let file_summary = app.get_llm_summary(&suggestion.file);
+                let file_index = app.index.files.get(&suggestion.file);
+                render_suggestion_detail(frame, suggestion, file_summary, file_index, *scroll);
             }
         }
         Overlay::Inquiry { response, scroll } => {
@@ -2411,12 +2413,19 @@ fn render_help(frame: &mut Frame) {
     frame.render_widget(block, area);
 }
 
-fn render_suggestion_detail(frame: &mut Frame, suggestion: &Suggestion, scroll: usize) {
+fn render_suggestion_detail(
+    frame: &mut Frame, 
+    suggestion: &Suggestion, 
+    file_summary: Option<&String>,
+    file_index: Option<&crate::index::FileIndex>,
+    scroll: usize
+) {
     let area = centered_rect(75, 80, frame.area());
     frame.render_widget(Clear, area);
 
-    let visible_height = area.height.saturating_sub(14) as usize;
     let inner_width = area.width.saturating_sub(10) as usize;
+    // Reserve space for: header (8 lines) + footer (3 lines) + borders (2 lines)
+    let visible_height = area.height.saturating_sub(15) as usize;
     
     // Get badge color based on suggestion kind
     let badge_color = match suggestion.kind {
@@ -2439,6 +2448,7 @@ fn render_suggestion_detail(frame: &mut Frame, suggestion: &Suggestion, scroll: 
         .and_then(|n| n.to_str())
         .unwrap_or("?");
     
+    // === FIXED HEADER ===
     let mut lines = vec![
         Line::from(""),
         // Header with badge and priority
@@ -2467,52 +2477,97 @@ fn render_suggestion_detail(frame: &mut Frame, suggestion: &Suggestion, scroll: 
             Span::styled(format!("       {}", suggestion.file.display()), 
                 Style::default().fg(Theme::GREY_500)),
         ]),
-        Line::from(""),
     ];
     
-    // Summary card
-    lines.push(Line::from(vec![
-        Span::styled("    ╭─ ", Style::default().fg(Theme::GREY_600)),
-        Span::styled("Summary", Style::default().fg(Theme::GREY_300)),
-        Span::styled(" ─".to_string() + &"─".repeat(inner_width.saturating_sub(15)) + "╮", Style::default().fg(Theme::GREY_600)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("    │", Style::default().fg(Theme::GREY_600)),
-    ]));
-    
-    let summary_wrapped = wrap_text(&suggestion.summary, inner_width.saturating_sub(6));
-    for wrapped_line in &summary_wrapped {
+    // File metrics bar (if we have file index data)
+    if let Some(fi) = file_index {
+        let func_count = fi.symbols.iter()
+            .filter(|s| matches!(s.kind, crate::index::SymbolKind::Function | crate::index::SymbolKind::Method))
+            .count();
+        
         lines.push(Line::from(vec![
-            Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
-            Span::styled(wrapped_line.to_string(), Style::default().fg(Theme::GREY_50)),
+            Span::styled("       ", Style::default()),
+            Span::styled(format!("{}", fi.loc), Style::default().fg(Theme::GREY_400)),
+            Span::styled(" LOC  ", Style::default().fg(Theme::GREY_600)),
+            Span::styled(format!("{}", func_count), Style::default().fg(Theme::GREY_400)),
+            Span::styled(" funcs  ", Style::default().fg(Theme::GREY_600)),
+            Span::styled(format!("{:.0}", fi.complexity), Style::default().fg(Theme::GREY_400)),
+            Span::styled(" complexity", Style::default().fg(Theme::GREY_600)),
         ]));
     }
     
-    lines.push(Line::from(vec![
+    lines.push(Line::from(""));
+    
+    // === BUILD SCROLLABLE CONTENT ===
+    let mut scrollable_content: Vec<Line<'static>> = Vec::new();
+    
+    // File Summary card (what this file is about)
+    scrollable_content.push(Line::from(vec![
+        Span::styled("    ╭─ ", Style::default().fg(Theme::GREY_600)),
+        Span::styled("File Summary", Style::default().fg(Theme::GREY_300)),
+        Span::styled(" ─".to_string() + &"─".repeat(inner_width.saturating_sub(19)) + "╮", Style::default().fg(Theme::GREY_600)),
+    ]));
+    scrollable_content.push(Line::from(vec![
         Span::styled("    │", Style::default().fg(Theme::GREY_600)),
     ]));
-    lines.push(Line::from(vec![
+    
+    // Show file summary if available, otherwise show a placeholder
+    let summary_text = if let Some(summary) = file_summary {
+        summary.clone()
+    } else if let Some(fi) = file_index {
+        fi.summary.purpose.clone()
+    } else {
+        "No summary available for this file.".to_string()
+    };
+    
+    // Full file summary - no truncation
+    let summary_wrapped = wrap_text(&summary_text, inner_width.saturating_sub(6));
+    for wrapped_line in &summary_wrapped {
+        scrollable_content.push(Line::from(vec![
+            Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
+            Span::styled(wrapped_line.to_string(), Style::default().fg(Theme::GREY_200)),
+        ]));
+    }
+    
+    scrollable_content.push(Line::from(vec![
+        Span::styled("    │", Style::default().fg(Theme::GREY_600)),
+    ]));
+    scrollable_content.push(Line::from(vec![
         Span::styled("    ╰".to_string() + &"─".repeat(inner_width.saturating_sub(4)) + "╯", Style::default().fg(Theme::GREY_600)),
     ]));
     
     // Line info if available
     if let Some(line) = suggestion.line {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
+        scrollable_content.push(Line::from(""));
+        scrollable_content.push(Line::from(vec![
             Span::styled(format!("    Line {}", line), 
                 Style::default().fg(Theme::GREY_300)),
         ]));
     }
 
-    // Detail section with markdown
-    if let Some(detail) = &suggestion.detail {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("    ╭─ ", Style::default().fg(Theme::GREY_600)),
-            Span::styled("Details", Style::default().fg(Theme::GREY_300)),
-            Span::styled(" ─".to_string() + &"─".repeat(inner_width.saturating_sub(15)) + "╮", Style::default().fg(Theme::GREY_600)),
+    // Fix Details section - what the suggestion is about
+    scrollable_content.push(Line::from(""));
+    scrollable_content.push(Line::from(vec![
+        Span::styled("    ╭─ ", Style::default().fg(Theme::GREY_600)),
+        Span::styled("Fix Details", Style::default().fg(Theme::GREY_300)),
+        Span::styled(" ─".to_string() + &"─".repeat(inner_width.saturating_sub(18)) + "╮", Style::default().fg(Theme::GREY_600)),
+    ]));
+    scrollable_content.push(Line::from(vec![
+        Span::styled("    │", Style::default().fg(Theme::GREY_600)),
+    ]));
+    
+    // Issue summary (what's wrong)
+    let issue_wrapped = wrap_text(&suggestion.summary, inner_width.saturating_sub(6));
+    for wrapped_line in &issue_wrapped {
+        scrollable_content.push(Line::from(vec![
+            Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
+            Span::styled(wrapped_line.to_string(), Style::default().fg(Theme::GREY_50)),
         ]));
-        lines.push(Line::from(vec![
+    }
+    
+    // Detail explanation (if any)
+    if let Some(detail) = &suggestion.detail {
+        scrollable_content.push(Line::from(vec![
             Span::styled("    │", Style::default().fg(Theme::GREY_600)),
         ]));
 
@@ -2520,42 +2575,41 @@ fn render_suggestion_detail(frame: &mut Frame, suggestion: &Suggestion, scroll: 
         let parsed_lines = markdown::parse_markdown(detail, inner_width.saturating_sub(8));
         
         // Add padding to each line
-        let padded_lines: Vec<Line<'static>> = parsed_lines.into_iter()
-            .map(|line| {
-                let mut spans = vec![
-                    Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
-                ];
-                spans.extend(line.spans);
-                Line::from(spans)
-            })
-            .collect();
-        
-        let total_lines = padded_lines.len();
-
-        for line in padded_lines.iter().skip(scroll).take(visible_height) {
-            lines.push(line.clone());
-        }
-
-        // Scroll indicator
-        if total_lines > visible_height {
-            lines.push(Line::from(vec![
-                Span::styled("    │", Style::default().fg(Theme::GREY_600)),
-            ]));
-            lines.push(Line::from(vec![
+        for line in parsed_lines {
+            let mut spans = vec![
                 Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
-                Span::styled(
-                    format!("↕ {}/{}", scroll + 1, total_lines.saturating_sub(visible_height) + 1),
-                    Style::default().fg(Theme::GREY_500)
-                ),
-            ]));
+            ];
+            spans.extend(line.spans);
+            scrollable_content.push(Line::from(spans));
         }
-        
+    }
+    
+    scrollable_content.push(Line::from(vec![
+        Span::styled("    │", Style::default().fg(Theme::GREY_600)),
+    ]));
+    scrollable_content.push(Line::from(vec![
+        Span::styled("    ╰".to_string() + &"─".repeat(inner_width.saturating_sub(4)) + "╯", Style::default().fg(Theme::GREY_600)),
+    ]));
+    
+    // === APPLY SCROLL TO CONTENT ===
+    let total_content_lines = scrollable_content.len();
+    let needs_scroll = total_content_lines > visible_height;
+    
+    for line in scrollable_content.into_iter().skip(scroll).take(visible_height) {
+        lines.push(line);
+    }
+    
+    // Scroll indicator
+    if needs_scroll {
         lines.push(Line::from(vec![
-            Span::styled("    │", Style::default().fg(Theme::GREY_600)),
+            Span::styled("    ", Style::default()),
+            Span::styled(
+                format!("↕ {}/{}", scroll + 1, total_content_lines.saturating_sub(visible_height) + 1),
+                Style::default().fg(Theme::GREY_500)
+            ),
         ]));
-        lines.push(Line::from(vec![
-            Span::styled("    ╰".to_string() + &"─".repeat(inner_width.saturating_sub(4)) + "╯", Style::default().fg(Theme::GREY_600)),
-        ]));
+    } else {
+        lines.push(Line::from(""));
     }
 
     lines.push(Line::from(""));
