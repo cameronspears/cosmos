@@ -105,7 +105,7 @@ pub fn setup_api_key_interactive() -> Result<String, String> {
     // Validate key format (should start with sk-)
     if !key.starts_with("sk-") {
         println!();
-        println!("  ⚠️  Key doesn't look like an OpenRouter key (should start with sk-)");
+        println!("  Warning: Key doesn't look like an OpenRouter key (should start with sk-)");
         println!("     Saving anyway...");
     }
 

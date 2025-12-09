@@ -2461,7 +2461,7 @@ fn render_suggestion_detail(frame: &mut Frame, suggestion: &Suggestion, scroll: 
         // File info
         Line::from(vec![
             Span::styled("    ", Style::default()),
-            Span::styled(format!("📄 {}", file_name), Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
+            Span::styled(file_name.to_string(), Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
             Span::styled(format!("       {}", suggestion.file.display()), 
@@ -2499,7 +2499,7 @@ fn render_suggestion_detail(frame: &mut Frame, suggestion: &Suggestion, scroll: 
     if let Some(line) = suggestion.line {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled(format!("    📍 Line {}", line), 
+            Span::styled(format!("    Line {}", line), 
                 Style::default().fg(Theme::GREY_300)),
         ]));
     }
