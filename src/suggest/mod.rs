@@ -4,7 +4,7 @@
 //! - Layer 1: Static rules (FREE)
 //! - Layer 2: Cached suggestions (ONE-TIME)
 //! - Layer 3: Grok Fast for categorization (~$0.0001/call)
-//! - Layer 4: LLM for deep analysis (Grok for analysis, Opus for code gen)
+//! - Layer 4: LLM for deep analysis (Speed for analysis, Smart for code gen)
 
 #![allow(dead_code)]
 
@@ -268,27 +268,6 @@ impl SuggestionEngine {
     pub fn add_llm_suggestion(&mut self, suggestion: Suggestion) {
         self.suggestions.push(suggestion);
         self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
-    }
-
-    /// Request deeper analysis for a file (calls LLM)
-    pub async fn request_deep_analysis(&mut self, path: &PathBuf) -> anyhow::Result<Vec<Suggestion>> {
-        let file_index = self.index.files.get(path)
-            .ok_or_else(|| anyhow::anyhow!("File not found in index"))?;
-        
-        // Read file content
-        let content = std::fs::read_to_string(&self.index.root.join(path))?;
-        
-        // Call LLM for deep analysis
-        let suggestions = llm::analyze_file_deep(path, &content, file_index).await?;
-        
-        // Add to our suggestions
-        for suggestion in &suggestions {
-            self.suggestions.push(suggestion.clone());
-        }
-        
-        self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
-        
-        Ok(suggestions)
     }
 
     /// Get suggestion count by priority

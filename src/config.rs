@@ -85,7 +85,8 @@ pub fn setup_api_key_interactive() -> Result<String, String> {
     println!("  │  🔑 OPENROUTER SETUP                                    │");
     println!("  └─────────────────────────────────────────────────────────┘");
     println!();
-    println!("  codecosmos uses OpenRouter for AI-powered fix suggestions.");
+    println!("  codecosmos uses OpenRouter for AI-powered suggestions.");
+    println!("  Uses @preset/speed for analysis, @preset/smart for code gen.");
     println!();
     println!("  1. Get a free API key at: https://openrouter.ai/keys");
     println!("  2. Paste it below (it will be saved locally)");

@@ -1562,8 +1562,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_main(frame, layout[1], app);
     render_footer(frame, layout[2], app);
 
-    // Loading overlay (shown when background tasks are running)
-    if app.loading.is_loading() {
+    // Loading is now shown inline in the footer status bar (non-blocking)
+    // Only show loading overlay for critical operations that need user attention
+    if matches!(app.loading, LoadingState::GeneratingFix) {
         render_loading_overlay(frame, &app.loading, app.loading_frame, app.summary_progress);
     }
 
@@ -2121,6 +2122,20 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled("  ", Style::default()),
     ];
+    
+    // Loading indicator (non-blocking, inline in status bar)
+    if app.loading.is_loading() {
+        let spinner = SPINNER_FRAMES[app.loading_frame % SPINNER_FRAMES.len()];
+        spans.push(Span::styled(
+            format!("{} ", spinner),
+            Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!("{} ", app.loading.message()),
+            Style::default().fg(Theme::GREY_200),
+        ));
+        spans.push(Span::styled("│ ", Style::default().fg(Theme::GREY_600)));
+    }
     
     // Branch with icon
     spans.push(Span::styled("⎇ ", Style::default().fg(Theme::GREY_500)));
@@ -3403,19 +3418,11 @@ fn render_pr_review(
     frame.render_widget(block, area);
 }
 
-fn render_loading_overlay(frame: &mut Frame, state: &LoadingState, anim_frame: usize, summary_progress: Option<(usize, usize)>) {
+fn render_loading_overlay(frame: &mut Frame, state: &LoadingState, anim_frame: usize, _summary_progress: Option<(usize, usize)>) {
     let area = frame.area();
     
-    // Build message with progress if available
-    let message = if *state == LoadingState::GeneratingSummaries {
-        if let Some((completed, total)) = summary_progress {
-            format!("Summarizing files {}/{}", completed, total)
-        } else {
-            state.message().to_string()
-        }
-    } else {
-        state.message().to_string()
-    };
+    // Simple message - summaries are silent background now
+    let message = state.message().to_string();
     
     // Calculate overlay dimensions
     let width = (message.len() + 12) as u16;

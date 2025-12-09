@@ -14,7 +14,6 @@ mod suggest;
 mod ui;
 
 // Keep these for compatibility during transition
-mod diff;
 mod git_ops;
 
 use anyhow::Result;
@@ -86,16 +85,7 @@ pub enum BackgroundMessage {
         preview: suggest::llm::FixPreview,
     },
     PreviewError(String),
-    /// Full fix ready (Phase 2 - after preview approval, shows diff for review)
-    FixReady {
-        suggestion_id: uuid::Uuid,
-        diff_preview: String,
-        file_path: PathBuf,
-        summary: String,
-        usage: Option<suggest::llm::Usage>,
-    },
-    FixError(String),
-    /// Direct fix applied (Opus generated + applied the change)
+    /// Direct fix applied (Smart preset generated + applied the change)
     DirectFixApplied {
         suggestion_id: uuid::Uuid,
         file_path: PathBuf,
@@ -105,11 +95,6 @@ pub enum BackgroundMessage {
         usage: Option<suggest::llm::Usage>,
     },
     DirectFixError(String),
-    RefinedFixReady {
-        diff_preview: String,
-        usage: Option<suggest::llm::Usage>,
-    },
-    RefinedFixError(String),
     /// AI code review completed
     ReviewReady(Vec<ui::PRReviewComment>),
     /// PR created successfully
@@ -333,7 +318,7 @@ async fn run_tui(
                     let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                         suggestions,
                         usage,
-                        model: "opus-4.5".to_string(),
+                        model: "speed".to_string(),
                     });
                 }
                 Err(e) => {
@@ -385,11 +370,11 @@ async fn run_tui(
                         continue;
                     }
                     
-                    // Use larger batch size (8 files) for faster processing
-                    let batch_size = 8;
+                    // Use large batch size (16 files) for faster processing
+                    let batch_size = 16;
                     let batches: Vec<_> = files.chunks(batch_size).collect();
                     
-                    // Process batches - could be parallelized further with join_all
+                    // Process batches sequentially (llm.rs handles internal parallelism)
                     for batch in batches {
                         if let Ok((summaries, usage)) = suggest::llm::generate_summaries_for_files(
                             &index_clone2, batch, &project_context
@@ -491,40 +476,32 @@ fn run_loop<B: Backend>(
                         app.suggestions.add_llm_suggestion(s);
                     }
                     
-                    // Track cost (Opus for suggestions)
+                    // Track cost (Speed preset for suggestions)
                     if let Some(u) = usage {
-                        let cost = u.calculate_cost(suggest::llm::Model::Opus);
+                        let cost = u.calculate_cost(suggest::llm::Model::Speed);
                         app.session_cost += cost;
                         app.session_tokens += u.total_tokens;
                     }
                     
-                    // Only show "Summarizing" if we actually need to generate summaries
-                    if app.needs_summary_generation {
-                        app.loading = LoadingState::GeneratingSummaries;
-                    } else {
-                        app.loading = LoadingState::None;
-                    }
+                    // Summaries generate silently in background - no blocking overlay
+                    app.loading = LoadingState::None;
                     
                     // More prominent toast for suggestions
                     app.show_toast(&format!("✦ {} suggestions ready ({})", count, &model));
                     app.active_model = Some(model);
                 }
                 BackgroundMessage::SuggestionsError(e) => {
-                    // Only show "Summarizing" if we actually need to generate summaries
-                    if app.needs_summary_generation {
-                        app.loading = LoadingState::GeneratingSummaries;
-                    } else {
-                        app.loading = LoadingState::None;
-                    }
+                    // Summaries generate silently in background - no blocking overlay
+                    app.loading = LoadingState::None;
                     app.show_toast(&format!("Error: {}", truncate(&e, 40)));
                 }
                 BackgroundMessage::SummariesReady { summaries, usage } => {
                     let new_count = summaries.len();
                     app.update_summaries(summaries);
 
-                    // Track cost (using GrokFast for summaries)
+                    // Track cost (using Speed preset for summaries)
                     if let Some(u) = usage {
-                        let cost = u.calculate_cost(suggest::llm::Model::GrokFast);
+                        let cost = u.calculate_cost(suggest::llm::Model::Speed);
                         app.session_cost += cost;
                         app.session_tokens += u.total_tokens;
                     }
@@ -537,11 +514,11 @@ fn run_loop<B: Backend>(
                         app.show_toast("All summaries loaded from cache");
                     }
                 }
-                BackgroundMessage::SummaryProgress { completed, total, summaries } => {
-                    // Update progress display
-                    app.summary_progress = Some((completed, total));
-                    // Merge new summaries
+                BackgroundMessage::SummaryProgress { completed, total: _, summaries } => {
+                    // Silently merge new summaries as they arrive (no progress UI)
                     app.update_summaries(summaries);
+                    // Track progress internally but don't display it
+                    app.summary_progress = Some((completed, 0)); // Keep for internal tracking only
                 }
                 BackgroundMessage::SummariesError(e) => {
                     app.loading = LoadingState::None;
@@ -556,41 +533,10 @@ fn run_loop<B: Backend>(
                     app.loading = LoadingState::None;
                     app.show_toast(&format!("Preview error: {}", truncate(&e, 40)));
                 }
-                BackgroundMessage::FixReady { suggestion_id, diff_preview, file_path, summary, usage } => {
-                    // Track cost
-                    if let Some(u) = usage {
-                        let cost = u.calculate_cost(suggest::llm::Model::GrokFast);
-                        app.session_cost += cost;
-                        app.session_tokens += u.total_tokens;
-                    }
-                    
-                    app.loading = LoadingState::None;
-                    app.show_apply_confirm(suggestion_id, diff_preview, file_path, summary);
-                }
-                BackgroundMessage::FixError(e) => {
-                    app.loading = LoadingState::None;
-                    app.show_toast(&format!("Fix error: {}", truncate(&e, 40)));
-                }
-                BackgroundMessage::RefinedFixReady { diff_preview, usage } => {
-                    // Track cost
-                    if let Some(u) = usage {
-                        let cost = u.calculate_cost(suggest::llm::Model::GrokFast);
-                        app.session_cost += cost;
-                        app.session_tokens += u.total_tokens;
-                    }
-                    
-                    app.loading = LoadingState::None;
-                    app.update_apply_diff(diff_preview);
-                    app.show_toast("Fix refined");
-                }
-                BackgroundMessage::RefinedFixError(e) => {
-                    app.loading = LoadingState::None;
-                    app.show_toast(&format!("Refine error: {}", truncate(&e, 35)));
-                }
                 BackgroundMessage::DirectFixApplied { suggestion_id, file_path, description, modified_areas, backup_path, usage } => {
                     // Track cost
                     if let Some(u) = usage {
-                        let cost = u.calculate_cost(suggest::llm::Model::GrokFast);
+                        let cost = u.calculate_cost(suggest::llm::Model::Speed);
                         app.session_cost += cost;
                         app.session_tokens += u.total_tokens;
                     }
@@ -636,7 +582,7 @@ fn run_loop<B: Backend>(
                 BackgroundMessage::QuestionResponse { question, answer, usage } => {
                     // Track cost
                     if let Some(u) = usage {
-                        let cost = u.calculate_cost(suggest::llm::Model::GrokFast);
+                        let cost = u.calculate_cost(suggest::llm::Model::Speed);
                         app.session_cost += cost;
                         app.session_tokens += u.total_tokens;
                     }
@@ -652,8 +598,8 @@ fn run_loop<B: Backend>(
         // Render
         terminal.draw(|f| ui::render(f, app))?;
 
-        // Poll for events with timeout (for animation)
-        if event::poll(Duration::from_millis(100))? {
+        // Poll for events with fast timeout (snappy animations)
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -712,127 +658,6 @@ fn run_loop<B: Backend>(
 
                 // Handle overlay mode
                 if app.overlay != Overlay::None {
-                    // Handle ApplyConfirm overlay with its different modes
-                    if let Overlay::ApplyConfirm { mode, suggestion_id, diff_preview, file_path, .. } = &app.overlay {
-                        let mode = mode.clone();
-                        let suggestion_id = *suggestion_id;
-                        let diff_preview = diff_preview.clone();
-                        let file_path_clone = file_path.clone();
-                        
-                        match mode {
-                            ui::ApplyMode::View => {
-                                match key.code {
-                                    KeyCode::Esc | KeyCode::Char('n') => app.close_overlay(),
-                                    KeyCode::Down | KeyCode::Char('j') => app.overlay_scroll_down(),
-                                    KeyCode::Up | KeyCode::Char('k') => app.overlay_scroll_up(),
-                                    KeyCode::Char('y') => {
-                                        // Apply the fix
-                                        let full_path = repo_path.join(&file_path_clone);
-                                        match apply_fix(&full_path, &diff_preview) {
-                                            Ok(_) => {
-                                                app.suggestions.mark_applied(suggestion_id);
-                                                app.show_toast("Changes applied successfully!");
-                                                app.close_overlay();
-                                            }
-                                            Err(e) => {
-                                                app.show_toast(&format!("Apply failed: {}", truncate(&e, 40)));
-                                            }
-                                        }
-                                    }
-                                    KeyCode::Char('e') => {
-                                        app.set_apply_mode(ui::ApplyMode::Edit);
-                                    }
-                                    KeyCode::Char('c') => {
-                                        app.set_apply_mode(ui::ApplyMode::Chat);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            ui::ApplyMode::Edit => {
-                                match key.code {
-                                    KeyCode::Esc => {
-                                        // Discard edits and return to view mode
-                                        app.discard_apply_edit();
-                                        app.show_toast("Edit cancelled");
-                                    }
-                                    KeyCode::F(2) => {
-                                        // F2 to save and return to view mode
-                                        app.commit_apply_edit();
-                                        app.show_toast("Edit saved");
-                                    }
-                                    KeyCode::Enter => {
-                                        // Enter adds a newline in edit mode
-                                        app.apply_edit_push('\n');
-                                    }
-                                    KeyCode::Backspace => app.apply_edit_pop(),
-                                    KeyCode::Tab => {
-                                        // Tab inserts spaces for indentation
-                                        app.apply_edit_push(' ');
-                                        app.apply_edit_push(' ');
-                                        app.apply_edit_push(' ');
-                                        app.apply_edit_push(' ');
-                                    }
-                                    KeyCode::Char(c) => app.apply_edit_push(c),
-                                    KeyCode::Down => app.overlay_scroll_down(),
-                                    KeyCode::Up => app.overlay_scroll_up(),
-                                    _ => {}
-                                }
-                            }
-                            ui::ApplyMode::Chat => {
-                                match key.code {
-                                    KeyCode::Esc => {
-                                        app.set_apply_mode(ui::ApplyMode::View);
-                                    }
-                                    KeyCode::Enter => {
-                                        // Get chat input and spawn refinement
-                                        if let Some(chat_text) = app.get_apply_chat_input() {
-                                            if !chat_text.is_empty() {
-                                                let chat_text = chat_text.to_string();
-                                                let repo_path_clone = repo_path.clone();
-                                                let tx_refine = tx.clone();
-                                                
-                                                // Find the suggestion to get more context
-                                                if let Some(suggestion) = app.suggestions.suggestions.iter().find(|s| s.id == suggestion_id) {
-                                                    let suggestion_clone = suggestion.clone();
-                                                    let current_diff = diff_preview.clone();
-                                                    
-                                                    app.loading = LoadingState::GeneratingFix;
-                                                    
-                                                    tokio::spawn(async move {
-                                                        let full_path = repo_path_clone.join(&suggestion_clone.file);
-                                                        let content = match std::fs::read_to_string(&full_path) {
-                                                            Ok(c) => c,
-                                                            Err(e) => {
-                                                                let _ = tx_refine.send(BackgroundMessage::RefinedFixError(format!("Failed to read file: {}", e)));
-                                                                return;
-                                                            }
-                                                        };
-                                                        
-                                                        match suggest::llm::refine_fix(&suggestion_clone.file, &content, &suggestion_clone, &current_diff, &chat_text).await {
-                                                            Ok(new_diff) => {
-                                                                let _ = tx_refine.send(BackgroundMessage::RefinedFixReady {
-                                                                    diff_preview: new_diff,
-                                                                    usage: None,
-                                                                });
-                                                            }
-                                                            Err(e) => {
-                                                                let _ = tx_refine.send(BackgroundMessage::RefinedFixError(e.to_string()));
-                                                            }
-                                                        }
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                    KeyCode::Backspace => app.apply_chat_pop(),
-                                    KeyCode::Char(c) => app.apply_chat_push(c),
-                                    _ => {}
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    
                     // Handle FixPreview overlay (Phase 1 - fast preview)
                     if let Overlay::FixPreview { suggestion_id, file_path, modifier_input, .. } = &app.overlay {
                         let suggestion_id = *suggestion_id;
@@ -855,7 +680,7 @@ fn run_loop<B: Backend>(
                                 app.close_overlay();
                             }
                             KeyCode::Char('y') if !is_typing_modifier => {
-                                // Phase 2: Generate and apply fix directly with Opus
+                                // Phase 2: Generate and apply fix with Smart preset
                                 if let Some(suggestion) = app.suggestions.suggestions.iter().find(|s| s.id == suggestion_id) {
                                     // Get the preview from the overlay
                                     let preview = if let Overlay::FixPreview { preview, .. } = &app.overlay {
@@ -914,45 +739,6 @@ fn run_loop<B: Backend>(
                                             }
                                             Err(e) => {
                                                 let _ = tx_fix.send(BackgroundMessage::DirectFixError(e.to_string()));
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            KeyCode::Char('d') if !is_typing_modifier => {
-                                // Alternative: Show diff preview instead of direct apply
-                                if let Some(suggestion) = app.suggestions.suggestions.iter().find(|s| s.id == suggestion_id) {
-                                    let suggestion_clone = suggestion.clone();
-                                    let summary = suggestion.summary.clone();
-                                    let repo_path_clone = repo_path.clone();
-                                    let tx_fix = tx.clone();
-                                    let file_path_clone = file_path.clone();
-                                    
-                                    app.loading = LoadingState::GeneratingFix;
-                                    app.close_overlay();
-                                    
-                                    tokio::spawn(async move {
-                                        let full_path = repo_path_clone.join(&file_path_clone);
-                                        let content = match std::fs::read_to_string(&full_path) {
-                                            Ok(c) => c,
-                                            Err(e) => {
-                                                let _ = tx_fix.send(BackgroundMessage::FixError(format!("Failed to read file: {}", e)));
-                                                return;
-                                            }
-                                        };
-                                        
-                                        match suggest::llm::generate_fix(&file_path_clone, &content, &suggestion_clone).await {
-                                            Ok(diff_preview) => {
-                                                let _ = tx_fix.send(BackgroundMessage::FixReady {
-                                                    suggestion_id,
-                                                    diff_preview,
-                                                    file_path: file_path_clone,
-                                                    summary,
-                                                    usage: None,
-                                                });
-                                            }
-                                            Err(e) => {
-                                                let _ = tx_fix.send(BackgroundMessage::FixError(e.to_string()));
                                             }
                                         }
                                     });
@@ -1403,79 +1189,3 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Apply a fix (diff) to a file
-fn apply_fix(file_path: &PathBuf, diff_text: &str) -> Result<(), String> {
-    use std::fs;
-    
-    // Try to parse as unified diff
-    if let Ok(diff) = diff::parse_unified_diff(diff_text) {
-        // Create backup
-        let backup_path = diff::backup_file(file_path)?;
-        
-        // Apply the diff
-        match diff::apply_diff_to_file(file_path, &diff) {
-            Ok(_) => {
-                // Remove backup on success
-                let _ = fs::remove_file(&backup_path);
-                Ok(())
-            }
-            Err(e) => {
-                // Restore from backup on failure
-                let _ = diff::restore_backup(file_path);
-                Err(e)
-            }
-        }
-    } else {
-        // Try to extract code from the response and apply directly
-        // Look for code blocks in the diff text
-        if let Some(new_content) = extract_code_from_response(diff_text) {
-            // Create backup
-            let backup_path = file_path.with_extension("orig");
-            fs::copy(file_path, &backup_path)
-                .map_err(|e| format!("Failed to create backup: {}", e))?;
-            
-            // Write new content
-            match fs::write(file_path, new_content) {
-                Ok(_) => {
-                    let _ = fs::remove_file(&backup_path);
-                    Ok(())
-                }
-                Err(e) => {
-                    // Restore backup
-                    let _ = fs::copy(&backup_path, file_path);
-                    let _ = fs::remove_file(&backup_path);
-                    Err(format!("Failed to write file: {}", e))
-                }
-            }
-        } else {
-            Err("Could not parse diff format".to_string())
-        }
-    }
-}
-
-/// Extract code from LLM response that might contain markdown code blocks
-fn extract_code_from_response(response: &str) -> Option<String> {
-    // Look for code blocks with ```
-    let lines: Vec<&str> = response.lines().collect();
-    let mut in_code_block = false;
-    let mut code_lines = Vec::new();
-    
-    for line in lines {
-        if line.starts_with("```") {
-            if in_code_block {
-                // End of code block
-                if !code_lines.is_empty() {
-                    return Some(code_lines.join("\n"));
-                }
-            } else {
-                // Start of code block
-                in_code_block = true;
-                code_lines.clear();
-            }
-        } else if in_code_block {
-            code_lines.push(line);
-        }
-    }
-    
-    None
-}
