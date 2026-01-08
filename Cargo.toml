@@ -26,6 +26,9 @@ futures = "0.3"
 dirs = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Database for suggestion history
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # AST parsing for multi-language support
 tree-sitter = "0.24"
 tree-sitter-rust = "0.23"
@@ -34,8 +37,35 @@ tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-go = "0.23"
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "cosmos"
 path = "src/main.rs"
 
+# ============================================================================
+# Release Profile Optimizations
+# ============================================================================
 
+# Default release profile with ThinLTO - good balance of performance and compile time
+[profile.release]
+lto = "thin"
+codegen-units = 16
+opt-level = 3
+
+# Maximum optimization profile for distribution builds
+# Build with: cargo build --profile release-dist
+[profile.release-dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Development profile with some optimizations for testing performance
+# Build with: cargo build --profile dev-fast
+[profile.dev-fast]
+inherits = "dev"
+opt-level = 1
+debug = true

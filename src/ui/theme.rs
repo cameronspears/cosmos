@@ -3,6 +3,8 @@
 //! A contemplative, high-contrast palette with celestial motifs.
 //! "Where code meets the cosmos"
 
+#![allow(dead_code)]
+
 use ratatui::style::{Color, Modifier, Style};
 
 /// The Cosmos theme - monochromatic with meaning
@@ -74,6 +76,28 @@ impl Theme {
 
     /// Red for removals - brighter for contrast  
     pub const RED: Color = Color::Rgb(230, 120, 120);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Badge colors for categorization
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Refactor badge color
+    pub const BADGE_REFACTOR: Color = Color::Rgb(180, 140, 255);  // Soft purple
+    
+    /// Quality badge color
+    pub const BADGE_QUALITY: Color = Color::Rgb(100, 180, 255);   // Soft blue
+    
+    /// Security badge color
+    pub const BADGE_SECURITY: Color = Color::Rgb(255, 160, 100);  // Soft orange
+    
+    /// Performance badge color
+    pub const BADGE_PERF: Color = Color::Rgb(130, 220, 180);      // Soft teal
+    
+    /// Documentation badge color
+    pub const BADGE_DOCS: Color = Color::Rgb(255, 200, 100);      // Soft yellow
+    
+    /// Bug badge color
+    pub const BADGE_BUG: Color = Color::Rgb(255, 130, 130);       // Soft red
 
     // ─────────────────────────────────────────────────────────────────────
     // Pre-built styles for common UI elements
@@ -193,8 +217,6 @@ impl Theme {
     pub const BULLET_FILLED: char = '●';
     pub const BULLET_EMPTY: char = '○';
     pub const BULLET_HALF: char = '◐';
-    pub const DIAMOND_FILLED: char = '◆';
-    pub const DIAMOND_EMPTY: char = '◇';
     pub const ARROW_RIGHT: char = '▸';
     pub const ARROW_DOWN: char = '▾';
     pub const DOT_SEPARATOR: char = '·';
@@ -265,18 +287,9 @@ impl Theme {
     pub const MOON_WANING: char = '◑';     // Waning moon
     pub const MOON_CRESCENT: char = '☽';   // Crescent moon (decorative)
 
-    /// Stars - for highlights and ratings
-    pub const STAR_FILLED: char = '✦';     // Filled star
-    pub const STAR_EMPTY: char = '✧';      // Empty star
-    pub const STAR_SPARKLE: char = '✨';   // Sparkle/suggestion
-    pub const STAR_FOUR: char = '✦';       // Four-pointed star
-    pub const STAR_SIX: char = '✶';        // Six-pointed star
-
     /// Cosmic decorations
     pub const CONSTELLATION: &'static str = "· · ·";
     pub const ORBIT: &'static str = "◌";
-    pub const GALAXY: char = '✴';
-    pub const COMET: &'static str = "━━━★";
 
     /// Priority indicators (cosmic)
     pub const PRIORITY_HIGH: char = '●';   // Full moon - attention
@@ -309,7 +322,7 @@ impl Theme {
     /// The Cosmos header/branding - elegant italic
     pub const COSMOS_LOGO: &'static str = "𝘤 𝘰 𝘴 𝘮 𝘰 𝘴";
     
-    pub const COSMOS_TAGLINE: &'static str = "𝘢 𝘤𝘰𝘯𝘵𝘦𝘮𝘱𝘭𝘢𝘵𝘪𝘷𝘦 𝘤𝘰𝘮𝘱𝘢𝘯𝘪𝘰𝘯 𝘧𝘰𝘳 𝘺𝘰𝘶𝘳 𝘤𝘰𝘥𝘦𝘣𝘢𝘴𝘦";
+    pub const COSMOS_TAGLINE: &'static str = "a contemplative companion for your codebase";
 
     /// Section headers - elegant serif style
     pub const SECTION_PROJECT: &'static str = "𝘱𝘳𝘰𝘫𝘦𝘤𝘵";
@@ -393,14 +406,14 @@ pub fn constellation_line(width: usize) -> String {
     pattern.repeat(repeat)[..width].to_string()
 }
 
-/// Generate stars rating (e.g., ✦✦✦✧✧)
-pub fn star_rating(filled: usize, total: usize) -> String {
+/// Generate dot rating (e.g., ●●●○○)
+pub fn dot_rating(filled: usize, total: usize) -> String {
     let mut result = String::new();
     for i in 0..total {
         if i < filled {
-            result.push(Theme::STAR_FILLED);
+            result.push(Theme::BULLET_FILLED);
         } else {
-            result.push(Theme::STAR_EMPTY);
+            result.push(Theme::BULLET_EMPTY);
         }
     }
     result

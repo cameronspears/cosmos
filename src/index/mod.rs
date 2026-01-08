@@ -3,6 +3,8 @@
 //! Uses tree-sitter for multi-language AST parsing to build
 //! semantic understanding of the codebase.
 
+#![allow(dead_code)]
+
 pub mod parser;
 
 use chrono::{DateTime, Utc};
@@ -278,7 +280,7 @@ impl FileSummary {
 }
 
 /// Infer the purpose of a file from its name and exports
-fn infer_purpose(path: &Path, symbols: &[Symbol], language: Language) -> String {
+fn infer_purpose(path: &Path, symbols: &[Symbol], _language: Language) -> String {
     let filename = path.file_stem()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
@@ -289,59 +291,256 @@ fn infer_purpose(path: &Path, symbols: &[Symbol], language: Language) -> String 
         .unwrap_or("");
     
     // Common filename patterns -> descriptions
-    let purpose = match filename.to_lowercase().as_str() {
-        "mod" => format!("{} module definitions", parent),
-        "main" => "Application entry point".to_string(),
-        "lib" => "Library root module".to_string(),
-        "index" => format!("{} module exports", parent),
-        "config" | "configuration" => "Configuration management".to_string(),
-        "utils" | "util" | "helpers" => "Utility functions".to_string(),
-        "types" => "Type definitions".to_string(),
-        "constants" | "consts" => "Constant definitions".to_string(),
-        "errors" | "error" => "Error types and handling".to_string(),
-        "tests" | "test" => "Test suite".to_string(),
-        "api" => "API definitions".to_string(),
-        "db" | "database" => "Database operations".to_string(),
-        "auth" | "authentication" => "Authentication logic".to_string(),
-        "routes" | "router" => "Route definitions".to_string(),
-        "middleware" => "Middleware handlers".to_string(),
-        "models" | "model" => "Data models".to_string(),
-        "views" | "view" => "View components".to_string(),
-        "controllers" | "controller" => "Request handlers".to_string(),
-        "services" | "service" => "Business logic services".to_string(),
-        "handlers" | "handler" => "Event/request handlers".to_string(),
-        _ => {
-            // Try to infer from symbols
-            if let Some(main_symbol) = symbols.iter()
-                .filter(|s| s.visibility == Visibility::Public)
-                .max_by_key(|s| s.line_count())
-            {
-                match main_symbol.kind {
-                    SymbolKind::Struct | SymbolKind::Class => {
-                        format!("{} implementation", main_symbol.name)
-                    }
-                    SymbolKind::Trait | SymbolKind::Interface => {
-                        format!("{} trait/interface", main_symbol.name)
-                    }
-                    SymbolKind::Function | SymbolKind::Method => {
-                        format!("{} and related functions", main_symbol.name)
-                    }
-                    _ => format!("{} module", capitalize(filename))
-                }
-            } else {
-                format!("{} module", capitalize(filename))
-            }
-        }
+    let known_purpose = match filename.to_lowercase().as_str() {
+        "mod" => Some(format!("{} module definitions", parent)),
+        "main" => Some("Application entry point".to_string()),
+        "lib" => Some("Library root module".to_string()),
+        "index" => Some(format!("{} module exports", parent)),
+        "config" | "configuration" => Some("Configuration management".to_string()),
+        "types" => Some("Type definitions".to_string()),
+        "constants" | "consts" => Some("Constant definitions".to_string()),
+        "tests" | "test" => Some("Test suite".to_string()),
+        _ => None,
     };
     
-    // Add language context
-    match language {
-        Language::Rust => purpose,
-        Language::TypeScript | Language::JavaScript => purpose,
-        Language::Python => purpose,
-        Language::Go => purpose,
-        Language::Unknown => purpose,
+    // Get public symbols grouped by kind
+    let public_symbols: Vec<_> = symbols.iter()
+        .filter(|s| s.visibility == Visibility::Public)
+        .collect();
+    
+    let functions: Vec<&str> = public_symbols.iter()
+        .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
+        .map(|s| s.name.as_str())
+        .collect();
+    
+    let types: Vec<&str> = public_symbols.iter()
+        .filter(|s| matches!(s.kind, SymbolKind::Struct | SymbolKind::Class | SymbolKind::Enum))
+        .map(|s| s.name.as_str())
+        .collect();
+    
+    let traits: Vec<&str> = public_symbols.iter()
+        .filter(|s| matches!(s.kind, SymbolKind::Trait | SymbolKind::Interface))
+        .map(|s| s.name.as_str())
+        .collect();
+    
+    // Build a descriptive summary
+    let mut parts = Vec::new();
+    
+    // Start with known purpose if we have one, otherwise infer from filename
+    if let Some(purpose) = known_purpose {
+        parts.push(purpose);
+    } else {
+        // Try to infer from filename pattern
+        let inferred = infer_from_filename(filename, parent);
+        if !inferred.is_empty() {
+            parts.push(inferred);
+        }
     }
+    
+    // Add type information
+    if !types.is_empty() {
+        let type_desc = if types.len() == 1 {
+            format!("Defines {} type", types[0])
+        } else if types.len() <= 3 {
+            format!("Defines {} types", types.join(", "))
+        } else {
+            format!("Defines {} and {} other types", types[..2].join(", "), types.len() - 2)
+        };
+        parts.push(type_desc);
+    }
+    
+    // Add trait/interface information
+    if !traits.is_empty() {
+        let trait_desc = if traits.len() == 1 {
+            format!("Defines {} trait", traits[0])
+        } else {
+            format!("Defines {} traits", traits.join(", "))
+        };
+        parts.push(trait_desc);
+    }
+    
+    // Add function information
+    if !functions.is_empty() {
+        let func_desc = if functions.len() == 1 {
+            format!("Provides {} function", humanize_name(functions[0]))
+        } else if functions.len() <= 4 {
+            let names: Vec<_> = functions.iter().map(|n| humanize_name(n)).collect();
+            format!("Provides {} functions", names.join(", "))
+        } else {
+            let names: Vec<_> = functions.iter().take(3).map(|n| humanize_name(n)).collect();
+            format!("Provides {} and {} other functions", names.join(", "), functions.len() - 3)
+        };
+        parts.push(func_desc);
+    }
+    
+    // If we still have nothing useful, provide a basic description
+    if parts.is_empty() {
+        if symbols.is_empty() {
+            return format!("{} module (no exports)", capitalize(filename));
+        } else {
+            return format!("{} module with {} symbols", capitalize(filename), symbols.len());
+        }
+    }
+    
+    // Join parts intelligently
+    if parts.len() == 1 {
+        parts[0].clone()
+    } else {
+        // First part as the main description, rest as details
+        format!("{}. {}", parts[0], parts[1..].join(". "))
+    }
+}
+
+/// Infer purpose from filename patterns (camelCase, snake_case, etc.)
+fn infer_from_filename(filename: &str, parent: &str) -> String {
+    let lower = filename.to_lowercase();
+    
+    // Check for common suffixes/patterns
+    if lower.ends_with("utils") || lower.ends_with("util") || lower.ends_with("helpers") || lower.ends_with("helper") {
+        let name = lower.replace("utils", "").replace("util", "").replace("helpers", "").replace("helper", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        if name.is_empty() {
+            return "General utility functions".to_string();
+        }
+        return format!("{} utility functions", capitalize(&name));
+    }
+    
+    if lower.ends_with("service") || lower.ends_with("services") {
+        let name = lower.replace("service", "").replace("services", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        if name.is_empty() {
+            return "Service layer logic".to_string();
+        }
+        return format!("{} service operations", capitalize(&name));
+    }
+    
+    if lower.ends_with("controller") || lower.ends_with("controllers") {
+        let name = lower.replace("controller", "").replace("controllers", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        if name.is_empty() {
+            return "Request controller handlers".to_string();
+        }
+        return format!("{} request handlers", capitalize(&name));
+    }
+    
+    if lower.ends_with("handler") || lower.ends_with("handlers") {
+        let name = lower.replace("handler", "").replace("handlers", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        if name.is_empty() {
+            return "Event/request handlers".to_string();
+        }
+        return format!("{} event handlers", capitalize(&name));
+    }
+    
+    if lower.ends_with("model") || lower.ends_with("models") {
+        let name = lower.replace("model", "").replace("models", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        if name.is_empty() {
+            return "Data model definitions".to_string();
+        }
+        return format!("{} data model", capitalize(&name));
+    }
+    
+    if lower.ends_with("api") {
+        let name = lower.replace("api", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        if name.is_empty() {
+            return "API endpoint definitions".to_string();
+        }
+        return format!("{} API operations", capitalize(&name));
+    }
+    
+    if lower.ends_with("client") {
+        let name = lower.replace("client", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        if name.is_empty() {
+            return "Client implementation".to_string();
+        }
+        return format!("{} client", capitalize(&name));
+    }
+    
+    if lower.ends_with("store") {
+        let name = lower.replace("store", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        if name.is_empty() {
+            return "State store management".to_string();
+        }
+        return format!("{} state management", capitalize(&name));
+    }
+    
+    if lower.ends_with("hook") || lower.ends_with("hooks") {
+        return "React hooks".to_string();
+    }
+    
+    if lower.starts_with("use") && filename.len() > 3 {
+        // React hook pattern: useAuth, useQuery, etc.
+        let hook_name = humanize_camel_case(&filename[3..]);
+        return format!("{} React hook", hook_name);
+    }
+    
+    // Check parent directory for context
+    if !parent.is_empty() {
+        let parent_lower = parent.to_lowercase();
+        if parent_lower == "components" || parent_lower == "component" {
+            return format!("{} component", capitalize(filename));
+        }
+        if parent_lower == "pages" || parent_lower == "views" {
+            return format!("{} page/view", capitalize(filename));
+        }
+        if parent_lower == "hooks" {
+            return format!("{} hook", capitalize(filename));
+        }
+        if parent_lower == "utils" || parent_lower == "lib" || parent_lower == "helpers" {
+            return format!("{} utilities", capitalize(filename));
+        }
+        if parent_lower == "api" || parent_lower == "routes" {
+            return format!("{} API endpoints", capitalize(filename));
+        }
+    }
+    
+    // Default: humanize the filename
+    let humanized = humanize_camel_case(filename);
+    if humanized != filename {
+        format!("{} functionality", humanized)
+    } else {
+        String::new()
+    }
+}
+
+/// Convert camelCase or PascalCase to human-readable form
+fn humanize_camel_case(s: &str) -> String {
+    let mut result = String::new();
+    let mut prev_was_upper = false;
+    
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 && !prev_was_upper {
+                result.push(' ');
+            }
+            result.push(c.to_lowercase().next().unwrap_or(c));
+            prev_was_upper = true;
+        } else if c == '_' || c == '-' {
+            result.push(' ');
+            prev_was_upper = false;
+        } else {
+            result.push(c);
+            prev_was_upper = false;
+        }
+    }
+    
+    // Capitalize first letter
+    let mut chars = result.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+    }
+}
+
+/// Humanize a symbol name for display
+fn humanize_name(name: &str) -> String {
+    let char_count = name.chars().count();
+    // Keep short names as-is
+    if char_count <= 12 {
+        return name.to_string();
+    }
+    // Truncate very long names (use char count, not byte length, for Unicode safety)
+    if char_count > 25 {
+        let truncated: String = name.chars().take(22).collect();
+        return format!("{}...", truncated);
+    }
+    name.to_string()
 }
 
 /// Capitalize the first letter of a string
@@ -719,7 +918,7 @@ impl FileTree {
 
     fn insert_recursive(
         &mut self,
-        entries: &mut Vec<FileTreeEntry>,
+        _entries: &mut Vec<FileTreeEntry>,
         components: &[std::path::Component],
         depth: usize,
         file_index: &FileIndex,
@@ -738,7 +937,7 @@ impl FileTree {
             is_dir: !is_last,
             depth,
             priority: if is_last { file_index.priority_indicator() } else { ' ' },
-            expanded: true,
+            expanded: false,
             children: Vec::new(),
         };
 

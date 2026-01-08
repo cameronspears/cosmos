@@ -1,12 +1,273 @@
 //! Panel utilities for Cosmos UI
 //!
-//! Helper functions for rendering panels and list items.
+//! Helper functions for rendering panels, buttons, and collapsible sections.
+
+#![allow(dead_code)]
 
 use crate::ui::theme::Theme;
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  BUTTON COMPONENTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a button-style key hint like [a] Apply
+pub fn button<'a>(key: &str, label: &str, highlighted: bool) -> Vec<Span<'a>> {
+    let (key_style, label_style) = if highlighted {
+        (
+            Style::default().fg(Theme::GREY_900).bg(Theme::WHITE).add_modifier(Modifier::BOLD),
+            Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300),
+            Style::default().fg(Theme::GREY_300),
+        )
+    };
+    
+    vec![
+        Span::styled(format!(" {} ", key), key_style),
+        Span::styled(format!(" {} ", label), label_style),
+    ]
+}
+
+/// Create a small/compact button
+pub fn button_sm<'a>(key: &str, label: &str) -> Vec<Span<'a>> {
+    vec![
+        Span::styled(format!("{}", key), Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {} ", label), Style::default().fg(Theme::GREY_400)),
+    ]
+}
+
+/// Create an action bar with multiple buttons
+pub fn action_bar<'a>(buttons: Vec<(&str, &str, bool)>) -> Line<'a> {
+    let mut spans = vec![Span::styled("  ", Style::default())];
+    
+    for (i, (key, label, highlighted)) in buttons.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", Style::default()));
+        }
+        spans.extend(button(key, label, highlighted));
+    }
+    
+    Line::from(spans)
+}
+
+/// Create a subtle action bar with smaller buttons
+pub fn action_bar_subtle<'a>(buttons: Vec<(&str, &str)>) -> Line<'a> {
+    let mut spans = vec![Span::styled("     ", Style::default())];
+    
+    for (i, (key, label)) in buttons.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("   ", Style::default()));
+        }
+        spans.extend(button_sm(key, label));
+    }
+    
+    Line::from(spans)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION CONTAINERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a section header with expand/collapse indicator
+pub fn section_header<'a>(
+    icon: &str,
+    title: &str, 
+    count: Option<usize>,
+    expanded: bool,
+    is_selected: bool,
+) -> Line<'a> {
+    let expand_icon = if expanded { "▼" } else { "▶" };
+    
+    let (title_style, count_style) = if is_selected {
+        (
+            Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD),
+            Style::default().fg(Theme::GREY_200),
+        )
+    } else {
+        (
+            Style::default().fg(Theme::GREY_100).add_modifier(Modifier::BOLD),
+            Style::default().fg(Theme::GREY_500),
+        )
+    };
+    
+    let cursor = if is_selected { " › " } else { "   " };
+    
+    let mut spans = vec![
+        Span::styled(cursor, Style::default().fg(Theme::GREY_100)),
+        Span::styled(format!("{} ", icon), Style::default().fg(Theme::GREY_400)),
+        Span::styled(expand_icon, Style::default().fg(Theme::GREY_500)),
+        Span::styled(format!(" {}", title), title_style),
+    ];
+    
+    if let Some(c) = count {
+        spans.push(Span::styled(format!(" ({})", c), count_style));
+    }
+    
+    Line::from(spans)
+}
+
+/// Create a subsection header (for nested groupings)
+pub fn subsection_header<'a>(title: &str, count: Option<usize>, is_selected: bool) -> Line<'a> {
+    let style = if is_selected {
+        Style::default().fg(Theme::WHITE).add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(Theme::GREY_200).add_modifier(Modifier::ITALIC)
+    };
+    
+    let cursor = if is_selected { "   › " } else { "     " };
+    
+    let mut spans = vec![
+        Span::styled(cursor, Style::default().fg(Theme::GREY_100)),
+        Span::styled(title.to_string(), style),
+    ];
+    
+    if let Some(c) = count {
+        spans.push(Span::styled(format!(" ({})", c), Style::default().fg(Theme::GREY_500)));
+    }
+    
+    Line::from(spans)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CONTENT CARDS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a content card with rounded corners
+pub fn card_top<'a>(width: usize) -> Line<'a> {
+    let inner = "─".repeat(width.saturating_sub(2));
+    Line::from(vec![
+        Span::styled(format!("     ╭{}╮", inner), Style::default().fg(Theme::GREY_600)),
+    ])
+}
+
+pub fn card_bottom<'a>(width: usize) -> Line<'a> {
+    let inner = "─".repeat(width.saturating_sub(2));
+    Line::from(vec![
+        Span::styled(format!("     ╰{}╯", inner), Style::default().fg(Theme::GREY_600)),
+    ])
+}
+
+pub fn card_line<'a>(content: &str, width: usize, style: Style) -> Line<'a> {
+    let padded = format!("{:<width$}", content, width = width.saturating_sub(2));
+    let truncated = if padded.chars().count() > width.saturating_sub(2) {
+        padded.chars().take(width.saturating_sub(5)).collect::<String>() + "..."
+    } else {
+        padded
+    };
+    
+    Line::from(vec![
+        Span::styled("     │", Style::default().fg(Theme::GREY_600)),
+        Span::styled(truncated, style),
+        Span::styled("│", Style::default().fg(Theme::GREY_600)),
+    ])
+}
+
+pub fn card_line_raw<'a>(spans: Vec<Span<'a>>, _width: usize) -> Line<'a> {
+    let mut all_spans = vec![
+        Span::styled("     │ ", Style::default().fg(Theme::GREY_600)),
+    ];
+    all_spans.extend(spans);
+    // Note: width padding would need proper calculation based on content
+    all_spans.push(Span::styled(" │", Style::default().fg(Theme::GREY_600)));
+    Line::from(all_spans)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  BADGES & INDICATORS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a priority badge
+pub fn priority_badge<'a>(priority: char) -> Span<'a> {
+    let (icon, style) = match priority {
+        '●' => ("●", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
+        '◐' => ("◐", Style::default().fg(Theme::GREY_200)),
+        '○' => ("○", Style::default().fg(Theme::GREY_400)),
+        _ => ("·", Style::default().fg(Theme::GREY_500)),
+    };
+    Span::styled(icon.to_string(), style)
+}
+
+/// Create a category/type badge
+pub fn type_badge<'a>(label: &str, color: ratatui::style::Color) -> Vec<Span<'a>> {
+    vec![
+        Span::styled(
+            format!(" {} ", label),
+            Style::default().fg(Theme::GREY_900).bg(color),
+        ),
+    ]
+}
+
+/// Create a status indicator
+pub fn status_indicator<'a>(status: &str, positive: bool) -> Span<'a> {
+    let (icon, style) = if positive {
+        (Theme::CHECK_MARK, Style::default().fg(Theme::GREEN))
+    } else {
+        (Theme::CROSS_MARK, Style::default().fg(Theme::RED))
+    };
+    Span::styled(format!("{} {}", icon, status), style)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SEPARATORS & DIVIDERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a thin separator line
+pub fn separator<'a>(width: usize) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(
+            format!("     {}", "─".repeat(width)),
+            Style::default().fg(Theme::GREY_700),
+        ),
+    ])
+}
+
+/// Create a dotted separator
+pub fn separator_dotted<'a>(width: usize) -> Line<'a> {
+    let dots = "·".repeat(width);
+    Line::from(vec![
+        Span::styled(format!("     {}", dots), Style::default().fg(Theme::GREY_700)),
+    ])
+}
+
+/// Create a labeled separator
+pub fn separator_labeled<'a>(label: &str, width: usize) -> Line<'a> {
+    let label_len = label.chars().count();
+    let left_len = 3;
+    let right_len = width.saturating_sub(label_len + left_len + 2);
+    
+    Line::from(vec![
+        Span::styled(format!("     {}", "─".repeat(left_len)), Style::default().fg(Theme::GREY_600)),
+        Span::styled(format!(" {} ", label), Style::default().fg(Theme::GREY_400).add_modifier(Modifier::ITALIC)),
+        Span::styled("─".repeat(right_len), Style::default().fg(Theme::GREY_600)),
+    ])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  INFO ROWS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a label-value info row
+pub fn info_row<'a>(label: &str, value: &str) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(format!("     {} ", label), Style::default().fg(Theme::GREY_500)),
+        Span::styled(value.to_string(), Style::default().fg(Theme::GREY_200)),
+    ])
+}
+
+/// Create a metric with icon
+pub fn metric<'a>(icon: &str, value: &str, label: &str) -> Vec<Span<'a>> {
+    vec![
+        Span::styled(format!("{} ", icon), Style::default().fg(Theme::GREY_400)),
+        Span::styled(value.to_string(), Style::default().fg(Theme::GREY_100).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {}", label), Style::default().fg(Theme::GREY_400)),
+    ]
+}
 
 /// Format a time duration in days as a human-readable string
 pub fn format_time_ago(days: i64) -> String {

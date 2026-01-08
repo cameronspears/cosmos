@@ -1,35 +1,21 @@
-# ☽ C O S M O S ✦
+# *c o s m o s*
 
-A contemplative vibe coding companion for your codebase.
+A **terminal-first codebase steward** for solo developers.
 
-Uses AST-based indexing and AI (Opus 4.5) to proactively suggest improvements, bug fixes, optimizations, and new features while minimizing LLM spend through smart caching and tiered model usage.
+Cosmos lives *outside* your editing loop. It reads git context, surfaces high-leverage improvements, and ships fixes as branches + PRs — all from the terminal.
 
 **Monochromatic. Minimal. Meaningful.**
 
-```
-╔══════════════════════════════════════════════════════════════╗
-║                    ☽ C O S M O S ✦                           ║
-║          a contemplative companion for your codebase         ║
-╠═══════════════════════════╦══════════════════════════════════╣
-║  PROJECT                  ║  SUGGESTIONS                     ║
-║  · src/                   ║  ● Improve: ai.rs has 715        ║
-║    · main.rs          ●   ║    lines - split into modules    ║
-║    · ui/                  ║                                  ║
-║    · index/               ║  ◐ Quality: Missing tests for    ║
-║  · tests/                 ║    public functions              ║
-╠═══════════════════════════╩══════════════════════════════════╣
-║  main ● 5 changed │ ? inquiry  ↵ view  a apply  q quit       ║
-╚══════════════════════════════════════════════════════════════╝
-```
+![Cosmos Main Interface](assets/image-1cd94e09-8039-41ea-bce0-95a5767cdb9b.png)
 
-## Features
+## What It Does
 
-- **AST-Powered Indexing** - Deep understanding of your codebase using tree-sitter
-- **Tiered AI Suggestions** - Opus 4.5 for depth, Grok Fast for speed, static rules for free
-- **Git-Aware Context** - Knows what you're working on from uncommitted changes
-- **Dual-Panel UI** - Project tree + suggestions side by side
-- **Cosmic Aesthetic** - Monochromatic with celestial motifs
-- **Hyper-Optimized** - <$0.10 per session through smart caching
+- **Indexes your codebase** using tree-sitter (Rust, TypeScript, JavaScript, Python, Go)
+- **Suggests improvements** via AI with smart tiering (Opus 4.5 for depth, fast models for speed)
+- **Ships fixes safely** — preview changes, apply to a branch, create PRs
+- **Remembers context** — caches summaries, tracks your decisions
+
+![Suggestions View](assets/image-591aa864-7d98-4437-9128-02a3744679bc.png)
 
 ## Installation
 
@@ -50,10 +36,13 @@ cosmos
 # Point at a specific project
 cosmos /path/to/project
 
+# Time-boxed improvement session (ritual mode)
+cosmos ritual --minutes 15
+
 # Show stats without TUI
 cosmos --stats
 
-# Set up AI features
+# Set up AI features (BYOK mode)
 cosmos --setup
 ```
 
@@ -63,103 +52,187 @@ cosmos --setup
 |-----|--------|
 | `↑/k` `↓/j` | Navigate |
 | `Tab` | Switch panels |
-| `Enter` | View suggestion detail |
+| `Enter` | View detail |
+| `/` | Search |
 | `?` | Toggle help |
-| `a` | Apply selected suggestion |
+
+### Actions
+
+| Key | Action |
+|-----|--------|
+| `a` | Apply suggestion (generates preview first) |
 | `d` | Dismiss suggestion |
-| `i` | Inquiry - ask AI for suggestions |
+| `i` | Inquiry — ask AI a question about your code |
+| `u` | Undo last applied change |
 | `r` | Refresh context |
-| `q` | Quit |
 
-## How It Works
+### Git & Shipping
 
-### 1. AST Indexing
+| Key | Action |
+|-----|--------|
+| `s` | Ship — commit + push + create PR |
+| `c` | Git status (stage/unstage files) |
+| `m` | Switch to main branch |
+| `b` | Branch workflow |
 
-On startup, Cosmos parses your codebase with tree-sitter to understand:
-- Functions, classes, structs, traits
-- Dependencies and imports
-- Code patterns and complexity
+### Modes & Views
 
-### 2. Tiered Suggestions
+| Key | Action |
+|-----|--------|
+| `R` | Ritual mode — curated time-boxed session |
+| `g` | Toggle flat/grouped view |
+| `S` | Cycle sort mode |
+| `M` | Repo memory (store decisions) |
+| `1-8` | Jump to architectural layer |
 
-| Layer | Cost | When Used |
-|-------|------|-----------|
-| **Static Rules** | $0 | Always - pattern matching for file size, complexity, TODOs |
-| **Cached** | $0 | Previously generated suggestions, stored in `.cosmos/` |
-| **Grok Fast** | ~$0.0001 | Quick categorization on browse |
-| **Opus 4.5** | ~$0.02 | Deep analysis on explicit inquiry |
+![Ship Workflow](assets/image-ceb802d7-fbe0-429c-ad69-5d867da46bb6.png)
 
-### 3. Git-Aware Context
+## Workflows
 
-Cosmos infers what you're working on from:
-- Uncommitted changes
-- Staged files
-- Recent commits
+### Apply Flow
 
-It prioritizes suggestions relevant to your current focus.
+When you press `a` on a suggestion:
+
+1. **Preview** — AI verifies the issue and shows a human-readable plan
+2. **Confirm** — Press `y` to apply, `n` to cancel, `m` to modify
+3. **Apply** — Creates a fix branch, applies the change, runs safety checks
+4. **Ship** — Press `s` to commit, push, and create a PR in one motion
+
+### Ritual Mode
+
+A focused, time-boxed improvement session:
+
+```bash
+cosmos ritual --minutes 10
+```
+
+Presents a curated queue of suggestions. Work through them one by one. Mark as done, skip, or dismiss.
+
+### Ship Workflow
+
+After applying changes, press `s` to:
+1. Stage modified files
+2. Commit with auto-generated message
+3. Push to remote
+4. Create a PR via GitHub CLI
+
+## Smart Caching
+
+Cosmos caches aggressively to minimize LLM costs:
+
+- **File summaries** — Cached by content hash, regenerated only when files change
+- **Suggestions** — Persisted between sessions
+- **Decisions** — Repo memory stores your preferences
+
+On subsequent runs, unchanged files load instantly from cache.
+
+![Codebase View](assets/image-d056b5fc-6545-4aac-a0a3-e5eaaeb3b83a.png)
 
 ## Suggestion Types
 
-| Icon | Type | Description |
-|------|------|-------------|
-| ● | High | Significant improvement opportunity |
-| ◐ | Medium | Worth considering |
-| ○ | Low | Minor enhancement |
+| Icon | Priority |
+|------|----------|
+| ● | High — significant improvement |
+| ◐ | Medium — worth considering |
+| ○ | Low — minor enhancement |
 
-**Categories:**
-- **Improvement** - Refactoring opportunities
-- **BugFix** - Potential bugs or error handling
-- **Optimization** - Performance improvements
-- **Quality** - Code cleanliness, missing tests
-- **Feature** - New feature suggestions
+**Categories:** Improvement, BugFix, Optimization, Quality, Feature
 
-## AI Setup
+## AI Setup (BYOK Mode)
 
 ```bash
 cosmos --setup
 ```
 
-This guides you through getting an OpenRouter API key (https://openrouter.ai/keys) and saves it securely.
+Guides you through getting an [OpenRouter API key](https://openrouter.ai/keys). Your key is saved locally.
 
-## Caching
+## License Management
 
-Cosmos stores suggestions in `.cosmos/` to:
-- Avoid redundant LLM calls
-- Speed up subsequent sessions
-- Remember dismissed suggestions
+```bash
+# Activate a license
+cosmos --activate <KEY>
 
-Add `.cosmos/` to your `.gitignore` (Cosmos does this automatically).
+# Check status
+cosmos --status
+
+# View usage
+cosmos --usage
+
+# Deactivate
+cosmos --deactivate
+```
+
+**Tiers:**
+- **Free** — BYOK mode, billed to your OpenRouter account
+- **Pro** — Bundled tokens, monthly allowance
+- **Team** — Higher limits, priority support
+
+## Configuration
+
+Press `O` to see your config file location. Config options:
+
+- **Privacy preview** (`P`) — Preview what gets sent to AI before sending
+- **Summarize changed only** (`T`) — Only summarize modified files and their dependencies
+
+## Project Structure
+
+```
+cosmos/
+├── src/
+│   ├── main.rs          # Entry point, CLI, event loop
+│   ├── cache/           # Smart caching (summaries, suggestions)
+│   ├── config.rs        # User configuration
+│   ├── context/         # Git-aware work context
+│   ├── git_ops.rs       # Git operations (branch, commit, PR)
+│   ├── grouping/        # Architectural layer detection
+│   ├── history.rs       # Suggestion history (SQLite)
+│   ├── index/           # AST-based codebase indexing
+│   ├── license.rs       # License management
+│   ├── onboarding.rs    # First-run experience
+│   ├── safe_apply.rs    # Safety checks before applying
+│   ├── suggest/         # Suggestion engine (LLM + static rules)
+│   └── ui/              # TUI components (ratatui)
+└── assets/              # Screenshots
+```
 
 ## Design Philosophy
 
-**Monochrome with meaning:**
-- White = attention required
-- Grey gradients = information hierarchy
-- Celestial symbols = cosmic branding
-
 **Contemplative pace:**
-- No flashing or jarring transitions
-- Zen-like layout with ample whitespace
 - Suggestions, not demands
+- Preview before applying
+- Undo always available
 
-**Hyper-optimization:**
+**Cost-conscious:**
 - Free static analysis first
-- AI only when needed
-- Cache everything cacheable
+- Smart caching eliminates redundant LLM calls
+- Tiered models (fast for summaries, powerful for suggestions)
 
-## Options
+**Git-native:**
+- Knows what you're working on from uncommitted changes
+- Ships fixes as proper branches with PRs
+- One-key undo to restore backups
+
+## CLI Reference
 
 ```
 Usage: cosmos [OPTIONS] [PATH]
+       cosmos ritual [PATH] --minutes <N>
 
 Arguments:
   [PATH]  Path to the repository [default: .]
 
 Options:
-      --setup   Set up OpenRouter API key
-      --stats   Show stats and exit (no TUI)
-  -h, --help    Print help
-  -V, --version Print version
+      --setup             Set up OpenRouter API key
+      --stats             Show stats and exit (no TUI)
+      --activate <KEY>    Activate a Cosmos Pro license
+      --deactivate        Deactivate current license
+      --status            Show license and usage status
+      --usage             Show token usage statistics
+  -h, --help              Print help
+  -V, --version           Print version
+
+Ritual Mode:
+      --minutes <N>       Session length in minutes [default: 10]
 ```
 
 ## License
@@ -168,4 +241,4 @@ MIT
 
 ---
 
-*"Where code meets the cosmos"*
+*"A contemplative companion for your codebase"*

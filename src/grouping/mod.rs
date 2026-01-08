@@ -3,6 +3,8 @@
 //! Organizes codebase files into architectural layers (Frontend, Backend, API, etc.)
 //! and feature clusters for a more intuitive project explorer.
 
+#![allow(dead_code)]
+
 pub mod heuristics;
 pub mod features;
 
@@ -206,7 +208,7 @@ pub struct FileGroup {
 }
 
 fn default_expanded() -> bool {
-    true
+    false
 }
 
 impl FileGroup {
@@ -215,7 +217,7 @@ impl FileGroup {
             layer,
             features: Vec::new(),
             ungrouped_files: Vec::new(),
-            expanded: true,
+            expanded: false,
         }
     }
 
@@ -366,3 +368,4 @@ impl GroupedTreeEntry {
         }
     }
 }
+

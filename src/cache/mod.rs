@@ -3,6 +3,8 @@
 //! Persists suggestions and index data to .cosmos/ directory
 //! to avoid redundant LLM calls and speed up startup.
 
+#![allow(dead_code)]
+
 use crate::index::CodebaseIndex;
 use crate::suggest::Suggestion;
 use chrono::{DateTime, Duration, Utc};
@@ -16,6 +18,7 @@ const INDEX_CACHE_FILE: &str = "index.json";
 const SUGGESTIONS_CACHE_FILE: &str = "suggestions.json";
 const SUMMARIES_CACHE_FILE: &str = "summaries.json";
 const SETTINGS_FILE: &str = "settings.json";
+const MEMORY_FILE: &str = "memory.json";
 
 /// Cache validity duration (24 hours for index, 7 days for suggestions)
 const INDEX_CACHE_HOURS: i64 = 24;
@@ -36,11 +39,11 @@ impl IndexCache {
     pub fn from_index(index: &CodebaseIndex) -> Self {
         let file_hashes = index.files.iter()
             .map(|(path, file_index)| {
+                // Use only content-based metrics, not mtime (which changes on git checkout, copy, etc.)
                 let hash = format!(
-                    "{}-{}-{}",
+                    "{}-{}",
                     file_index.loc,
-                    file_index.symbols.len(),
-                    file_index.last_modified.timestamp()
+                    file_index.symbols.len()
                 );
                 (path.clone(), hash)
             })
@@ -151,7 +154,7 @@ const LLM_SUMMARY_CACHE_DAYS: i64 = 30;
 pub struct LlmSummaryEntry {
     /// The AI-generated summary text
     pub summary: String,
-    /// Hash of file content (LOC + symbols + mtime) for change detection
+    /// Hash of file content (LOC + symbols) for change detection
     pub file_hash: String,
     /// When this summary was generated
     pub generated_at: DateTime<Utc>,
@@ -262,11 +265,11 @@ impl Default for LlmSummaryCache {
 pub fn compute_file_hashes(index: &CodebaseIndex) -> HashMap<PathBuf, String> {
     index.files.iter()
         .map(|(path, file_index)| {
+            // Use only content-based metrics, not mtime (which changes on git checkout, copy, etc.)
             let hash = format!(
-                "{}-{}-{}",
+                "{}-{}",
                 file_index.loc,
-                file_index.symbols.len(),
-                file_index.last_modified.timestamp()
+                file_index.symbols.len()
             );
             (path.clone(), hash)
         })
@@ -282,6 +285,47 @@ pub struct Settings {
     pub applied: Vec<uuid::Uuid>,
     /// Custom ignore patterns
     pub ignore_patterns: Vec<String>,
+}
+
+/// Local “repo memory” entries (decisions, conventions, reminders).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RepoMemory {
+    pub entries: Vec<MemoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryEntry {
+    pub id: uuid::Uuid,
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl RepoMemory {
+    pub fn add(&mut self, text: String) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        self.entries.push(MemoryEntry {
+            id,
+            text,
+            created_at: Utc::now(),
+        });
+        id
+    }
+
+    /// Render a concise memory context for LLM prompts.
+    pub fn to_prompt_context(&self, max_entries: usize, max_chars: usize) -> String {
+        let mut entries = self.entries.clone();
+        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at)); // newest first
+
+        let mut out = String::new();
+        for e in entries.into_iter().take(max_entries) {
+            let line = format!("- {}\n", e.text.trim());
+            if out.len() + line.len() > max_chars {
+                break;
+            }
+            out.push_str(&line);
+        }
+        out.trim().to_string()
+    }
 }
 
 /// The cache manager
@@ -436,6 +480,27 @@ impl Cache {
         self.ensure_dir()?;
         let path = self.cache_dir.join(SETTINGS_FILE);
         let content = serde_json::to_string_pretty(settings)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+
+    /// Load repo memory (decisions/conventions) from `.cosmos/memory.json`
+    pub fn load_repo_memory(&self) -> RepoMemory {
+        let path = self.cache_dir.join(MEMORY_FILE);
+        if !path.exists() {
+            return RepoMemory::default();
+        }
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok())
+            .unwrap_or_default()
+    }
+
+    /// Save repo memory to `.cosmos/memory.json`
+    pub fn save_repo_memory(&self, memory: &RepoMemory) -> anyhow::Result<()> {
+        self.ensure_dir()?;
+        let path = self.cache_dir.join(MEMORY_FILE);
+        let content = serde_json::to_string_pretty(memory)?;
         fs::write(path, content)?;
         Ok(())
     }

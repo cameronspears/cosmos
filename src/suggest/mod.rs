@@ -4,12 +4,14 @@
 //! - Layer 1: Static rules (FREE)
 //! - Layer 2: Cached suggestions (ONE-TIME)
 //! - Layer 3: Grok Fast for categorization (~$0.0001/call)
-//! - Layer 4: Opus 4.5 for deep analysis (on-demand only)
+//! - Layer 4: LLM for deep analysis (Speed for analysis, Smart for code gen)
+
+#![allow(dead_code)]
 
 pub mod llm;
 pub mod static_rules;
 
-use crate::index::{CodebaseIndex, FileIndex, Pattern, PatternKind, PatternSeverity};
+use crate::index::{CodebaseIndex, PatternSeverity};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -24,7 +26,7 @@ pub enum SuggestionSource {
     Cached,
     /// Grok Fast for quick categorization
     LlmFast,
-    /// Opus 4.5 for detailed analysis
+    /// LLM for detailed analysis
     LlmDeep,
 }
 
@@ -178,16 +180,15 @@ pub struct SuggestionEngine {
 }
 
 impl SuggestionEngine {
-    /// Create a new suggestion engine from a codebase index (with static suggestions)
+    /// Create a new suggestion engine from a codebase index
+    /// 
+    /// By default, starts empty - LLM suggestions are generated separately.
+    /// Static rules are available as fallback but not auto-generated.
     pub fn new(index: CodebaseIndex) -> Self {
-        let mut engine = Self {
+        Self {
             suggestions: Vec::new(),
             index,
-        };
-        
-        // Generate static suggestions (free) - kept for fallback
-        engine.generate_static_suggestions();
-        engine
+        }
     }
     
     /// Create an empty suggestion engine (populated by LLM later)
@@ -197,11 +198,14 @@ impl SuggestionEngine {
             index,
         }
     }
-
-    /// Generate suggestions from static analysis (no LLM) - kept for fallback
+    
+    /// Generate suggestions from static analysis (no LLM)
+    /// 
+    /// Only used as fallback when LLM is unavailable (no API key).
+    /// These are intentionally minimal - we trust the LLM for real suggestions.
     #[allow(dead_code)]
-    fn generate_static_suggestions(&mut self) {
-        // Use static rules to generate suggestions
+    pub fn generate_static_suggestions(&mut self) {
+        // Only generate static suggestions for truly critical issues
         for (path, file_index) in &self.index.files {
             let static_suggestions = static_rules::analyze_file(path, file_index);
             self.suggestions.extend(static_suggestions);
@@ -262,31 +266,83 @@ impl SuggestionEngine {
         }
     }
 
+    /// Mark a suggestion as not applied (used for undo).
+    pub fn unmark_applied(&mut self, id: Uuid) {
+        if let Some(s) = self.suggestions.iter_mut().find(|s| s.id == id) {
+            s.applied = false;
+        }
+    }
+
     /// Add a suggestion from LLM
     pub fn add_llm_suggestion(&mut self, suggestion: Suggestion) {
         self.suggestions.push(suggestion);
         self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
     }
 
-    /// Request deeper analysis for a file (calls LLM)
-    pub async fn request_deep_analysis(&mut self, path: &PathBuf) -> anyhow::Result<Vec<Suggestion>> {
-        let file_index = self.index.files.get(path)
-            .ok_or_else(|| anyhow::anyhow!("File not found in index"))?;
-        
-        // Read file content
-        let content = std::fs::read_to_string(&self.index.root.join(path))?;
-        
-        // Call LLM for deep analysis
-        let suggestions = llm::analyze_file_deep(path, &content, file_index).await?;
-        
-        // Add to our suggestions
-        for suggestion in &suggestions {
-            self.suggestions.push(suggestion.clone());
+    /// Sort suggestions with git context: changed files first, then blast radius, then priority.
+    pub fn sort_with_context(&mut self, context: &crate::context::WorkContext) {
+        let changed: std::collections::HashSet<PathBuf> = context
+            .all_changed_files()
+            .into_iter()
+            .cloned()
+            .collect();
+
+        // “Blast radius” = files that import changed files (and direct deps of changed files).
+        let mut blast: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for path in &changed {
+            if let Some(file_index) = self.index.files.get(path) {
+                for u in &file_index.summary.used_by {
+                    blast.insert(u.clone());
+                }
+                for d in &file_index.summary.depends_on {
+                    blast.insert(d.clone());
+                }
+            }
         }
-        
-        self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
-        
-        Ok(suggestions)
+        for c in &changed {
+            blast.remove(c);
+        }
+
+        let kind_weight = |k: SuggestionKind| -> i64 {
+            match k {
+                SuggestionKind::BugFix => 40,
+                SuggestionKind::Optimization => 25,
+                SuggestionKind::Testing => 20,
+                SuggestionKind::Quality => 15,
+                SuggestionKind::Documentation => 10,
+                SuggestionKind::Improvement => 10,
+                SuggestionKind::Feature => 0,
+            }
+        };
+
+        self.suggestions.sort_by(|a, b| {
+            let a_changed = changed.contains(&a.file);
+            let b_changed = changed.contains(&b.file);
+            if a_changed != b_changed {
+                return b_changed.cmp(&a_changed);
+            }
+
+            let a_blast = blast.contains(&a.file);
+            let b_blast = blast.contains(&b.file);
+            if a_blast != b_blast {
+                return b_blast.cmp(&a_blast);
+            }
+
+            // Higher priority first
+            let pri = b.priority.cmp(&a.priority);
+            if pri != std::cmp::Ordering::Equal {
+                return pri;
+            }
+
+            // Then kind weight
+            let kw = kind_weight(b.kind).cmp(&kind_weight(a.kind));
+            if kw != std::cmp::Ordering::Equal {
+                return kw;
+            }
+
+            // Finally: newest first
+            b.created_at.cmp(&a.created_at)
+        });
     }
 
     /// Get suggestion count by priority

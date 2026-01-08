@@ -3,6 +3,8 @@
 //! Uses dependency graph analysis, directory structure, and naming patterns
 //! to identify feature clusters within each architectural layer.
 
+#![allow(dead_code)]
+
 use super::{CodebaseGrouping, Feature, Layer};
 use crate::index::CodebaseIndex;
 use std::collections::{HashMap, HashSet};
@@ -517,3 +519,4 @@ mod tests {
         assert_eq!(generate_cluster_name(&files, 0), "user");
     }
 }
+

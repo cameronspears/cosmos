@@ -6,8 +6,10 @@
 //! - Current branch
 //! - Work-in-progress detection
 
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
-use git2::{Repository, Status, StatusOptions};
+use git2::{Repository, StatusOptions};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -169,7 +171,10 @@ fn get_current_branch(repo: &Repository) -> anyhow::Result<String> {
 fn get_file_statuses(repo: &Repository) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true);
-    opts.recurse_untracked_dirs(false);
+    opts.include_ignored(false);
+    opts.include_unmodified(false);
+    opts.recurse_untracked_dirs(true);
+    opts.exclude_submodules(true);
 
     let statuses = repo.statuses(Some(&mut opts))?;
 
@@ -182,22 +187,22 @@ fn get_file_statuses(repo: &Repository) -> anyhow::Result<(Vec<PathBuf>, Vec<Pat
         let path = entry.path().map(PathBuf::from);
 
         if let Some(path) = path {
-            if status.contains(Status::WT_MODIFIED)
-                || status.contains(Status::WT_DELETED)
-                || status.contains(Status::WT_RENAMED)
-            {
+            // Working tree modifications (not yet staged)
+            if status.is_wt_modified() || status.is_wt_deleted() || status.is_wt_renamed() {
                 uncommitted.push(path.clone());
             }
 
-            if status.contains(Status::INDEX_NEW)
-                || status.contains(Status::INDEX_MODIFIED)
-                || status.contains(Status::INDEX_DELETED)
-                || status.contains(Status::INDEX_RENAMED)
+            // Staged changes (in index)
+            if status.is_index_new() || status.is_index_modified() 
+                || status.is_index_deleted() || status.is_index_renamed() 
             {
                 staged.push(path.clone());
             }
 
-            if status.contains(Status::WT_NEW) && !status.contains(Status::INDEX_NEW) {
+            // Untracked files (new in working tree, but NOT staged)
+            // A file that's been `git add`ed will have is_index_new() true,
+            // so we exclude those from the untracked list.
+            if status.is_wt_new() && !status.is_index_new() {
                 untracked.push(path);
             }
         }

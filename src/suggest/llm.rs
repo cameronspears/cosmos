@@ -1,60 +1,132 @@
 //! LLM-powered suggestions via OpenRouter
 //!
-//! Single Opus 4.5 call for high-quality codebase-wide analysis.
+//! Supports two modes:
+//! - BYOK (Bring Your Own Key): User provides OpenRouter API key, billed directly
+//! - Managed (Pro): Cosmos proxy handles API calls, billed through license
+//!
+//! Uses @preset/speed for ultra-fast analysis/summaries, @preset/smart for quality code generation.
 //! Uses smart context building to maximize insight per token.
+
+#![allow(dead_code)]
 
 use super::{Priority, Suggestion, SuggestionKind, SuggestionSource};
 use crate::config::Config;
 use crate::context::WorkContext;
-use crate::index::{CodebaseIndex, FileIndex, PatternKind, SymbolKind};
+use crate::index::{CodebaseIndex, PatternKind, SymbolKind};
+use crate::license::LicenseManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// OpenRouter direct API URL (BYOK mode)
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
+/// Cosmos managed API URL (Pro mode) - proxies to OpenRouter with usage tracking
+/// TODO: Set this to your hosted endpoint when ready
+/// For now, Pro users still use OpenRouter directly (with usage tracking locally)
+const COSMOS_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+
+/// API mode for LLM calls
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiMode {
+    /// User's own OpenRouter API key (free tier)
+    Byok,
+    /// Cosmos managed API (Pro/Team tier)
+    Managed,
+}
+
+impl ApiMode {
+    /// Determine the API mode based on license and config
+    pub fn detect() -> (Self, Option<String>) {
+        let license_manager = LicenseManager::load();
+        let config = Config::load();
+        
+        // Check if user has an OpenRouter API key configured (BYOK)
+        let byok_key = config.get_api_key();
+        
+        // Pro/Team users: 
+        // - If managed API is ready (COSMOS_API_URL != OpenRouter), use managed mode
+        // - Otherwise, fall back to BYOK if they have a key configured
+        // - Track usage locally either way
+        if license_manager.tier().has_managed_ai() {
+            // For now, managed mode uses OpenRouter directly (until we have a proxy)
+            // Pro users must also have BYOK configured until managed API is live
+            if let Some(key) = byok_key {
+                return (ApiMode::Managed, Some(key));
+            }
+            // Pro license but no API key - can't make calls yet
+            // Return None so we show a helpful error
+            return (ApiMode::Managed, None);
+        }
+        
+        // Free tier: use BYOK if configured
+        if let Some(key) = byok_key {
+            return (ApiMode::Byok, Some(key));
+        }
+        
+        // No API access available
+        (ApiMode::Byok, None)
+    }
+    
+    /// Get the API URL for this mode
+    pub fn url(&self) -> &'static str {
+        // Both modes use OpenRouter for now until managed proxy is live
+        OPENROUTER_URL
+    }
+    
+    /// Get the appropriate header name for the API key
+    pub fn auth_header(&self) -> &'static str {
+        match self {
+            ApiMode::Byok => "Authorization",
+            ApiMode::Managed => "Authorization", // Same for now, will change when proxy is live
+        }
+    }
+}
+
 // Model pricing per million tokens (as of 2024)
-const OPUS_INPUT_COST: f64 = 15.0;   // $15 per 1M input tokens
-const OPUS_OUTPUT_COST: f64 = 75.0;  // $75 per 1M output tokens
-const GROK_INPUT_COST: f64 = 5.0;    // $5 per 1M input tokens  
-const GROK_OUTPUT_COST: f64 = 15.0;  // $15 per 1M output tokens
+// Speed preset: ultra-fast routing for analysis
+const SPEED_INPUT_COST: f64 = 0.25;   // $0.25 per 1M input tokens  
+const SPEED_OUTPUT_COST: f64 = 0.69;  // $0.69 per 1M output tokens
+// Smart preset: quality routing for code generation (cheaper than raw Opus)
+const SMART_INPUT_COST: f64 = 3.0;    // ~$3 per 1M input tokens (estimated)
+const SMART_OUTPUT_COST: f64 = 15.0;  // ~$15 per 1M output tokens (estimated)
 
 /// Models available for suggestions
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Model {
-    /// Grok Fast - for quick categorization
-    GrokFast,
-    /// Opus 4.5 - for deep analysis
-    Opus,
+    /// Speed preset - ultra-fast routing for analysis and summaries
+    Speed,
+    /// Smart preset - quality routing for code generation (replaces Opus)
+    Smart,
 }
 
 impl Model {
     pub fn id(&self) -> &'static str {
         match self {
-            Model::GrokFast => "x-ai/grok-4.1-fast",
-            Model::Opus => "anthropic/claude-opus-4.5",
+            Model::Speed => "@preset/speed",
+            Model::Smart => "@preset/smart",
         }
     }
 
     pub fn max_tokens(&self) -> u32 {
         match self {
-            Model::GrokFast => 1024,
-            Model::Opus => 8192,
+            Model::Speed => 8192,
+            Model::Smart => 8192,
         }
     }
     
     pub fn display_name(&self) -> &'static str {
         match self {
-            Model::GrokFast => "grok-4.1-fast",
-            Model::Opus => "opus-4.5",
+            Model::Speed => "speed",
+            Model::Smart => "smart",
         }
     }
     
     /// Calculate cost in USD based on token usage
     pub fn calculate_cost(&self, prompt_tokens: u32, completion_tokens: u32) -> f64 {
         let (input_rate, output_rate) = match self {
-            Model::GrokFast => (GROK_INPUT_COST, GROK_OUTPUT_COST),
-            Model::Opus => (OPUS_INPUT_COST, OPUS_OUTPUT_COST),
+            Model::Speed => (SPEED_INPUT_COST, SPEED_OUTPUT_COST),
+            Model::Smart => (SMART_INPUT_COST, SMART_OUTPUT_COST),
         };
         
         let input_cost = (prompt_tokens as f64 / 1_000_000.0) * input_rate;
@@ -125,32 +197,49 @@ struct MessageContent {
     content: String,
 }
 
-/// Get API key from config
-fn get_api_key() -> Option<String> {
-    Config::load().get_api_key()
-}
-
-/// Check if LLM is available
+/// Check if LLM is available (either BYOK or managed)
 pub fn is_available() -> bool {
-    get_api_key().is_some()
+    let (_, api_key) = ApiMode::detect();
+    api_key.is_some()
 }
 
-/// Call OpenRouter API (returns content only, for backwards compatibility)
+/// Get current API mode (for display/debugging)
+pub fn current_mode() -> ApiMode {
+    let (mode, _) = ApiMode::detect();
+    mode
+}
+
+/// Call LLM API (returns content only, for backwards compatibility)
 async fn call_llm(system: &str, user: &str, model: Model) -> anyhow::Result<String> {
     let response = call_llm_with_usage(system, user, model, false).await?;
     Ok(response.content)
 }
 
-/// Call OpenRouter API with full response including usage stats
+/// Call LLM API with full response including usage stats
+/// Automatically routes to BYOK (OpenRouter) or Managed (Cosmos API) based on license
 async fn call_llm_with_usage(
     system: &str, 
     user: &str, 
     model: Model,
     json_mode: bool,
 ) -> anyhow::Result<LlmResponse> {
-    let api_key = get_api_key().ok_or_else(|| anyhow::anyhow!("No API key configured"))?;
+    let (mode, api_key) = ApiMode::detect();
+    let api_key = api_key.ok_or_else(|| {
+        match mode {
+            ApiMode::Managed => {
+                // Pro user but no API key - managed proxy not live yet
+                anyhow::anyhow!(
+                    "Cosmos Pro managed API coming soon! For now, please also run 'cosmos --setup' to configure your OpenRouter key."
+                )
+            }
+            ApiMode::Byok => {
+                anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
+            }
+        }
+    })?;
 
     let client = reqwest::Client::new();
+    let url = mode.url();
 
     let response_format = if json_mode {
         Some(ResponseFormat {
@@ -177,12 +266,17 @@ async fn call_llm_with_usage(
         response_format,
     };
 
-    let response = client
-        .post(OPENROUTER_URL)
-        .header("Authorization", format!("Bearer {}", api_key))
+    // Build request with appropriate headers for the API mode
+    let mut request_builder = client
+        .post(url)
         .header("Content-Type", "application/json")
-        .header("HTTP-Referer", "https://github.com/cosmos")
-        .header("X-Title", "Cosmos")
+        .header("HTTP-Referer", "https://cosmos.dev")
+        .header("X-Title", "Cosmos");
+
+    // Add auth header (both modes use OpenRouter directly for now)
+    request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+
+    let response = request_builder
         .json(&request)
         .send()
         .await?;
@@ -190,7 +284,24 @@ async fn call_llm_with_usage(
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("API error {}: {}", status, text));
+        
+        // Provide helpful error messages based on status
+        let error_msg = match status.as_u16() {
+            401 => {
+                match mode {
+                    ApiMode::Byok => "Invalid API key. Run 'cosmos --setup' to update it.".to_string(),
+                    ApiMode::Managed => "License invalid or expired. Check 'cosmos --status'.".to_string(),
+                }
+            }
+            429 => {
+                match mode {
+                    ApiMode::Byok => "Rate limited by OpenRouter. Try again in a moment.".to_string(),
+                    ApiMode::Managed => "Token quota exceeded. Upgrade at cosmos.dev/pro".to_string(),
+                }
+            }
+            _ => format!("API error {}: {}", status, text),
+        };
+        return Err(anyhow::anyhow!("{}", error_msg));
     }
 
     let chat_response: ChatResponse = response.json().await?;
@@ -201,6 +312,14 @@ async fn call_llm_with_usage(
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow::anyhow!("No response from AI"))?;
     
+    // Record usage for Pro users (managed mode)
+    if mode == ApiMode::Managed {
+        if let Some(ref usage) = chat_response.usage {
+            let mut license_manager = LicenseManager::load();
+            license_manager.record_usage(usage.total_tokens as u64);
+        }
+    }
+    
     Ok(LlmResponse {
         content,
         usage: chat_response.usage,
@@ -208,105 +327,12 @@ async fn call_llm_with_usage(
     })
 }
 
-/// Quick file summary using Grok Fast
-pub async fn quick_summary(path: &PathBuf, content: &str, file_index: &FileIndex) -> anyhow::Result<String> {
-    let system = r#"You are a code analyst. Provide a brief summary of what this file does.
-Output exactly 1-2 sentences. Be specific and technical."#;
-
-    let user = format!(
-        "File: {} ({} lines, {} functions)\n\n{}",
-        path.display(),
-        file_index.loc,
-        file_index.symbols.len(),
-        truncate_content(content, 2000)
-    );
-
-    call_llm(system, &user, Model::GrokFast).await
-}
-
-/// Deep analysis using Opus 4.5 (on-demand only)
-pub async fn analyze_file_deep(
-    path: &PathBuf,
-    content: &str,
-    file_index: &FileIndex,
-) -> anyhow::Result<Vec<Suggestion>> {
-    let system = r#"You are a senior code reviewer. Analyze this file and suggest improvements.
-
-OUTPUT FORMAT (JSON array):
-[
-  {
-    "kind": "improvement|bugfix|feature|optimization|quality|documentation|testing",
-    "priority": "high|medium|low",
-    "summary": "One-line description",
-    "detail": "Explanation with specific recommendations",
-    "line": null or line number
-  }
-]
-
-GUIDELINES:
-- Be specific and actionable
-- Focus on the most impactful improvements
-- Limit to 3-5 suggestions
-- Consider: correctness, performance, maintainability, readability
-- Only suggest changes that provide real value"#;
-
-    let metrics = format!(
-        "Metrics:\n- Lines: {}\n- Functions: {}\n- Complexity: {:.1}\n- Patterns detected: {}",
-        file_index.loc,
-        file_index.symbols.len(),
-        file_index.complexity,
-        file_index.patterns.len()
-    );
-
-    let user = format!(
-        "File: {}\n\n{}\n\nCode:\n```\n{}\n```",
-        path.display(),
-        metrics,
-        truncate_content(content, 8000)
-    );
-
-    let response = call_llm(system, &user, Model::Opus).await?;
-
-    parse_suggestions(&response, path)
-}
-
-/// Inquiry-based suggestion - user asks "what should I improve?"
-pub async fn inquiry(
-    path: &PathBuf,
-    content: &str,
-    file_index: &FileIndex,
-    context: Option<&str>,
-) -> anyhow::Result<String> {
-    let system = r#"You are a thoughtful code companion. The developer is asking for suggestions on what to improve.
-
-Respond conversationally but concisely. Structure your response:
-
-1. **Quick Assessment** (1 sentence)
-2. **Top Recommendation** (2-3 sentences)
-3. **Why it matters** (1 sentence)
-
-Be specific to this code. Don't be generic."#;
-
-    let context_text = context.map(|c| format!("\nContext: {}", c)).unwrap_or_default();
-
-    let user = format!(
-        "File: {} ({} lines)\n\nSymbols: {}\nPatterns found: {}{}\n\nCode:\n```\n{}\n```\n\nWhat should I improve?",
-        path.display(),
-        file_index.loc,
-        file_index.symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "),
-        file_index.patterns.len(),
-        context_text,
-        truncate_content(content, 4000)
-    );
-
-    call_llm(system, &user, Model::GrokFast).await
-}
-
 /// Ask cosmos a general question about the codebase
 pub async fn ask_question(
     index: &CodebaseIndex,
     context: &WorkContext,
     question: &str,
+    repo_memory: Option<String>,
 ) -> anyhow::Result<(String, Option<Usage>)> {
     let system = r#"You are Cosmos, a contemplative companion for codebases. The developer is asking you a question about their code.
 
@@ -337,6 +363,12 @@ Format your response with markdown for readability:
         .map(|s| format!("{:?}: {}", s.kind, s.name))
         .collect();
 
+    let memory_section = repo_memory
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+        .map(|m| format!("\n\nREPO MEMORY (follow these conventions):\n{}", m))
+        .unwrap_or_default();
+
     let user = format!(
         r#"PROJECT CONTEXT:
 - {} files, {} lines of code
@@ -345,6 +377,8 @@ Format your response with markdown for readability:
 - Key files: {}
 
 KEY SYMBOLS:
+{}
+
 {}
 
 QUESTION:
@@ -356,46 +390,16 @@ QUESTION:
         context.modified_count,
         file_list.join(", "),
         symbols.join("\n"),
+        memory_section,
         question
     );
 
-    let response = call_llm_with_usage(system, &user, Model::GrokFast, false).await?;
+    let response = call_llm_with_usage(system, &user, Model::Speed, false).await?;
     Ok((response.content, response.usage))
 }
 
-/// Generate a fix/change for a specific suggestion (returns diff format)
-pub async fn generate_fix(
-    path: &PathBuf,
-    content: &str,
-    suggestion: &Suggestion,
-) -> anyhow::Result<String> {
-    let system = r#"You are a code improvement assistant. Generate a fix for the described issue.
-
-OUTPUT FORMAT:
-1. Brief explanation (2-3 sentences)
-2. Code changes in unified diff format:
-   --- a/filepath
-   +++ b/filepath
-   @@ context @@
-    unchanged
-   -removed
-   +added
-
-Be precise. Only change what's necessary."#;
-
-    let user = format!(
-        "File: {}\n\nIssue: {}\n{}\n\nCode:\n```\n{}\n```",
-        path.display(),
-        suggestion.summary,
-        suggestion.detail.as_deref().unwrap_or(""),
-        truncate_content(content, 6000)
-    );
-
-    call_llm(system, &user, Model::Opus).await
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
-//  DIRECT CODE GENERATION (Human plan → Opus applies changes)
+//  DIRECT CODE GENERATION (Human plan → Smart preset applies changes)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Result of generating and applying a fix
@@ -412,12 +416,13 @@ pub struct AppliedFix {
 }
 
 /// Generate the actual fixed code content based on a human-language plan
-/// This is Phase 2 of the two-phase fix flow - Opus generates the actual changes
+/// This is Phase 2 of the two-phase fix flow - Smart preset generates the actual changes
 pub async fn generate_fix_content(
     path: &PathBuf,
     content: &str,
     suggestion: &Suggestion,
     plan: &FixPreview,
+    repo_memory: Option<String>,
 ) -> anyhow::Result<AppliedFix> {
     let system = r#"You are a senior developer implementing a code fix. You've been given a plan - now implement it.
 
@@ -436,23 +441,32 @@ CRITICAL RULES:
 - Keep imports, comments, and structure intact"#;
 
     let plan_text = format!(
-        "Plan: {}\nScope: {}\nAffected areas: {}{}",
+        "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
+        if plan.verified { "CONFIRMED" } else { "UNCONFIRMED" },
+        plan.verification_note,
         plan.description,
         plan.scope.label(),
         plan.affected_areas.join(", "),
         plan.modifier.as_ref().map(|m| format!("\nUser modifications: {}", m)).unwrap_or_default()
     );
 
+    let memory_section = repo_memory
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+        .map(|m| format!("\n\nRepo conventions / decisions:\n{}", m))
+        .unwrap_or_default();
+
     let user = format!(
-        "File: {}\n\nOriginal Issue: {}\n{}\n\n{}\n\nCurrent Code:\n```\n{}\n```\n\nImplement the fix according to the plan. Output the complete updated file.",
+        "File: {}\n\nOriginal Issue: {}\n{}\n{}\n\n{}\n\nCurrent Code:\n```\n{}\n```\n\nImplement the fix according to the plan. Output the complete updated file.",
         path.display(),
         suggestion.summary,
         suggestion.detail.as_deref().unwrap_or(""),
+        memory_section,
         plan_text,
         content
     );
 
-    let response = call_llm_with_usage(system, &user, Model::Opus, true).await?;
+    let response = call_llm_with_usage(system, &user, Model::Smart, true).await?;
     
     // Parse the JSON response
     let json_str = extract_json_object(&response.content)
@@ -503,6 +517,14 @@ CRITICAL RULES:
 /// Quick preview of what a fix will do - generated in <1 second
 #[derive(Debug, Clone, PartialEq)]
 pub struct FixPreview {
+    /// Whether the issue was verified to exist in the code
+    pub verified: bool,
+    /// Explanation of verification result
+    pub verification_note: String,
+    /// Code snippet that proves the claim (evidence)
+    pub evidence_snippet: Option<String>,
+    /// Starting line number of the evidence snippet
+    pub evidence_line: Option<u32>,
     /// Human-readable description of what will change (1-2 sentences)
     pub description: String,
     /// Which functions/areas are affected
@@ -539,41 +561,55 @@ impl FixScope {
 }
 
 /// Generate a quick preview of what the fix will do (uses Grok Fast for speed)
-/// This is Phase 1 of the two-phase fix flow - lets users approve before waiting for full diff
+/// This is Phase 1 of the two-phase fix flow - verifies the issue and lets users approve before waiting for full diff
 pub async fn generate_fix_preview(
     path: &PathBuf,
     suggestion: &Suggestion,
     modifier: Option<&str>,
+    repo_memory: Option<String>,
 ) -> anyhow::Result<FixPreview> {
-    let system = r#"You are a code assistant. Briefly describe what changes are needed to fix this issue.
+    let system = r#"You are a code assistant. First VERIFY whether this issue actually exists in the code, then describe what changes would fix it.
 
 OUTPUT FORMAT (JSON):
 {
-  "description": "1-2 sentence description of what will change",
+  "verified": true,
+  "verification_note": "Brief explanation of whether the issue was found and where",
+  "evidence_snippet": "const BATCH_SIZE = 1000;",
+  "evidence_line": 42,
+  "description": "1-2 sentence description of what will change (if verified)",
   "affected_areas": ["function_name", "another_function"],
-  "scope": "small|medium|large"
+  "scope": "small"
 }
 
-SCOPE GUIDE:
-- small: few lines, simple change
-- medium: modifying a function or adding a new one
-- large: multiple functions, restructuring, or splitting files
+RULES:
+- verified: boolean true if issue exists, false if it doesn't exist or was already fixed
+- verification_note: explain what you found
+- evidence_snippet: 1-3 lines of the ACTUAL code from the file that proves your claim. Only include the relevant code, not surrounding context. Omit if no specific code evidence is needed.
+- evidence_line: the line number where the evidence snippet starts
+- scope: one of "small", "medium", or "large"
 
-Be concise. No code, just describe the change in plain English."#;
+Be concise. The verification note should explain the finding in plain English. The evidence snippet shows proof."#;
 
     let modifier_text = modifier
         .map(|m| format!("\n\nUser wants: {}", m))
         .unwrap_or_default();
 
+    let memory_section = repo_memory
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+        .map(|m| format!("\n\nRepo conventions / decisions:\n{}", m))
+        .unwrap_or_default();
+
     let user = format!(
-        "File: {}\nIssue: {}\n{}{}",
+        "File: {}\nIssue: {}\n{}{}{}",
         path.display(),
         suggestion.summary,
         suggestion.detail.as_deref().unwrap_or(""),
+        memory_section,
         modifier_text
     );
 
-    let response = call_llm(system, &user, Model::GrokFast).await?;
+    let response = call_llm(system, &user, Model::Speed).await?;
     parse_fix_preview(&response, modifier.map(String::from))
 }
 
@@ -585,6 +621,33 @@ fn parse_fix_preview(response: &str, modifier: Option<String>) -> anyhow::Result
 
     let parsed: serde_json::Value = serde_json::from_str(json_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse preview JSON: {}", e))?;
+
+    // Handle verified as either boolean or string
+    let verified = parsed.get("verified")
+        .map(|v| {
+            if let Some(b) = v.as_bool() {
+                b
+            } else if let Some(s) = v.as_str() {
+                s.eq_ignore_ascii_case("true")
+            } else {
+                true // Default to true
+            }
+        })
+        .unwrap_or(true); // Default to true for backwards compatibility
+
+    let verification_note = parsed.get("verification_note")
+        .and_then(|v| v.as_str())
+        .unwrap_or(if verified { "Issue verified" } else { "Issue not found" })
+        .to_string();
+
+    let evidence_snippet = parsed.get("evidence_snippet")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
+
+    let evidence_line = parsed.get("evidence_line")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
 
     let description = parsed.get("description")
         .and_then(|v| v.as_str())
@@ -607,6 +670,10 @@ fn parse_fix_preview(response: &str, modifier: Option<String>) -> anyhow::Result
     };
 
     Ok(FixPreview {
+        verified,
+        verification_note,
+        evidence_snippet,
+        evidence_line,
         description,
         affected_areas,
         scope,
@@ -614,46 +681,11 @@ fn parse_fix_preview(response: &str, modifier: Option<String>) -> anyhow::Result
     })
 }
 
-/// Refine a fix based on user feedback via chat
-pub async fn refine_fix(
-    path: &PathBuf,
-    content: &str,
-    suggestion: &Suggestion,
-    current_diff: &str,
-    user_feedback: &str,
-) -> anyhow::Result<String> {
-    let system = r#"You are a code improvement assistant. The user wants to modify a proposed fix based on their feedback.
-
-OUTPUT FORMAT:
-1. Brief explanation (2-3 sentences)
-2. Updated code changes in unified diff format:
-   --- a/filepath
-   +++ b/filepath
-   @@ context @@
-    unchanged
-   -removed
-   +added
-
-Incorporate the user's feedback into the fix. Be precise. Only change what's necessary."#;
-
-    let user = format!(
-        "File: {}\n\nOriginal Issue: {}\n{}\n\nCurrent Proposed Fix:\n{}\n\nUser Feedback: {}\n\nOriginal Code:\n```\n{}\n```\n\nPlease update the fix based on the user's feedback.",
-        path.display(),
-        suggestion.summary,
-        suggestion.detail.as_deref().unwrap_or(""),
-        current_diff,
-        user_feedback,
-        truncate_content(content, 4000)
-    );
-
-    call_llm(system, &user, Model::Opus).await
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  UNIFIED CODEBASE ANALYSIS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Analyze entire codebase with a single Opus 4.5 call
+/// Analyze entire codebase with @preset/smart for quality suggestions
 /// 
 /// This is the main entry point for generating high-quality suggestions.
 /// Uses smart context building to pack maximum insight into the prompt.
@@ -661,8 +693,9 @@ Incorporate the user's feedback into the fix. Be precise. Only change what's nec
 pub async fn analyze_codebase(
     index: &CodebaseIndex,
     context: &WorkContext,
+    repo_memory: Option<String>,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>)> {
-    let system = r#"You are an expert code reviewer analyzing a codebase. Your goal is to find the most impactful improvements.
+    let system = r#"You are a senior developer reviewing a codebase. Your job is to find genuinely useful improvements - things that will make the app better, not just cleaner.
 
 OUTPUT FORMAT (JSON array, 5-10 suggestions):
 [
@@ -670,31 +703,45 @@ OUTPUT FORMAT (JSON array, 5-10 suggestions):
     "file": "relative/path/to/file.rs",
     "kind": "improvement|bugfix|feature|optimization|quality|documentation|testing",
     "priority": "high|medium|low",
-    "summary": "Concise one-line description of the issue/improvement",
-    "detail": "Specific, actionable explanation with code context",
+    "summary": "One-line description of what to do and why it matters",
+    "detail": "Brief explanation with specific guidance",
     "line": null or specific line number if applicable
   }
 ]
 
-GUIDELINES:
-- Focus on HIGH-VALUE changes: bugs, security issues, major refactors, performance wins
-- Be specific: mention exact function names, patterns, and line numbers
-- Prioritize files the developer is actively working on (marked CHANGED)
-- Consider the codebase holistically - suggest architectural improvements
-- Don't suggest trivial style changes or obvious fixes
-- Each suggestion should be actionable and provide clear value
-- Consider: correctness, security, performance, maintainability, testability"#;
+WHAT TO LOOK FOR (aim for variety across these categories):
+- **Bugs & Edge Cases**: Race conditions, off-by-one errors, null/None handling, error swallowing
+- **Security**: Hardcoded secrets, SQL injection, XSS, path traversal, insecure defaults
+- **Performance**: N+1 queries, unnecessary allocations, blocking in async, missing caching opportunities
+- **API Design**: Confusing function signatures, missing validation, inconsistent return types
+- **User Experience**: Error messages that don't help, missing loading states, accessibility gaps
+- **Reliability**: Missing retries for network calls, no timeouts, silent failures
+- **Feature Gaps**: Obvious missing functionality, half-implemented features, TODO items worth addressing
+- **Testing Blind Spots**: Critical paths without tests, brittle test setups
 
-    let user_prompt = build_codebase_context(index, context);
+AVOID:
+- "Split this file" or "break this function up" unless it's genuinely causing problems
+- Generic advice like "add more comments" or "improve naming"
+- Suggestions that would just make the code "cleaner" without real benefit
+- Anything a linter would catch
+
+PRIORITIZE:
+- Files marked [CHANGED] - the developer is actively working there
+- Things that could cause bugs or outages
+- Quick wins that provide immediate value
+- Suggestions specific to THIS codebase, not generic best practices"#;
+
+    let user_prompt = build_codebase_context(index, context, repo_memory.as_deref());
     
-    let response = call_llm_with_usage(system, &user_prompt, Model::Opus, true).await?;
+    // Use Smart preset for quality reasoning on suggestions
+    let response = call_llm_with_usage(system, &user_prompt, Model::Smart, true).await?;
     
     let suggestions = parse_codebase_suggestions(&response.content)?;
     Ok((suggestions, response.usage))
 }
 
 /// Build rich context from codebase index for the LLM prompt
-fn build_codebase_context(index: &CodebaseIndex, context: &WorkContext) -> String {
+fn build_codebase_context(index: &CodebaseIndex, context: &WorkContext, repo_memory: Option<&str>) -> String {
     let stats = index.stats();
     let project_name = index.root.file_name()
         .and_then(|n| n.to_str())
@@ -704,130 +751,146 @@ fn build_codebase_context(index: &CodebaseIndex, context: &WorkContext) -> Strin
     
     // Header with overview
     sections.push(format!(
-        "CODEBASE: {} ({} files, {} LOC, {} symbols)\n\
-         BRANCH: {} | FOCUS: {} | CHANGED FILES: {}",
+        "CODEBASE: {} ({} files, {} LOC)\nBRANCH: {} | FOCUS: {}",
         project_name,
         stats.file_count,
         stats.total_loc,
-        stats.symbol_count,
         context.branch,
         context.inferred_focus.as_deref().unwrap_or("general"),
-        context.modified_count
     ));
     
-    // Files by priority (most important first)
-    let mut files_section = String::from("\n\nFILES (by priority):");
-    let files_by_priority = index.files_by_priority();
-    
-    for (path, file_index) in files_by_priority.iter().take(30) {
-        let is_changed = context.all_changed_files().iter().any(|f| f == path);
-        let changed_marker = if is_changed { " [CHANGED]" } else { "" };
-        
-        let func_count = file_index.symbols.iter()
-            .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
-            .count();
-        
-        let top_symbols: Vec<_> = file_index.symbols.iter()
-            .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
-            .take(5)
-            .map(|s| s.name.as_str())
+    // Uncommitted changes FIRST (highest priority)
+    if !context.uncommitted_files.is_empty() || !context.staged_files.is_empty() {
+        let mut changes_section = String::from("\n\nACTIVELY WORKING ON [CHANGED]:");
+        for file in context.uncommitted_files.iter().chain(context.staged_files.iter()).take(15) {
+            // Include file details if we have them
+            if let Some(file_index) = index.files.get(file) {
+                let exports: Vec<_> = file_index.symbols.iter()
+                    .filter(|s| s.visibility == crate::index::Visibility::Public)
+                    .take(5)
+                    .map(|s| s.name.as_str())
+                    .collect();
+                let exports_str = if exports.is_empty() { String::new() } else { format!(" exports: {}", exports.join(", ")) };
+                changes_section.push_str(&format!("\n- {} ({} LOC){}",
+                    file.display(), file_index.loc, exports_str));
+            } else {
+                changes_section.push_str(&format!("\n- {}", file.display()));
+            }
+        }
+        sections.push(changes_section);
+    }
+
+    // Blast radius: files affected by the current changes (direct importers + direct deps)
+    if !context.all_changed_files().is_empty() {
+        let changed: std::collections::HashSet<PathBuf> = context
+            .all_changed_files()
+            .into_iter()
+            .cloned()
             .collect();
-        
-        files_section.push_str(&format!(
-            "\n- {}: {} LOC, {} funcs, complexity {:.0}{}",
-            path.display(),
-            file_index.loc,
-            func_count,
-            file_index.complexity,
-            changed_marker
-        ));
-        
-        if !top_symbols.is_empty() {
-            files_section.push_str(&format!("\n  symbols: {}", top_symbols.join(", ")));
+        let mut related: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+        for c in &changed {
+            if let Some(file_index) = index.files.get(c) {
+                // Who imports this file?
+                for u in file_index.summary.used_by.iter().take(10) {
+                    related.insert(u.clone());
+                }
+                // What does this file depend on?
+                for d in file_index.summary.depends_on.iter().take(10) {
+                    related.insert(d.clone());
+                }
+            }
+        }
+        for c in &changed {
+            related.remove(c);
+        }
+
+        if !related.is_empty() {
+            let mut list: Vec<_> = related.into_iter().collect();
+            list.sort();
+            let mut blast = String::from("\n\nBLAST RADIUS (related to [CHANGED]):");
+            for path in list.into_iter().take(15) {
+                blast.push_str(&format!("\n- {}", path.display()));
+            }
+            sections.push(blast);
         }
     }
-    sections.push(files_section);
-    
-    // Detected patterns (code smells, issues)
-    if !index.patterns.is_empty() {
-        let mut patterns_section = String::from("\n\nDETECTED PATTERNS:");
-        
-        // Group patterns by severity
-        let high_patterns: Vec<_> = index.patterns.iter()
-            .filter(|p| matches!(p.kind, PatternKind::GodModule | PatternKind::DeepNesting | PatternKind::MissingErrorHandling))
-            .take(10)
-            .collect();
-        
-        for pattern in &high_patterns {
-            patterns_section.push_str(&format!(
-                "\n- {:?} at {}:{} - {}",
-                pattern.kind,
-                pattern.file.display(),
-                pattern.line,
-                truncate_str(&pattern.description, 60)
-            ));
+
+    // Repo memory / conventions (solo dev “second brain”)
+    if let Some(mem) = repo_memory {
+        let mem = mem.trim();
+        if !mem.is_empty() {
+            sections.push(format!("\n\nREPO MEMORY (follow these conventions):\n{}", mem));
         }
-        
-        // Add other patterns summary
-        let other_count = index.patterns.len() - high_patterns.len();
-        if other_count > 0 {
-            patterns_section.push_str(&format!("\n- ... and {} more patterns", other_count));
-        }
-        
-        sections.push(patterns_section);
     }
     
-    // High complexity functions (potential refactor targets)
-    let mut complex_funcs: Vec<_> = index.symbols.iter()
-        .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
-        .filter(|s| s.complexity > 15.0 || s.line_count() > 50)
-        .collect();
-    complex_funcs.sort_by(|a, b| b.complexity.partial_cmp(&a.complexity).unwrap_or(std::cmp::Ordering::Equal));
-    
-    if !complex_funcs.is_empty() {
-        let mut funcs_section = String::from("\n\nHIGH COMPLEXITY FUNCTIONS:");
-        for func in complex_funcs.iter().take(15) {
-            funcs_section.push_str(&format!(
-                "\n- {}::{} ({}:{}) - {} lines, complexity {:.0}",
-                func.file.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                func.name,
-                func.file.display(),
-                func.line,
-                func.line_count(),
-                func.complexity
-            ));
-        }
-        sections.push(funcs_section);
-    }
-    
-    // Recent changes context (what's being worked on)
+    // Recent commits for understanding what's being worked on
     if !context.recent_commits.is_empty() {
-        let mut commits_section = String::from("\n\nRECENT ACTIVITY:");
+        let mut commits_section = String::from("\n\nRECENT COMMITS:");
         for commit in context.recent_commits.iter().take(5) {
             commits_section.push_str(&format!(
-                "\n- {}: {} ({})",
+                "\n- {}: {}",
                 commit.short_sha,
-                truncate_str(&commit.message, 50),
-                commit.files_changed.len()
+                truncate_str(&commit.message, 60),
             ));
         }
         sections.push(commits_section);
     }
     
-    // Uncommitted changes (highest priority for review)
-    if !context.uncommitted_files.is_empty() || !context.staged_files.is_empty() {
-        let mut changes_section = String::from("\n\nUNCOMMITTED CHANGES (prioritize these):");
-        for file in context.uncommitted_files.iter().chain(context.staged_files.iter()).take(10) {
-            changes_section.push_str(&format!("\n- {}", file.display()));
+    // Key files with their purpose (not just metrics)
+    let mut files_section = String::from("\n\nKEY FILES:");
+    let files_by_priority = index.files_by_priority();
+    
+    for (path, file_index) in files_by_priority.iter().take(25) {
+        let is_changed = context.all_changed_files().iter().any(|f| f == path);
+        if is_changed { continue; } // Already listed above
+        
+        // Get public exports to understand what this file does
+        let exports: Vec<_> = file_index.symbols.iter()
+            .filter(|s| s.visibility == crate::index::Visibility::Public)
+            .take(4)
+            .map(|s| s.name.as_str())
+            .collect();
+        
+        let exports_str = if exports.is_empty() { 
+            String::new() 
+        } else { 
+            format!(" → {}", exports.join(", ")) 
+        };
+        
+        files_section.push_str(&format!(
+            "\n- {} ({} LOC){}",
+            path.display(),
+            file_index.loc,
+            exports_str
+        ));
+    }
+    sections.push(files_section);
+    
+    // TODOs and FIXMEs found in code (actionable items from the developer)
+    let todos: Vec<_> = index.patterns.iter()
+        .filter(|p| matches!(p.kind, PatternKind::TodoMarker))
+        .take(10)
+        .collect();
+    
+    if !todos.is_empty() {
+        let mut todos_section = String::from("\n\nTODO/FIXME MARKERS IN CODE:");
+        for todo in &todos {
+            todos_section.push_str(&format!(
+                "\n- {}:{} - {}",
+                todo.file.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                todo.line,
+                truncate_str(&todo.description, 70)
+            ));
         }
-        sections.push(changes_section);
+        sections.push(todos_section);
     }
     
-    // Final instruction
+    // Final instruction - open-ended
     sections.push(String::from(
-        "\n\nAnalyze this codebase and provide 5-10 high-value suggestions. \
-         Focus on bugs, security issues, performance problems, and major refactoring opportunities. \
-         Prioritize changed files and high-complexity areas."
+        "\n\nLook for bugs, security issues, performance problems, missing error handling, \
+         UX improvements, and feature opportunities. Prioritize the [CHANGED] files (and BLAST RADIUS). \
+         Give me varied, specific suggestions - not just code organization advice."
     ));
     
     sections.join("")
@@ -835,19 +898,73 @@ fn build_codebase_context(index: &CodebaseIndex, context: &WorkContext) -> Strin
 
 /// Parse suggestions from codebase-wide analysis
 fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<Suggestion>> {
-    // Try to extract JSON array from response
-    let json_str = if let Some(start) = response.find('[') {
-        if let Some(end) = response.rfind(']') {
-            &response[start..=end]
+    // Strip markdown code fences if present
+    let trimmed = response.trim();
+    let clean = if trimmed.starts_with("```json") {
+        trimmed.strip_prefix("```json").unwrap_or(trimmed)
+    } else if trimmed.starts_with("```") {
+        trimmed.strip_prefix("```").unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    let clean = if clean.ends_with("```") {
+        clean.strip_suffix("```").unwrap_or(clean)
+    } else {
+        clean
+    };
+    let clean = clean.trim();
+
+    // Handle both array format and object-with-suggestions format
+    // Speed preset often returns {"suggestions": [...]} instead of just [...]
+    let json_str = if clean.starts_with('{') {
+        // Try to extract "suggestions" array from object
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(clean) {
+            if let Some(suggestions) = obj.get("suggestions") {
+                // Convert suggestions array back to string for parsing
+                match serde_json::to_string(suggestions) {
+                    Ok(s) => s,
+                    Err(_) => clean.to_string(),
+                }
+            } else {
+                clean.to_string()
+            }
         } else {
-            response
+            clean.to_string()
+        }
+    } else if let Some(start) = clean.find('[') {
+        // Extract JSON array from response
+        if let Some(end) = clean.rfind(']') {
+            clean[start..=end].to_string()
+        } else {
+            clean.to_string()
         }
     } else {
-        response
+        clean.to_string()
     };
 
-    let parsed: Vec<CodebaseSuggestionJson> = serde_json::from_str(json_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse suggestions: {}", e))?;
+    // Try to parse as array first
+    let parsed: Vec<CodebaseSuggestionJson> = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(e) => {
+            // Try to fix common JSON issues and retry
+            let fixed = fix_json_issues(&json_str);
+            match serde_json::from_str(&fixed) {
+                Ok(v) => v,
+                Err(_) => {
+                    // If still failing, try to extract individual objects and parse them
+                    match try_parse_individual_suggestions(&json_str) {
+                        Ok(v) if !v.is_empty() => v,
+                        _ => {
+                            // Log the error but return empty instead of crashing
+                            eprintln!("Warning: Failed to parse LLM suggestions: {}", e);
+                            eprintln!("Response preview: {}", truncate_str(&json_str, 300));
+                            return Ok(Vec::new());
+                        }
+                    }
+                }
+            }
+        }
+    };
 
     let suggestions = parsed
         .into_iter()
@@ -909,21 +1026,90 @@ fn truncate_str(s: &str, max: usize) -> &str {
     }
 }
 
+/// Try to fix common JSON issues from LLM responses
+fn fix_json_issues(json: &str) -> String {
+    let mut fixed = json.to_string();
+    
+    // Remove trailing commas before ] or }
+    fixed = fixed.replace(",]", "]");
+    fixed = fixed.replace(",}", "}");
+    
+    // Fix common quote issues - smart quotes to regular quotes
+    fixed = fixed.replace('\u{201C}', "\"");  // Left double quote
+    fixed = fixed.replace('\u{201D}', "\"");  // Right double quote
+    fixed = fixed.replace('\u{2018}', "'");   // Left single quote
+    fixed = fixed.replace('\u{2019}', "'");   // Right single quote
+    
+    // Remove any control characters that might have slipped in
+    fixed = fixed.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
+    
+    fixed
+}
+
+/// Try to parse individual suggestion objects if array parsing fails
+fn try_parse_individual_suggestions(json: &str) -> anyhow::Result<Vec<CodebaseSuggestionJson>> {
+    let mut suggestions = Vec::new();
+    let mut depth = 0;
+    let mut start = None;
+    
+    for (i, c) in json.char_indices() {
+        match c {
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start {
+                        let obj_str = &json[s..=i];
+                        if let Ok(suggestion) = serde_json::from_str::<CodebaseSuggestionJson>(obj_str) {
+                            suggestions.push(suggestion);
+                        }
+                    }
+                    start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    Ok(suggestions)
+}
+
 /// Parse JSON suggestions from LLM response
 fn parse_suggestions(response: &str, path: &PathBuf) -> anyhow::Result<Vec<Suggestion>> {
+    // Strip markdown code fences if present
+    let trimmed = response.trim();
+    let clean = if trimmed.starts_with("```json") {
+        trimmed.strip_prefix("```json").unwrap_or(trimmed)
+    } else if trimmed.starts_with("```") {
+        trimmed.strip_prefix("```").unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    let clean = if clean.ends_with("```") {
+        clean.strip_suffix("```").unwrap_or(clean)
+    } else {
+        clean
+    };
+    let clean = clean.trim();
+
     // Try to extract JSON array from response
-    let json_str = if let Some(start) = response.find('[') {
-        if let Some(end) = response.rfind(']') {
-            &response[start..=end]
+    let json_str = if let Some(start) = clean.find('[') {
+        if let Some(end) = clean.rfind(']') {
+            &clean[start..=end]
         } else {
-            response
+            clean
         }
     } else {
-        response
+        clean
     };
 
     let parsed: Vec<SuggestionJson> = serde_json::from_str(json_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse suggestions: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse suggestions: {} | Response preview: {}", e, truncate_str(json_str, 200)))?;
 
     let suggestions = parsed
         .into_iter()
@@ -1284,16 +1470,16 @@ pub async fn generate_file_summaries(
 }
 
 /// Generate summaries for a specific list of files with project context
-/// Uses parallel batch processing for speed
+/// Uses aggressive parallel batch processing for speed
 pub async fn generate_summaries_for_files(
     index: &CodebaseIndex,
     files: &[PathBuf],
     project_context: &str,
 ) -> anyhow::Result<(HashMap<PathBuf, String>, Option<Usage>)> {
-    // Increased batch size for fewer API calls
-    let batch_size = 8;
-    // Number of concurrent API calls (be careful with rate limits)
-    let concurrency = 2;
+    // Large batch size for fewer API calls
+    let batch_size = 16;
+    // Higher concurrency for faster processing (Speed preset handles this well)
+    let concurrency = 4;
     
     let batches: Vec<_> = files.chunks(batch_size).collect();
     
@@ -1415,7 +1601,7 @@ OUTPUT: A JSON object mapping file paths to summary strings. Example:
 
     let user_prompt = build_batch_context(index, files, project_context);
     
-    let response = call_llm_with_usage(system, &user_prompt, Model::GrokFast, true).await?;
+    let response = call_llm_with_usage(system, &user_prompt, Model::Speed, true).await?;
     
     let summaries = parse_summaries_response(&response.content)?;
     
@@ -1540,143 +1726,56 @@ fn parse_summaries_response(response: &str) -> anyhow::Result<HashMap<PathBuf, S
     let json_str = extract_json_object(response)
         .ok_or_else(|| anyhow::anyhow!("No JSON object found in response"))?;
 
-    let parsed: HashMap<String, String> = serde_json::from_str(json_str)
-        .map_err(|e| {
-            // Try to provide helpful error context
-            let preview = if json_str.len() > 100 {
-                format!("{}...", &json_str[..100])
-            } else {
-                json_str.to_string()
-            };
-            anyhow::anyhow!("JSON parse error: {} | Preview: {}", e, preview)
-        })?;
+    // First try to parse as a simple {path: summary} object
+    if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(json_str) {
+        let summaries = parsed
+            .into_iter()
+            .map(|(path, summary)| (PathBuf::from(path), summary))
+            .collect();
+        return Ok(summaries);
+    }
 
-    let summaries = parsed
-        .into_iter()
-        .map(|(path, summary)| (PathBuf::from(path), summary))
-        .collect();
-
-    Ok(summaries)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  FEATURE ENHANCEMENT
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Response from feature enhancement LLM call
-#[derive(Debug, Clone, Deserialize)]
-pub struct FeatureEnhancement {
-    pub name: String,
-    pub description: String,
-}
-
-/// Enhance feature names and generate descriptions using LLM
-/// 
-/// Takes a list of auto-detected features with their file lists and asks
-/// the LLM to provide better names and descriptions.
-pub async fn enhance_features(
-    grouping: &crate::grouping::CodebaseGrouping,
-    index: &CodebaseIndex,
-) -> anyhow::Result<(HashMap<String, FeatureEnhancement>, Option<Usage>)> {
-    // Build context about features to enhance
-    let mut features_to_enhance = Vec::new();
-    
-    for group in grouping.groups.values() {
-        for feature in &group.features {
-            // Build file context for this feature
-            let files_info: Vec<String> = feature.files.iter()
-                .take(10)  // Limit to 10 files per feature
-                .filter_map(|path| {
-                    let file_index = index.files.get(path)?;
-                    let exports: Vec<_> = file_index.symbols.iter()
-                        .filter(|s| s.visibility == crate::index::Visibility::Public)
-                        .take(5)
-                        .map(|s| s.name.as_str())
+    // Try to parse as a wrapper object (e.g., {"analysis": {...}, "summaries": {...}})
+    if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(json_str) {
+        // Look for common wrapper keys that might contain summaries
+        for key in ["summaries", "files", "results", "data"] {
+            if let Some(inner) = wrapper.get(key) {
+                if let Ok(parsed) = serde_json::from_value::<HashMap<String, String>>(inner.clone()) {
+                    let summaries = parsed
+                        .into_iter()
+                        .map(|(path, summary)| (PathBuf::from(path), summary))
                         .collect();
-                    
-                    Some(format!(
-                        "  - {} ({} LOC, exports: {})",
-                        path.display(),
-                        file_index.loc,
-                        if exports.is_empty() { "none".to_string() } else { exports.join(", ") }
-                    ))
-                })
-                .collect();
-            
-            if !files_info.is_empty() {
-                features_to_enhance.push(format!(
-                    "Feature '{}' (Layer: {}):\n{}",
-                    feature.name,
-                    group.layer.label(),
-                    files_info.join("\n")
-                ));
+                    return Ok(summaries);
+                }
+            }
+        }
+        
+        // If the wrapper is an object, try to extract string values directly
+        // (handles case where LLM adds extra keys like "analysis" alongside file paths)
+        if let Some(obj) = wrapper.as_object() {
+            let mut summaries = HashMap::new();
+            for (key, value) in obj {
+                // Skip meta keys that aren't file paths
+                if key == "analysis" || key == "notes" || key == "summary" {
+                    continue;
+                }
+                if let Some(summary) = value.as_str() {
+                    summaries.insert(PathBuf::from(key), summary.to_string());
+                }
+            }
+            if !summaries.is_empty() {
+                return Ok(summaries);
             }
         }
     }
-    
-    if features_to_enhance.is_empty() {
-        return Ok((HashMap::new(), None));
-    }
-    
-    // Build prompt
-    let user_prompt = format!(r#"Analyze these auto-detected feature groupings from a codebase and provide better names and descriptions.
 
-For each feature:
-1. Suggest a clear, concise name (kebab-case, 2-4 words max)
-2. Provide a brief description (1 sentence)
-
-Current features:
-{}
-
-Respond in JSON format:
-{{
-  "original-name": {{
-    "name": "better-name",
-    "description": "Brief description"
-  }},
-  ...
-}}
-
-Only include features that need improvement. Skip generic names like "misc-*" or "cluster-*"."#,
-        features_to_enhance.join("\n\n")
-    );
-    
-    let system_prompt = "You are a code organization expert. Analyze feature groupings and suggest clearer names and descriptions. Respond only with valid JSON.";
-    
-    // Use Grok for fast categorization
-    let response = call_llm_with_usage(system_prompt, &user_prompt, Model::GrokFast, true).await?;
-    
-    // Parse response
-    let enhancements = parse_feature_enhancements(&response.content)?;
-    
-    Ok((enhancements, response.usage))
-}
-
-/// Parse feature enhancement response
-fn parse_feature_enhancements(response: &str) -> anyhow::Result<HashMap<String, FeatureEnhancement>> {
-    let json_str = extract_json_object(response)
-        .ok_or_else(|| anyhow::anyhow!("No JSON object found in response"))?;
-    
-    let parsed: HashMap<String, FeatureEnhancement> = serde_json::from_str(json_str)
-        .map_err(|e| anyhow::anyhow!("JSON parse error: {}", e))?;
-    
-    Ok(parsed)
-}
-
-/// Apply LLM enhancements to a grouping
-pub fn apply_feature_enhancements(
-    grouping: &mut crate::grouping::CodebaseGrouping,
-    enhancements: &HashMap<String, FeatureEnhancement>,
-) {
-    for group in grouping.groups.values_mut() {
-        for feature in &mut group.features {
-            if let Some(enhancement) = enhancements.get(&feature.name) {
-                feature.name = enhancement.name.clone();
-                feature.description = Some(enhancement.description.clone());
-            }
-        }
-    }
-    grouping.llm_enhanced = true;
+    // Final fallback: provide helpful error
+    let preview = if json_str.len() > 200 {
+        format!("{}...", &json_str[..200])
+    } else {
+        json_str.to_string()
+    };
+    Err(anyhow::anyhow!("Could not extract summaries from response. Preview: {}", preview))
 }
 
 // ============================================================================
@@ -1691,7 +1790,7 @@ pub struct PRFileReview {
     pub comment: String,
 }
 
-/// Review changes using Sonnet 4 for thorough code review
+/// Review changes using LLM for thorough code review
 pub async fn review_changes(
     files_changed: &[(PathBuf, String)], // (file_path, diff)
 ) -> anyhow::Result<(Vec<crate::ui::PRReviewComment>, Usage)> {
@@ -1724,8 +1823,8 @@ Be constructive and focused. Skip trivial issues. Highlight the most important p
 
     let user_prompt = format!("Review these changes:\n{}", changes_text);
     
-    // Use Opus for thorough review
-    let response = call_llm_with_usage(system_prompt, &user_prompt, Model::Opus, true).await?;
+    // Use Grok Fast for thorough review
+    let response = call_llm_with_usage(system_prompt, &user_prompt, Model::Speed, true).await?;
     
     let usage = response.usage.unwrap_or_default();
     
@@ -1742,13 +1841,29 @@ fn parse_review_response(
 ) -> anyhow::Result<Vec<crate::ui::PRReviewComment>> {
     use crate::ui::{PRReviewComment, ReviewSeverity};
     
+    // Strip markdown code fences if present
+    let trimmed = content.trim();
+    let clean = if trimmed.starts_with("```json") {
+        trimmed.strip_prefix("```json").unwrap_or(trimmed)
+    } else if trimmed.starts_with("```") {
+        trimmed.strip_prefix("```").unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    let clean = if clean.ends_with("```") {
+        clean.strip_suffix("```").unwrap_or(clean)
+    } else {
+        clean
+    };
+    let clean = clean.trim();
+
     // Extract JSON from response
-    let json_start = content.find('[').unwrap_or(0);
-    let json_end = content.rfind(']').map(|i| i + 1).unwrap_or(content.len());
-    let json_str = &content[json_start..json_end];
+    let json_start = clean.find('[').unwrap_or(0);
+    let json_end = clean.rfind(']').map(|i| i + 1).unwrap_or(clean.len());
+    let json_str = &clean[json_start..json_end];
     
     let reviews: Vec<PRFileReview> = serde_json::from_str(json_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse review JSON: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse review JSON: {} | Response preview: {}", e, truncate_str(json_str, 200)))?;
     
     // Convert to PRReviewComment
     let mut comments = Vec::new();
