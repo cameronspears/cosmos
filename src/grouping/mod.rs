@@ -99,8 +99,8 @@ impl Layer {
     /// Get icon for the layer
     pub fn icon(&self) -> &'static str {
         match self {
-            Layer::Frontend => "›",  // UI
-            Layer::Backend => "›",   // Server
+            Layer::Frontend => "◇",  // Diamond - UI
+            Layer::Backend => "◆",   // Filled diamond - Server
             Layer::API => "⬡",       // Hexagon - Routes
             Layer::Database => "◈",  // Diamond with dot - Data
             Layer::Shared => "○",    // Circle - Shared

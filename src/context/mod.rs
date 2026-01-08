@@ -199,8 +199,10 @@ fn get_file_statuses(repo: &Repository) -> anyhow::Result<(Vec<PathBuf>, Vec<Pat
                 staged.push(path.clone());
             }
 
-            // Untracked files (new in working tree, not in index)
-            if status.is_wt_new() {
+            // Untracked files (new in working tree, but NOT staged)
+            // A file that's been `git add`ed will have is_index_new() true,
+            // so we exclude those from the untracked list.
+            if status.is_wt_new() && !status.is_index_new() {
                 untracked.push(path);
             }
         }

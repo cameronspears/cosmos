@@ -39,11 +39,11 @@ impl IndexCache {
     pub fn from_index(index: &CodebaseIndex) -> Self {
         let file_hashes = index.files.iter()
             .map(|(path, file_index)| {
+                // Use only content-based metrics, not mtime (which changes on git checkout, copy, etc.)
                 let hash = format!(
-                    "{}-{}-{}",
+                    "{}-{}",
                     file_index.loc,
-                    file_index.symbols.len(),
-                    file_index.last_modified.timestamp()
+                    file_index.symbols.len()
                 );
                 (path.clone(), hash)
             })
@@ -154,7 +154,7 @@ const LLM_SUMMARY_CACHE_DAYS: i64 = 30;
 pub struct LlmSummaryEntry {
     /// The AI-generated summary text
     pub summary: String,
-    /// Hash of file content (LOC + symbols + mtime) for change detection
+    /// Hash of file content (LOC + symbols) for change detection
     pub file_hash: String,
     /// When this summary was generated
     pub generated_at: DateTime<Utc>,

@@ -379,13 +379,12 @@ fn str_to_source(s: &str) -> SuggestionSource {
 /// Simple hash for grouping similar summaries
 fn hash_summary(summary: &str) -> String {
     // Use first 100 chars lowercased as a simple grouping key
-    let normalized = summary.to_lowercase();
-    let truncated = if normalized.len() > 100 {
-        &normalized[..100]
-    } else {
-        &normalized
-    };
-    truncated.to_string()
+    // Must use char iteration to avoid panicking on multi-byte UTF-8 boundaries
+    summary
+        .to_lowercase()
+        .chars()
+        .take(100)
+        .collect()
 }
 
 #[cfg(test)]
@@ -442,6 +441,24 @@ mod tests {
         
         let analytics = db.get_analytics().unwrap();
         assert_eq!(analytics.total_suggestions, 5);
+    }
+
+    #[test]
+    fn test_hash_summary_multibyte_utf8() {
+        // This would panic before the fix if slicing at byte 100 fell within a multi-byte char
+        let summary_with_emoji = "🎉".repeat(50); // 50 emojis = 200 bytes, 50 chars
+        let hash = hash_summary(&summary_with_emoji);
+        assert_eq!(hash.chars().count(), 50); // Should truncate to 100 chars, but only 50 available
+        
+        // Mix of ASCII and multi-byte to hit exactly the boundary
+        let mixed = format!("{}{}", "a".repeat(99), "é"); // 99 ASCII + 1 two-byte char = 101 bytes
+        let hash = hash_summary(&mixed);
+        assert_eq!(hash.chars().count(), 100); // Should get exactly 100 chars
+        
+        // Long string with Chinese characters (3 bytes each)
+        let chinese = "中".repeat(50); // 50 chars = 150 bytes
+        let hash = hash_summary(&chinese);
+        assert_eq!(hash.chars().count(), 50); // Only 50 chars available
     }
 }
 

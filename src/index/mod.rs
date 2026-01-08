@@ -397,7 +397,11 @@ fn infer_from_filename(filename: &str, parent: &str) -> String {
     
     // Check for common suffixes/patterns
     if lower.ends_with("utils") || lower.ends_with("util") || lower.ends_with("helpers") || lower.ends_with("helper") {
-        return format!("{} utility functions", capitalize(&lower.replace("utils", "").replace("util", "").replace("helpers", "").replace("helper", "").trim_end_matches('_').trim_end_matches('-')));
+        let name = lower.replace("utils", "").replace("util", "").replace("helpers", "").replace("helper", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        if name.is_empty() {
+            return "General utility functions".to_string();
+        }
+        return format!("{} utility functions", capitalize(&name));
     }
     
     if lower.ends_with("service") || lower.ends_with("services") {
@@ -526,13 +530,15 @@ fn humanize_camel_case(s: &str) -> String {
 
 /// Humanize a symbol name for display
 fn humanize_name(name: &str) -> String {
+    let char_count = name.chars().count();
     // Keep short names as-is
-    if name.len() <= 12 {
+    if char_count <= 12 {
         return name.to_string();
     }
-    // Truncate very long names
-    if name.len() > 25 {
-        return format!("{}...", &name[..22]);
+    // Truncate very long names (use char count, not byte length, for Unicode safety)
+    if char_count > 25 {
+        let truncated: String = name.chars().take(22).collect();
+        return format!("{}...", truncated);
     }
     name.to_string()
 }

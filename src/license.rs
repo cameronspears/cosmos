@@ -5,7 +5,7 @@
 //! - Pro: Managed AI credits + history + analytics
 //! - Team: Everything + sync + SSO (future)
 
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -81,13 +81,8 @@ impl License {
     /// Create a new license from a key
     pub fn new(key: String, tier: Tier) -> Self {
         let now = Utc::now();
-        // Period resets on the 1st of next month
-        let next_month = if now.day() == 1 {
-            now
-        } else {
-            // Simple: add 30 days for now
-            now + chrono::Duration::days(30)
-        };
+        // Period resets ~30 days from activation
+        let period_resets_at = now + chrono::Duration::days(30);
 
         Self {
             key,
@@ -96,7 +91,7 @@ impl License {
             expires_at: None,
             email: None,
             tokens_used: 0,
-            period_resets_at: next_month,
+            period_resets_at,
         }
     }
 
@@ -116,9 +111,14 @@ impl License {
         }
     }
 
-    /// Tokens remaining this period
+    /// Tokens remaining this period (accounts for period reset)
     pub fn tokens_remaining(&self) -> u64 {
         let allowance = self.tier.token_allowance();
+        // If period has expired, tokens_used would be reset to 0 on next mutation,
+        // so we should report full allowance available
+        if Utc::now() >= self.period_resets_at {
+            return allowance;
+        }
         allowance.saturating_sub(self.tokens_used)
     }
 
@@ -424,6 +424,20 @@ pub fn deactivate_interactive() -> Result<(), String> {
     Ok(())
 }
 
+/// Safely format a license key for display, masking the middle portion.
+/// Returns the full key if it's too short to mask safely.
+fn format_key_masked(key: &str) -> String {
+    // Need at least 16 chars to safely show 12 prefix + 4 suffix with "..."
+    if key.len() >= 16 {
+        format!("{}...{}", &key[..12], &key[key.len() - 4..])
+    } else if key.is_empty() {
+        "(invalid)".to_string()
+    } else {
+        // Key is too short to mask; show it partially obscured
+        format!("{}...", &key[..key.len().min(8)])
+    }
+}
+
 /// Show current license status
 pub fn show_status() {
     let manager = LicenseManager::load();
@@ -438,7 +452,7 @@ pub fn show_status() {
     match manager.get_license() {
         Some(license) => {
             println!("  Tier:      {}", license.tier.label().to_uppercase());
-            println!("  Key:       {}...{}", &license.key[..12], &license.key[license.key.len()-4..]);
+            println!("  Key:       {}", format_key_masked(&license.key));
             println!("  Activated: {}", license.activated_at.format("%Y-%m-%d"));
 
             if let Some(exp) = license.expires_at {

@@ -138,9 +138,9 @@ pub fn generate_fix_branch_name(suggestion_id: &str, summary: &str) -> String {
         .collect::<Vec<_>>()
         .join("-");
     
-    // Truncate slug to reasonable length
-    let slug = if slug.len() > 40 {
-        slug[..40].trim_end_matches('-').to_string()
+    // Truncate slug to reasonable length (character-safe for Unicode)
+    let slug = if slug.chars().count() > 40 {
+        slug.chars().take(40).collect::<String>().trim_end_matches('-').to_string()
     } else {
         slug
     };
