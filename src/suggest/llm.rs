@@ -572,13 +572,15 @@ EXAMPLE - Adding a null check:
     })
 }
 
-/// Truncate a string for error messages
+/// Truncate a string for error messages (UTF-8 safe)
 fn truncate_for_error(s: &str) -> String {
-    const MAX_LEN: usize = 100;
-    if s.len() <= MAX_LEN {
+    const MAX_CHARS: usize = 100;
+    // Use char iteration to avoid panicking on multi-byte UTF-8 boundaries
+    // (same pattern as hash_summary in history.rs)
+    if s.chars().count() <= MAX_CHARS {
         s.to_string()
     } else {
-        format!("{}...", &s[..MAX_LEN])
+        format!("{}...", s.chars().take(MAX_CHARS).collect::<String>())
     }
 }
 
