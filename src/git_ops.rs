@@ -111,6 +111,23 @@ pub fn create_fix_branch_from_main(repo_path: &Path, branch_name: &str) -> Resul
     let main_commit = main_branch.get().peel_to_commit()
         .context("Failed to get commit from main branch")?;
     
+    // Check if branch already exists (from a previous failed attempt)
+    if let Ok(mut existing) = repo.find_branch(branch_name, git2::BranchType::Local) {
+        // We need to checkout main first - can't delete the currently checked out branch
+        let main_ref = main_branch.get().name()
+            .context("Failed to get main branch ref name")?;
+        let main_object = main_branch.get().peel(git2::ObjectType::Any)
+            .context("Failed to peel main branch")?;
+        repo.checkout_tree(&main_object, None)
+            .context("Failed to checkout main branch tree")?;
+        repo.set_head(main_ref)
+            .context("Failed to set HEAD to main branch")?;
+        
+        // Now we can safely delete the existing branch
+        existing.delete()
+            .context(format!("Failed to delete existing branch '{}'", branch_name))?;
+    }
+    
     // Create the new branch from main
     repo.branch(branch_name, &main_commit, false)
         .context(format!("Failed to create branch '{}' from main", branch_name))?;
@@ -326,6 +343,123 @@ pub fn reset_file(repo_path: &Path, file_path: &str) -> Result<()> {
             String::from_utf8_lossy(&output.stderr)
         ))
     }
+}
+
+// ============================================================================
+// Clean Main State Operations
+// ============================================================================
+
+/// Check if we're currently on main or master branch
+#[allow(dead_code)]
+pub fn is_on_main_branch(repo_path: &Path) -> Result<bool> {
+    let repo = Repository::open(repo_path)?;
+    let head = repo.head().context("Failed to get HEAD")?;
+    let branch = head.shorthand().unwrap_or("");
+    
+    Ok(branch == "main" || branch == "master")
+}
+
+/// Get the name of the main branch (main or master)
+pub fn get_main_branch_name(repo_path: &Path) -> Result<String> {
+    let repo = Repository::open(repo_path)?;
+    
+    if repo.find_branch("main", git2::BranchType::Local).is_ok() {
+        Ok("main".to_string())
+    } else if repo.find_branch("master", git2::BranchType::Local).is_ok() {
+        Ok("master".to_string())
+    } else {
+        Err(anyhow::anyhow!("Could not find 'main' or 'master' branch"))
+    }
+}
+
+/// Stash all changes (staged + unstaged) with an optional message
+/// Uses git CLI for reliable stash behavior
+pub fn stash_changes(repo_path: &Path, message: Option<&str>) -> Result<()> {
+    let mut args = vec!["stash", "push", "--include-untracked"];
+    
+    if let Some(msg) = message {
+        args.push("-m");
+        args.push(msg);
+    }
+    
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(&args)
+        .output()
+        .context("Failed to run git stash")?;
+    
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "git stash failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+/// Hard reset the working directory and switch to main branch
+/// WARNING: This discards all uncommitted changes permanently
+pub fn reset_to_main(repo_path: &Path) -> Result<()> {
+    let main_branch = get_main_branch_name(repo_path)?;
+    
+    // First, reset any staged changes
+    let reset_output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["reset", "--hard", "HEAD"])
+        .output()
+        .context("Failed to reset working directory")?;
+    
+    if !reset_output.status.success() {
+        return Err(anyhow::anyhow!(
+            "git reset failed: {}",
+            String::from_utf8_lossy(&reset_output.stderr)
+        ));
+    }
+    
+    // Clean untracked files
+    let clean_output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["clean", "-fd"])
+        .output()
+        .context("Failed to clean untracked files")?;
+    
+    if !clean_output.status.success() {
+        return Err(anyhow::anyhow!(
+            "git clean failed: {}",
+            String::from_utf8_lossy(&clean_output.stderr)
+        ));
+    }
+    
+    // Checkout main branch
+    let checkout_output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["checkout", &main_branch])
+        .output()
+        .context("Failed to checkout main branch")?;
+    
+    if checkout_output.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "git checkout {} failed: {}",
+            main_branch,
+            String::from_utf8_lossy(&checkout_output.stderr)
+        ))
+    }
+}
+
+/// Stash changes and switch to main branch
+pub fn stash_and_switch_to_main(repo_path: &Path) -> Result<()> {
+    let main_branch = get_main_branch_name(repo_path)?;
+    
+    // Stash with a descriptive message
+    stash_changes(repo_path, Some("cosmos: auto-stash before switching to main"))?;
+    
+    // Checkout main branch
+    checkout_branch(repo_path, &main_branch)?;
+    
+    Ok(())
 }
 
 // ============================================================================

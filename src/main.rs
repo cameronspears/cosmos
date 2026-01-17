@@ -91,15 +91,21 @@ pub enum BackgroundMessage {
     },
     PreviewError(String),
     /// Direct fix applied (Smart preset generated + applied the change)
+    /// Supports both single-file and multi-file changes
     DirectFixApplied {
         suggestion_id: uuid::Uuid,
-        file_path: PathBuf,
+        /// All file changes (path, backup_path, diff)
+        file_changes: Vec<(PathBuf, PathBuf, String)>,
         description: String,
-        modified_areas: Vec<String>,
-        backup_path: PathBuf,
         safety_checks: Vec<safe_apply::CheckResult>,
         usage: Option<suggest::llm::Usage>,
         branch_name: String,
+        /// Human-friendly title for PR (e.g., "Batch Processing")
+        friendly_title: String,
+        /// Behavior-focused problem description for non-technical readers
+        problem_summary: String,
+        /// What will be different after the fix
+        outcome: String,
     },
     DirectFixError(String),
     /// Ship workflow progress update
@@ -297,6 +303,18 @@ async fn run_tui(
     app.repo_memory = cache_manager.load_repo_memory();
     // Load cached domain glossary (auto-extracted terminology)
     app.glossary = cache_manager.load_glossary().unwrap_or_default();
+    
+    // Check for unsaved work and show startup overlay if needed
+    if let Ok(status) = git_ops::current_status(&repo_path) {
+        let main_branch = git_ops::get_main_branch_name(&repo_path).unwrap_or_else(|_| "main".to_string());
+        let is_on_main = status.branch == main_branch;
+        let changed_count = status.staged.len() + status.modified.len();
+        
+        // Show overlay if not on main or has uncommitted changes
+        if !is_on_main || changed_count > 0 {
+            app.show_startup_check(changed_count);
+        }
+    }
     
     // Check if we have API access (and budgets allow it)
     let mut ai_enabled = suggest::llm::is_available();
@@ -706,15 +724,10 @@ app.suggestions.sort_with_context(&app.context);
                     app.summary_progress = None;
                     app.show_toast(&format!("Summary error: {}", truncate(&e, 80)));
                 }
-                BackgroundMessage::PreviewReady { suggestion_id, file_path, summary, preview } => {
+                BackgroundMessage::PreviewReady { preview, .. } => {
                     app.loading = LoadingState::None;
-                    // Check if we're in the new workflow or legacy overlay mode
-                    if app.workflow_step == WorkflowStep::Verify {
-                        app.set_verify_preview(preview);
-                    } else {
-                        // Legacy: show overlay
-                        app.show_fix_preview(suggestion_id, file_path, summary, preview);
-                    }
+                    // Set the preview in the Verify workflow step
+                    app.set_verify_preview(preview);
                 }
                 BackgroundMessage::PreviewError(e) => {
                     app.loading = LoadingState::None;
@@ -725,7 +738,7 @@ app.suggestions.sort_with_context(&app.context);
                     }
                     app.show_toast(&format!("Preview error: {}", truncate(&e, 80)));
                 }
-                BackgroundMessage::DirectFixApplied { suggestion_id, file_path, description, modified_areas, backup_path, safety_checks: _, usage, branch_name } => {
+                BackgroundMessage::DirectFixApplied { suggestion_id, file_changes, description, safety_checks: _, usage, branch_name, friendly_title, problem_summary, outcome } => {
                     // Track cost
                     if let Some(u) = usage {
                         let cost = u.calculate_cost(suggest::llm::Model::Smart);
@@ -741,60 +754,53 @@ app.suggestions.sort_with_context(&app.context);
                     // Store the cosmos branch name - this enables the Ship workflow
                     app.cosmos_branch = Some(branch_name.clone());
 
-                    // Track as pending change for batch commit
-                    let diff = format!("Modified areas: {}", modified_areas.join(", "));
-                    app.add_pending_change(suggestion_id, file_path.clone(), description.clone(), diff, backup_path.clone());
+                    // Convert file_changes to FileChange structs for multi-file support
+                    let ui_file_changes: Vec<ui::FileChange> = file_changes.iter()
+                        .map(|(path, backup, diff)| ui::FileChange::new(path.clone(), diff.clone(), backup.clone()))
+                        .collect();
 
-                    // Read original (backup) and new content for verification
-                    let original_content = std::fs::read_to_string(&backup_path).unwrap_or_default();
-                    let full_path = app.repo_path.join(&file_path);
-                    let new_content = std::fs::read_to_string(&full_path).unwrap_or_default();
+                    // Track as pending change with multi-file support
+                    app.pending_changes.push(ui::PendingChange::with_preview_context_multi(
+                        suggestion_id,
+                        ui_file_changes,
+                        description.clone(),
+                        friendly_title,
+                        problem_summary,
+                        outcome,
+                    ));
 
-                    // Use new workflow Review step if in workflow mode
-                    if app.workflow_step == WorkflowStep::Verify {
-                        app.start_review(file_path.clone(), original_content.clone(), new_content.clone());
-                        
-                        // Trigger verification in background
-                        let tx_verify = tx.clone();
-                        let file_for_verify = file_path.clone();
-                        tokio::spawn(async move {
-                            let files_with_content = vec![(file_for_verify, original_content, new_content)];
-                            match suggest::llm::verify_changes(&files_with_content, 1, &[]).await {
-                                Ok(review) => {
-                                    let _ = tx_verify.send(BackgroundMessage::VerificationComplete {
-                                        findings: review.findings,
-                                        summary: review.summary,
-                                        usage: review.usage,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx_verify.send(BackgroundMessage::Error(format!("Verification failed: {}", e)));
-                                }
+                    // Read original (backup) and new content for verification (all files)
+                    let files_with_content: Vec<(PathBuf, String, String)> = file_changes.iter()
+                        .map(|(path, backup, _diff)| {
+                            let original = std::fs::read_to_string(backup).unwrap_or_default();
+                            let full_path = app.repo_path.join(path);
+                            let new_content = std::fs::read_to_string(&full_path).unwrap_or_default();
+                            (path.clone(), original, new_content)
+                        })
+                        .collect();
+
+                    // Transition to Review workflow step (use first file for display)
+                    let first_file = file_changes.first().map(|(p, _, _)| p.clone()).unwrap_or_default();
+                    let first_original = files_with_content.first().map(|(_, o, _)| o.clone()).unwrap_or_default();
+                    let first_new = files_with_content.first().map(|(_, _, n)| n.clone()).unwrap_or_default();
+                    app.start_review(first_file, first_original.clone(), first_new.clone());
+                    
+                    // Trigger verification in background (all files)
+                    let tx_verify = tx.clone();
+                    tokio::spawn(async move {
+                        match suggest::llm::verify_changes(&files_with_content, 1, &[]).await {
+                            Ok(review) => {
+                                let _ = tx_verify.send(BackgroundMessage::VerificationComplete {
+                                    findings: review.findings,
+                                    summary: review.summary,
+                                    usage: review.usage,
+                                });
                             }
-                        });
-                    } else {
-                        // Legacy: show verification review overlay
-                        app.show_verification_review(file_path.clone(), original_content.clone(), new_content.clone());
-
-                        // Trigger verification in background
-                        let tx_verify = tx.clone();
-                        let file_for_verify = file_path.clone();
-                        tokio::spawn(async move {
-                            let files_with_content = vec![(file_for_verify, original_content, new_content)];
-                            match suggest::llm::verify_changes(&files_with_content, 1, &[]).await {
-                                Ok(review) => {
-                                    let _ = tx_verify.send(BackgroundMessage::VerificationComplete {
-                                        findings: review.findings,
-                                        summary: review.summary,
-                                        usage: review.usage,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx_verify.send(BackgroundMessage::Error(format!("Verification failed: {}", e)));
-                                }
+                            Err(e) => {
+                                let _ = tx_verify.send(BackgroundMessage::Error(format!("Verification failed: {}", e)));
                             }
-                        });
-                    }
+                        }
+                    });
                 }
                 BackgroundMessage::DirectFixError(e) => {
                     app.loading = LoadingState::None;
@@ -852,9 +858,8 @@ app.suggestions.sort_with_context(&app.context);
                     }
 
                     app.loading = LoadingState::None;
-                    // Show the response in the inquiry overlay
-                    let response = format!("Q: {}\n\n{}", question, answer);
-                    app.show_inquiry(response);
+                    // Show the response in the ask cosmos panel
+                    app.show_inquiry(question, answer);
                 }
                 BackgroundMessage::VerificationComplete { findings, summary, usage } => {
                     // Track cost
@@ -864,12 +869,8 @@ app.suggestions.sort_with_context(&app.context);
                         app.session_tokens += u.total_tokens;
                         let _ = app.config.record_tokens(u.total_tokens);
                     }
-                    // Use new workflow or legacy overlay
-                    if app.workflow_step == WorkflowStep::Review {
-                        app.set_review_findings(findings, summary);
-                    } else {
-                        app.set_verification_findings(findings, summary);
-                    }
+                    // Update the Review workflow step with findings
+                    app.set_review_findings(findings, summary);
                 }
                 BackgroundMessage::VerificationFixComplete { new_content, description, usage } => {
                     // Track cost
@@ -882,65 +883,35 @@ app.suggestions.sort_with_context(&app.context);
                     
                     app.show_toast(&format!("Fixed: {}", truncate(&description, 40)));
                     
-                    // Handle based on workflow mode
-                    if app.workflow_step == WorkflowStep::Review {
-                        // Update workflow review state
-                        let file_path = app.review_state.file_path.clone();
-                        let original_content = app.review_state.original_content.clone();
-                        let iteration = app.review_state.review_iteration + 1;
-                        let fixed_titles = app.review_state.fixed_titles.clone();
+                    // Update workflow review state
+                    let file_path = app.review_state.file_path.clone();
+                    let original_content = app.review_state.original_content.clone();
+                    let iteration = app.review_state.review_iteration + 1;
+                    let fixed_titles = app.review_state.fixed_titles.clone();
+                    
+                    app.review_fix_complete(new_content.clone());
+                    
+                    // Trigger re-review
+                    if let Some(fp) = file_path {
+                        app.review_state.reviewing = true;
+                        app.loading = LoadingState::ReviewingChanges;
                         
-                        app.review_fix_complete(new_content.clone());
-                        
-                        // Trigger re-review
-                        if let Some(fp) = file_path {
-                            app.review_state.reviewing = true;
-                            app.loading = LoadingState::ReviewingChanges;
-                            
-                            let tx_verify = tx.clone();
-                            tokio::spawn(async move {
-                                let files_with_content = vec![(fp, original_content, new_content)];
-                                match suggest::llm::verify_changes(&files_with_content, iteration, &fixed_titles).await {
-                                    Ok(review) => {
-                                        let _ = tx_verify.send(BackgroundMessage::VerificationComplete {
-                                            findings: review.findings,
-                                            summary: review.summary,
-                                            usage: review.usage,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        let _ = tx_verify.send(BackgroundMessage::Error(format!("Re-verification failed: {}", e)));
-                                    }
+                        let tx_verify = tx.clone();
+                        tokio::spawn(async move {
+                            let files_with_content = vec![(fp, original_content, new_content)];
+                            match suggest::llm::verify_changes(&files_with_content, iteration, &fixed_titles).await {
+                                Ok(review) => {
+                                    let _ = tx_verify.send(BackgroundMessage::VerificationComplete {
+                                        findings: review.findings,
+                                        summary: review.summary,
+                                        usage: review.usage,
+                                    });
                                 }
-                            });
-                        }
-                    } else {
-                        // Legacy overlay mode
-                        app.update_verification_content(new_content.clone());
-                        
-                        if let Some((file_path, original_content, _, iteration, fixed_titles)) = app.get_verification_state() {
-                            if let Overlay::VerificationReview { reviewing, .. } = &mut app.overlay {
-                                *reviewing = true;
+                                Err(e) => {
+                                    let _ = tx_verify.send(BackgroundMessage::Error(format!("Re-verification failed: {}", e)));
+                                }
                             }
-                            app.loading = LoadingState::ReviewingChanges;
-                            
-                            let tx_verify = tx.clone();
-                            tokio::spawn(async move {
-                                let files_with_content = vec![(file_path, original_content, new_content)];
-                                match suggest::llm::verify_changes(&files_with_content, iteration, &fixed_titles).await {
-                                    Ok(review) => {
-                                        let _ = tx_verify.send(BackgroundMessage::VerificationComplete {
-                                            findings: review.findings,
-                                            summary: review.summary,
-                                            usage: review.usage,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        let _ = tx_verify.send(BackgroundMessage::Error(format!("Re-verification failed: {}", e)));
-                                    }
-                                }
-                            });
-                        }
+                        });
                     }
                 }
             }
@@ -974,7 +945,27 @@ app.suggestions.sort_with_context(&app.context);
                 if app.input_mode == InputMode::Question {
                     match key.code {
                         KeyCode::Esc => app.exit_question(),
+                        KeyCode::Up => {
+                            // Navigate suggestions when input is empty
+                            if app.question_input.is_empty() {
+                                app.question_suggestion_up();
+                            }
+                        }
+                        KeyCode::Down => {
+                            // Navigate suggestions when input is empty
+                            if app.question_input.is_empty() {
+                                app.question_suggestion_down();
+                            }
+                        }
+                        KeyCode::Tab => {
+                            // Use selected suggestion
+                            app.use_selected_suggestion();
+                        }
                         KeyCode::Enter => {
+                            // If input is empty, use the selected suggestion first
+                            if app.question_input.is_empty() && !app.question_suggestions.is_empty() {
+                                app.use_selected_suggestion();
+                            }
                             let question = app.take_question();
                             if !question.is_empty() {
                                 // Privacy preview (what will be sent) before the network call
@@ -1132,13 +1123,14 @@ app.suggestions.sort_with_context(&app.context);
                                 let repo_path = app.repo_path.clone();
                                 let branch = branch_name.clone();
                                 let commit_message = app.generate_commit_message();
+                                let (pr_title, pr_body) = app.generate_pr_content();
                                 let files: Vec<PathBuf> = app.pending_changes.iter()
-                                    .map(|c| c.file_path.clone())
+                                    .flat_map(|c| c.files.iter().map(|f| f.path.clone()))
                                     .collect();
                                 let tx_ship = tx.clone();
-                                
+
                                 app.ship_step = Some(ui::ShipStep::Committing);
-                                
+
                                 tokio::spawn(async move {
                                     // Stage all files (handle both absolute and relative paths)
                                     for file in &files {
@@ -1147,7 +1139,7 @@ app.suggestions.sort_with_context(&app.context);
                                         } else {
                                             Some(file.clone())
                                         };
-                                        
+
                                         if let Some(path) = rel_path {
                                             if let Err(e) = git_ops::stage_file(&repo_path, path.to_str().unwrap_or_default()) {
                                                 let _ = tx_ship.send(BackgroundMessage::ShipError(format!("Stage failed: {}", e)));
@@ -1155,7 +1147,7 @@ app.suggestions.sort_with_context(&app.context);
                                             }
                                         }
                                     }
-                                    
+
                                     // Validate staging
                                     if let Ok(status) = git_ops::current_status(&repo_path) {
                                         if status.staged.is_empty() {
@@ -1163,28 +1155,22 @@ app.suggestions.sort_with_context(&app.context);
                                             return;
                                         }
                                     }
-                                    
+
                                     // Commit
                                     if let Err(e) = git_ops::commit(&repo_path, &commit_message) {
                                         let _ = tx_ship.send(BackgroundMessage::ShipError(format!("Commit failed: {}", e)));
                                         return;
                                     }
                                     let _ = tx_ship.send(BackgroundMessage::ShipProgress(ui::ShipStep::Pushing));
-                                    
+
                                     // Push
                                     if let Err(e) = git_ops::push_branch(&repo_path, &branch) {
                                         let _ = tx_ship.send(BackgroundMessage::ShipError(format!("Push failed: {}", e)));
                                         return;
                                     }
                                     let _ = tx_ship.send(BackgroundMessage::ShipProgress(ui::ShipStep::CreatingPR));
-                                    
-                                    // Create PR
-                                    let pr_title = commit_message.lines().next().unwrap_or("Cosmos fix").to_string();
-                                    let pr_body = format!(
-                                        "## Summary\n\nAutomated fix applied by Cosmos.\n\n{}\n\n---\n*Created with [Cosmos](https://cosmos.dev)*",
-                                        commit_message
-                                    );
-                                    
+
+                                    // Create PR with human-friendly content
                                     match git_ops::create_pr(&repo_path, &pr_title, &pr_body) {
                                         Ok(url) => {
                                             let _ = tx_ship.send(BackgroundMessage::ShipComplete(url));
@@ -1196,198 +1182,6 @@ app.suggestions.sort_with_context(&app.context);
                                         }
                                     }
                                 });
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-// Handle FixPreview overlay (Phase 1 - fast preview)
-                    if let Overlay::FixPreview { suggestion_id, file_path, modifier_input, .. } = &app.overlay {
-                        let suggestion_id = *suggestion_id;
-                        let file_path = file_path.clone();
-                        let modifier_input = modifier_input.clone();
-                        let is_typing_modifier = !modifier_input.is_empty();
-                        
-                        match key.code {
-                            KeyCode::Esc => {
-                                if is_typing_modifier {
-                                    // Clear modifier and stay in preview
-                                    if let Overlay::FixPreview { modifier_input, .. } = &mut app.overlay {
-                                        modifier_input.clear();
-                                    }
-                                } else {
-                                    app.close_overlay();
-                                }
-                            }
-                            KeyCode::Char('n') if !is_typing_modifier => {
-                                app.close_overlay();
-                            }
-                            KeyCode::Char('y') if !is_typing_modifier => {
-                                if let Err(e) = app.config.allow_ai(app.session_cost) {
-                                    app.show_toast(&e);
-                                    continue;
-                                }
-                                // Phase 2: Generate and apply fix with Smart preset
-                                let preview = if let Overlay::FixPreview { preview, .. } = &app.overlay {
-                                    preview.clone()
-                                } else {
-                                    continue;
-                                };
-                                
-                                // Show warning toast if proceeding with unverified fix
-                                if !preview.verified {
-                                    app.show_toast("Proceeding with unverified fix...");
-                                }
-                                
-                                if let Some(suggestion) = app.suggestions.suggestions.iter().find(|s| s.id == suggestion_id) {
-                                    
-                                    let suggestion_clone = suggestion.clone();
-                                    let repo_path_clone = repo_path.clone();
-                                    let tx_fix = tx.clone();
-                                    let file_path_clone = file_path.clone();
-                                    
-                                    app.loading = LoadingState::GeneratingFix;
-                                    app.close_overlay();
-                                    
-                                    tokio::spawn(async move {
-                                        // Create a new branch from main before applying the fix
-                                        let branch_name = git_ops::generate_fix_branch_name(
-                                            &suggestion_clone.id.to_string(),
-                                            &suggestion_clone.summary
-                                        );
-                                        
-                                        // Try to create and checkout the fix branch from main
-                                        let created_branch = match git_ops::create_fix_branch_from_main(&repo_path_clone, &branch_name) {
-                                            Ok(name) => name,
-                                            Err(e) => {
-                                                let _ = tx_fix.send(BackgroundMessage::DirectFixError(
-                                                    format!("Failed to create fix branch: {}. Please ensure you have no uncommitted changes and 'main' or 'master' branch exists.", e)
-                                                ));
-                                                return;
-                                            }
-                                        };
-                                        
-                                        let full_path = repo_path_clone.join(&file_path_clone);
-                                        let content = match std::fs::read_to_string(&full_path) {
-                                            Ok(c) => c,
-                                            Err(e) => {
-                                                let _ = tx_fix.send(BackgroundMessage::DirectFixError(format!("Failed to read file: {}", e)));
-                                                return;
-                                            }
-                                        };
-                                        
-                                        // Generate the fix content using the human plan (+ repo memory)
-                                        let mem = crate::cache::Cache::new(&repo_path_clone)
-                                            .load_repo_memory()
-                                            .to_prompt_context(12, 900);
-                                        let mem = if mem.trim().is_empty() { None } else { Some(mem) };
-                                        match suggest::llm::generate_fix_content(&file_path_clone, &content, &suggestion_clone, &preview, mem).await {
-                                            Ok(applied_fix) => {
-                                                // Create backup before applying
-                                                let backup_path = full_path.with_extension("cosmos.bak");
-                                                if let Err(e) = std::fs::copy(&full_path, &backup_path) {
-                                                    let _ = tx_fix.send(BackgroundMessage::DirectFixError(format!("Failed to create backup: {}", e)));
-                                                    return;
-                                                }
-                                                
-                                                // Write the new content
-                                                match std::fs::write(&full_path, &applied_fix.new_content) {
-                                                    Ok(_) => {
-                                                        // Stage immediately after writing - ensures changes are ready to ship
-                                                        let rel_path = full_path.strip_prefix(&repo_path_clone)
-                                                            .map(|p| p.to_string_lossy().to_string())
-                                                            .unwrap_or_else(|_| file_path_clone.to_string_lossy().to_string());
-                                                        let _ = git_ops::stage_file(&repo_path_clone, &rel_path);
-                                                        
-                                                        // Run fast local checks for confidence (best-effort)
-                                                        let safety_checks = crate::safe_apply::run(&repo_path_clone);
-
-                                                        let _ = tx_fix.send(BackgroundMessage::DirectFixApplied {
-                                                            suggestion_id,
-                                                            file_path: file_path_clone,
-                                                            description: applied_fix.description,
-                                                            modified_areas: applied_fix.modified_areas,
-                                                            backup_path,
-                                                            safety_checks,
-                                                            usage: applied_fix.usage,
-                                                            branch_name: created_branch,
-                                                        });
-                                                    }
-                                                    Err(e) => {
-                                                        // Restore backup on failure
-                                                        let _ = std::fs::copy(&backup_path, &full_path);
-                                                        let _ = std::fs::remove_file(&backup_path);
-                                                        let _ = tx_fix.send(BackgroundMessage::DirectFixError(format!("Failed to write fix: {}", e)));
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                let _ = tx_fix.send(BackgroundMessage::DirectFixError(e.to_string()));
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            KeyCode::Char('m') if !is_typing_modifier => {
-                                // Start typing modifier - set to single space to trigger typing mode
-                                // The space will be trimmed when used, but keeps us in typing mode
-                                if let Overlay::FixPreview { modifier_input, .. } = &mut app.overlay {
-                                    modifier_input.clear();
-                                    modifier_input.push(' ');
-                                }
-                            }
-                            KeyCode::Enter if is_typing_modifier => {
-                                // Regenerate preview with modifier
-                                if let Some(suggestion) = app.suggestions.suggestions.iter().find(|s| s.id == suggestion_id) {
-                                    if let Err(e) = app.config.allow_ai(app.session_cost) {
-                                        app.show_toast(&e);
-                                        continue;
-                                    }
-                                    let suggestion_clone = suggestion.clone();
-                                    let summary = suggestion.summary.clone();
-                                    let file_path_clone = file_path.clone();
-                                    let trimmed = modifier_input.trim();
-                                    let modifier = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
-                                    let tx_preview = tx.clone();
-                                    let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
-                                    
-                                    app.loading = LoadingState::GeneratingPreview;
-                                    app.close_overlay();
-                                    
-                                    tokio::spawn(async move {
-                                        let mem = if repo_memory_context.trim().is_empty() {
-                                            None
-                                        } else {
-                                            Some(repo_memory_context)
-                                        };
-                                        match suggest::llm::generate_fix_preview(&file_path_clone, &suggestion_clone, modifier.as_deref(), mem).await {
-                                            Ok(preview) => {
-                                                let _ = tx_preview.send(BackgroundMessage::PreviewReady {
-                                                    suggestion_id,
-                                                    file_path: file_path_clone,
-                                                    summary,
-                                                    preview,
-                                                });
-                                            }
-                                            Err(e) => {
-                                                let _ = tx_preview.send(BackgroundMessage::PreviewError(e.to_string()));
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            KeyCode::Char('d') if !is_typing_modifier => {
-                                // Dismiss the suggestion (especially useful when not verified)
-                                app.suggestions.dismiss(suggestion_id);
-                                app.show_toast("Dismissed");
-                                app.close_overlay();
-                            }
-                            KeyCode::Backspace if is_typing_modifier => {
-                                app.preview_modifier_pop();
-                            }
-                            KeyCode::Char(c) if is_typing_modifier => {
-                                app.preview_modifier_push(c);
                             }
                             _ => {}
                         }
@@ -1472,11 +1266,12 @@ app.suggestions.sort_with_context(&app.context);
                                 let repo_path = app.repo_path.clone();
                                 let branch = branch_name.clone();
                                 let message = commit_message.clone();
+                                let (pr_title, pr_body) = app.generate_pr_content();
                                 let files = files.clone();
                                 let tx_ship = tx.clone();
-                                
+
                                 app.update_ship_step(ui::ShipStep::Committing);
-                                
+
                                 tokio::spawn(async move {
                                     // Step 1: Stage all files (handle both absolute and relative paths)
                                     for file in &files {
@@ -1485,7 +1280,7 @@ app.suggestions.sort_with_context(&app.context);
                                         } else {
                                             Some(file.clone())
                                         };
-                                        
+
                                         if let Some(path) = rel_path {
                                             if let Err(e) = git_ops::stage_file(&repo_path, path.to_str().unwrap_or_default()) {
                                                 let _ = tx_ship.send(BackgroundMessage::ShipError(format!("Stage failed: {}", e)));
@@ -1493,7 +1288,7 @@ app.suggestions.sort_with_context(&app.context);
                                             }
                                         }
                                     }
-                                    
+
                                     // Validate: ensure something is staged before committing
                                     if let Ok(status) = git_ops::current_status(&repo_path) {
                                         if status.staged.is_empty() {
@@ -1501,28 +1296,22 @@ app.suggestions.sort_with_context(&app.context);
                                             return;
                                         }
                                     }
-                                    
+
                                     // Step 2: Commit
                                     if let Err(e) = git_ops::commit(&repo_path, &message) {
                                         let _ = tx_ship.send(BackgroundMessage::ShipError(format!("Commit failed: {}", e)));
                                         return;
                                     }
                                     let _ = tx_ship.send(BackgroundMessage::ShipProgress(ui::ShipStep::Pushing));
-                                    
+
                                     // Step 3: Push
                                     if let Err(e) = git_ops::push_branch(&repo_path, &branch) {
                                         let _ = tx_ship.send(BackgroundMessage::ShipError(format!("Push failed: {}", e)));
                                         return;
                                     }
                                     let _ = tx_ship.send(BackgroundMessage::ShipProgress(ui::ShipStep::CreatingPR));
-                                    
-                                    // Step 4: Create PR
-                                    let pr_title = message.lines().next().unwrap_or("Cosmos fix").to_string();
-                                    let pr_body = format!(
-                                        "## Summary\n\nAutomated fix applied by Cosmos.\n\n{}\n\n---\n*Created with [Cosmos](https://cosmos.dev)*",
-                                        message
-                                    );
-                                    
+
+                                    // Step 4: Create PR with human-friendly content
                                     match git_ops::create_pr(&repo_path, &pr_title, &pr_body) {
                                         Ok(url) => {
                                             let _ = tx_ship.send(BackgroundMessage::ShipComplete(url));
@@ -1543,148 +1332,6 @@ app.suggestions.sort_with_context(&app.context);
                                 }
                                 app.clear_pending_changes();
                                 app.close_overlay();
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    
-                    // Handle VerificationReview overlay (adversarial code review)
-                    if let Overlay::VerificationReview {
-                        file_path, original_content, new_content, findings, selected, reviewing, fixing, review_iteration, fixed_titles, ..
-                    } = &app.overlay {
-                        match key.code {
-                            KeyCode::Esc | KeyCode::Char('q') => {
-                                if !*reviewing && !*fixing {
-                                    app.close_overlay();
-                                }
-                            }
-                            KeyCode::Down => {
-                                // Move cursor down
-                                if !*reviewing && !*fixing {
-                                    app.verification_cursor_down();
-                                }
-                            }
-                            KeyCode::Up => {
-                                // Move cursor up
-                                if !*reviewing && !*fixing {
-                                    app.verification_cursor_up();
-                                }
-                            }
-                            KeyCode::Char(' ') | KeyCode::Char('x') => {
-                                // Toggle selection of finding at cursor
-                                if !*reviewing && !*fixing && !findings.is_empty() {
-                                    app.toggle_finding_at_cursor();
-                                }
-                            }
-                            KeyCode::Char('a') => {
-                                // Select all
-                                if !*reviewing && !*fixing {
-                                    app.select_all_findings();
-                                }
-                            }
-                            KeyCode::Char('n') => {
-                                // Select none
-                                if !*reviewing && !*fixing {
-                                    app.deselect_all_findings();
-                                }
-                            }
-                            KeyCode::Char('f') => {
-                                // Fix selected findings
-                                if !*reviewing && !*fixing && !selected.is_empty() {
-                                    let selected_findings = app.get_selected_findings();
-                                    let file = file_path.clone();
-                                    let content = new_content.clone();
-                                    let original = original_content.clone();
-                                    let iter = *review_iteration;
-                                    let fixed = fixed_titles.clone();
-                                    let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
-                                    let memory = if repo_memory_context.trim().is_empty() { None } else { Some(repo_memory_context) };
-                                    let tx_fix = tx.clone();
-
-                                    app.set_verification_fixing(true);
-
-                                    tokio::spawn(async move {
-                                        // Pass original content for context on later iterations
-                                        let orig_ref = if iter > 1 { Some(original.as_str()) } else { None };
-                                        match suggest::llm::fix_review_findings(
-                                            &file, 
-                                            &content,
-                                            orig_ref,
-                                            &selected_findings,
-                                            memory,
-                                            iter,
-                                            &fixed,
-                                        ).await {
-                                            Ok(fix) => {
-                                                let _ = tx_fix.send(BackgroundMessage::VerificationFixComplete {
-                                                    new_content: fix.new_content,
-                                                    description: fix.description,
-                                                    usage: fix.usage,
-                                                });
-                                            }
-                                            Err(e) => {
-                                                let _ = tx_fix.send(BackgroundMessage::Error(e.to_string()));
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            KeyCode::Char('r') => {
-                                // Re-run verification review
-                                if !*reviewing && !*fixing {
-                                    let file = file_path.clone();
-                                    let orig = original_content.clone();
-                                    let new = new_content.clone();
-                                    let iter = *review_iteration;
-                                    let fixed = fixed_titles.clone();
-                                    let tx_verify = tx.clone();
-
-                                    // Reset to reviewing state
-                                    if let Overlay::VerificationReview { reviewing, findings, selected, summary, .. } = &mut app.overlay {
-                                        *reviewing = true;
-                                        findings.clear();
-                                        selected.clear();
-                                        *summary = String::new();
-                                    }
-                                    app.loading = LoadingState::ReviewingChanges;
-
-                                    tokio::spawn(async move {
-                                        let files_with_content = vec![(file, orig, new)];
-                                        match suggest::llm::verify_changes(&files_with_content, iter, &fixed).await {
-                                            Ok(review) => {
-                                                let _ = tx_verify.send(BackgroundMessage::VerificationComplete {
-                                                    findings: review.findings,
-                                                    summary: review.summary,
-                                                    usage: review.usage,
-                                                });
-                                            }
-                                            Err(e) => {
-                                                let _ = tx_verify.send(BackgroundMessage::Error(e.to_string()));
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            KeyCode::Char('s') | KeyCode::Enter => {
-                                // Skip remaining issues and accept / ship
-                                if !*reviewing && !*fixing {
-                                    // Close overlay and accept the changes
-                                    app.close_overlay();
-                                    app.show_toast("Changes accepted");
-                                }
-                            }
-                            KeyCode::PageDown => {
-                                // Page down through findings
-                                if !*reviewing && !*fixing {
-                                    app.verification_page_down();
-                                }
-                            }
-                            KeyCode::PageUp => {
-                                // Page up through findings
-                                if !*reviewing && !*fixing {
-                                    app.verification_page_up();
-                                }
                             }
                             _ => {}
                         }
@@ -1725,18 +1372,12 @@ app.suggestions.sort_with_context(&app.context);
                                 // Create PR
                                 if pr_url.is_none() {
                                     let repo_path = app.repo_path.clone();
-                                    let commit_message = app.generate_commit_message();
+                                    let (pr_title, pr_body) = app.generate_pr_content();
                                     let tx_pr = tx.clone();
-                                    
+
                                     app.show_toast("Creating PR...");
-                                    
+
                                     tokio::spawn(async move {
-                                        let pr_title = commit_message.lines().next()
-                                            .unwrap_or("Cosmos fix").to_string();
-                                        let pr_body = format!(
-                                            "## Summary\n\n{}\n\n---\n*Applied with Cosmos*",
-                                            commit_message
-                                        );
                                         match git_ops::create_pr(&repo_path, &pr_title, &pr_body) {
                                             Ok(url) => {
                                                 let _ = tx_pr.send(BackgroundMessage::PRCreated(url));
@@ -1809,6 +1450,55 @@ app.suggestions.sort_with_context(&app.context);
                                 KeyCode::Char('c') => {
                                     // Start commit
                                     app.git_start_commit();
+                                }
+                                KeyCode::Char('r') => {
+                                    // Restore selected file (discard changes)
+                                    app.git_restore_selected();
+                                }
+                                KeyCode::Char('S') => {
+                                    // Stage all files
+                                    app.git_stage_all();
+                                }
+                                KeyCode::Char('X') => {
+                                    // Hard reset - discard all changes
+                                    match app.git_reset_hard() {
+                                        Ok(_) => {
+                                            app.show_toast("Reset complete - all changes discarded");
+                                            app.close_overlay();
+                                        }
+                                        Err(e) => {
+                                            app.show_toast(&format!("Reset failed: {}", e));
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('m') => {
+                                    // Switch to main branch
+                                    match app.git_switch_to_main() {
+                                        Ok(_) => {
+                                            app.show_toast("Switched to main branch");
+                                            app.refresh_git_status();
+                                        }
+                                        Err(e) => {
+                                            app.show_toast(&format!("Switch failed: {}", e));
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('P') => {
+                                    // Push current branch
+                                    let branch = app.context.branch.clone();
+                                    match git_ops::push_branch(&app.repo_path, &branch) {
+                                        Ok(_) => {
+                                            app.show_toast(&format!("Pushed {}", branch));
+                                            app.refresh_git_status();
+                                        }
+                                        Err(e) => {
+                                            app.show_toast(&format!("Push failed: {}", e));
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('d') => {
+                                    // Delete untracked file
+                                    app.git_delete_untracked();
                                 }
                                 _ => {}
                             }
@@ -2090,65 +1780,70 @@ app.suggestions.sort_with_context(&app.context);
                         }
                         continue;
                     }
+
+                    // Handle Startup Check overlay
+                    if let ui::Overlay::StartupCheck { confirming_discard, .. } = &app.overlay {
+                        let confirming = *confirming_discard;
+                        match key.code {
+                            KeyCode::Esc => {
+                                if confirming {
+                                    // Cancel confirmation, go back to main options
+                                    app.startup_check_confirm_discard(false);
+                                } else {
+                                    // Quit cosmos
+                                    app.should_quit = true;
+                                }
+                            }
+                            KeyCode::Char('s') if !confirming => {
+                                // Save (stash) and start fresh
+                                match git_ops::stash_and_switch_to_main(&app.repo_path) {
+                                    Ok(_) => {
+                                        app.close_overlay();
+                                        app.show_toast("Work saved! Restore with 'git stash pop'");
+                                        // Refresh context after switching branches
+                                        let _ = app.context.refresh();
+                                    }
+                                    Err(e) => {
+                                        app.show_toast(&format!("Failed to save: {}", e));
+                                    }
+                                }
+                            }
+                            KeyCode::Char('d') if !confirming => {
+                                // Show discard confirmation
+                                app.startup_check_confirm_discard(true);
+                            }
+                            KeyCode::Char('c') if !confirming => {
+                                // Continue as-is
+                                app.close_overlay();
+                            }
+                            KeyCode::Char('y') if confirming => {
+                                // Confirm discard
+                                match git_ops::reset_to_main(&app.repo_path) {
+                                    Ok(_) => {
+                                        app.close_overlay();
+                                        app.show_toast("Started fresh");
+                                        // Refresh context after resetting
+                                        let _ = app.context.refresh();
+                                    }
+                                    Err(e) => {
+                                        app.show_toast(&format!("Failed to reset: {}", e));
+                                    }
+                                }
+                            }
+                            KeyCode::Char('n') if confirming => {
+                                // Cancel confirmation
+                                app.startup_check_confirm_discard(false);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     
-                    // Handle other overlays
+                    // Handle other overlays (generic scroll/close)
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
                         KeyCode::Down => app.overlay_scroll_down(),
                         KeyCode::Up => app.overlay_scroll_up(),
-                        KeyCode::Char('a') => {
-                            if let Overlay::SuggestionDetail { suggestion_id, .. } = &app.overlay {
-                                let suggestion_id = *suggestion_id;
-                                if let Some(suggestion) = app.suggestions.suggestions.iter().find(|s| s.id == suggestion_id) {
-                                    if !suggest::llm::is_available() {
-                                        app.show_toast("Run: cosmos --setup");
-                                    } else {
-                                        if let Err(e) = app.config.allow_ai(app.session_cost) {
-                                            app.show_toast(&e);
-                                            continue;
-                                        }
-                                        // Phase 1: Generate quick preview (fast)
-                                        let file_path = suggestion.file.clone();
-                                        let summary = suggestion.summary.clone();
-                                        let suggestion_clone = suggestion.clone();
-                                        let tx_preview = tx.clone();
-                                        let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
-                                        
-                                        app.loading = LoadingState::GeneratingPreview;
-                                        app.close_overlay();
-                                        
-                                        tokio::spawn(async move {
-                                            let mem = if repo_memory_context.trim().is_empty() {
-                                                None
-                                            } else {
-                                                Some(repo_memory_context)
-                                            };
-                                            match suggest::llm::generate_fix_preview(&file_path, &suggestion_clone, None, mem).await {
-                                                Ok(preview) => {
-                                                    let _ = tx_preview.send(BackgroundMessage::PreviewReady {
-                                                        suggestion_id,
-                                                        file_path,
-                                                        summary,
-                                                        preview,
-                                                    });
-                                                }
-                                                Err(e) => {
-                                                    let _ = tx_preview.send(BackgroundMessage::PreviewError(e.to_string()));
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        KeyCode::Char('d') => {
-                            if let Overlay::SuggestionDetail { suggestion_id, .. } = &app.overlay {
-                                let id = *suggestion_id;
-                                app.suggestions.dismiss(id);
-                                app.show_toast("Dismissed");
-                                app.close_overlay();
-                            }
-                        }
                         _ => {}
                     }
                     continue;
@@ -2159,8 +1854,11 @@ app.suggestions.sort_with_context(&app.context);
                     KeyCode::Char('q') => app.should_quit = true,
                     KeyCode::Tab => app.toggle_panel(),
                     KeyCode::Down => {
-                        // Handle navigation based on workflow step
-                        if app.active_panel == ActivePanel::Suggestions {
+                        // Handle ask cosmos scroll first
+                        if app.is_ask_cosmos_mode() {
+                            app.ask_cosmos_scroll_down();
+                        } else if app.active_panel == ActivePanel::Suggestions {
+                            // Handle navigation based on workflow step
                             match app.workflow_step {
                                 WorkflowStep::Review if !app.review_state.reviewing && !app.review_state.fixing => {
                                     app.review_cursor_down();
@@ -2179,8 +1877,11 @@ app.suggestions.sort_with_context(&app.context);
                         }
                     }
                     KeyCode::Up => {
-                        // Handle navigation based on workflow step
-                        if app.active_panel == ActivePanel::Suggestions {
+                        // Handle ask cosmos scroll first
+                        if app.is_ask_cosmos_mode() {
+                            app.ask_cosmos_scroll_up();
+                        } else if app.active_panel == ActivePanel::Suggestions {
+                            // Handle navigation based on workflow step
                             match app.workflow_step {
                                 WorkflowStep::Review if !app.review_state.reviewing && !app.review_state.fixing => {
                                     app.review_cursor_up();
@@ -2275,13 +1976,14 @@ app.suggestions.sort_with_context(&app.context);
                                                     }
                                                     let suggestion_id = suggestion.id;
                                                     let file_path = suggestion.file.clone();
+                                                    let additional_files = suggestion.additional_files.clone();
                                                     let summary = suggestion.summary.clone();
                                                     let suggestion_clone = suggestion.clone();
                                                     let tx_preview = tx.clone();
                                                     let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
                                                     
-                                                    // Move to Verify step
-                                                    app.start_verify(suggestion_id, file_path.clone(), summary.clone());
+                                                    // Move to Verify step (with multi-file support)
+                                                    app.start_verify_multi(suggestion_id, file_path.clone(), additional_files, summary.clone());
                                                     
                                                     tokio::spawn(async move {
                                                         let mem = if repo_memory_context.trim().is_empty() {
@@ -2337,53 +2039,150 @@ app.suggestions.sort_with_context(&app.context);
                                                                 }
                                                             };
                                                             
-                                                            let full_path = repo_path.join(&fp);
-                                                            let content = match std::fs::read_to_string(&full_path) {
-                                                                Ok(c) => c,
-                                                                Err(e) => {
-                                                                    let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!("Failed to read file: {}", e)));
-                                                                    return;
-                                                                }
-                                                            };
-                                                            
                                                             let mem = if repo_memory_context.trim().is_empty() { None } else { Some(repo_memory_context) };
-                                                            match suggest::llm::generate_fix_content(&fp, &content, &suggestion, &preview, mem).await {
-                                                                Ok(applied_fix) => {
-                                                                    let backup_path = full_path.with_extension("cosmos.bak");
-                                                                    if let Err(e) = std::fs::copy(&full_path, &backup_path) {
-                                                                        let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!("Failed to create backup: {}", e)));
+                                                            
+                                                            // Check if this is a multi-file suggestion
+                                                            if suggestion.is_multi_file() {
+                                                                // Multi-file fix
+                                                                let all_files = suggestion.affected_files();
+                                                                
+                                                                // Read all file contents
+                                                                let mut file_contents: Vec<(PathBuf, String)> = Vec::new();
+                                                                for file_path in &all_files {
+                                                                    let full_path = repo_path.join(file_path);
+                                                                    match std::fs::read_to_string(&full_path) {
+                                                                        Ok(content) => file_contents.push(((*file_path).clone(), content)),
+                                                                        Err(e) => {
+                                                                            let _ = tx_apply.send(BackgroundMessage::DirectFixError(
+                                                                                format!("Failed to read {}: {}", file_path.display(), e)
+                                                                            ));
+                                                                            return;
+                                                                        }
+                                                                    }
+                                                                }
+                                                                
+                                                                // Generate multi-file fix
+                                                                match suggest::llm::generate_multi_file_fix(&file_contents, &suggestion, &preview, mem).await {
+                                                                    Ok(multi_fix) => {
+                                                                        // Backup all files first
+                                                                        let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new();
+                                                                        for file_edit in &multi_fix.file_edits {
+                                                                            let full_path = repo_path.join(&file_edit.path);
+                                                                            let backup_path = full_path.with_extension("cosmos.bak");
+                                                                            if let Err(e) = std::fs::copy(&full_path, &backup_path) {
+                                                                                // Rollback any backups we made
+                                                                                for (_, bp) in &backups {
+                                                                                    let _ = std::fs::remove_file(bp);
+                                                                                }
+                                                                                let _ = tx_apply.send(BackgroundMessage::DirectFixError(
+                                                                                    format!("Failed to backup {}: {}", file_edit.path.display(), e)
+                                                                                ));
+                                                                                return;
+                                                                            }
+                                                                            backups.push((file_edit.path.clone(), backup_path));
+                                                                        }
+                                                                        
+                                                                        // Apply all edits
+                                                                        let mut file_changes: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+                                                                        for file_edit in &multi_fix.file_edits {
+                                                                            let full_path = repo_path.join(&file_edit.path);
+                                                                            let backup_path = full_path.with_extension("cosmos.bak");
+                                                                            
+                                                                            match std::fs::write(&full_path, &file_edit.new_content) {
+                                                                                Ok(_) => {
+                                                                                    // Stage the file
+                                                                                    let rel_path = full_path.strip_prefix(&repo_path)
+                                                                                        .map(|p| p.to_string_lossy().to_string())
+                                                                                        .unwrap_or_else(|_| file_edit.path.to_string_lossy().to_string());
+                                                                                    let _ = git_ops::stage_file(&repo_path, &rel_path);
+                                                                                    
+                                                                                    let diff = format!("Modified: {}", file_edit.modified_areas.join(", "));
+                                                                                    file_changes.push((file_edit.path.clone(), backup_path, diff));
+                                                                                }
+                                                                                Err(e) => {
+                                                                                    // Rollback all changes
+                                                                                    for (path, backup) in &backups {
+                                                                                        let full = repo_path.join(path);
+                                                                                        let _ = std::fs::copy(backup, &full);
+                                                                                        let _ = std::fs::remove_file(backup);
+                                                                                    }
+                                                                                    let _ = tx_apply.send(BackgroundMessage::DirectFixError(
+                                                                                        format!("Failed to write {}: {}", file_edit.path.display(), e)
+                                                                                    ));
+                                                                                    return;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        
+                                                                        let safety_checks = crate::safe_apply::run(&repo_path);
+                                                                        
+                                                                        let _ = tx_apply.send(BackgroundMessage::DirectFixApplied {
+                                                                            suggestion_id: sid,
+                                                                            file_changes,
+                                                                            description: multi_fix.description,
+                                                                            safety_checks,
+                                                                            usage: multi_fix.usage,
+                                                                            branch_name: created_branch,
+                                                                            friendly_title: preview.friendly_title.clone(),
+                                                                            problem_summary: preview.problem_summary.clone(),
+                                                                            outcome: preview.outcome.clone(),
+                                                                        });
+                                                                    }
+                                                                    Err(e) => {
+                                                                        let _ = tx_apply.send(BackgroundMessage::DirectFixError(e.to_string()));
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                // Single-file fix (original logic)
+                                                                let full_path = repo_path.join(&fp);
+                                                                let content = match std::fs::read_to_string(&full_path) {
+                                                                    Ok(c) => c,
+                                                                    Err(e) => {
+                                                                        let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!("Failed to read file: {}", e)));
                                                                         return;
                                                                     }
-                                                                    
-                                                                    match std::fs::write(&full_path, &applied_fix.new_content) {
-                                                                        Ok(_) => {
-                                                                            let rel_path = full_path.strip_prefix(&repo_path)
-                                                                                .map(|p| p.to_string_lossy().to_string())
-                                                                                .unwrap_or_else(|_| fp.to_string_lossy().to_string());
-                                                                            let _ = git_ops::stage_file(&repo_path, &rel_path);
-                                                                            
-                                                                            let safety_checks = crate::safe_apply::run(&repo_path);
-                                                                            
-                                                                            let _ = tx_apply.send(BackgroundMessage::DirectFixApplied {
-                                                                                suggestion_id: sid,
-                                                                                file_path: fp,
-                                                                                description: applied_fix.description,
-                                                                                modified_areas: applied_fix.modified_areas,
-                                                                                backup_path,
-                                                                                safety_checks,
-                                                                                usage: applied_fix.usage,
-                                                                                branch_name: created_branch,
-                                                                            });
+                                                                };
+                                                                
+                                                                match suggest::llm::generate_fix_content(&fp, &content, &suggestion, &preview, mem).await {
+                                                                    Ok(applied_fix) => {
+                                                                        let backup_path = full_path.with_extension("cosmos.bak");
+                                                                        if let Err(e) = std::fs::copy(&full_path, &backup_path) {
+                                                                            let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!("Failed to create backup: {}", e)));
+                                                                            return;
                                                                         }
-                                                                        Err(e) => {
-                                                                            let _ = std::fs::copy(&backup_path, &full_path);
-                                                                            let _ = std::fs::remove_file(&backup_path);
-                                                                            let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!("Failed to write fix: {}", e)));
+                                                                        
+                                                                        match std::fs::write(&full_path, &applied_fix.new_content) {
+                                                                            Ok(_) => {
+                                                                                let rel_path = full_path.strip_prefix(&repo_path)
+                                                                                    .map(|p| p.to_string_lossy().to_string())
+                                                                                    .unwrap_or_else(|_| fp.to_string_lossy().to_string());
+                                                                                let _ = git_ops::stage_file(&repo_path, &rel_path);
+                                                                                
+                                                                                let safety_checks = crate::safe_apply::run(&repo_path);
+                                                                                let diff = format!("Modified: {}", applied_fix.modified_areas.join(", "));
+                                                                                
+                                                                                let _ = tx_apply.send(BackgroundMessage::DirectFixApplied {
+                                                                                    suggestion_id: sid,
+                                                                                    file_changes: vec![(fp, backup_path, diff)],
+                                                                                    description: applied_fix.description,
+                                                                                    safety_checks,
+                                                                                    usage: applied_fix.usage,
+                                                                                    branch_name: created_branch,
+                                                                                    friendly_title: preview.friendly_title.clone(),
+                                                                                    problem_summary: preview.problem_summary.clone(),
+                                                                                    outcome: preview.outcome.clone(),
+                                                                                });
+                                                                            }
+                                                                            Err(e) => {
+                                                                                let _ = std::fs::copy(&backup_path, &full_path);
+                                                                                let _ = std::fs::remove_file(&backup_path);
+                                                                                let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!("Failed to write fix: {}", e)));
+                                                                            }
                                                                         }
                                                                     }
-                                                                }
-                                                                Err(e) => {
-                                                                    let _ = tx_apply.send(BackgroundMessage::DirectFixError(e.to_string()));
+                                                                    Err(e) => {
+                                                                        let _ = tx_apply.send(BackgroundMessage::DirectFixError(e.to_string()));
+                                                                    }
                                                                 }
                                                             }
                                                         });
@@ -2392,8 +2191,50 @@ app.suggestions.sort_with_context(&app.context);
                                             }
                                         }
                                         WorkflowStep::Review => {
-                                            // If review passed, move to Ship
-                                            if app.review_passed() {
+                                            // If findings are selected, fix them; otherwise move to Ship
+                                            if !app.review_state.reviewing
+                                               && !app.review_state.fixing
+                                               && !app.review_state.selected.is_empty() {
+                                                // Fix selected findings (same as 'f' key)
+                                                let selected_findings = app.get_selected_review_findings();
+                                                let file = app.review_state.file_path.clone();
+                                                let content = app.review_state.new_content.clone();
+                                                let original = app.review_state.original_content.clone();
+                                                let iter = app.review_state.review_iteration;
+                                                let fixed = app.review_state.fixed_titles.clone();
+                                                let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
+                                                let memory = if repo_memory_context.trim().is_empty() { None } else { Some(repo_memory_context) };
+                                                let tx_fix = tx.clone();
+
+                                                if let Some(file_path) = file {
+                                                    app.set_review_fixing(true);
+
+                                                    tokio::spawn(async move {
+                                                        let orig_ref = if iter > 1 { Some(original.as_str()) } else { None };
+                                                        match suggest::llm::fix_review_findings(
+                                                            &file_path, 
+                                                            &content,
+                                                            orig_ref,
+                                                            &selected_findings,
+                                                            memory,
+                                                            iter,
+                                                            &fixed,
+                                                        ).await {
+                                                            Ok(fix) => {
+                                                                let _ = tx_fix.send(BackgroundMessage::VerificationFixComplete {
+                                                                    new_content: fix.new_content,
+                                                                    description: fix.description,
+                                                                    usage: fix.usage,
+                                                                });
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = tx_fix.send(BackgroundMessage::Error(e.to_string()));
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                            } else if app.review_passed() || app.review_state.selected.is_empty() {
+                                                // No selections or review passed - move to Ship
                                                 app.start_ship();
                                             }
                                         }
@@ -2405,37 +2246,32 @@ app.suggestions.sort_with_context(&app.context);
                                                     let repo_path = app.repo_path.clone();
                                                     let branch_name = app.ship_state.branch_name.clone();
                                                     let commit_message = app.ship_state.commit_message.clone();
+                                                    let (pr_title, pr_body) = app.generate_pr_content();
                                                     let tx_ship = tx.clone();
-                                                    
+
                                                     app.set_ship_step(ui::ShipStep::Committing);
-                                                    
+
                                                     tokio::spawn(async move {
                                                         // Execute ship workflow
                                                         let _ = tx_ship.send(BackgroundMessage::ShipProgress(ui::ShipStep::Committing));
-                                                        
+
                                                         // Commit (files are already staged)
                                                         if let Err(e) = git_ops::commit(&repo_path, &commit_message) {
                                                             let _ = tx_ship.send(BackgroundMessage::ShipError(e.to_string()));
                                                             return;
                                                         }
-                                                        
+
                                                         let _ = tx_ship.send(BackgroundMessage::ShipProgress(ui::ShipStep::Pushing));
-                                                        
+
                                                         // Push
                                                         if let Err(e) = git_ops::push_branch(&repo_path, &branch_name) {
                                                             let _ = tx_ship.send(BackgroundMessage::ShipError(e.to_string()));
                                                             return;
                                                         }
-                                                        
+
                                                         let _ = tx_ship.send(BackgroundMessage::ShipProgress(ui::ShipStep::CreatingPR));
-                                                        
-                                                        // Create PR with descriptive body from commit message
-                                                        let pr_title = commit_message.lines().next()
-                                                            .unwrap_or("Cosmos fix").to_string();
-                                                        let pr_body = format!(
-                                                            "## Summary\n\n{}\n\n---\n*Applied with Cosmos*",
-                                                            commit_message
-                                                        );
+
+                                                        // Create PR with human-friendly content
                                                         match git_ops::create_pr(&repo_path, &pr_title, &pr_body) {
                                                             Ok(url) => {
                                                                 let _ = tx_ship.send(BackgroundMessage::ShipComplete(url));
@@ -2462,8 +2298,11 @@ app.suggestions.sort_with_context(&app.context);
                         }
                     }
                     KeyCode::Esc => {
-                        // Handle workflow back navigation
-                        if app.active_panel == ActivePanel::Suggestions && app.workflow_step != WorkflowStep::Suggestions {
+                        // Handle ask cosmos mode exit first
+                        if app.is_ask_cosmos_mode() {
+                            app.exit_ask_cosmos();
+                        } else if app.active_panel == ActivePanel::Suggestions && app.workflow_step != WorkflowStep::Suggestions {
+                            // Handle workflow back navigation
                             app.workflow_back();
                         } else if !app.search_query.is_empty() {
                             app.exit_search();
@@ -2476,17 +2315,12 @@ app.suggestions.sort_with_context(&app.context);
                     KeyCode::PageDown => app.page_down(),
                     KeyCode::PageUp => app.page_up(),
                     KeyCode::Char('?') => app.toggle_help(),
-                    KeyCode::Char('d') => app.dismiss_selected(),
                     KeyCode::Char('a') => {
-                        // Handle 'a' based on context
+                        // Select all findings in Review step
                         if app.active_panel == ActivePanel::Suggestions && app.workflow_step == WorkflowStep::Review {
-                            // Select all findings
                             if !app.review_state.reviewing && !app.review_state.fixing {
                                 app.review_select_all();
                             }
-                        } else {
-                            // Legacy: show suggestion detail (now use Enter to verify)
-                            app.show_suggestion_detail();
                         }
                     }
                     KeyCode::Char('i') => {
@@ -2496,29 +2330,6 @@ app.suggestions.sort_with_context(&app.context);
                             app.start_question();
                         }
                     }
-                    KeyCode::Char('b') => {
-                        // Branch workflow - create branch and commit pending changes
-                        // If already on a cosmos branch, this shows ship dialog
-                        app.show_branch_dialog();
-                    }
-                    KeyCode::Char('s') => {
-                        // Handle 's' based on context
-                        if app.active_panel == ActivePanel::Suggestions && app.workflow_step == WorkflowStep::Review {
-                            // Skip to Ship (skip remaining review findings)
-                            if !app.review_state.reviewing && !app.review_state.fixing {
-                                app.start_ship();
-                            }
-                        } else {
-                            // Legacy ship workflow
-                            if app.is_ready_to_ship() {
-                                app.show_ship_dialog();
-                            } else if app.pending_change_count() > 0 {
-                                app.show_toast("First apply a fix (creates branch), then ship");
-                            } else {
-                                app.show_toast("No changes to ship");
-                            }
-                        }
-                    }
                     KeyCode::Char('u') => {
                         // Undo the last applied change (restore backup)
                         match app.undo_last_pending_change() {
@@ -2526,35 +2337,9 @@ app.suggestions.sort_with_context(&app.context);
                             Err(e) => app.show_toast(&e),
                         }
                     }
-                    KeyCode::Char('c') => {
-                        // Git status - view and manage changed files
-                        app.show_git_status();
-                    }
-                    KeyCode::Char('m') => {
-                        // Switch to main branch (quick escape from fix branches)
-                        if app.is_on_main_branch() {
-                            app.show_toast("Already on main");
-                        } else {
-                            match app.git_switch_to_main() {
-                                Ok(_) => {
-                                    app.show_toast("Switched to main");
-                                    let _ = app.context.refresh();
-                                }
-                                Err(e) => app.show_toast(&e),
-                            }
-                        }
-                    }
-                    KeyCode::Char('M') => {
-                        // Repo memory (decisions/conventions)
-                        app.show_repo_memory();
-                    }
                     KeyCode::Char('R') => {
                         // Open reset cosmos overlay
                         app.open_reset_overlay();
-                    }
-                    KeyCode::Char('e') => {
-                        // Show error log overlay
-                        app.show_error_log();
                     }
                     _ => {}
                 }

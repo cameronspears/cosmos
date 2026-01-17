@@ -9,6 +9,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
+use unicode_width::UnicodeWidthStr;
 use super::theme::Theme;
 
 /// Parse markdown text and convert to styled Lines
@@ -131,7 +132,7 @@ fn wrap_and_parse_inline(text: &str, max_width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Simple text wrapping
+/// Simple text wrapping using Unicode display width
 fn wrap_text_simple(text: &str, max_width: usize) -> Vec<String> {
     if max_width == 0 {
         return vec![text.to_string()];
@@ -139,16 +140,21 @@ fn wrap_text_simple(text: &str, max_width: usize) -> Vec<String> {
     
     let mut lines = Vec::new();
     let mut current_line = String::new();
+    let mut current_width: usize = 0;
     
     for word in text.split_whitespace() {
+        let word_width = word.width();
         if current_line.is_empty() {
             current_line = word.to_string();
-        } else if current_line.len() + 1 + word.len() <= max_width {
+            current_width = word_width;
+        } else if current_width + 1 + word_width <= max_width {
             current_line.push(' ');
             current_line.push_str(word);
+            current_width += 1 + word_width;
         } else {
             lines.push(current_line);
             current_line = word.to_string();
+            current_width = word_width;
         }
     }
     

@@ -301,25 +301,25 @@ async fn call_llm_with_usage(
 }
 
 /// Ask cosmos a general question about the codebase
+/// Uses the Smart model for thoughtful, well-reasoned responses in plain English
 pub async fn ask_question(
     index: &CodebaseIndex,
     context: &WorkContext,
     question: &str,
     repo_memory: Option<String>,
 ) -> anyhow::Result<(String, Option<Usage>)> {
-    let system = r#"You are Cosmos, a contemplative companion for codebases. The developer is asking you a question about their code.
+    let system = r#"You are Cosmos, a thoughtful guide who helps people understand codebases without requiring technical knowledge.
 
-Respond thoughtfully and concisely. Be specific to their codebase when you can.
-Use the project context provided to give relevant answers.
-If the question is about specific files or code, reference them by path.
-Keep responses focused and actionable - developers appreciate brevity.
+The user is asking about their project. They may not be a developer, so:
+- Write in plain English sentences and paragraphs
+- Avoid code snippets, function names, and technical jargon
+- Explain concepts as you would to a curious colleague
+- Be conversational and helpful, not robotic
+- Focus on the "what" and "why", not the "how it's implemented"
+- Use analogies when they help clarify complex ideas
 
-Format your response with markdown for readability:
-- Use **bold** for emphasis
-- Use `code` for file names, functions, and code snippets
-- Use bullet points for lists
-- Use ### for section headers if needed
-- Keep it clean and scannable"#;
+Keep responses clear and well-organized. Use short paragraphs for readability.
+You may use **bold** for emphasis and bullet points for lists, but avoid code formatting."#;
 
     // Build context about the codebase
     let stats = index.stats();
@@ -328,7 +328,7 @@ Format your response with markdown for readability:
         .map(|p| p.display().to_string())
         .collect();
     
-    // Get symbols for context
+    // Get symbols for context (used internally, not exposed to user)
     let symbols: Vec<_> = index.files.values()
         .flat_map(|f| f.symbols.iter())
         .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Struct | SymbolKind::Enum))
@@ -339,19 +339,18 @@ Format your response with markdown for readability:
     let memory_section = repo_memory
         .as_deref()
         .filter(|m| !m.trim().is_empty())
-        .map(|m| format!("\n\nREPO MEMORY (follow these conventions):\n{}", m))
+        .map(|m| format!("\n\nPROJECT NOTES:\n{}", m))
         .unwrap_or_default();
 
     let user = format!(
         r#"PROJECT CONTEXT:
 - {} files, {} lines of code
-- {} symbols total
-- Branch: {}, {} uncommitted changes
-- Key files: {}
+- {} components/features total
+- Currently on: {}
+- Key areas: {}
 
-KEY SYMBOLS:
+INTERNAL STRUCTURE (for your reference, don't mention these names directly):
 {}
-
 {}
 
 QUESTION:
@@ -360,14 +359,13 @@ QUESTION:
         stats.total_loc,
         stats.symbol_count,
         context.branch,
-        context.modified_count,
         file_list.join(", "),
         symbols.join("\n"),
         memory_section,
         question
     );
 
-    let response = call_llm_with_usage(system, &user, Model::Speed, false).await?;
+    let response = call_llm_with_usage(system, &user, Model::Smart, false).await?;
     Ok((response.content, response.usage))
 }
 
@@ -558,6 +556,265 @@ fn truncate_for_error(s: &str) -> String {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  MULTI-FILE FIX GENERATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A single file's edit within a multi-file fix
+#[derive(Debug, Clone)]
+pub struct FileEdit {
+    pub path: PathBuf,
+    pub new_content: String,
+    pub modified_areas: Vec<String>,
+}
+
+/// Result of generating a multi-file fix
+#[derive(Debug, Clone)]
+pub struct MultiFileAppliedFix {
+    /// Human-readable description of what was changed
+    pub description: String,
+    /// Edits for each file
+    pub file_edits: Vec<FileEdit>,
+    /// Usage stats
+    pub usage: Option<Usage>,
+}
+
+/// Edits for a single file in the JSON response
+#[derive(Debug, Clone, Deserialize)]
+struct FileEditsJson {
+    file: String,
+    edits: Vec<EditOp>,
+}
+
+/// Generate coordinated fixes across multiple files
+/// 
+/// This function handles multi-file refactors like:
+/// - Renaming a function and updating all callers
+/// - Extracting shared code and updating imports
+/// - Interface changes that affect multiple files
+pub async fn generate_multi_file_fix(
+    files: &[(PathBuf, String)],  // (path, content) pairs
+    suggestion: &Suggestion,
+    plan: &FixPreview,
+    repo_memory: Option<String>,
+) -> anyhow::Result<MultiFileAppliedFix> {
+    let system = r#"You are a senior developer implementing a multi-file refactor. You've been given a plan - now implement coordinated changes across all files.
+
+OUTPUT FORMAT (JSON):
+{
+  "description": "1-2 sentence summary of what you changed across all files",
+  "file_edits": [
+    {
+      "file": "path/to/file.rs",
+      "edits": [
+        {
+          "old_string": "exact text to find and replace",
+          "new_string": "replacement text"
+        }
+      ]
+    }
+  ]
+}
+
+CRITICAL RULES FOR EDITS:
+- old_string must be EXACT text from the file (copy-paste precision)
+- old_string must be UNIQUE within its file - include enough context (3-5 lines)
+- new_string is what replaces it (can be same length, longer, or shorter)
+- Multiple edits per file are applied in order
+- Preserve indentation exactly - spaces and tabs matter
+- Do NOT include line numbers in old_string or new_string
+- Include ALL files that need changes - don't leave any file half-refactored
+
+MULTI-FILE CONSISTENCY:
+- Ensure renamed symbols match across all files
+- Update all import statements that reference moved/renamed items
+- Keep function signatures consistent between definition and call sites
+
+EXAMPLE - Renaming a function across files:
+{
+  "description": "Renamed process_batch to handle_batch_items and updated all callers",
+  "file_edits": [
+    {
+      "file": "src/processor.rs",
+      "edits": [
+        {
+          "old_string": "pub fn process_batch(",
+          "new_string": "pub fn handle_batch_items("
+        }
+      ]
+    },
+    {
+      "file": "src/main.rs",
+      "edits": [
+        {
+          "old_string": "processor::process_batch(",
+          "new_string": "processor::handle_batch_items("
+        }
+      ]
+    }
+  ]
+}"#;
+
+    let plan_text = format!(
+        "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
+        if plan.verified { "CONFIRMED" } else { "UNCONFIRMED" },
+        plan.verification_note,
+        plan.description,
+        plan.scope.label(),
+        plan.affected_areas.join(", "),
+        plan.modifier.as_ref().map(|m| format!("\nUser modifications: {}", m)).unwrap_or_default()
+    );
+
+    let memory_section = repo_memory
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+        .map(|m| format!("\n\nRepo conventions / decisions:\n{}", m))
+        .unwrap_or_default();
+
+    // Build the files section
+    let files_section: String = files.iter()
+        .map(|(path, content)| format!("=== {} ===\n```\n{}\n```", path.display(), content))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let user = format!(
+        "Original Issue: {}\n{}\n{}\n\n{}\n\nFILES TO MODIFY:\n\n{}\n\nImplement the fix using search/replace edits for each file. Ensure consistency across all files.",
+        suggestion.summary,
+        suggestion.detail.as_deref().unwrap_or(""),
+        memory_section,
+        plan_text,
+        files_section
+    );
+
+    let response = call_llm_with_usage(system, &user, Model::Smart, true).await?;
+    
+    // Parse the JSON response
+    let json_str = extract_json_object(&response.content)
+        .ok_or_else(|| anyhow::anyhow!("No JSON found in multi-file fix response"))?;
+    
+    let parsed: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse multi-file fix JSON: {}", e))?;
+    
+    let description = parsed.get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Applied the requested multi-file fix")
+        .to_string();
+    
+    // Parse file edits
+    let file_edits_json: Vec<FileEditsJson> = parsed.get("file_edits")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'file_edits' array in response"))?;
+    
+    if file_edits_json.is_empty() {
+        return Err(anyhow::anyhow!("No file edits provided in response"));
+    }
+    
+    // Apply edits to each file
+    let mut file_edits = Vec::new();
+    
+    for file_edit_json in file_edits_json {
+        let file_path = PathBuf::from(&file_edit_json.file);
+        
+        // Find the original content for this file
+        let original_content = files.iter()
+            .find(|(p, _)| {
+                // Match by file name or full path
+                p == &file_path || 
+                p.file_name() == file_path.file_name() ||
+                p.ends_with(&file_path)
+            })
+            .map(|(_, content)| content.as_str())
+            .ok_or_else(|| anyhow::anyhow!("File {} not found in provided files", file_edit_json.file))?;
+        
+        // Apply edits sequentially
+        let mut new_content = original_content.to_string();
+        let mut modified_areas = Vec::new();
+        
+        for (i, edit) in file_edit_json.edits.iter().enumerate() {
+            let matches: Vec<_> = new_content.match_indices(&edit.old_string).collect();
+            
+            if matches.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Edit {} in {}: old_string not found.\nSearched for: {:?}",
+                    i + 1,
+                    file_edit_json.file,
+                    truncate_for_error(&edit.old_string)
+                ));
+            }
+            
+            if matches.len() > 1 {
+                return Err(anyhow::anyhow!(
+                    "Edit {} in {}: old_string matches {} times (must be unique).\nSearched for: {:?}",
+                    i + 1,
+                    file_edit_json.file,
+                    matches.len(),
+                    truncate_for_error(&edit.old_string)
+                ));
+            }
+            
+            new_content = new_content.replacen(&edit.old_string, &edit.new_string, 1);
+            
+            // Try to extract function/area name from the edit
+            if let Some(area) = extract_modified_area(&edit.old_string) {
+                if !modified_areas.contains(&area) {
+                    modified_areas.push(area);
+                }
+            }
+        }
+        
+        // Normalize whitespace
+        let mut new_content: String = new_content
+            .lines()
+            .map(|line| line.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !new_content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        
+        if new_content.trim().is_empty() {
+            return Err(anyhow::anyhow!("Generated content for {} is empty", file_edit_json.file));
+        }
+        
+        file_edits.push(FileEdit {
+            path: file_path,
+            new_content,
+            modified_areas,
+        });
+    }
+    
+    Ok(MultiFileAppliedFix {
+        description,
+        file_edits,
+        usage: response.usage,
+    })
+}
+
+/// Try to extract a function/struct name from an edit string
+fn extract_modified_area(old_string: &str) -> Option<String> {
+    // Look for common patterns like "fn name(", "pub fn name(", "struct Name", etc.
+    let patterns = [
+        (r"fn\s+(\w+)\s*\(", 1),
+        (r"pub\s+fn\s+(\w+)\s*\(", 1),
+        (r"struct\s+(\w+)", 1),
+        (r"impl\s+(\w+)", 1),
+        (r"trait\s+(\w+)", 1),
+        (r"enum\s+(\w+)", 1),
+    ];
+    
+    for (pattern, group) in patterns {
+        if let Ok(re) = regex::Regex::new(pattern) {
+            if let Some(caps) = re.captures(old_string) {
+                if let Some(m) = caps.get(group) {
+                    return Some(m.as_str().to_string());
+                }
+            }
+        }
+    }
+    
+    None
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  FAST FIX PREVIEW (Phase 1 of two-phase fix)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -566,6 +823,16 @@ fn truncate_for_error(s: &str) -> String {
 pub struct FixPreview {
     /// Whether the issue was verified to exist in the code
     pub verified: bool,
+    
+    // ─── User-facing fields (non-technical) ───────────────────────────────
+    /// Friendly topic name for non-technical users (e.g. "Batch Processing")
+    pub friendly_title: String,
+    /// Behavior-focused problem description (what happens, not how code works)
+    pub problem_summary: String,
+    /// What happens after the fix (outcome, not implementation)
+    pub outcome: String,
+    
+    // ─── Technical fields (for internal/developer use) ────────────────────
     /// Explanation of verification result
     pub verification_note: String,
     /// Code snippet that proves the claim (evidence)
@@ -620,6 +887,9 @@ pub async fn generate_fix_preview(
 OUTPUT FORMAT (JSON):
 {
   "verified": true,
+  "friendly_title": "Batch Processing",
+  "problem_summary": "When processing multiple items at once, if any single item fails, all remaining items are abandoned.",
+  "outcome": "Each item will be handled independently - one failure won't stop the rest from completing.",
   "verification_note": "Brief explanation of whether the issue was found and where",
   "evidence_snippet": "const BATCH_SIZE = 1000;",
   "evidence_line": 42,
@@ -630,10 +900,20 @@ OUTPUT FORMAT (JSON):
 
 RULES:
 - verified: boolean true if issue exists, false if it doesn't exist or was already fixed
-- verification_note: explain what you found
+- friendly_title: A short, non-technical topic name (2-4 words). NO file names, NO function names.
+- problem_summary: Describe what HAPPENS (behavior) not HOW it works (code). Write for someone who doesn't know programming. 1-2 sentences max.
+- outcome: Describe what will be DIFFERENT after the fix. Focus on the result, not the implementation. 1 sentence.
+- verification_note: explain what you found (technical, for internal use)
 - evidence_snippet: 1-3 lines of the ACTUAL code from the file that proves your claim. Only include the relevant code, not surrounding context. Omit if no specific code evidence is needed.
 - evidence_line: the line number where the evidence snippet starts
 - scope: one of "small", "medium", or "large"
+
+IMPORTANT for friendly_title, problem_summary, and outcome:
+- Write for a NON-TECHNICAL audience who doesn't know programming
+- NEVER use: function names, variable names, file names, code syntax
+- NEVER use: try/catch, Promise, async/await, callback, API, endpoint, etc.
+- Describe BEHAVIOR (what happens to the user/system) not IMPLEMENTATION (what code does)
+- Use simple, everyday language
 
 Be concise. The verification note should explain the finding in plain English. The evidence snippet shows proof."#;
 
@@ -687,6 +967,22 @@ fn parse_fix_preview(response: &str, modifier: Option<String>) -> anyhow::Result
         .unwrap_or(if verified { "Issue verified" } else { "Issue not found" })
         .to_string();
 
+    // Parse user-facing fields (non-technical)
+    let friendly_title = parsed.get("friendly_title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Issue")
+        .to_string();
+
+    let problem_summary = parsed.get("problem_summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("An issue was found that needs attention.")
+        .to_string();
+
+    let outcome = parsed.get("outcome")
+        .and_then(|v| v.as_str())
+        .unwrap_or("This will be fixed.")
+        .to_string();
+
     let evidence_snippet = parsed.get("evidence_snippet")
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
@@ -718,6 +1014,9 @@ fn parse_fix_preview(response: &str, modifier: Option<String>) -> anyhow::Result
 
     Ok(FixPreview {
         verified,
+        friendly_title,
+        problem_summary,
+        outcome,
         verification_note,
         evidence_snippet,
         evidence_line,
@@ -752,28 +1051,48 @@ OUTPUT FORMAT (JSON array, 5-10 suggestions):
 [
   {
     "file": "relative/path/to/file.rs",
+    "additional_files": ["other/file.rs"],
     "kind": "improvement|bugfix|feature|optimization|quality|documentation|testing",
     "priority": "high|medium|low",
-    "summary": "REQUIRED 3-PART FORMAT: [code location] → [technical problem] → [user/business impact]",
-    "detail": "Brief explanation with specific guidance",
+    "summary": "Plain-language description of the problem and its impact on users",
+    "detail": "Technical explanation with specific guidance for developers",
     "line": null or specific line number if applicable
   }
 ]
 
-SUMMARY FORMAT (REQUIRED - all 3 parts in every summary):
-"[function/code location] → [technical problem] → [user/business impact]"
+MULTI-FILE SUGGESTIONS:
+Use "additional_files" when a change requires coordinated edits across multiple files:
+- Renaming a function/type and updating all callers
+- Extracting shared code into a new module and updating imports
+- Fixing an interface change that affects multiple implementations
+- Refactoring that requires updating both definition and usage sites
+Leave "additional_files" empty or omit it for single-file changes.
+
+SUMMARY FORMAT - WRITE FOR NON-TECHNICAL READERS:
+Describe what HAPPENS to users, not what code does. A product manager should understand this.
 
 GOOD EXAMPLES:
-- "processEmailQueue() in jobs/email.rs → throws on empty batch, no catch → Dump Alert emails never send, users miss price drops"
-- "calculateTrimmedMean() in stats.rs → divides by zero when dataset < trim_count → Analytics page crashes, users see error instead of stats"
-- "TaskQueue.run() in queue.rs → no catch on individual task errors → one failure kills all queued jobs, batch imports hang forever"
-- "send_notification() in notify.rs → no retry on 5xx from Resend API → transient API issues cause silent notification failures"
+- "When processing a batch of items, if one item fails, all remaining items are skipped and never processed"
+- "Price alerts sometimes fail to send during brief network hiccups, so users miss time-sensitive deals"
+- "The trading calculator shows invalid results when there's not enough price history, confusing users"
+- "Bulk imports can hang indefinitely if a single record has bad data, with no indication of what went wrong"
 
-BAD EXAMPLES (rejected - too vague):
-- "Division by zero possible" (WHICH function? WHAT breaks for users?)
-- "Error handling issue" (WHERE? WHAT's the impact?)
-- "Missing retry logic" (for WHAT? WHY should I care?)
-- "Could cause silent failures" (WHAT fails? WHO notices?)
+BAD EXAMPLES (rejected - too technical):
+- "processEmailQueue() throws on empty batch" (users don't know what functions are)
+- "divides by zero when dataset < trim_count" (technical jargon)
+- "no retry logic for Resend API 5xx errors" (meaningless to non-developers)
+- "Promise.all rejects" or "async/await" or "try/catch" (code concepts)
+
+NEVER USE IN SUMMARIES:
+- Function names, variable names, or file names
+- Technical terms: API, async, callback, exception, null, undefined, NaN, array, object
+- Code concepts: try/catch, Promise, error handling, retry logic, race condition
+- Jargon: 5xx, 4xx, HTTP, JSON, SQL, query, endpoint
+
+INSTEAD, DESCRIBE:
+- What the user sees or experiences
+- What action fails or behaves unexpectedly
+- What business outcome is affected
 
 WHAT TO LOOK FOR (aim for variety):
 - **Bugs & Edge Cases**: Race conditions, off-by-one errors, null/None handling, error swallowing
@@ -783,17 +1102,17 @@ WHAT TO LOOK FOR (aim for variety):
 - **User Experience**: Error messages that don't help, missing loading states
 
 AVOID:
+- Technical jargon in summaries (save that for the "detail" field)
+- Function names, code syntax, or programming concepts in summaries
 - "Split this file" or "break this function up" unless it's genuinely causing problems
 - Generic advice like "add more comments" or "improve naming"
 - Suggestions that would just make the code "cleaner" without real benefit
-- Anything a linter would catch
-- Vague summaries that don't name specific code or explain user impact
 
 PRIORITIZE:
 - Files marked [CHANGED] - the developer is actively working there
 - Things that could cause bugs or outages
 - Quick wins that provide immediate value
-- Use DOMAIN TERMINOLOGY when provided (these are this project's specific terms)"#;
+- Use DOMAIN TERMINOLOGY when provided (use this project's specific business terms, not code terms)"#;
 
     let user_prompt = build_codebase_context(index, context, repo_memory.as_deref(), glossary);
     
@@ -1063,6 +1382,10 @@ fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<Suggestion>>
             };
 
             let file_path = PathBuf::from(&s.file);
+            let additional_files: Vec<PathBuf> = s.additional_files
+                .into_iter()
+                .map(|f| PathBuf::from(f))
+                .collect();
             
             let mut suggestion = Suggestion::new(
                 kind,
@@ -1071,7 +1394,8 @@ fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<Suggestion>>
                 s.summary,
                 SuggestionSource::LlmDeep,
             )
-            .with_detail(s.detail);
+            .with_detail(s.detail)
+            .with_additional_files(additional_files);
 
             if let Some(line) = s.line {
                 suggestion = suggestion.with_line(line);
@@ -1087,6 +1411,8 @@ fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<Suggestion>>
 #[derive(Deserialize)]
 struct CodebaseSuggestionJson {
     file: String,
+    #[serde(default)]
+    additional_files: Vec<String>,
     kind: String,
     priority: String,
     summary: String,
@@ -2227,8 +2553,20 @@ OUTPUT FORMAT (JSON):
 {{
   "summary": "Brief assessment - be concise",
   "pass": true,
-  "findings": []
-}}"#,
+  "findings": [
+    {{
+      "file": "path/to/file.rs",
+      "line": 42,
+      "severity": "warning",
+      "category": "bug",
+      "title": "Short description",
+      "description": "Plain language explanation",
+      "recommended": true
+    }}
+  ]
+}}
+
+If no issues found, use "findings": []"#,
             fixed_list = if fixed_titles.is_empty() {
                 "(none recorded)".to_string()
             } else {

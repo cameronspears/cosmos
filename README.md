@@ -75,7 +75,6 @@ cosmos --setup
 | Key | Action |
 |-----|--------|
 | `a` | Apply suggestion (generates preview first) |
-| `d` | Dismiss suggestion |
 | `i` | Inquiry — ask AI a question about your code |
 | `u` | Undo last applied change |
 | `r` | Refresh context |
@@ -120,7 +119,7 @@ A focused, time-boxed improvement session:
 cosmos ritual --minutes 10
 ```
 
-Presents a curated queue of suggestions. Work through them one by one. Mark as done, skip, or dismiss.
+Presents a curated queue of suggestions. Work through them one by one. Mark as done or skip.
 
 ### Ship Workflow
 

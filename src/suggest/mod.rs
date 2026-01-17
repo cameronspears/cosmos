@@ -118,7 +118,11 @@ pub struct Suggestion {
     pub id: Uuid,
     pub kind: SuggestionKind,
     pub priority: Priority,
+    /// Primary file (used for display/grouping)
     pub file: PathBuf,
+    /// Additional files affected by this suggestion (for multi-file refactors)
+    #[serde(default)]
+    pub additional_files: Vec<PathBuf>,
     pub line: Option<usize>,
     pub summary: String,
     pub detail: Option<String>,
@@ -143,6 +147,7 @@ impl Suggestion {
             kind,
             priority,
             file,
+            additional_files: Vec::new(),
             line: None,
             summary,
             detail: None,
@@ -163,12 +168,40 @@ impl Suggestion {
         self
     }
 
+    pub fn with_additional_files(mut self, files: Vec<PathBuf>) -> Self {
+        self.additional_files = files;
+        self
+    }
+
+    /// Get all files affected by this suggestion (primary + additional)
+    pub fn affected_files(&self) -> Vec<&PathBuf> {
+        std::iter::once(&self.file)
+            .chain(self.additional_files.iter())
+            .collect()
+    }
+
+    /// Check if this is a multi-file suggestion
+    pub fn is_multi_file(&self) -> bool {
+        !self.additional_files.is_empty()
+    }
+
+    /// Get the total number of files affected
+    pub fn file_count(&self) -> usize {
+        1 + self.additional_files.len()
+    }
+
     /// Format for display in the suggestion list
     pub fn display_summary(&self) -> String {
-        if let Some(line) = self.line {
-            format!("{}:{} - {}", self.file.display(), line, self.summary)
+        let file_indicator = if self.is_multi_file() {
+            format!(" [{}]", self.file_count())
         } else {
-            format!("{} - {}", self.file.display(), self.summary)
+            String::new()
+        };
+        
+        if let Some(line) = self.line {
+            format!("{}:{}{} - {}", self.file.display(), line, file_indicator, self.summary)
+        } else {
+            format!("{}{} - {}", self.file.display(), file_indicator, self.summary)
         }
     }
 }
@@ -215,11 +248,14 @@ impl SuggestionEngine {
         self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
     }
 
-    /// Get suggestions for a specific file
+    /// Get suggestions for a specific file (includes multi-file suggestions that affect this file)
     pub fn suggestions_for_file(&self, path: &PathBuf) -> Vec<&Suggestion> {
         self.suggestions
             .iter()
-            .filter(|s| &s.file == path && !s.dismissed && !s.applied)
+            .filter(|s| {
+                !s.dismissed && !s.applied && 
+                (&s.file == path || s.additional_files.contains(path))
+            })
             .collect()
     }
 
