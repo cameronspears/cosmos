@@ -70,7 +70,7 @@ impl Model {
     pub fn max_tokens(&self) -> u32 {
         MODEL_MAX_TOKENS
     }
-    
+
     pub fn display_name(&self) -> &'static str {
         match self {
             Model::Speed => "speed",
@@ -79,7 +79,7 @@ impl Model {
             Model::Reviewer => "reviewer",
         }
     }
-    
+
     /// Calculate cost in USD based on token usage
     pub fn calculate_cost(&self, prompt_tokens: u32, completion_tokens: u32) -> f64 {
         let (input_rate, output_rate) = match self {
@@ -88,10 +88,10 @@ impl Model {
             Model::Smart => (SMART_INPUT_COST, SMART_OUTPUT_COST),
             Model::Reviewer => (REVIEWER_INPUT_COST, REVIEWER_OUTPUT_COST),
         };
-        
+
         let input_cost = (prompt_tokens as f64 / 1_000_000.0) * input_rate;
         let output_cost = (completion_tokens as f64 / 1_000_000.0) * output_rate;
-        
+
         input_cost + output_cost
     }
 }
@@ -171,8 +171,8 @@ async fn call_llm(system: &str, user: &str, model: Model) -> anyhow::Result<Stri
 
 /// Rate limit retry configuration
 const MAX_RETRIES: u32 = 3;
-const INITIAL_BACKOFF_MS: u64 = 2000;  // 2 seconds
-const BACKOFF_MULTIPLIER: u64 = 2;     // Exponential backoff
+const BACKOFF_DELAYS_MS: [u64; 3] = [1000, 2000, 4000];  // 1s, 2s, 4s
+const JITTER_PERCENT: f64 = 0.20;  // ±20% randomization
 
 /// Extract retry-after hint from OpenRouter response (if present)
 fn parse_retry_after(text: &str) -> Option<u64> {
@@ -193,11 +193,34 @@ fn parse_retry_after(text: &str) -> Option<u64> {
     None
 }
 
+/// Calculate backoff delay with jitter for retry attempt
+fn calculate_backoff_with_jitter(retry_count: u32) -> u64 {
+    let base_delay = BACKOFF_DELAYS_MS
+        .get(retry_count.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or(BACKOFF_DELAYS_MS[BACKOFF_DELAYS_MS.len() - 1]);
+
+    // Add ±20% jitter using simple deterministic approach
+    // Use retry_count to vary the jitter direction
+    let jitter_factor = if retry_count % 2 == 0 {
+        1.0 + JITTER_PERCENT * (retry_count as f64 / MAX_RETRIES as f64)
+    } else {
+        1.0 - JITTER_PERCENT * (retry_count as f64 / MAX_RETRIES as f64)
+    };
+
+    (base_delay as f64 * jitter_factor) as u64
+}
+
+/// Check if an HTTP status code is retryable
+fn is_retryable_status(status_code: u16) -> bool {
+    status_code == 429 || (500..=599).contains(&status_code)
+}
+
 /// Call LLM API with full response including usage stats
 /// Includes automatic retry with exponential backoff for rate limits
 async fn call_llm_with_usage(
-    system: &str, 
-    user: &str, 
+    system: &str,
+    user: &str,
     model: Model,
     json_mode: bool,
 ) -> anyhow::Result<LlmResponse> {
@@ -235,7 +258,7 @@ async fn call_llm_with_usage(
 
     let mut last_error = String::new();
     let mut retry_count = 0;
-    
+
     while retry_count <= MAX_RETRIES {
         // Build request with OpenRouter headers
         let response = client
@@ -256,7 +279,7 @@ async fn call_llm_with_usage(
                 .first()
                 .map(|c| c.message.content.clone())
                 .ok_or_else(|| anyhow::anyhow!("No response from AI"))?;
-            
+
             return Ok(LlmResponse {
                 content,
                 usage: chat_response.usage,
@@ -266,30 +289,37 @@ async fn call_llm_with_usage(
 
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        
-        // Handle rate limiting with retry
-        if status.as_u16() == 429 && retry_count < MAX_RETRIES {
+
+        // Handle retryable errors (429 rate limit and 5xx server errors)
+        let status_code = status.as_u16();
+        if is_retryable_status(status_code) && retry_count < MAX_RETRIES {
             retry_count += 1;
-            
-            // Calculate backoff delay
-            let retry_after = parse_retry_after(&text);
-            let backoff_secs = retry_after.unwrap_or_else(|| {
-                INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(retry_count - 1) / 1000
-            });
-            
+
+            // Calculate backoff delay with jitter
+            let backoff_ms = if status_code == 429 {
+                // For rate limits, respect retry-after header if present
+                parse_retry_after(&text)
+                    .map(|secs| secs * 1000)
+                    .unwrap_or_else(|| calculate_backoff_with_jitter(retry_count))
+            } else {
+                // For 5xx errors, use standard backoff with jitter
+                calculate_backoff_with_jitter(retry_count)
+            };
+
             // Log the retry attempt (this will be visible in error log if it ultimately fails)
+            let error_type = if status_code == 429 { "Rate limited" } else { "Server error" };
             last_error = format!(
-                "Rate limited by OpenRouter (attempt {}/{}). Retrying in {}s...",
-                retry_count, MAX_RETRIES + 1, backoff_secs
+                "{} by OpenRouter (attempt {}/{}). Retrying in {}ms...",
+                error_type, retry_count, MAX_RETRIES + 1, backoff_ms
             );
-            
+
             // Wait before retrying
-            tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
             continue;
         }
-        
+
         // Non-retryable error or max retries exceeded
-        let error_msg = match status.as_u16() {
+        let error_msg = match status_code {
             401 => {
                 "Invalid API key. Run 'cosmos --setup' to update it.".to_string()
             }
@@ -300,13 +330,20 @@ async fn call_llm_with_usage(
                 )
             }
             500..=599 => {
-                format!("OpenRouter server error ({}). The service may be temporarily unavailable.", status)
+                if retry_count >= MAX_RETRIES {
+                    format!(
+                        "OpenRouter server error ({}) after {} retries. The service may be temporarily unavailable.",
+                        status, retry_count
+                    )
+                } else {
+                    format!("OpenRouter server error ({}). The service may be temporarily unavailable.", status)
+                }
             }
             _ => format!("API error {}: {}", status, truncate_str(&text, 200)),
         };
         return Err(anyhow::anyhow!("{}", error_msg));
     }
-    
+
     // Should not reach here, but handle it gracefully
     Err(anyhow::anyhow!("{}", last_error))
 }
@@ -338,7 +375,7 @@ You may use **bold** for emphasis and bullet points for lists, but avoid code fo
         .take(50)  // Limit to avoid huge prompts
         .map(|p| p.display().to_string())
         .collect();
-    
+
     // Get symbols for context (used internally, not exposed to user)
     let symbols: Vec<_> = index.files.values()
         .flat_map(|f| f.symbols.iter())
@@ -477,39 +514,39 @@ EXAMPLE - Adding a null check:
     );
 
     let response = call_llm_with_usage(system, &user, Model::Smart, true).await?;
-    
+
     // Parse the JSON response
     let json_str = extract_json_object(&response.content)
         .ok_or_else(|| anyhow::anyhow!("No JSON found in fix response"))?;
-    
+
     let parsed: serde_json::Value = serde_json::from_str(json_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse fix JSON: {}", e))?;
-    
+
     let description = parsed.get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("Applied the requested fix")
         .to_string();
-    
+
     let modified_areas = parsed.get("modified_areas")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    
+
     // Parse and apply edits
     let edits: Vec<EditOp> = parsed.get("edits")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'edits' array in response"))?;
-    
+
     if edits.is_empty() {
         return Err(anyhow::anyhow!("No edits provided in response"));
     }
-    
+
     // Apply edits sequentially with validation
     let mut new_content = content.to_string();
     for (i, edit) in edits.iter().enumerate() {
         // Validate old_string exists exactly once
         let matches: Vec<_> = new_content.match_indices(&edit.old_string).collect();
-        
+
         if matches.is_empty() {
             return Err(anyhow::anyhow!(
                 "Edit {}: old_string not found in file. The LLM may have made an error.\nSearched for: {:?}",
@@ -517,7 +554,7 @@ EXAMPLE - Adding a null check:
                 truncate_for_error(&edit.old_string)
             ));
         }
-        
+
         if matches.len() > 1 {
             return Err(anyhow::anyhow!(
                 "Edit {}: old_string matches {} times (must be unique). Need more context.\nSearched for: {:?}",
@@ -526,11 +563,11 @@ EXAMPLE - Adding a null check:
                 truncate_for_error(&edit.old_string)
             ));
         }
-        
+
         // Apply the replacement
         new_content = new_content.replacen(&edit.old_string, &edit.new_string, 1);
     }
-    
+
     // Strip trailing whitespace from each line and ensure file ends with newline
     let mut new_content: String = new_content
         .lines()
@@ -540,12 +577,12 @@ EXAMPLE - Adding a null check:
     if !new_content.ends_with('\n') {
         new_content.push('\n');
     }
-    
+
     // Validate the new content isn't empty
     if new_content.trim().is_empty() {
         return Err(anyhow::anyhow!("Generated content is empty"));
     }
-    
+
     Ok(AppliedFix {
         description,
         new_content,
@@ -597,7 +634,7 @@ struct FileEditsJson {
 }
 
 /// Generate coordinated fixes across multiple files
-/// 
+///
 /// This function handles multi-file refactors like:
 /// - Renaming a function and updating all callers
 /// - Extracting shared code and updating imports
@@ -697,52 +734,52 @@ EXAMPLE - Renaming a function across files:
     );
 
     let response = call_llm_with_usage(system, &user, Model::Smart, true).await?;
-    
+
     // Parse the JSON response
     let json_str = extract_json_object(&response.content)
         .ok_or_else(|| anyhow::anyhow!("No JSON found in multi-file fix response"))?;
-    
+
     let parsed: serde_json::Value = serde_json::from_str(json_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse multi-file fix JSON: {}", e))?;
-    
+
     let description = parsed.get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("Applied the requested multi-file fix")
         .to_string();
-    
+
     // Parse file edits
     let file_edits_json: Vec<FileEditsJson> = parsed.get("file_edits")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'file_edits' array in response"))?;
-    
+
     if file_edits_json.is_empty() {
         return Err(anyhow::anyhow!("No file edits provided in response"));
     }
-    
+
     // Apply edits to each file
     let mut file_edits = Vec::new();
-    
+
     for file_edit_json in file_edits_json {
         let file_path = PathBuf::from(&file_edit_json.file);
-        
+
         // Find the original content for this file
         let original_content = files.iter()
             .find(|(p, _)| {
                 // Match by file name or full path
-                p == &file_path || 
+                p == &file_path ||
                 p.file_name() == file_path.file_name() ||
                 p.ends_with(&file_path)
             })
             .map(|(_, content)| content.as_str())
             .ok_or_else(|| anyhow::anyhow!("File {} not found in provided files", file_edit_json.file))?;
-        
+
         // Apply edits sequentially
         let mut new_content = original_content.to_string();
         let mut modified_areas = Vec::new();
-        
+
         for (i, edit) in file_edit_json.edits.iter().enumerate() {
             let matches: Vec<_> = new_content.match_indices(&edit.old_string).collect();
-            
+
             if matches.is_empty() {
                 return Err(anyhow::anyhow!(
                     "Edit {} in {}: old_string not found.\nSearched for: {:?}",
@@ -751,7 +788,7 @@ EXAMPLE - Renaming a function across files:
                     truncate_for_error(&edit.old_string)
                 ));
             }
-            
+
             if matches.len() > 1 {
                 return Err(anyhow::anyhow!(
                     "Edit {} in {}: old_string matches {} times (must be unique).\nSearched for: {:?}",
@@ -761,9 +798,9 @@ EXAMPLE - Renaming a function across files:
                     truncate_for_error(&edit.old_string)
                 ));
             }
-            
+
             new_content = new_content.replacen(&edit.old_string, &edit.new_string, 1);
-            
+
             // Try to extract function/area name from the edit
             if let Some(area) = extract_modified_area(&edit.old_string) {
                 if !modified_areas.contains(&area) {
@@ -771,7 +808,7 @@ EXAMPLE - Renaming a function across files:
                 }
             }
         }
-        
+
         // Normalize whitespace
         let mut new_content: String = new_content
             .lines()
@@ -781,18 +818,18 @@ EXAMPLE - Renaming a function across files:
         if !new_content.ends_with('\n') {
             new_content.push('\n');
         }
-        
+
         if new_content.trim().is_empty() {
             return Err(anyhow::anyhow!("Generated content for {} is empty", file_edit_json.file));
         }
-        
+
         file_edits.push(FileEdit {
             path: file_path,
             new_content,
             modified_areas,
         });
     }
-    
+
     Ok(MultiFileAppliedFix {
         description,
         file_edits,
@@ -811,7 +848,7 @@ fn extract_modified_area(old_string: &str) -> Option<String> {
         (r"trait\s+(\w+)", 1),
         (r"enum\s+(\w+)", 1),
     ];
-    
+
     for (pattern, group) in patterns {
         if let Ok(re) = regex::Regex::new(pattern) {
             if let Some(caps) = re.captures(old_string) {
@@ -821,7 +858,7 @@ fn extract_modified_area(old_string: &str) -> Option<String> {
             }
         }
     }
-    
+
     None
 }
 
@@ -834,7 +871,7 @@ fn extract_modified_area(old_string: &str) -> Option<String> {
 pub struct FixPreview {
     /// Whether the issue was verified to exist in the code
     pub verified: bool,
-    
+
     // ─── User-facing fields (non-technical) ───────────────────────────────
     /// Friendly topic name for non-technical users (e.g. "Batch Processing")
     pub friendly_title: String,
@@ -842,7 +879,7 @@ pub struct FixPreview {
     pub problem_summary: String,
     /// What happens after the fix (outcome, not implementation)
     pub outcome: String,
-    
+
     // ─── Technical fields (for internal/developer use) ────────────────────
     /// Explanation of verification result
     pub verification_note: String,
@@ -871,11 +908,11 @@ impl FixScope {
     pub fn label(&self) -> &'static str {
         match self {
             FixScope::Small => "small",
-            FixScope::Medium => "medium", 
+            FixScope::Medium => "medium",
             FixScope::Large => "large",
         }
     }
-    
+
     pub fn icon(&self) -> &'static str {
         match self {
             FixScope::Small => "·",
@@ -1043,11 +1080,11 @@ fn parse_fix_preview(response: &str, modifier: Option<String>) -> anyhow::Result
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Analyze entire codebase with @preset/smart for quality suggestions
-/// 
+///
 /// This is the main entry point for generating high-quality suggestions.
 /// Uses smart context building to pack maximum insight into the prompt.
 /// Returns suggestions and usage stats for cost tracking.
-/// 
+///
 /// The optional `glossary` provides domain-specific terminology to help
 /// the LLM use the correct terms in suggestion summaries.
 pub async fn analyze_codebase(
@@ -1126,18 +1163,18 @@ PRIORITIZE:
 - Use DOMAIN TERMINOLOGY when provided (use this project's specific business terms, not code terms)"#;
 
     let user_prompt = build_codebase_context(index, context, repo_memory.as_deref(), glossary);
-    
+
     // Use Smart preset for quality reasoning on suggestions
     let response = call_llm_with_usage(system, &user_prompt, Model::Smart, true).await?;
-    
+
     let suggestions = parse_codebase_suggestions(&response.content)?;
     Ok((suggestions, response.usage))
 }
 
 /// Build rich context from codebase index for the LLM prompt
 fn build_codebase_context(
-    index: &CodebaseIndex, 
-    context: &WorkContext, 
+    index: &CodebaseIndex,
+    context: &WorkContext,
     repo_memory: Option<&str>,
     glossary: Option<&DomainGlossary>,
 ) -> String {
@@ -1145,9 +1182,9 @@ fn build_codebase_context(
     let project_name = index.root.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("project");
-    
+
     let mut sections = Vec::new();
-    
+
     // Header with overview
     sections.push(format!(
         "CODEBASE: {} ({} files, {} LOC)\nBRANCH: {} | FOCUS: {}",
@@ -1157,7 +1194,7 @@ fn build_codebase_context(
         context.branch,
         context.inferred_focus.as_deref().unwrap_or("general"),
     ));
-    
+
     // Uncommitted changes FIRST (highest priority)
     if !context.uncommitted_files.is_empty() || !context.staged_files.is_empty() {
         let mut changes_section = String::from("\n\nACTIVELY WORKING ON [CHANGED]:");
@@ -1230,7 +1267,7 @@ fn build_codebase_context(
             sections.push(format!("\n\n{}", glossary_context));
         }
     }
-    
+
     // Recent commits for understanding what's being worked on
     if !context.recent_commits.is_empty() {
         let mut commits_section = String::from("\n\nRECENT COMMITS:");
@@ -1243,28 +1280,28 @@ fn build_codebase_context(
         }
         sections.push(commits_section);
     }
-    
+
     // Key files with their purpose (not just metrics)
     let mut files_section = String::from("\n\nKEY FILES:");
     let files_by_priority = index.files_by_priority();
-    
+
     for (path, file_index) in files_by_priority.iter().take(25) {
         let is_changed = context.all_changed_files().iter().any(|f| f == path);
         if is_changed { continue; } // Already listed above
-        
+
         // Get public exports to understand what this file does
         let exports: Vec<_> = file_index.symbols.iter()
             .filter(|s| s.visibility == crate::index::Visibility::Public)
             .take(4)
             .map(|s| s.name.as_str())
             .collect();
-        
-        let exports_str = if exports.is_empty() { 
-            String::new() 
-        } else { 
-            format!(" → {}", exports.join(", ")) 
+
+        let exports_str = if exports.is_empty() {
+            String::new()
+        } else {
+            format!(" → {}", exports.join(", "))
         };
-        
+
         files_section.push_str(&format!(
             "\n- {} ({} LOC){}",
             path.display(),
@@ -1273,13 +1310,13 @@ fn build_codebase_context(
         ));
     }
     sections.push(files_section);
-    
+
     // TODOs and FIXMEs found in code (actionable items from the developer)
     let todos: Vec<_> = index.patterns.iter()
         .filter(|p| matches!(p.kind, PatternKind::TodoMarker))
         .take(10)
         .collect();
-    
+
     if !todos.is_empty() {
         let mut todos_section = String::from("\n\nTODO/FIXME MARKERS IN CODE:");
         for todo in &todos {
@@ -1292,14 +1329,14 @@ fn build_codebase_context(
         }
         sections.push(todos_section);
     }
-    
+
     // Final instruction - open-ended
     sections.push(String::from(
         "\n\nLook for bugs, security issues, performance problems, missing error handling, \
          UX improvements, and feature opportunities. Prioritize the [CHANGED] files (and BLAST RADIUS). \
          Give me varied, specific suggestions - not just code organization advice."
     ));
-    
+
     sections.join("")
 }
 
@@ -1397,7 +1434,7 @@ fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<Suggestion>>
                 .into_iter()
                 .map(|f| PathBuf::from(f))
                 .collect();
-            
+
             let mut suggestion = Suggestion::new(
                 kind,
                 priority,
@@ -1448,20 +1485,20 @@ fn truncate_str(s: &str, max_chars: usize) -> &str {
 /// Try to fix common JSON issues from LLM responses
 fn fix_json_issues(json: &str) -> String {
     let mut fixed = json.to_string();
-    
+
     // Remove trailing commas before ] or }
     fixed = fixed.replace(",]", "]");
     fixed = fixed.replace(",}", "}");
-    
+
     // Fix common quote issues - smart quotes to regular quotes
     fixed = fixed.replace('\u{201C}', "\"");  // Left double quote
     fixed = fixed.replace('\u{201D}', "\"");  // Right double quote
     fixed = fixed.replace('\u{2018}', "'");   // Left single quote
     fixed = fixed.replace('\u{2019}', "'");   // Right single quote
-    
+
     // Remove any control characters that might have slipped in
     fixed = fixed.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
-    
+
     fixed
 }
 
@@ -1470,7 +1507,7 @@ fn try_parse_individual_suggestions(json: &str) -> anyhow::Result<Vec<CodebaseSu
     let mut suggestions = Vec::new();
     let mut depth = 0;
     let mut start = None;
-    
+
     for (i, c) in json.char_indices() {
         match c {
             '{' => {
@@ -1494,7 +1531,7 @@ fn try_parse_individual_suggestions(json: &str) -> anyhow::Result<Vec<CodebaseSu
             _ => {}
         }
     }
-    
+
     Ok(suggestions)
 }
 
@@ -1605,27 +1642,27 @@ pub fn discover_project_context(index: &CodebaseIndex) -> String {
     let project_name = index.root.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("project");
-    
+
     let mut context_parts = Vec::new();
-    
+
     // 1. Try to read README.md
     let readme_content = try_read_readme(&index.root);
     if let Some(readme) = readme_content {
         context_parts.push(readme);
     }
-    
+
     // 2. Try to read package description from Cargo.toml, package.json, etc.
     let package_desc = try_read_package_description(&index.root);
     if let Some(desc) = package_desc {
         context_parts.push(desc);
     }
-    
+
     // 3. Analyze file structure for domain hints
     let structure_hints = analyze_project_structure(index);
     if !structure_hints.is_empty() {
         context_parts.push(structure_hints);
     }
-    
+
     // Combine and truncate
     if context_parts.is_empty() {
         format!("Project: {}", project_name)
@@ -1644,7 +1681,7 @@ pub fn discover_project_context(index: &CodebaseIndex) -> String {
 fn try_read_readme(root: &std::path::Path) -> Option<String> {
     // Try common README filenames
     let readme_names = ["README.md", "readme.md", "README.MD", "README", "readme"];
-    
+
     for name in readme_names {
         let path = root.join(name);
         if path.exists() {
@@ -1662,7 +1699,7 @@ fn extract_readme_summary(content: &str) -> String {
     let mut in_code_block = false;
     let mut found_header = false;
     let mut line_count = 0;
-    
+
     for line in content.lines() {
         // Skip code blocks
         if line.starts_with("```") {
@@ -1672,37 +1709,37 @@ fn extract_readme_summary(content: &str) -> String {
         if in_code_block {
             continue;
         }
-        
+
         // Skip badges and empty lines at the start
         if !found_header && (line.trim().is_empty() || line.contains("![") || line.contains("[![")) {
             continue;
         }
-        
+
         // Found meaningful content
         found_header = true;
-        
+
         // Skip table of contents style lines
         if line.starts_with("- [") || line.starts_with("* [") {
             continue;
         }
-        
+
         // Add line
         let trimmed = line.trim();
         if !trimmed.is_empty() {
             result.push(trimmed.to_string());
             line_count += 1;
         }
-        
+
         // Get first ~10 meaningful lines
         if line_count >= 10 {
             break;
         }
     }
-    
+
     if result.is_empty() {
         return String::new();
     }
-    
+
     format!("README:\n{}", result.join("\n"))
 }
 
@@ -1717,7 +1754,7 @@ fn try_read_package_description(root: &std::path::Path) -> Option<String> {
             }
         }
     }
-    
+
     // Try package.json
     let package_path = root.join("package.json");
     if package_path.exists() {
@@ -1727,7 +1764,7 @@ fn try_read_package_description(root: &std::path::Path) -> Option<String> {
             }
         }
     }
-    
+
     // Try pyproject.toml
     let pyproject_path = root.join("pyproject.toml");
     if pyproject_path.exists() {
@@ -1737,14 +1774,14 @@ fn try_read_package_description(root: &std::path::Path) -> Option<String> {
             }
         }
     }
-    
+
     None
 }
 
 fn extract_cargo_description(content: &str) -> Option<String> {
     let mut name = None;
     let mut description = None;
-    
+
     for line in content.lines() {
         let line = line.trim();
         if line.starts_with("name = ") {
@@ -1754,7 +1791,7 @@ fn extract_cargo_description(content: &str) -> Option<String> {
             description = line.split('"').nth(1).map(|s| s.to_string());
         }
     }
-    
+
     match (name, description) {
         (Some(n), Some(d)) => Some(format!("Package: {} - {}", n, d)),
         (Some(n), None) => Some(format!("Package: {}", n)),
@@ -1767,7 +1804,7 @@ fn extract_package_json_description(content: &str) -> Option<String> {
     // Simple JSON parsing for name and description
     let mut name = None;
     let mut description = None;
-    
+
     for line in content.lines() {
         let line = line.trim();
         if line.starts_with("\"name\"") {
@@ -1781,7 +1818,7 @@ fn extract_package_json_description(content: &str) -> Option<String> {
                 .map(|s| s.to_string());
         }
     }
-    
+
     match (name, description) {
         (Some(n), Some(d)) => Some(format!("Package: {} - {}", n, d)),
         (Some(n), None) => Some(format!("Package: {}", n)),
@@ -1793,7 +1830,7 @@ fn extract_package_json_description(content: &str) -> Option<String> {
 fn extract_pyproject_description(content: &str) -> Option<String> {
     let mut name = None;
     let mut description = None;
-    
+
     for line in content.lines() {
         let line = line.trim();
         if line.starts_with("name = ") {
@@ -1803,7 +1840,7 @@ fn extract_pyproject_description(content: &str) -> Option<String> {
             description = line.split('"').nth(1).map(|s| s.to_string());
         }
     }
-    
+
     match (name, description) {
         (Some(n), Some(d)) => Some(format!("Project: {} - {}", n, d)),
         (Some(n), None) => Some(format!("Project: {}", n)),
@@ -1815,7 +1852,7 @@ fn extract_pyproject_description(content: &str) -> Option<String> {
 /// Analyze project structure for domain hints
 fn analyze_project_structure(index: &CodebaseIndex) -> String {
     let mut hints = Vec::new();
-    
+
     // Count files by directory
     let mut dir_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for path in index.files.keys() {
@@ -1824,22 +1861,22 @@ fn analyze_project_structure(index: &CodebaseIndex) -> String {
             *dir_counts.entry(dir).or_insert(0) += 1;
         }
     }
-    
+
     // Identify key directories
     let key_dirs: Vec<_> = dir_counts.iter()
         .filter(|(_, count)| **count > 2)
         .map(|(dir, count)| format!("{} ({} files)", dir, count))
         .take(5)
         .collect();
-    
+
     if !key_dirs.is_empty() {
         hints.push(format!("Key directories: {}", key_dirs.join(", ")));
     }
-    
+
     // Identify technologies
     let mut technologies = Vec::new();
     let files: Vec<_> = index.files.keys().collect();
-    
+
     if files.iter().any(|p| p.extension().map(|e| e == "rs").unwrap_or(false)) {
         technologies.push("Rust");
     }
@@ -1855,14 +1892,14 @@ fn analyze_project_structure(index: &CodebaseIndex) -> String {
     if files.iter().any(|p| p.extension().map(|e| e == "go").unwrap_or(false)) {
         technologies.push("Go");
     }
-    
+
     if !technologies.is_empty() {
         hints.push(format!("Technologies: {}", technologies.join(", ")));
     }
-    
+
     // File count summary
     hints.push(format!("Total: {} files, {} symbols", index.files.len(), index.symbols.len()));
-    
+
     hints.join("\n")
 }
 
@@ -1879,10 +1916,10 @@ pub struct SummaryBatchResult {
 }
 
 /// Generate rich, context-aware summaries for all files in the codebase
-/// 
+///
 /// Uses batched approach (4 files per call) for reliability.
 /// Returns all summaries, domain glossary, and total usage stats.
-/// 
+///
 /// DEPRECATED: Use generate_file_summaries_incremental instead for caching support.
 #[allow(dead_code)]
 pub async fn generate_file_summaries(
@@ -1905,13 +1942,13 @@ pub async fn generate_summaries_for_files(
     let batch_size = 16;
     // Higher concurrency for faster processing (Speed preset handles this well)
     let concurrency = 4;
-    
+
     let batches: Vec<_> = files.chunks(batch_size).collect();
-    
+
     let mut all_summaries = HashMap::new();
     let mut glossary = DomainGlossary::new();
     let mut total_usage = Usage::default();
-    
+
     // Process batches with limited concurrency
     for batch_group in batches.chunks(concurrency) {
         // Run concurrent batches
@@ -1919,15 +1956,15 @@ pub async fn generate_summaries_for_files(
             .iter()
             .map(|batch| generate_summary_batch(index, batch, project_context))
             .collect();
-        
+
         let results = futures::future::join_all(futures).await;
-        
+
         for result in results {
             match result {
                 Ok(batch_result) => {
                     // Collect summaries
                     all_summaries.extend(batch_result.summaries.clone());
-                    
+
                     // Collect terms into glossary
                     for (term, definition) in batch_result.terms {
                         // Associate term with files from this batch
@@ -1935,7 +1972,7 @@ pub async fn generate_summaries_for_files(
                             glossary.add_term(term.clone(), definition.clone(), file.clone());
                         }
                     }
-                    
+
                     if let Some(usage) = batch_result.usage {
                         total_usage.prompt_tokens += usage.prompt_tokens;
                         total_usage.completion_tokens += usage.completion_tokens;
@@ -1949,13 +1986,13 @@ pub async fn generate_summaries_for_files(
             }
         }
     }
-    
+
     let final_usage = if total_usage.total_tokens > 0 {
         Some(total_usage)
     } else {
         None
     };
-    
+
     Ok((all_summaries, glossary, final_usage))
 }
 
@@ -1965,7 +2002,7 @@ pub async fn generate_summaries_for_files(
 pub enum SummaryPriority {
     /// Tier 1: Changed files, high complexity - summarize immediately
     High,
-    /// Tier 2: Files with suggestions, focus directories - summarize soon  
+    /// Tier 2: Files with suggestions, focus directories - summarize soon
     Medium,
     /// Tier 3: Everything else - background processing
     Low,
@@ -1980,9 +2017,9 @@ pub fn prioritize_files_for_summary(
     let mut high_priority = Vec::new();
     let mut medium_priority = Vec::new();
     let mut low_priority = Vec::new();
-    
+
     let changed_files: std::collections::HashSet<_> = context.all_changed_files().into_iter().collect();
-    
+
     for path in files_needing_summary {
         // Check if file is in the index
         let file_index = match index.files.get(path) {
@@ -1992,29 +2029,29 @@ pub fn prioritize_files_for_summary(
                 continue;
             }
         };
-        
+
         // Tier 1: Changed files or high complexity
         if changed_files.contains(path) || file_index.complexity > 20.0 || file_index.loc > 500 {
             high_priority.push(path.clone());
             continue;
         }
-        
+
         // Tier 2: Recent modification or in focus area
-        let is_recent = file_index.last_modified.timestamp() > 
+        let is_recent = file_index.last_modified.timestamp() >
             (chrono::Utc::now() - chrono::Duration::days(7)).timestamp();
         let in_focus = context.inferred_focus.as_ref()
             .map(|focus| path.to_string_lossy().contains(focus))
             .unwrap_or(false);
-        
+
         if is_recent || in_focus {
             medium_priority.push(path.clone());
             continue;
         }
-        
+
         // Tier 3: Everything else
         low_priority.push(path.clone());
     }
-    
+
     (high_priority, medium_priority, low_priority)
 }
 
@@ -2035,7 +2072,7 @@ ALSO extract domain-specific terminology - terms that are unique to THIS codebas
 - Custom abstractions (e.g., "TaskQueue" = background job system)
 - Domain entities (e.g., "Listing" = item for sale, "Watchlist" = user's tracked items)
 
-IMPORTANT: Use the PROJECT CONTEXT provided to understand what this codebase is for. 
+IMPORTANT: Use the PROJECT CONTEXT provided to understand what this codebase is for.
 Write definitive statements like "This file handles X" not vague guesses.
 Be specific and technical. Reference actual function/struct names.
 
@@ -2053,11 +2090,11 @@ OUTPUT: A JSON object with two keys:
 For "terms": only include 3-8 domain-specific terms per batch. Skip generic programming terms (like "Controller", "Service", "Handler"). Focus on business/domain concepts that need explanation."#;
 
     let user_prompt = build_batch_context(index, files, project_context);
-    
+
     let response = call_llm_with_usage(system, &user_prompt, Model::Speed, true).await?;
-    
+
     let (summaries, terms) = parse_summaries_and_terms_response(&response.content, &index.root)?;
-    
+
     Ok(SummaryBatchResult {
         summaries,
         terms,
@@ -2070,51 +2107,51 @@ fn build_batch_context(index: &CodebaseIndex, files: &[PathBuf], project_context
     let project_name = index.root.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("project");
-    
+
     let mut sections = Vec::new();
-    
+
     // Include project context at the top
     sections.push(format!(
         "PROJECT: {}\n\n=== PROJECT CONTEXT (use this to understand file purposes) ===\n{}\n=== END PROJECT CONTEXT ===\n\nFILES TO SUMMARIZE:",
         project_name,
         project_context
     ));
-    
+
     for path in files {
         if let Some(file_index) = index.files.get(path) {
             let func_count = file_index.symbols.iter()
                 .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
                 .count();
-            
+
             let struct_count = file_index.symbols.iter()
                 .filter(|s| matches!(s.kind, SymbolKind::Struct | SymbolKind::Class | SymbolKind::Interface | SymbolKind::Trait))
                 .count();
-            
+
             // Get public exports
             let exports: Vec<_> = file_index.symbols.iter()
                 .filter(|s| s.visibility == crate::index::Visibility::Public)
                 .take(6)
                 .map(|s| s.name.as_str())
                 .collect();
-            
+
             // Get imports
             let deps: Vec<_> = file_index.dependencies.iter()
                 .filter(|d| !d.is_external)
                 .take(4)
                 .map(|d| d.import_path.as_str())
                 .collect();
-            
-            let exports_str = if exports.is_empty() { 
-                "none".to_string() 
-            } else { 
-                exports.join(", ") 
+
+            let exports_str = if exports.is_empty() {
+                "none".to_string()
+            } else {
+                exports.join(", ")
             };
-            let deps_str = if deps.is_empty() { 
-                "none".to_string() 
-            } else { 
-                deps.join(", ") 
+            let deps_str = if deps.is_empty() {
+                "none".to_string()
+            } else {
+                deps.join(", ")
             };
-            
+
             sections.push(format!(
                 "\n---\nFILE: {}\n{} LOC | {} functions | {} structs\nExports: {}\nImports: {}",
                 path.display(),
@@ -2124,7 +2161,7 @@ fn build_batch_context(index: &CodebaseIndex, files: &[PathBuf], project_context
                 exports_str,
                 deps_str
             ));
-            
+
             // Add doc comments if available
             if let Ok(content) = std::fs::read_to_string(index.root.join(path)) {
                 let doc_lines: Vec<_> = content.lines()
@@ -2132,21 +2169,21 @@ fn build_batch_context(index: &CodebaseIndex, files: &[PathBuf], project_context
                     .filter(|l| l.starts_with("//!") || l.starts_with("///") || l.starts_with("#") || l.starts_with("\"\"\""))
                     .take(2)
                     .collect();
-                
+
                 if !doc_lines.is_empty() {
                     sections.push(format!("Doc: {}", doc_lines.join(" ")));
                 }
             }
         }
     }
-    
+
     sections.join("")
 }
 
 /// Extract JSON from LLM response, handling markdown fences and noise
 fn extract_json_object(response: &str) -> Option<&str> {
     let trimmed = response.trim();
-    
+
     // Remove markdown code fences
     let clean = if trimmed.starts_with("```json") {
         trimmed.strip_prefix("```json").unwrap_or(trimmed)
@@ -2155,19 +2192,19 @@ fn extract_json_object(response: &str) -> Option<&str> {
     } else {
         trimmed
     };
-    
+
     let clean = if clean.ends_with("```") {
         clean.strip_suffix("```").unwrap_or(clean)
     } else {
         clean
     };
-    
+
     let clean = clean.trim();
-    
+
     // Find JSON object boundaries
     let start = clean.find('{')?;
     let end = clean.rfind('}')?;
-    
+
     if start <= end {
         Some(&clean[start..=end])
     } else {
@@ -2208,7 +2245,7 @@ fn parse_summaries_response(response: &str, root: &Path) -> anyhow::Result<HashM
                 }
             }
         }
-        
+
         // If the wrapper is an object, try to extract string values directly
         // (handles case where LLM adds extra keys like "analysis" alongside file paths)
         if let Some(obj) = wrapper.as_object() {
@@ -2239,7 +2276,7 @@ fn parse_summaries_response(response: &str, root: &Path) -> anyhow::Result<HashM
 
 /// Parse response containing both summaries and domain terms
 fn parse_summaries_and_terms_response(
-    response: &str, 
+    response: &str,
     root: &Path
 ) -> anyhow::Result<(HashMap<PathBuf, String>, HashMap<String, String>)> {
     let json_str = extract_json_object(response)
@@ -2331,10 +2368,10 @@ pub struct VerificationReview {
 }
 
 /// Perform deep adversarial review of code changes using the Reviewer model
-/// 
+///
 /// This uses a different model (cognitive diversity) with adversarial prompting
 /// to find issues that the implementing model might have missed.
-/// 
+///
 /// On re-reviews (iteration > 1), the prompt is adjusted to focus on verifying fixes
 /// rather than finding entirely new issues.
 pub async fn verify_changes(
@@ -2468,10 +2505,10 @@ If no issues found, use "findings": []"#,
     let mut changes_text = String::new();
     for (path, old_content, new_content) in files_with_content {
         let file_name = path.display().to_string();
-        
+
         // Create a simple diff view
         changes_text.push_str(&format!("\n=== {} ===\n", file_name));
-        
+
         if old_content.is_empty() {
             // New file
             changes_text.push_str("(NEW FILE)\n");
@@ -2489,28 +2526,28 @@ If no issues found, use "findings": []"#,
     let user = format!("Review these code changes for bugs and issues:\n{}", changes_text);
 
     let response = call_llm_with_usage(&system, &user, Model::Reviewer, true).await?;
-    
+
     // Parse the response
     let json_str = extract_json_object(&response.content)
         .ok_or_else(|| anyhow::anyhow!("No JSON found in review response"))?;
-    
+
     #[derive(Deserialize)]
     struct ReviewResponse {
         summary: String,
         pass: Option<bool>,
         findings: Vec<ReviewFinding>,
     }
-    
+
     let parsed: ReviewResponse = serde_json::from_str(json_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse review JSON: {}", e))?;
-    
+
     // Determine pass based on findings if not explicitly set
     let pass = parsed.pass.unwrap_or_else(|| {
-        !parsed.findings.iter().any(|f| 
+        !parsed.findings.iter().any(|f|
             f.severity == "critical" || f.severity == "warning"
         )
     });
-    
+
     Ok(VerificationReview {
         findings: parsed.findings,
         summary: parsed.summary,
@@ -2530,7 +2567,7 @@ fn add_line_numbers(content: &str) -> String {
 }
 
 /// Fix selected review findings
-/// 
+///
 /// Takes the content and findings to address, returns fixed content.
 /// On later iterations, includes original content and fix history for better context.
 pub async fn fix_review_findings(
@@ -2603,7 +2640,7 @@ OUTPUT FORMAT (JSON):
 CRITICAL RULES FOR EDITS:
 - old_string must be EXACT text from the file (copy-paste precision)
 - old_string must be UNIQUE in the file - include enough context
-- Preserve indentation exactly  
+- Preserve indentation exactly
 - Fix the ROOT CAUSE this time, not just the symptom
 - Consider all edge cases the reviewer might check"#,
             fixed_list = if fixed_titles.is_empty() {
@@ -2651,55 +2688,55 @@ CRITICAL RULES FOR EDITS:
 
     // Always use Smart model for fixes - getting it right the first time saves iterations
     let response = call_llm_with_usage(&system, &user, Model::Smart, true).await?;
-    
+
     // Parse the JSON response
     let json_str = extract_json_object(&response.content)
         .ok_or_else(|| anyhow::anyhow!("No JSON found in fix response"))?;
-    
+
     let parsed: serde_json::Value = serde_json::from_str(json_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse fix JSON: {}", e))?;
-    
+
     let description = parsed.get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("Fixed review findings")
         .to_string();
-    
+
     let modified_areas = parsed.get("modified_areas")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    
+
     // Parse and apply edits
     let edits: Vec<EditOp> = parsed.get("edits")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'edits' array in response"))?;
-    
+
     if edits.is_empty() {
         return Err(anyhow::anyhow!("No edits provided in response"));
     }
-    
+
     // Apply edits sequentially with validation
     let mut new_content = content.to_string();
     for (i, edit) in edits.iter().enumerate() {
         let matches: Vec<_> = new_content.match_indices(&edit.old_string).collect();
-        
+
         if matches.is_empty() {
             return Err(anyhow::anyhow!(
                 "Edit {}: old_string not found in file.\nSearched for: {:?}",
                 i + 1, truncate_for_error(&edit.old_string)
             ));
         }
-        
+
         if matches.len() > 1 {
             return Err(anyhow::anyhow!(
                 "Edit {}: old_string matches {} times (must be unique).\nSearched for: {:?}",
                 i + 1, matches.len(), truncate_for_error(&edit.old_string)
             ));
         }
-        
+
         new_content = new_content.replacen(&edit.old_string, &edit.new_string, 1);
     }
-    
+
     // Normalize whitespace
     let mut new_content: String = new_content
         .lines()
@@ -2709,11 +2746,11 @@ CRITICAL RULES FOR EDITS:
     if !new_content.ends_with('\n') {
         new_content.push('\n');
     }
-    
+
     if new_content.trim().is_empty() {
         return Err(anyhow::anyhow!("Generated content is empty"));
     }
-    
+
     Ok(AppliedFix {
         description,
         new_content,
