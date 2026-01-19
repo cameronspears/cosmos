@@ -1,8 +1,5 @@
 //! Tree-sitter based parser for multi-language AST analysis
 
-#![allow(dead_code)]
-#![allow(unused_imports)]
-
 use super::{Dependency, Language, Symbol, SymbolKind, Visibility};
 use std::path::Path;
 use tree_sitter::Parser;

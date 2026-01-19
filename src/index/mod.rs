@@ -3,8 +3,6 @@
 //! Uses tree-sitter for multi-language AST parsing to build
 //! semantic understanding of the codebase.
 
-#![allow(dead_code)]
-
 pub mod parser;
 
 use chrono::{DateTime, Utc};
@@ -81,6 +79,7 @@ pub enum SymbolKind {
 }
 
 impl SymbolKind {
+    #[allow(dead_code)]
     pub fn icon(&self) -> char {
         match self {
             SymbolKind::Function | SymbolKind::Method => 'f',
@@ -153,6 +152,7 @@ impl PatternKind {
         }
     }
 
+    #[allow(dead_code)]
     pub fn description(&self) -> &'static str {
         match self {
             PatternKind::LongFunction => "Function exceeds 50 lines",
@@ -231,6 +231,7 @@ impl FileSummary {
     }
     
     /// Format for display in the UI
+    #[allow(dead_code)]
     pub fn display(&self) -> String {
         let mut lines = Vec::new();
         
@@ -852,15 +853,6 @@ impl CodebaseIndex {
         }
     }
 
-    /// Get file tree structure
-    pub fn file_tree(&self) -> FileTree {
-        let mut tree = FileTree::new();
-        for path in self.files.keys() {
-            tree.insert(path, &self.files[path]);
-        }
-        tree
-    }
-
     /// Apply grouping information to file indexes
     pub fn apply_grouping(&mut self, grouping: &crate::grouping::CodebaseGrouping) {
         for (path, assignment) in &grouping.file_assignments {
@@ -883,90 +875,15 @@ impl CodebaseIndex {
 pub struct IndexStats {
     pub file_count: usize,
     pub total_loc: usize,
+    #[allow(dead_code)]
     pub total_sloc: usize,
     pub symbol_count: usize,
     pub pattern_count: usize,
+    #[allow(dead_code)]
     pub high_priority_patterns: usize,
 }
 
-/// File tree structure for UI display
-#[derive(Debug, Clone, Default)]
-pub struct FileTree {
-    pub entries: Vec<FileTreeEntry>,
-}
-
-#[derive(Debug, Clone)]
-pub struct FileTreeEntry {
-    pub name: String,
-    pub path: PathBuf,
-    pub is_dir: bool,
-    pub depth: usize,
-    pub priority: char,
-    pub expanded: bool,
-    pub children: Vec<FileTreeEntry>,
-}
-
-impl FileTree {
-    pub fn new() -> Self {
-        Self { entries: Vec::new() }
-    }
-
-    pub fn insert(&mut self, path: &Path, file_index: &FileIndex) {
-        let components: Vec<_> = path.components().collect();
-        self.insert_recursive(&mut self.entries.clone(), &components, 0, file_index);
-    }
-
-    fn insert_recursive(
-        &mut self,
-        _entries: &mut Vec<FileTreeEntry>,
-        components: &[std::path::Component],
-        depth: usize,
-        file_index: &FileIndex,
-    ) {
-        // Simplified tree building - actual implementation would be more complex
-        if components.is_empty() {
-            return;
-        }
-
-        let name = components[0].as_os_str().to_string_lossy().to_string();
-        let is_last = components.len() == 1;
-        
-        let entry = FileTreeEntry {
-            name,
-            path: file_index.path.clone(),
-            is_dir: !is_last,
-            depth,
-            priority: if is_last { file_index.priority_indicator() } else { ' ' },
-            expanded: false,
-            children: Vec::new(),
-        };
-
-        self.entries.push(entry);
-    }
-
-    /// Flatten tree for display
-    pub fn flatten(&self) -> Vec<FlatTreeEntry> {
-        let mut result = Vec::new();
-        self.flatten_recursive(&self.entries, &mut result);
-        result
-    }
-
-    fn flatten_recursive(&self, entries: &[FileTreeEntry], result: &mut Vec<FlatTreeEntry>) {
-        for entry in entries {
-            result.push(FlatTreeEntry {
-                name: entry.name.clone(),
-                path: entry.path.clone(),
-                is_dir: entry.is_dir,
-                depth: entry.depth,
-                priority: entry.priority,
-            });
-            if entry.expanded {
-                self.flatten_recursive(&entry.children, result);
-            }
-        }
-    }
-}
-
+/// Flattened file tree entry for UI display
 #[derive(Debug, Clone)]
 pub struct FlatTreeEntry {
     pub name: String,

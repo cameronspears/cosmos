@@ -6,10 +6,7 @@
 //! - Layer 3: Grok Fast for categorization (~$0.0001/call)
 //! - Layer 4: LLM for deep analysis (Speed for analysis, Smart for code gen)
 
-#![allow(dead_code)]
-
 pub mod llm;
-pub mod static_rules;
 
 use crate::index::{CodebaseIndex, PatternSeverity};
 use chrono::{DateTime, Utc};
@@ -215,48 +212,12 @@ pub struct SuggestionEngine {
 impl SuggestionEngine {
     /// Create a new suggestion engine from a codebase index
     /// 
-    /// By default, starts empty - LLM suggestions are generated separately.
-    /// Static rules are available as fallback but not auto-generated.
+    /// Starts empty - LLM suggestions are generated separately.
     pub fn new(index: CodebaseIndex) -> Self {
         Self {
             suggestions: Vec::new(),
             index,
         }
-    }
-    
-    /// Create an empty suggestion engine (populated by LLM later)
-    pub fn new_empty(index: CodebaseIndex) -> Self {
-        Self {
-            suggestions: Vec::new(),
-            index,
-        }
-    }
-    
-    /// Generate suggestions from static analysis (no LLM)
-    /// 
-    /// Only used as fallback when LLM is unavailable (no API key).
-    /// These are intentionally minimal - we trust the LLM for real suggestions.
-    #[allow(dead_code)]
-    pub fn generate_static_suggestions(&mut self) {
-        // Only generate static suggestions for truly critical issues
-        for (path, file_index) in &self.index.files {
-            let static_suggestions = static_rules::analyze_file(path, file_index);
-            self.suggestions.extend(static_suggestions);
-        }
-
-        // Sort by priority (high first)
-        self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
-    }
-
-    /// Get suggestions for a specific file (includes multi-file suggestions that affect this file)
-    pub fn suggestions_for_file(&self, path: &PathBuf) -> Vec<&Suggestion> {
-        self.suggestions
-            .iter()
-            .filter(|s| {
-                !s.dismissed && !s.applied && 
-                (&s.file == path || s.additional_files.contains(path))
-            })
-            .collect()
     }
 
     /// Get all active suggestions (not dismissed/applied)
@@ -265,19 +226,6 @@ impl SuggestionEngine {
             .iter()
             .filter(|s| !s.dismissed && !s.applied)
             .collect()
-    }
-
-    /// Get suggestions grouped by file
-    pub fn suggestions_by_file(&self) -> std::collections::HashMap<PathBuf, Vec<&Suggestion>> {
-        let mut map: std::collections::HashMap<PathBuf, Vec<&Suggestion>> = std::collections::HashMap::new();
-        
-        for suggestion in self.active_suggestions() {
-            map.entry(suggestion.file.clone())
-                .or_default()
-                .push(suggestion);
-        }
-        
-        map
     }
 
     /// Get high priority suggestions
@@ -289,6 +237,7 @@ impl SuggestionEngine {
     }
 
     /// Dismiss a suggestion
+    #[allow(dead_code)]
     pub fn dismiss(&mut self, id: Uuid) {
         if let Some(s) = self.suggestions.iter_mut().find(|s| s.id == id) {
             s.dismissed = true;
@@ -395,6 +344,7 @@ impl SuggestionEngine {
 
 #[derive(Debug, Clone, Default)]
 pub struct SuggestionCounts {
+    #[allow(dead_code)]
     pub total: usize,
     pub high: usize,
     pub medium: usize,

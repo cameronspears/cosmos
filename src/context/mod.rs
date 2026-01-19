@@ -6,8 +6,6 @@
 //! - Current branch
 //! - Work-in-progress detection
 
-#![allow(dead_code)]
-
 use chrono::{DateTime, Utc};
 use git2::{Repository, StatusOptions};
 use serde::{Deserialize, Serialize};
@@ -33,7 +31,8 @@ pub struct WorkContext {
     pub uncommitted_files: Vec<PathBuf>,
     /// Files staged for commit
     pub staged_files: Vec<PathBuf>,
-    /// Untracked files
+    /// Untracked files (kept for potential future use)
+    #[allow(dead_code)]
     pub untracked_files: Vec<PathBuf>,
     /// Recent commits (last 5)
     pub recent_commits: Vec<CommitInfo>,
@@ -81,6 +80,7 @@ impl WorkContext {
     }
 
     /// Check if there are any uncommitted changes
+    #[allow(dead_code)]
     pub fn has_changes(&self) -> bool {
         !self.uncommitted_files.is_empty() || !self.staged_files.is_empty()
     }
@@ -94,6 +94,7 @@ impl WorkContext {
     }
 
     /// Get the most recently modified directories
+    #[allow(dead_code)]
     pub fn active_directories(&self) -> Vec<String> {
         let mut dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -118,6 +119,7 @@ impl WorkContext {
     }
 
     /// Format status for display
+    #[allow(dead_code)]
     pub fn status_line(&self) -> String {
         let mut parts = Vec::new();
 
@@ -135,6 +137,7 @@ impl WorkContext {
     }
 
     /// Get a summary of the work context
+    #[allow(dead_code)]
     pub fn summary(&self) -> String {
         let mut lines = Vec::new();
 
@@ -356,43 +359,9 @@ fn infer_focus(
     }
 }
 
-/// Moon phase indicator based on progress (for aesthetic)
-pub fn moon_phase(progress: f64) -> char {
-    // Progress from 0.0 to 1.0 maps to moon phases
-    match (progress * 8.0) as usize {
-        0 => '\u{1F311}', // 
-        1 => '\u{1F312}', // 
-        2 => '\u{1F313}', // 
-        3 => '\u{1F314}', // 
-        4 => '\u{1F315}', // 
-        5 => '\u{1F316}', // 
-        6 => '\u{1F317}', // 
-        7 => '\u{1F318}', // 
-        _ => '\u{1F315}', // 
-    }
-}
-
-/// Simpler moon phase with ASCII-safe characters
-pub fn moon_phase_simple(progress: f64) -> char {
-    match (progress * 4.0) as usize {
-        0 => '\u{25CB}', // 
-        1 => '\u{25D0}', // 
-        2 => '\u{25CF}', // 
-        3 => '\u{25D1}', // 
-        _ => '\u{25CF}', // 
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_moon_phases() {
-        assert_eq!(moon_phase_simple(0.0), '\u{25CB}');
-        assert_eq!(moon_phase_simple(0.5), '\u{25CF}');
-        assert_eq!(moon_phase_simple(1.0), '\u{25CF}');
-    }
 
     #[test]
     fn test_infer_focus() {

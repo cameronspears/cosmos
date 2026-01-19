@@ -349,16 +349,6 @@ pub fn reset_file(repo_path: &Path, file_path: &str) -> Result<()> {
 // Clean Main State Operations
 // ============================================================================
 
-/// Check if we're currently on main or master branch
-#[allow(dead_code)]
-pub fn is_on_main_branch(repo_path: &Path) -> Result<bool> {
-    let repo = Repository::open(repo_path)?;
-    let head = repo.head().context("Failed to get HEAD")?;
-    let branch = head.shorthand().unwrap_or("");
-    
-    Ok(branch == "main" || branch == "master")
-}
-
 /// Get the name of the main branch (main or master)
 pub fn get_main_branch_name(repo_path: &Path) -> Result<String> {
     let repo = Repository::open(repo_path)?;

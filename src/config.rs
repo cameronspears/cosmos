@@ -2,8 +2,6 @@
 //!
 //! Stores settings in ~/.config/codecosmos/config.json
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -85,6 +83,11 @@ impl Config {
         self.get_api_key().is_some()
     }
 
+    /// Validate API key format (should start with sk-)
+    pub fn validate_api_key_format(key: &str) -> bool {
+        key.starts_with("sk-")
+    }
+
     /// Refresh daily token counter if the day changed.
     pub fn ensure_daily_rollover(&mut self) {
         let today = chrono::Utc::now().date_naive().to_string();
@@ -142,7 +145,7 @@ pub fn setup_api_key_interactive() -> Result<String, String> {
     println!("  └─────────────────────────────────────────────────────────┘");
     println!();
     println!("  codecosmos uses OpenRouter for AI-powered suggestions.");
-    println!("  Uses @preset/speed for analysis, @preset/smart for code gen.");
+    println!("  Uses a 4-tier model system optimized for cost and quality.");
     println!();
     println!("  1. Get a free API key at: https://openrouter.ai/keys");
     println!("  2. Paste it below (it will be saved locally)");
@@ -158,8 +161,8 @@ pub fn setup_api_key_interactive() -> Result<String, String> {
         return Err("No API key provided".to_string());
     }
 
-    // Validate key format (should start with sk-)
-    if !key.starts_with("sk-") {
+    // Validate key format
+    if !Config::validate_api_key_format(&key) {
         println!();
         println!("  Warning: Key doesn't look like an OpenRouter key (should start with sk-)");
         println!("     Saving anyway...");

@@ -9,7 +9,6 @@ mod cache;
 mod config;
 mod context;
 mod grouping;
-mod history;
 mod index;
 mod onboarding;
 mod safe_apply;
@@ -114,10 +113,6 @@ pub enum BackgroundMessage {
     ShipComplete(String),
     /// Ship workflow error
     ShipError(String),
-    /// AI code review completed
-    ReviewReady(Vec<ui::PRReviewComment>),
-    /// PR created successfully
-    PRCreated(String), // PR URL
     /// Generic error (used for push/etc)
     Error(String),
     /// Response to a user question
@@ -178,7 +173,7 @@ async fn main() -> Result<()> {
     let context = init_context(&path)?;
     
     // Create empty suggestion engine (will be populated by LLM)
-    let suggestions = SuggestionEngine::new_empty(index.clone());
+    let suggestions = SuggestionEngine::new(index.clone());
 
     // Stats mode: print and exit
     if args.stats {
@@ -597,7 +592,7 @@ fn run_loop<B: Backend>(
                     // Diff-first ordering: changed files and their blast radius float to the top.
 app.suggestions.sort_with_context(&app.context);
 
-                    // Track cost (Smart preset for suggestions)
+                    // Track cost (Smart model for suggestions)
                     if let Some(u) = usage {
                         let cost = u.calculate_cost(suggest::llm::Model::Smart);
                         app.session_cost += cost;
@@ -837,20 +832,14 @@ app.suggestions.sort_with_context(&app.context);
                     app.close_overlay();
                     app.show_toast(&format!("Ship failed: {}", truncate(&e, 80)));
                 }
-                BackgroundMessage::ReviewReady(comments) => {
-                    app.set_review_comments(comments);
-                }
-                BackgroundMessage::PRCreated(url) => {
-                    app.set_pr_url(url.clone());
-                }
                 BackgroundMessage::Error(e) => {
                     app.loading = LoadingState::None;
                     app.show_toast(&truncate(&e, 100));
                 }
                 BackgroundMessage::QuestionResponse { question, answer, usage } => {
-                    // Track cost
+                    // Track cost (Balanced model for questions)
                     if let Some(u) = usage {
-                        let cost = u.calculate_cost(suggest::llm::Model::Speed);
+                        let cost = u.calculate_cost(suggest::llm::Model::Balanced);
                         app.session_cost += cost;
                         app.session_tokens += u.total_tokens;
                         let _ = app.config.record_tokens(u.total_tokens);
@@ -1338,68 +1327,6 @@ app.suggestions.sort_with_context(&app.context);
                         continue;
                     }
 
-                    // Handle PRReview overlay
-                    if let Overlay::PRReview { files_changed, reviewing, pr_url, .. } = &app.overlay {
-                        match key.code {
-                            KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
-                            KeyCode::Down => app.overlay_scroll_down(),
-                            KeyCode::Up => app.overlay_scroll_up(),
-                            KeyCode::Char('r') => {
-                                if !*reviewing {
-                                    // Start AI review
-                                    let files = files_changed.clone();
-                                    let tx_review = tx.clone();
-                                    
-                                    // Set reviewing state
-                                    if let Overlay::PRReview { reviewing, .. } = &mut app.overlay {
-                                        *reviewing = true;
-                                    }
-                                    app.loading = LoadingState::ReviewingChanges;
-                                    
-                                    tokio::spawn(async move {
-                                        match suggest::llm::review_changes(&files).await {
-                                            Ok((comments, _usage)) => {
-                                                let _ = tx_review.send(BackgroundMessage::ReviewReady(comments));
-                                            }
-                                            Err(e) => {
-                                                let _ = tx_review.send(BackgroundMessage::Error(e.to_string()));
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            KeyCode::Char('c') => {
-                                // Create PR
-                                if pr_url.is_none() {
-                                    let repo_path = app.repo_path.clone();
-                                    let (pr_title, pr_body) = app.generate_pr_content();
-                                    let tx_pr = tx.clone();
-
-                                    app.show_toast("Creating PR...");
-
-                                    tokio::spawn(async move {
-                                        match git_ops::create_pr(&repo_path, &pr_title, &pr_body) {
-                                            Ok(url) => {
-                                                let _ = tx_pr.send(BackgroundMessage::PRCreated(url));
-                                            }
-                                            Err(e) => {
-                                                let _ = tx_pr.send(BackgroundMessage::Error(e.to_string()));
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            KeyCode::Char('o') => {
-                                // Open PR in browser
-                                if let Some(url) = pr_url {
-                                    let _ = git_ops::open_url(url);
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    
                     // Handle GitStatus overlay - simplified interface
                     if let Overlay::GitStatus { commit_input, .. } = &app.overlay {
                         // Check if we're in commit input mode
@@ -1595,7 +1522,7 @@ app.suggestions.sort_with_context(&app.context);
                                             
                                             // Clear in-memory suggestions if needed
                                             if needs_suggestions {
-                                                app.suggestions = suggest::SuggestionEngine::new_empty(app.index.clone());
+                                                app.suggestions = suggest::SuggestionEngine::new(app.index.clone());
                                             }
                                             
                                             // Clear in-memory summaries if needed

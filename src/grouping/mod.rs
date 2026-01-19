@@ -3,11 +3,8 @@
 //! Organizes codebase files into architectural layers (Frontend, Backend, API, etc.)
 //! and feature clusters for a more intuitive project explorer.
 
-#![allow(dead_code)]
-
 pub mod heuristics;
 pub mod features;
-pub mod llm_enhance;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -101,6 +98,7 @@ impl Layer {
     }
 
     /// Get icon for the layer
+    #[allow(dead_code)]
     pub fn icon(&self) -> &'static str {
         match self {
             Layer::Frontend => "◇",  // Diamond - UI
@@ -116,6 +114,7 @@ impl Layer {
     }
     
     /// Get the index of this layer (for quick jumping with number keys)
+    #[allow(dead_code)]
     pub fn index(&self) -> usize {
         match self {
             Layer::Frontend => 1,
@@ -236,6 +235,7 @@ impl FileGroup {
     }
 
     /// Add or update a feature
+    #[allow(dead_code)]
     pub fn add_feature(&mut self, feature: Feature) {
         if let Some(existing) = self.features.iter_mut().find(|f| f.name == feature.name) {
             existing.files.extend(feature.files);
@@ -284,6 +284,7 @@ impl CodebaseGrouping {
     }
 
     /// Assign a file to a layer (without feature, default confidence)
+    #[allow(dead_code)]
     pub fn assign_file(&mut self, path: PathBuf, layer: Layer) {
         self.assign_file_with_confidence(path, layer, Confidence::Medium);
     }
@@ -302,6 +303,7 @@ impl CodebaseGrouping {
     }
 
     /// Assign a file to a layer and feature
+    #[allow(dead_code)]
     pub fn assign_file_to_feature(&mut self, path: PathBuf, layer: Layer, feature_name: &str) {
         // Preserve existing confidence if available
         let confidence = self.file_assignments.get(&path)
@@ -328,24 +330,13 @@ impl CodebaseGrouping {
     }
 
     /// Get the layer for a file
+    #[allow(dead_code)]
     pub fn get_layer(&self, path: &PathBuf) -> Option<Layer> {
         self.file_assignments.get(path).map(|a| a.layer)
     }
 
-    /// Get the confidence for a file's layer assignment
-    pub fn get_confidence(&self, path: &PathBuf) -> Option<Confidence> {
-        self.file_assignments.get(path).map(|a| a.confidence)
-    }
-
-    /// Get files with low confidence (candidates for LLM enhancement)
-    pub fn low_confidence_files(&self) -> Vec<&PathBuf> {
-        self.file_assignments.iter()
-            .filter(|(_, a)| a.confidence == Confidence::Low)
-            .map(|(p, _)| p)
-            .collect()
-    }
-
     /// Get groups in display order
+    #[allow(dead_code)]
     pub fn groups_ordered(&self) -> Vec<&FileGroup> {
         Layer::all()
             .iter()
@@ -354,45 +345,10 @@ impl CodebaseGrouping {
             .collect()
     }
 
-    /// Get mutable access to a specific group
-    pub fn get_group_mut(&mut self, layer: Layer) -> Option<&mut FileGroup> {
-        self.groups.get_mut(&layer)
-    }
-
     /// Total file count
+    #[allow(dead_code)]
     pub fn total_files(&self) -> usize {
         self.file_assignments.len()
-    }
-    
-    /// Reassign a file to a different layer (for LLM corrections)
-    pub fn reassign_file(&mut self, path: &PathBuf, new_layer: Layer, confidence: Confidence) {
-        // Remove from old group
-        if let Some(old_assignment) = self.file_assignments.get(path) {
-            let old_layer = old_assignment.layer;
-            if old_layer != new_layer {
-                if let Some(group) = self.groups.get_mut(&old_layer) {
-                    // Remove from ungrouped files
-                    group.ungrouped_files.retain(|p| p != path);
-                    // Remove from any features
-                    for feature in &mut group.features {
-                        feature.files.retain(|p| p != path);
-                    }
-                }
-            }
-        }
-        
-        // Update assignment
-        self.file_assignments.insert(path.clone(), FileAssignment {
-            layer: new_layer,
-            feature: None,
-            confidence,
-        });
-        
-        // Add to new group
-        self.groups
-            .entry(new_layer)
-            .or_insert_with(|| FileGroup::new(new_layer))
-            .add_file(path.clone());
     }
 }
 
@@ -402,6 +358,7 @@ pub struct GroupedTreeEntry {
     pub kind: GroupedEntryKind,
     pub name: String,
     pub path: Option<PathBuf>,
+    #[allow(dead_code)]
     pub depth: usize,
     pub expanded: bool,
     pub file_count: usize,

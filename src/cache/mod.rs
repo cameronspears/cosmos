@@ -3,8 +3,6 @@
 //! Persists suggestions and index data to .cosmos/ directory
 //! to avoid redundant LLM calls and speed up startup.
 
-#![allow(dead_code)]
-
 use crate::index::CodebaseIndex;
 use crate::suggest::Suggestion;
 use chrono::{DateTime, Duration, Utc};
@@ -92,9 +90,10 @@ impl ResetOption {
     }
 }
 
-/// Cache validity duration (24 hours for index, 7 days for suggestions)
+/// Cache validity durations
 const INDEX_CACHE_HOURS: i64 = 24;
 const SUGGESTIONS_CACHE_DAYS: i64 = 7;
+const LLM_SUMMARY_CACHE_DAYS: i64 = 30;
 
 /// Cached index metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,35 +107,26 @@ pub struct IndexCache {
 
 impl IndexCache {
     /// Create from a CodebaseIndex
+    #[allow(dead_code)]
     pub fn from_index(index: &CodebaseIndex) -> Self {
-        let file_hashes = index.files.iter()
-            .map(|(path, file_index)| {
-                // Use only content-based metrics, not mtime (which changes on git checkout, copy, etc.)
-                let hash = format!(
-                    "{}-{}",
-                    file_index.loc,
-                    file_index.symbols.len()
-                );
-                (path.clone(), hash)
-            })
-            .collect();
-
         Self {
             root: index.root.clone(),
             file_count: index.files.len(),
             symbol_count: index.symbols.len(),
             cached_at: Utc::now(),
-            file_hashes,
+            file_hashes: compute_file_hashes(index),
         }
     }
 
     /// Check if the cache is still valid
+    #[allow(dead_code)]
     pub fn is_valid(&self) -> bool {
         let age = Utc::now() - self.cached_at;
         age < Duration::hours(INDEX_CACHE_HOURS)
     }
 
     /// Check if a file has changed since caching
+    #[allow(dead_code)]
     pub fn file_changed(&self, path: &PathBuf, new_hash: &str) -> bool {
         self.file_hashes.get(path).map(|h| h != new_hash).unwrap_or(true)
     }
@@ -153,6 +143,7 @@ pub struct SuggestionsCache {
 
 impl SuggestionsCache {
     /// Create from a list of suggestions
+    #[allow(dead_code)]
     pub fn from_suggestions(suggestions: &[Suggestion]) -> Self {
         let files: Vec<PathBuf> = suggestions.iter()
             .map(|s| s.file.clone())
@@ -168,12 +159,14 @@ impl SuggestionsCache {
     }
 
     /// Check if the cache is still valid
+    #[allow(dead_code)]
     pub fn is_valid(&self) -> bool {
         let age = Utc::now() - self.cached_at;
         age < Duration::days(SUGGESTIONS_CACHE_DAYS)
     }
 
     /// Filter out suggestions for files that have changed
+    #[allow(dead_code)]
     pub fn filter_unchanged(&self, changed_files: &[PathBuf]) -> Vec<Suggestion> {
         self.suggestions.iter()
             .filter(|s| !changed_files.contains(&s.file))
@@ -182,44 +175,11 @@ impl SuggestionsCache {
     }
 }
 
-/// Cached file summaries (static analysis)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SummariesCache {
-    pub summaries: HashMap<PathBuf, crate::index::FileSummary>,
-    pub cached_at: DateTime<Utc>,
-}
-
-impl SummariesCache {
-    /// Create from file index
-    pub fn from_index(index: &CodebaseIndex) -> Self {
-        let summaries = index.files.iter()
-            .map(|(path, file_index)| (path.clone(), file_index.summary.clone()))
-            .collect();
-        
-        Self {
-            summaries,
-            cached_at: Utc::now(),
-        }
-    }
-    
-    /// Check if the cache is still valid
-    pub fn is_valid(&self) -> bool {
-        let age = Utc::now() - self.cached_at;
-        age < Duration::days(SUGGESTIONS_CACHE_DAYS)
-    }
-    
-    /// Get summary for a file
-    pub fn get(&self, path: &PathBuf) -> Option<&crate::index::FileSummary> {
-        self.summaries.get(path)
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  LLM SUMMARY CACHE - Persistent storage for AI-generated summaries
 // ═══════════════════════════════════════════════════════════════════════════
 
 const LLM_SUMMARIES_CACHE_FILE: &str = "llm_summaries.json";
-const LLM_SUMMARY_CACHE_DAYS: i64 = 30;
 
 /// A single LLM-generated summary entry with hash for change detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +249,7 @@ impl LlmSummaryCache {
     }
 
     /// Get summary for a file if valid
+    #[allow(dead_code)]
     pub fn get_valid_summary(&self, path: &PathBuf, current_hash: &str) -> Option<&str> {
         if self.is_file_valid(path, current_hash) {
             self.summaries.get(path).map(|e| e.summary.as_str())
@@ -335,6 +296,7 @@ impl LlmSummaryCache {
     }
 
     /// Count stats
+    #[allow(dead_code)]
     pub fn stats(&self) -> (usize, usize) {
         let total = self.summaries.len();
         let valid = self.summaries.iter()
@@ -593,6 +555,7 @@ impl Cache {
     }
 
     /// Load cached index metadata
+    #[allow(dead_code)]
     pub fn load_index_cache(&self) -> Option<IndexCache> {
         let path = self.cache_dir.join(INDEX_CACHE_FILE);
         if !path.exists() {
@@ -618,53 +581,10 @@ impl Cache {
         Ok(())
     }
 
-    /// Load cached suggestions
-    pub fn load_suggestions_cache(&self) -> Option<SuggestionsCache> {
-        let path = self.cache_dir.join(SUGGESTIONS_CACHE_FILE);
-        if !path.exists() {
-            return None;
-        }
-
-        let content = fs::read_to_string(&path).ok()?;
-        let cache: SuggestionsCache = serde_json::from_str(&content).ok()?;
-        
-        if cache.is_valid() {
-            Some(cache)
-        } else {
-            None
-        }
-    }
-
     /// Save suggestions cache
     pub fn save_suggestions_cache(&self, cache: &SuggestionsCache) -> anyhow::Result<()> {
         self.ensure_dir()?;
         let path = self.cache_dir.join(SUGGESTIONS_CACHE_FILE);
-        let content = serde_json::to_string_pretty(cache)?;
-        fs::write(path, content)?;
-        Ok(())
-    }
-    
-    /// Load cached file summaries
-    pub fn load_summaries_cache(&self) -> Option<SummariesCache> {
-        let path = self.cache_dir.join(SUMMARIES_CACHE_FILE);
-        if !path.exists() {
-            return None;
-        }
-
-        let content = fs::read_to_string(&path).ok()?;
-        let cache: SummariesCache = serde_json::from_str(&content).ok()?;
-        
-        if cache.is_valid() {
-            Some(cache)
-        } else {
-            None
-        }
-    }
-
-    /// Save file summaries cache
-    pub fn save_summaries_cache(&self, cache: &SummariesCache) -> anyhow::Result<()> {
-        self.ensure_dir()?;
-        let path = self.cache_dir.join(SUMMARIES_CACHE_FILE);
         let content = serde_json::to_string_pretty(cache)?;
         fs::write(path, content)?;
         Ok(())
@@ -691,6 +611,7 @@ impl Cache {
     }
 
     /// Load settings
+    #[allow(dead_code)]
     pub fn load_settings(&self) -> Settings {
         let path = self.cache_dir.join(SETTINGS_FILE);
         if !path.exists() {
@@ -704,6 +625,7 @@ impl Cache {
     }
 
     /// Save settings
+    #[allow(dead_code)]
     pub fn save_settings(&self, settings: &Settings) -> anyhow::Result<()> {
         self.ensure_dir()?;
         let path = self.cache_dir.join(SETTINGS_FILE);
@@ -753,27 +675,8 @@ impl Cache {
         Ok(())
     }
 
-    /// Add a dismissed suggestion ID
-    pub fn dismiss_suggestion(&self, id: uuid::Uuid) -> anyhow::Result<()> {
-        let mut settings = self.load_settings();
-        if !settings.dismissed.contains(&id) {
-            settings.dismissed.push(id);
-            self.save_settings(&settings)?;
-        }
-        Ok(())
-    }
-
-    /// Add an applied suggestion ID
-    pub fn mark_applied(&self, id: uuid::Uuid) -> anyhow::Result<()> {
-        let mut settings = self.load_settings();
-        if !settings.applied.contains(&id) {
-            settings.applied.push(id);
-            self.save_settings(&settings)?;
-        }
-        Ok(())
-    }
-
     /// Clear all caches
+    #[allow(dead_code)]
     pub fn clear(&self) -> anyhow::Result<()> {
         if self.cache_dir.exists() {
             fs::remove_dir_all(&self.cache_dir)?;
@@ -809,6 +712,7 @@ impl Cache {
     }
 
     /// Get cache stats
+    #[allow(dead_code)]
     pub fn stats(&self) -> CacheStats {
         let mut stats = CacheStats::default();
 
@@ -832,6 +736,7 @@ impl Cache {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct CacheStats {
     pub exists: bool,
@@ -842,6 +747,7 @@ pub struct CacheStats {
 }
 
 impl CacheStats {
+    #[allow(dead_code)]
     pub fn size_human(&self) -> String {
         if self.total_size < 1024 {
             format!("{} B", self.total_size)
@@ -864,18 +770,6 @@ mod tests {
         let cache = Cache::new(dir.path());
         
         assert!(cache.load_settings().dismissed.is_empty());
-    }
-
-    #[test]
-    fn test_dismiss_suggestion() {
-        let dir = tempdir().unwrap();
-        let cache = Cache::new(dir.path());
-        
-        let id = uuid::Uuid::new_v4();
-        cache.dismiss_suggestion(id).unwrap();
-        
-        let settings = cache.load_settings();
-        assert!(settings.dismissed.contains(&id));
     }
 
     #[test]

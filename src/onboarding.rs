@@ -4,9 +4,6 @@
 //! - Try free with BYOK (Bring Your Own Key)
 //! - Skip setup (limited functionality)
 
-// Allow dead code - quick_setup is for non-interactive/CI use cases
-#![allow(dead_code)]
-
 use crate::config::Config;
 use std::io::{self, IsTerminal, Write};
 
@@ -130,7 +127,7 @@ fn setup_byok() -> Result<(), String> {
     }
     
     // Validate format
-    if !key.starts_with("sk-") {
+    if !Config::validate_api_key_format(key) {
         println!();
         println!("  Warning: Key doesn't look like an OpenRouter key (should start with sk-)");
         print!("  Save anyway? [y/N]: ");
@@ -180,18 +177,6 @@ fn print_skip_message() {
     let _ = io::stdout().flush();
     let mut _input = String::new();
     let _ = io::stdin().read_line(&mut _input);
-}
-
-/// Quick setup wizard for API key (non-interactive, for CI/scripts)
-pub fn quick_setup(api_key: &str) -> Result<(), String> {
-    if api_key.is_empty() {
-        return Err("API key cannot be empty".to_string());
-    }
-    
-    let mut config = Config::load();
-    config.set_api_key(api_key)?;
-    
-    Ok(())
 }
 
 #[cfg(test)]

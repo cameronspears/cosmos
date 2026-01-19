@@ -215,15 +215,6 @@ pub enum Overlay {
         commit_message: String,
         pending_files: Vec<PathBuf>,
     },
-    /// PR Review panel with AI code review
-    PRReview {
-        branch_name: String,
-        files_changed: Vec<(PathBuf, String)>, // (path, diff)
-        review_comments: Vec<PRReviewComment>,
-        scroll: usize,
-        reviewing: bool,
-        pr_url: Option<String>,
-    },
     /// Git status panel for viewing and managing changed files
     GitStatus {
         staged: Vec<String>,
@@ -386,33 +377,6 @@ pub struct AskCosmosState {
     pub scroll: usize,
 }
 
-/// A comment from AI code review
-#[derive(Debug, Clone, PartialEq)]
-pub struct PRReviewComment {
-    pub file: PathBuf,
-    pub comment: String,
-    pub severity: ReviewSeverity,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewSeverity {
-    Praise,    // Good stuff
-    Info,      // FYI
-    Suggest,   // Could improve
-    Warning,   // Should fix
-}
-
-impl ReviewSeverity {
-    pub fn icon(&self) -> &'static str {
-        match self {
-            ReviewSeverity::Praise => "+",
-            ReviewSeverity::Info => "○",
-            ReviewSeverity::Suggest => "◐",
-            ReviewSeverity::Warning => "●",
-        }
-    }
-}
-
 /// Toast notification kind - affects duration and styling
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ToastKind {
@@ -444,13 +408,13 @@ pub struct Toast {
 
 impl Toast {
     pub fn new(message: &str) -> Self {
-        // Auto-detect error toasts
+        // Auto-detect toast type - check success indicators BEFORE error keywords
         let kind = if message.contains("Rate limit") || message.contains("rate limited") {
             ToastKind::RateLimit
+        } else if message.starts_with("Fixed:") || message.starts_with('+') {
+            ToastKind::Success
         } else if message.contains("failed") || message.contains("error") || message.contains("Error") {
             ToastKind::Error
-        } else if message.starts_with('+') {
-            ToastKind::Success
         } else {
             ToastKind::Info
         };
@@ -1677,14 +1641,16 @@ impl App {
         }
     }
 
-    /// Show a toast message (only errors and rate limits are displayed)
+    /// Show a toast message (errors, rate limits, and success messages are displayed)
     pub fn show_toast(&mut self, message: &str) {
         let toast = Toast::new(message);
         if toast.is_error() {
             self.log_error_internal(message, None);
-            self.toast = Some(toast); // Only show error/rate-limit toasts
+            self.toast = Some(toast);
+        } else if matches!(toast.kind, ToastKind::Success) {
+            self.toast = Some(toast);
         }
-        // Info and Success toasts are silently ignored
+        // Info toasts are silently ignored
     }
     
     /// Log an error with optional context (also shows toast)
@@ -2089,30 +2055,6 @@ impl App {
         format!("{}, {}, and {} more", titles[0], titles[1], titles.len() - 2)
     }
 
-    /// Show the PR review panel
-    pub fn show_pr_review(&mut self) {
-        if self.pending_changes.is_empty() {
-            self.show_toast("No changes to review");
-            return;
-        }
-        
-        let branch_name = self.cosmos_branch.clone()
-            .unwrap_or_else(|| self.generate_branch_name());
-        
-        let files_changed: Vec<(PathBuf, String)> = self.pending_changes.iter()
-            .flat_map(|c| c.files.iter().map(|f| (f.path.clone(), f.diff.clone())))
-            .collect();
-        
-        self.overlay = Overlay::PRReview {
-            branch_name,
-            files_changed,
-            review_comments: Vec::new(),
-            scroll: 0,
-            reviewing: false,
-            pr_url: None,
-        };
-    }
-    
     /// Update branch name in branch dialog
     pub fn update_branch_name(&mut self, name: String) {
         if let Overlay::BranchCreate { branch_name, .. } = &mut self.overlay {
@@ -2124,22 +2066,6 @@ impl App {
     pub fn update_commit_message(&mut self, msg: String) {
         if let Overlay::BranchCreate { commit_message, .. } = &mut self.overlay {
             *commit_message = msg;
-        }
-    }
-    
-    /// Set PR review comments from AI analysis
-    pub fn set_review_comments(&mut self, comments: Vec<PRReviewComment>) {
-        if let Overlay::PRReview { review_comments, reviewing, .. } = &mut self.overlay {
-            *review_comments = comments;
-            *reviewing = false;
-        }
-        self.loading = LoadingState::None;
-    }
-    
-    /// Set the PR URL after creation
-    pub fn set_pr_url(&mut self, url: String) {
-        if let Overlay::PRReview { pr_url, .. } = &mut self.overlay {
-            *pr_url = Some(url);
         }
     }
 
@@ -3067,9 +2993,6 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
         Overlay::BranchCreate { branch_name, commit_message, pending_files } => {
             render_branch_dialog(frame, branch_name, commit_message, pending_files);
-        }
-        Overlay::PRReview { branch_name, files_changed, review_comments, scroll, reviewing, pr_url } => {
-            render_pr_review(frame, branch_name, files_changed, review_comments, *scroll, *reviewing, pr_url);
         }
         Overlay::GitStatus { staged, modified, untracked, selected, scroll, commit_input } => {
             render_git_status(frame, staged, modified, untracked, *selected, *scroll, commit_input.as_deref(), &app.context.branch);
@@ -4700,7 +4623,7 @@ fn render_help(frame: &mut Frame, scroll: usize) {
 
     let block = Paragraph::new(help_text)
         .block(Block::default()
-            .title(" › 𝘩𝘦𝘭𝘱 ")
+            .title(" 𝘩𝘦𝘭𝘱 ")
             .title_style(Style::default().fg(Theme::GREY_100))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Theme::GREY_400))
@@ -5978,125 +5901,6 @@ fn render_ship_dialog(
             .title_style(Style::default().fg(Theme::GREEN))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Theme::GREEN))
-            .style(Style::default().bg(Theme::GREY_900)));
-
-    frame.render_widget(block, area);
-}
-
-fn render_pr_review(
-    frame: &mut Frame,
-    branch_name: &str,
-    files_changed: &[(PathBuf, String)],
-    review_comments: &[PRReviewComment],
-    scroll: usize,
-    reviewing: bool,
-    pr_url: &Option<String>,
-) {
-    let area = centered_rect(80, 85, frame.area());
-    frame.render_widget(Clear, area);
-
-    let visible_height = area.height.saturating_sub(14) as usize;
-    
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("     › ", Style::default().fg(Theme::WHITE)),
-            Span::styled("PR Review", Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(format!("     Branch: {}", branch_name), Style::default().fg(Theme::GREY_200)),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("     {} files changed", files_changed.len()), Style::default().fg(Theme::GREY_300)),
-        ]),
-    ];
-    
-    if let Some(url) = pr_url {
-        lines.push(Line::from(vec![
-            Span::styled(format!("     PR: {}", url), Style::default().fg(Theme::GREY_200)),
-        ]));
-    }
-    
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("     ─────────────────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
-    ]));
-    lines.push(Line::from(""));
-    
-    if review_comments.is_empty() {
-        if !reviewing {
-            lines.push(Line::from(vec![
-                Span::styled("     Press 'r' to get AI code review", Style::default().fg(Theme::GREY_300)),
-            ]));
-        }
-    } else {
-        // Show review comments
-        for (i, comment) in review_comments.iter().skip(scroll).take(visible_height).enumerate() {
-            let file_name = comment.file.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("?");
-            
-            lines.push(Line::from(vec![
-                Span::styled(format!("     {} ", comment.severity.icon()), 
-                    Style::default().fg(match comment.severity {
-                        ReviewSeverity::Praise => Theme::GREEN,
-                        ReviewSeverity::Info => Theme::GREY_300,
-                        ReviewSeverity::Suggest => Theme::WHITE,
-                        ReviewSeverity::Warning => Theme::RED,
-                    })),
-                Span::styled(file_name, Style::default().fg(Theme::GREY_100).add_modifier(Modifier::BOLD)),
-            ]));
-            
-            // Wrap comment
-            let wrapped = wrap_text(&comment.comment, 55);
-            for line in wrapped {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("       {}", line), Style::default().fg(Theme::GREY_200)),
-                ]));
-            }
-            
-            if i < review_comments.len().saturating_sub(scroll).min(visible_height) - 1 {
-                lines.push(Line::from(""));
-            }
-        }
-    }
-    
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("     ─────────────────────────────────────────────────────", Style::default().fg(Theme::GREY_600))
-    ]));
-    lines.push(Line::from(""));
-    
-    // Action hints
-    if pr_url.is_some() {
-        lines.push(Line::from(vec![
-            Span::styled("     𝘰", Style::default().fg(Theme::WHITE)),
-            Span::styled(" open in browser   ", Style::default().fg(Theme::GREY_400)),
-            Span::styled("𝘳", Style::default().fg(Theme::WHITE)),
-            Span::styled(" review again   ", Style::default().fg(Theme::GREY_400)),
-            Span::styled("Esc", Style::default().fg(Theme::WHITE)),
-            Span::styled(" close", Style::default().fg(Theme::GREY_400)),
-        ]));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("     𝘳", Style::default().fg(Theme::WHITE)),
-            Span::styled(" review   ", Style::default().fg(Theme::GREY_400)),
-            Span::styled("𝘤", Style::default().fg(Theme::WHITE)),
-            Span::styled(" create PR   ", Style::default().fg(Theme::GREY_400)),
-            Span::styled("Esc", Style::default().fg(Theme::WHITE)),
-            Span::styled(" close", Style::default().fg(Theme::GREY_400)),
-        ]));
-    }
-    lines.push(Line::from(""));
-
-    let block = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(Block::default()
-            .title(" › 𝘱𝘳 𝘳𝘦𝘷𝘪𝘦𝘸 ")
-            .title_style(Style::default().fg(Theme::GREY_100))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Theme::GREY_400))
             .style(Style::default().bg(Theme::GREY_900)));
 
     frame.render_widget(block, area);

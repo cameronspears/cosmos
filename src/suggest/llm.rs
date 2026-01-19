@@ -2,10 +2,13 @@
 //!
 //! BYOK only: user provides an OpenRouter API key, billed directly.
 //!
-//! Uses @preset/speed for ultra-fast analysis/summaries, @preset/smart for quality code generation.
-//! Uses smart context building to maximize insight per token.
-
-#![allow(dead_code)]
+//! Uses a 4-tier model system optimized for cost and quality:
+//! - Speed (gpt-oss-120b): Fast summaries and file classification
+//! - Balanced (claude-sonnet-4.5): Questions and fix previews
+//! - Smart (claude-opus-4.5): Code generation and suggestions
+//! - Reviewer (gpt-5.2): Adversarial bug-finding
+//!
+//! All models use :nitro suffix for high-throughput provider routing.
 
 use super::{Priority, Suggestion, SuggestionKind, SuggestionSource};
 use crate::cache::DomainGlossary;
@@ -24,48 +27,54 @@ fn api_key() -> Option<String> {
     Config::load().get_api_key()
 }
 
-// Model pricing per million tokens (as of 2024)
-// Speed preset: ultra-fast routing for analysis
-const SPEED_INPUT_COST: f64 = 0.25;   // $0.25 per 1M input tokens  
-const SPEED_OUTPUT_COST: f64 = 0.69;  // $0.69 per 1M output tokens
-// Smart preset: quality routing for code generation (cheaper than raw Opus)
-const SMART_INPUT_COST: f64 = 3.0;    // ~$3 per 1M input tokens (estimated)
-const SMART_OUTPUT_COST: f64 = 15.0;  // ~$15 per 1M output tokens (estimated)
-// Reviewer preset: adversarial code review (different model family for cognitive diversity)
-const REVIEWER_INPUT_COST: f64 = 2.0;  // ~$2 per 1M input tokens (estimated)
-const REVIEWER_OUTPUT_COST: f64 = 8.0; // ~$8 per 1M output tokens (estimated)
+// Model pricing per million tokens (estimated, check OpenRouter for current rates)
+// Speed: openai/gpt-oss-120b - fast, cheap model for summaries
+const SPEED_INPUT_COST: f64 = 0.10;   // $0.10 per 1M input tokens
+const SPEED_OUTPUT_COST: f64 = 0.30;  // $0.30 per 1M output tokens
+// Balanced: anthropic/claude-sonnet-4.5 - good reasoning at medium cost
+const BALANCED_INPUT_COST: f64 = 3.0;   // $3 per 1M input tokens
+const BALANCED_OUTPUT_COST: f64 = 15.0; // $15 per 1M output tokens
+// Smart: anthropic/claude-opus-4.5 - best reasoning for code generation
+const SMART_INPUT_COST: f64 = 15.0;   // $15 per 1M input tokens
+const SMART_OUTPUT_COST: f64 = 75.0;  // $75 per 1M output tokens
+// Reviewer: openai/gpt-5.2 - different model family for cognitive diversity
+const REVIEWER_INPUT_COST: f64 = 5.0;  // $5 per 1M input tokens (estimated)
+const REVIEWER_OUTPUT_COST: f64 = 15.0; // $15 per 1M output tokens (estimated)
 
 /// Models available for suggestions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Model {
-    /// Speed preset - ultra-fast routing for analysis and summaries
+    /// Speed tier - fast, cheap model for summaries and classification (gpt-oss-120b)
     Speed,
-    /// Smart preset - quality routing for code generation (replaces Opus)
+    /// Balanced tier - good reasoning at medium cost for questions/previews (claude-sonnet-4.5)
+    Balanced,
+    /// Smart tier - best reasoning for code generation (claude-opus-4.5)
     Smart,
-    /// Reviewer preset - adversarial code review (different model for cognitive diversity)
+    /// Reviewer tier - different model family for adversarial bug-finding (gpt-5.2)
     Reviewer,
 }
+
+/// Maximum tokens for all model tiers
+const MODEL_MAX_TOKENS: u32 = 16384;
 
 impl Model {
     pub fn id(&self) -> &'static str {
         match self {
-            Model::Speed => "@preset/speed",
-            Model::Smart => "@preset/smart",
-            Model::Reviewer => "@preset/reviewer",
+            Model::Speed => "openai/gpt-oss-120b:nitro",
+            Model::Balanced => "anthropic/claude-sonnet-4.5:nitro",
+            Model::Smart => "anthropic/claude-opus-4.5:nitro",
+            Model::Reviewer => "openai/gpt-5.2:nitro",
         }
     }
 
     pub fn max_tokens(&self) -> u32 {
-        match self {
-            Model::Speed => 8192,
-            Model::Smart => 8192,
-            Model::Reviewer => 8192,
-        }
+        MODEL_MAX_TOKENS
     }
     
     pub fn display_name(&self) -> &'static str {
         match self {
             Model::Speed => "speed",
+            Model::Balanced => "balanced",
             Model::Smart => "smart",
             Model::Reviewer => "reviewer",
         }
@@ -75,6 +84,7 @@ impl Model {
     pub fn calculate_cost(&self, prompt_tokens: u32, completion_tokens: u32) -> f64 {
         let (input_rate, output_rate) = match self {
             Model::Speed => (SPEED_INPUT_COST, SPEED_OUTPUT_COST),
+            Model::Balanced => (BALANCED_INPUT_COST, BALANCED_OUTPUT_COST),
             Model::Smart => (SMART_INPUT_COST, SMART_OUTPUT_COST),
             Model::Reviewer => (REVIEWER_INPUT_COST, REVIEWER_OUTPUT_COST),
         };
@@ -105,6 +115,7 @@ impl Usage {
 pub struct LlmResponse {
     pub content: String,
     pub usage: Option<Usage>,
+    #[allow(dead_code)]
     pub model: String,
 }
 
@@ -365,12 +376,12 @@ QUESTION:
         question
     );
 
-    let response = call_llm_with_usage(system, &user, Model::Smart, false).await?;
+    let response = call_llm_with_usage(system, &user, Model::Balanced, false).await?;
     Ok((response.content, response.usage))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  DIRECT CODE GENERATION (Human plan → Smart preset applies changes)
+//  DIRECT CODE GENERATION (Human plan → Smart model applies changes)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Result of generating and applying a fix
@@ -936,7 +947,7 @@ Be concise. The verification note should explain the finding in plain English. T
         modifier_text
     );
 
-    let response = call_llm(system, &user, Model::Smart).await?;
+    let response = call_llm(system, &user, Model::Balanced).await?;
     parse_fix_preview(&response, modifier.map(String::from))
 }
 
@@ -1420,12 +1431,17 @@ struct CodebaseSuggestionJson {
     line: Option<usize>,
 }
 
-/// Truncate a string for display
-fn truncate_str(s: &str, max: usize) -> &str {
-    if s.len() <= max {
+/// Truncate a string for display (Unicode-safe)
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    if s.chars().count() <= max_chars {
         s
     } else {
-        &s[..max]
+        // Find byte index of the max_chars-th character
+        let byte_idx = s.char_indices()
+            .nth(max_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        &s[..byte_idx]
     }
 }
 
@@ -1483,6 +1499,7 @@ fn try_parse_individual_suggestions(json: &str) -> anyhow::Result<Vec<CodebaseSu
 }
 
 /// Parse JSON suggestions from LLM response
+#[allow(dead_code)]
 fn parse_suggestions(response: &str, path: &PathBuf) -> anyhow::Result<Vec<Suggestion>> {
     // Strip markdown code fences if present
     let trimmed = response.trim();
@@ -1563,6 +1580,7 @@ struct SuggestionJson {
 }
 
 /// Truncate content for API calls
+#[allow(dead_code)]
 fn truncate_content(content: &str, max_chars: usize) -> String {
     if content.len() <= max_chars {
         content.to_string()
@@ -1866,6 +1884,7 @@ pub struct SummaryBatchResult {
 /// Returns all summaries, domain glossary, and total usage stats.
 /// 
 /// DEPRECATED: Use generate_file_summaries_incremental instead for caching support.
+#[allow(dead_code)]
 pub async fn generate_file_summaries(
     index: &CodebaseIndex,
 ) -> anyhow::Result<(HashMap<PathBuf, String>, DomainGlossary, Option<Usage>)> {
@@ -1941,6 +1960,7 @@ pub async fn generate_summaries_for_files(
 }
 
 /// Priority tier for file summarization
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryPriority {
     /// Tier 1: Changed files, high complexity - summarize immediately
@@ -2155,25 +2175,12 @@ fn extract_json_object(response: &str) -> Option<&str> {
     }
 }
 
-/// Parse the summaries JSON response with robust error handling
-fn normalize_summary_path(raw: &str, root: &Path) -> PathBuf {
-    let mut cleaned = raw.trim().replace('\\', "/");
-    while cleaned.starts_with("./") {
-        cleaned = cleaned.trim_start_matches("./").to_string();
-    }
-
-    let mut path = PathBuf::from(cleaned);
-    if path.is_absolute() {
-        if let Ok(stripped) = path.strip_prefix(root) {
-            if !stripped.as_os_str().is_empty() {
-                path = stripped.to_path_buf();
-            }
-        }
-    }
-
-    path
+/// Normalize a path string to repo-relative format (wrapper around cache::normalize_summary_path)
+fn normalize_path_str(raw: &str, root: &Path) -> PathBuf {
+    crate::cache::normalize_summary_path(&PathBuf::from(raw.trim()), root)
 }
 
+#[allow(dead_code)]
 fn parse_summaries_response(response: &str, root: &Path) -> anyhow::Result<HashMap<PathBuf, String>> {
     let json_str = extract_json_object(response)
         .ok_or_else(|| anyhow::anyhow!("No JSON object found in response"))?;
@@ -2182,7 +2189,7 @@ fn parse_summaries_response(response: &str, root: &Path) -> anyhow::Result<HashM
     if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(json_str) {
         let summaries = parsed
             .into_iter()
-            .map(|(path, summary)| (normalize_summary_path(&path, root), summary))
+            .map(|(path, summary)| (normalize_path_str(&path, root), summary))
             .collect();
         return Ok(summaries);
     }
@@ -2195,7 +2202,7 @@ fn parse_summaries_response(response: &str, root: &Path) -> anyhow::Result<HashM
                 if let Ok(parsed) = serde_json::from_value::<HashMap<String, String>>(inner.clone()) {
                     let summaries = parsed
                         .into_iter()
-                        .map(|(path, summary)| (normalize_summary_path(&path, root), summary))
+                        .map(|(path, summary)| (normalize_path_str(&path, root), summary))
                         .collect();
                     return Ok(summaries);
                 }
@@ -2212,7 +2219,7 @@ fn parse_summaries_response(response: &str, root: &Path) -> anyhow::Result<HashM
                     continue;
                 }
                 if let Some(summary) = value.as_str() {
-                    summaries.insert(normalize_summary_path(key, root), summary.to_string());
+                    summaries.insert(normalize_path_str(key, root), summary.to_string());
                 }
             }
             if !summaries.is_empty() {
@@ -2248,7 +2255,7 @@ fn parse_summaries_and_terms_response(
             if let Some(obj) = summaries_obj.as_object() {
                 for (path, summary) in obj {
                     if let Some(s) = summary.as_str() {
-                        summaries.insert(normalize_summary_path(path, root), s.to_string());
+                        summaries.insert(normalize_path_str(path, root), s.to_string());
                     }
                 }
             }
@@ -2282,7 +2289,7 @@ fn parse_summaries_and_terms_response(
                     continue;
                 }
                 if let Some(summary) = value.as_str() {
-                    summaries.insert(normalize_summary_path(key, root), summary.to_string());
+                    summaries.insert(normalize_path_str(key, root), summary.to_string());
                 }
             }
             if !summaries.is_empty() {
@@ -2294,125 +2301,6 @@ fn parse_summaries_and_terms_response(
     // Try old format as complete fallback
     let summaries = parse_summaries_response(response, root)?;
     Ok((summaries, HashMap::new()))
-}
-
-// ============================================================================
-// PR Review with AI
-// ============================================================================
-
-/// A single file review comment from the AI
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PRFileReview {
-    pub file: String,
-    pub severity: String, // "praise", "info", "suggest", "warning"
-    pub comment: String,
-}
-
-/// Review changes using LLM for thorough code review
-pub async fn review_changes(
-    files_changed: &[(PathBuf, String)], // (file_path, diff)
-) -> anyhow::Result<(Vec<crate::ui::PRReviewComment>, Usage)> {
-    let config = crate::config::Config::load();
-    let _api_key = config.get_api_key()
-        .ok_or_else(|| anyhow::anyhow!("API key not configured"))?;
-    
-    // Build the review prompt
-    let mut changes_text = String::new();
-    for (path, diff) in files_changed {
-        let file_name = path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-        changes_text.push_str(&format!("\n--- {} ---\n{}\n", file_name, diff));
-    }
-    
-    let system_prompt = r#"You are a senior code reviewer. Review the following changes and provide concise, actionable feedback.
-
-For each file, provide ONE comment with:
-- severity: "praise" (good code), "info" (FYI), "suggest" (could improve), or "warning" (should fix)
-- A brief comment (1-2 sentences max)
-
-Respond with a JSON array of objects:
-[
-  {"file": "filename.ts", "severity": "suggest", "comment": "Consider adding error handling for the async call."},
-  {"file": "another.ts", "severity": "praise", "comment": "Clean refactor, good separation of concerns."}
-]
-
-Be constructive and focused. Skip trivial issues. Highlight the most important points."#;
-
-    let user_prompt = format!("Review these changes:\n{}", changes_text);
-    
-    // Use Grok Fast for thorough review
-    let response = call_llm_with_usage(system_prompt, &user_prompt, Model::Speed, true).await?;
-    
-    let usage = response.usage.unwrap_or_default();
-    
-    // Parse the response
-    let reviews = parse_review_response(&response.content, files_changed)?;
-    
-    Ok((reviews, usage))
-}
-
-/// Parse the JSON review response into PRReviewComments
-fn parse_review_response(
-    content: &str, 
-    files_changed: &[(PathBuf, String)]
-) -> anyhow::Result<Vec<crate::ui::PRReviewComment>> {
-    use crate::ui::{PRReviewComment, ReviewSeverity};
-    
-    // Strip markdown code fences if present
-    let trimmed = content.trim();
-    let clean = if trimmed.starts_with("```json") {
-        trimmed.strip_prefix("```json").unwrap_or(trimmed)
-    } else if trimmed.starts_with("```") {
-        trimmed.strip_prefix("```").unwrap_or(trimmed)
-    } else {
-        trimmed
-    };
-    let clean = if clean.ends_with("```") {
-        clean.strip_suffix("```").unwrap_or(clean)
-    } else {
-        clean
-    };
-    let clean = clean.trim();
-
-    // Extract JSON from response
-    let json_start = clean.find('[').unwrap_or(0);
-    let json_end = clean.rfind(']').map(|i| i + 1).unwrap_or(clean.len());
-    let json_str = &clean[json_start..json_end];
-    
-    let reviews: Vec<PRFileReview> = serde_json::from_str(json_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse review JSON: {} | Response preview: {}", e, truncate_str(json_str, 200)))?;
-    
-    // Convert to PRReviewComment
-    let mut comments = Vec::new();
-    for review in reviews {
-        // Find the matching file path
-        let file_path = files_changed.iter()
-            .find(|(p, _)| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n == review.file || review.file.ends_with(n))
-                    .unwrap_or(false)
-            })
-            .map(|(p, _)| p.clone())
-            .unwrap_or_else(|| PathBuf::from(&review.file));
-        
-        let severity = match review.severity.to_lowercase().as_str() {
-            "praise" => ReviewSeverity::Praise,
-            "info" => ReviewSeverity::Info,
-            "suggest" => ReviewSeverity::Suggest,
-            "warning" => ReviewSeverity::Warning,
-            _ => ReviewSeverity::Info,
-        };
-        
-        comments.push(PRReviewComment {
-            file: file_path,
-            comment: review.comment,
-            severity,
-        });
-    }
-    
-    Ok(comments)
 }
 
 // ============================================================================
@@ -2437,6 +2325,7 @@ pub struct ReviewFinding {
 pub struct VerificationReview {
     pub findings: Vec<ReviewFinding>,
     pub summary: String,        // Overall assessment
+    #[allow(dead_code)]
     pub pass: bool,             // True if no critical/warning issues
     pub usage: Option<Usage>,
 }
