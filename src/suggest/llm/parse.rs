@@ -5,10 +5,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Parse suggestions from codebase-wide analysis
-pub(crate) fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<Suggestion>> {
-    // Strip markdown code fences if present
-    let trimmed = response.trim();
+/// Strip markdown code fences from a response
+fn strip_markdown_fences(text: &str) -> &str {
+    let trimmed = text.trim();
     let clean = if trimmed.starts_with("```json") {
         trimmed.strip_prefix("```json").unwrap_or(trimmed)
     } else if trimmed.starts_with("```") {
@@ -21,34 +20,43 @@ pub(crate) fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<S
     } else {
         clean
     };
-    let clean = clean.trim();
+    clean.trim()
+}
+
+/// Extract a JSON fragment between matching delimiters
+fn extract_json_fragment<'a>(text: &'a str, open: char, close: char) -> Option<&'a str> {
+    let start = text.find(open)?;
+    let end = text.rfind(close)?;
+    if start <= end {
+        Some(&text[start..=end])
+    } else {
+        None
+    }
+}
+
+/// Parse suggestions from codebase-wide analysis
+pub(crate) fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<Suggestion>> {
+    let clean = strip_markdown_fences(response);
+    let sanitized = fix_json_issues(clean);
 
     // Handle both array format and object-with-suggestions format
     // Speed preset often returns {"suggestions": [...]} instead of just [...]
-    let json_str = if clean.starts_with('{') {
+    let json_str = if let Some(obj_str) = extract_json_fragment(&sanitized, '{', '}') {
         // Try to extract "suggestions" array from object
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(clean) {
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(obj_str) {
             if let Some(suggestions) = obj.get("suggestions") {
                 // Convert suggestions array back to string for parsing
-                match serde_json::to_string(suggestions) {
-                    Ok(s) => s,
-                    Err(_) => clean.to_string(),
-                }
+                serde_json::to_string(suggestions).unwrap_or_else(|_| obj_str.to_string())
             } else {
-                clean.to_string()
+                obj_str.to_string()
             }
         } else {
-            clean.to_string()
+            obj_str.to_string()
         }
-    } else if let Some(start) = clean.find('[') {
-        // Extract JSON array from response
-        if let Some(end) = clean.rfind(']') {
-            clean[start..=end].to_string()
-        } else {
-            clean.to_string()
-        }
+    } else if let Some(array_str) = extract_json_fragment(&sanitized, '[', ']') {
+        array_str.to_string()
     } else {
-        clean.to_string()
+        sanitized
     };
 
     // Try to parse as array first
@@ -203,34 +211,8 @@ pub(crate) fn truncate_content(content: &str, max_chars: usize) -> String {
 
 /// Extract JSON from LLM response, handling markdown fences and noise
 fn extract_json_object(response: &str) -> Option<&str> {
-    let trimmed = response.trim();
-
-    // Remove markdown code fences
-    let clean = if trimmed.starts_with("```json") {
-        trimmed.strip_prefix("```json").unwrap_or(trimmed)
-    } else if trimmed.starts_with("```") {
-        trimmed.strip_prefix("```").unwrap_or(trimmed)
-    } else {
-        trimmed
-    };
-
-    let clean = if clean.ends_with("```") {
-        clean.strip_suffix("```").unwrap_or(clean)
-    } else {
-        clean
-    };
-
-    let clean = clean.trim();
-
-    // Find JSON object boundaries
-    let start = clean.find('{')?;
-    let end = clean.rfind('}')?;
-
-    if start <= end {
-        Some(&clean[start..=end])
-    } else {
-        None
-    }
+    let clean = strip_markdown_fences(response);
+    extract_json_fragment(clean, '{', '}')
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -257,6 +239,12 @@ where
     match serde_json::from_str::<T>(json_str) {
         Ok(parsed) => Ok((parsed, None)),
         Err(initial_error) => {
+            let fixed_json = fix_json_issues(json_str);
+            if fixed_json != json_str {
+                if let Ok(parsed) = serde_json::from_str::<T>(&fixed_json) {
+                    return Ok((parsed, None));
+                }
+            }
             // Self-correction: ask LLM to fix its own JSON
             let correction_response =
                 request_json_correction(response, &initial_error, context_hint).await?;
@@ -266,7 +254,8 @@ where
                 || anyhow::anyhow!("No JSON found in correction response for {}", context_hint),
             )?;
 
-            let parsed = serde_json::from_str::<T>(corrected_json).map_err(|e| {
+            let corrected_json = fix_json_issues(corrected_json);
+            let parsed = serde_json::from_str::<T>(&corrected_json).map_err(|e| {
                 anyhow::anyhow!(
                     "JSON still invalid after self-correction for {}: {}\nOriginal error: {}",
                     context_hint,
@@ -351,9 +340,10 @@ pub(crate) fn parse_summaries_response(
 ) -> anyhow::Result<HashMap<PathBuf, String>> {
     let json_str = extract_json_object(response)
         .ok_or_else(|| anyhow::anyhow!("No JSON object found in response"))?;
+    let json_str = fix_json_issues(json_str);
 
     // First try to parse as a simple {path: summary} object
-    if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(json_str) {
+    if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(&json_str) {
         let summaries = parsed
             .into_iter()
             .map(|(path, summary)| (normalize_path_str(&path, root), summary))
@@ -362,7 +352,7 @@ pub(crate) fn parse_summaries_response(
     }
 
     // Try to parse as a wrapper object (e.g., {"analysis": {...}, "summaries": {...}})
-    if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(json_str) {
+    if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&json_str) {
         // Look for common wrapper keys that might contain summaries
         for key in ["summaries", "files", "results", "data"] {
             if let Some(inner) = wrapper.get(key) {
@@ -416,9 +406,10 @@ pub(crate) fn parse_summaries_and_terms_response(
 ) -> anyhow::Result<(HashMap<PathBuf, String>, HashMap<String, String>)> {
     let json_str = extract_json_object(response)
         .ok_or_else(|| anyhow::anyhow!("No JSON object found in response"))?;
+    let json_str = fix_json_issues(json_str);
 
     // Try to parse as the expected format: {summaries: {...}, terms: {...}}
-    if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(json_str) {
+    if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&json_str) {
         let mut summaries = HashMap::new();
         let mut terms = HashMap::new();
 

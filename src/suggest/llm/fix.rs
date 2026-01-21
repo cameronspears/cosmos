@@ -1,6 +1,7 @@
-use super::client::{call_llm, call_llm_with_usage};
+use super::client::call_llm_with_usage;
 use super::models::{Model, Usage};
-use super::parse::{merge_usage, parse_json_with_retry, request_json_correction_generic};
+use super::parse::{merge_usage, parse_json_with_retry};
+use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{FIX_CONTENT_SYSTEM, FIX_PREVIEW_SYSTEM, MULTI_FILE_FIX_SYSTEM};
 use crate::suggest::Suggestion;
 use serde::Deserialize;
@@ -65,11 +66,8 @@ pub async fn generate_fix_content(
             .unwrap_or_default()
     );
 
-    let memory_section = repo_memory
-        .as_deref()
-        .filter(|m| !m.trim().is_empty())
-        .map(|m| format!("\n\nRepo conventions / decisions:\n{}", m))
-        .unwrap_or_default();
+    let memory_section =
+        format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
 
     let user = format!(
         "File: {}\n\nOriginal Issue: {}\n{}\n{}\n\n{}\n\nCurrent Code:\n```\n{}\n```\n\nImplement the fix using search/replace edits. Be precise with old_string - it must match exactly.",
@@ -101,41 +99,10 @@ pub async fn generate_fix_content(
     }
 
     // Apply edits sequentially with validation
-    let mut new_content = content.to_string();
-    for (i, edit) in edits.iter().enumerate() {
-        // Validate old_string exists exactly once
-        let matches: Vec<_> = new_content.match_indices(&edit.old_string).collect();
-
-        if matches.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Edit {}: old_string not found in file. The LLM may have made an error.\nSearched for: {:?}",
-                i + 1,
-                truncate_for_error(&edit.old_string)
-            ));
-        }
-
-        if matches.len() > 1 {
-            return Err(anyhow::anyhow!(
-                "Edit {}: old_string matches {} times (must be unique). Need more context.\nSearched for: {:?}",
-                i + 1,
-                matches.len(),
-                truncate_for_error(&edit.old_string)
-            ));
-        }
-
-        // Apply the replacement
-        new_content = new_content.replacen(&edit.old_string, &edit.new_string, 1);
-    }
+    let new_content = apply_edits_with_context(content, &edits, "file")?;
 
     // Strip trailing whitespace from each line and ensure file ends with newline
-    let mut new_content: String = new_content
-        .lines()
-        .map(|line| line.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !new_content.ends_with('\n') {
-        new_content.push('\n');
-    }
+    let mut new_content = normalize_generated_content(new_content);
 
     // Validate the new content isn't empty
     if new_content.trim().is_empty() {
@@ -160,6 +127,52 @@ pub(crate) fn truncate_for_error(s: &str) -> String {
     } else {
         format!("{}...", s.chars().take(MAX_CHARS).collect::<String>())
     }
+}
+
+pub(crate) fn apply_edits_with_context(
+    content: &str,
+    edits: &[EditOp],
+    context_label: &str,
+) -> anyhow::Result<String> {
+    let mut new_content = content.to_string();
+    for (i, edit) in edits.iter().enumerate() {
+        let matches: Vec<_> = new_content.match_indices(&edit.old_string).collect();
+
+        if matches.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Edit {}: old_string not found in {}. The LLM may have made an error.\nSearched for: {:?}",
+                i + 1,
+                context_label,
+                truncate_for_error(&edit.old_string)
+            ));
+        }
+
+        if matches.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "Edit {}: old_string matches {} times in {} (must be unique). Need more context.\nSearched for: {:?}",
+                i + 1,
+                matches.len(),
+                context_label,
+                truncate_for_error(&edit.old_string)
+            ));
+        }
+
+        new_content = new_content.replacen(&edit.old_string, &edit.new_string, 1);
+    }
+
+    Ok(new_content)
+}
+
+pub(crate) fn normalize_generated_content(content: String) -> String {
+    let mut normalized = content
+        .lines()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !normalized.ends_with('\n') {
+        normalized.push('\n');
+    }
+    normalized
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -225,11 +238,8 @@ pub async fn generate_multi_file_fix(
             .unwrap_or_default()
     );
 
-    let memory_section = repo_memory
-        .as_deref()
-        .filter(|m| !m.trim().is_empty())
-        .map(|m| format!("\n\nRepo conventions / decisions:\n{}", m))
-        .unwrap_or_default();
+    let memory_section =
+        format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
 
     // Build the files section
     let files_section: String = files
@@ -271,7 +281,7 @@ pub async fn generate_multi_file_fix(
 
     for file_edit_json in file_edits_json {
         let file_path = PathBuf::from(&file_edit_json.file);
-        let mut new_content = files
+        let new_content = files
             .iter()
             .find(|(path, _)| path == &file_path)
             .map(|(_, content)| content.clone())
@@ -279,43 +289,17 @@ pub async fn generate_multi_file_fix(
 
         let mut modified_areas = Vec::new();
         for edit in &file_edit_json.edits {
-            let matches: Vec<_> = new_content.match_indices(&edit.old_string).collect();
-
-            if matches.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "old_string not found in file {}. Searched for: {:?}",
-                    file_path.display(),
-                    truncate_for_error(&edit.old_string)
-                ));
-            }
-
-            if matches.len() > 1 {
-                return Err(anyhow::anyhow!(
-                    "old_string matches {} times in file {} (must be unique). Searched for: {:?}",
-                    matches.len(),
-                    file_path.display(),
-                    truncate_for_error(&edit.old_string)
-                ));
-            }
-
-            // Extract function/area name from old_string if possible
             if let Some(area) = extract_modified_area(&edit.old_string) {
                 modified_areas.push(area);
             }
-
-            // Apply edit
-            new_content = new_content.replacen(&edit.old_string, &edit.new_string, 1);
         }
+
+        let context = format!("file {}", file_path.display());
+        let new_content =
+            apply_edits_with_context(&new_content, &file_edit_json.edits, &context)?;
 
         // Strip trailing whitespace and ensure file ends with newline
-        let mut new_content: String = new_content
-            .lines()
-            .map(|line| line.trim_end())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !new_content.ends_with('\n') {
-            new_content.push('\n');
-        }
+        let new_content = normalize_generated_content(new_content);
 
         file_edits.push(FileEdit {
             path: file_path,
@@ -427,11 +411,8 @@ pub async fn generate_fix_preview(
         .map(|m| format!("\n\nUser wants: {}", m))
         .unwrap_or_default();
 
-    let memory_section = repo_memory
-        .as_deref()
-        .filter(|m| !m.trim().is_empty())
-        .map(|m| format!("\n\nRepo conventions / decisions:\n{}", m))
-        .unwrap_or_default();
+    let memory_section =
+        format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
 
     let user = format!(
         "File: {}\nIssue: {}\n{}{}{}",
@@ -442,49 +423,12 @@ pub async fn generate_fix_preview(
         modifier_text
     );
 
-    let response = call_llm(FIX_PREVIEW_SYSTEM, &user, Model::Balanced).await?;
+    let response = call_llm_with_usage(FIX_PREVIEW_SYSTEM, &user, Model::Balanced, true).await?;
 
     // Try parsing, with self-correction retry on failure
-    match try_parse_preview_json(&response) {
-        Ok(parsed) => build_fix_preview(parsed, modifier.map(String::from)),
-        Err(initial_error) => {
-            // Try LLM self-correction
-            if let Ok(correction) = request_json_correction_generic(
-                &response,
-                &initial_error.to_string(),
-                "fix preview",
-            )
-            .await
-            {
-                if let Ok(parsed) = try_parse_preview_json(&correction.content) {
-                    return build_fix_preview(parsed, modifier.map(String::from));
-                }
-            }
-            Err(initial_error)
-        }
-    }
-}
-
-/// Attempt to parse fix preview JSON from a response
-fn try_parse_preview_json(response: &str) -> anyhow::Result<serde_json::Value> {
-    // Strip code fences
-    let trimmed = response.trim();
-    let clean = if trimmed.starts_with("```json") {
-        trimmed.strip_prefix("```json").unwrap_or(trimmed)
-    } else if trimmed.starts_with("```") {
-        trimmed.strip_prefix("```").unwrap_or(trimmed)
-    } else {
-        trimmed
-    };
-    let clean = if clean.ends_with("```") {
-        clean.strip_suffix("```").unwrap_or(clean)
-    } else {
-        clean
-    };
-    let clean = clean.trim();
-
-    serde_json::from_str(clean)
-        .map_err(|e| anyhow::anyhow!("Failed to parse fix preview JSON: {}", e))
+    let (parsed, _correction_usage): (serde_json::Value, _) =
+        parse_json_with_retry(&response.content, "fix preview").await?;
+    build_fix_preview(parsed, modifier.map(String::from))
 }
 
 fn build_fix_preview(

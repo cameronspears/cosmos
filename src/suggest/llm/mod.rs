@@ -3,6 +3,7 @@ pub mod client;
 pub mod fix;
 pub mod models;
 pub mod parse;
+pub mod prompt_utils;
 pub mod prompts;
 pub mod review;
 pub mod summaries;
