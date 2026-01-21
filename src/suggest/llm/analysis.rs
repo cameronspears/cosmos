@@ -1,6 +1,7 @@
 use super::client::{call_llm_with_usage, truncate_str};
 use super::models::{Model, Usage};
 use super::parse::parse_codebase_suggestions;
+use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{ANALYZE_CODEBASE_SYSTEM, ASK_QUESTION_SYSTEM};
 use crate::cache::DomainGlossary;
 use crate::context::WorkContext;
@@ -36,11 +37,7 @@ pub async fn ask_question(
         .map(|s| format!("{:?}: {}", s.kind, s.name))
         .collect();
 
-    let memory_section = repo_memory
-        .as_deref()
-        .filter(|m| !m.trim().is_empty())
-        .map(|m| format!("\n\nPROJECT NOTES:\n{}", m))
-        .unwrap_or_default();
+    let memory_section = format_repo_memory_section(repo_memory.as_deref(), "PROJECT NOTES");
 
     let user = format!(
         r#"PROJECT CONTEXT:
@@ -194,10 +191,10 @@ fn build_codebase_context(
     }
 
     // Repository memory / conventions
-    if let Some(mem) = repo_memory {
-        if !mem.trim().is_empty() {
-            sections.push(format!("\n\nREPO MEMORY (CONVENTIONS/DECISIONS):\n{}", mem));
-        }
+    let memory_section =
+        format_repo_memory_section(repo_memory, "REPO MEMORY (CONVENTIONS/DECISIONS)");
+    if !memory_section.is_empty() {
+        sections.push(memory_section);
     }
 
     // Domain glossary

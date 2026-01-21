@@ -60,12 +60,6 @@ pub fn is_available() -> bool {
     api_key().is_some()
 }
 
-/// Call LLM API (returns content only, for backwards compatibility)
-pub(crate) async fn call_llm(system: &str, user: &str, model: Model) -> anyhow::Result<String> {
-    let response = call_llm_with_usage(system, user, model, false).await?;
-    Ok(response.content)
-}
-
 /// Rate limit retry configuration
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 2000; // 2 seconds

@@ -1,7 +1,8 @@
 use super::client::call_llm_with_usage;
-use super::fix::{truncate_for_error, AppliedFix, FixResponse};
+use super::fix::{apply_edits_with_context, normalize_generated_content, AppliedFix, FixResponse};
 use super::models::{Model, Usage};
 use super::parse::{merge_usage, parse_json_with_retry};
+use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{review_fix_system_prompt, review_system_prompt};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -139,11 +140,7 @@ pub async fn fix_review_findings(
         })
         .collect();
 
-    let memory_section = repo_memory
-        .as_deref()
-        .filter(|m| !m.trim().is_empty())
-        .map(|m| format!("\n\nRepo conventions:\n{}", m))
-        .unwrap_or_default();
+    let memory_section = format_repo_memory_section(repo_memory.as_deref(), "Repo conventions");
 
     // For iterations > 1, include original content so model can see the full evolution
     let original_section = if iteration > 1 {
@@ -185,39 +182,10 @@ pub async fn fix_review_findings(
     }
 
     // Apply edits sequentially with validation
-    let mut new_content = content.to_string();
-    for (i, edit) in edits.iter().enumerate() {
-        let matches: Vec<_> = new_content.match_indices(&edit.old_string).collect();
-
-        if matches.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Edit {}: old_string not found in file.\nSearched for: {:?}",
-                i + 1,
-                truncate_for_error(&edit.old_string)
-            ));
-        }
-
-        if matches.len() > 1 {
-            return Err(anyhow::anyhow!(
-                "Edit {}: old_string matches {} times (must be unique).\nSearched for: {:?}",
-                i + 1,
-                matches.len(),
-                truncate_for_error(&edit.old_string)
-            ));
-        }
-
-        new_content = new_content.replacen(&edit.old_string, &edit.new_string, 1);
-    }
+    let new_content = apply_edits_with_context(content, &edits, "file")?;
 
     // Normalize whitespace
-    let mut new_content: String = new_content
-        .lines()
-        .map(|line| line.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !new_content.ends_with('\n') {
-        new_content.push('\n');
-    }
+    let mut new_content = normalize_generated_content(new_content);
 
     if new_content.trim().is_empty() {
         return Err(anyhow::anyhow!("Generated content is empty"));
