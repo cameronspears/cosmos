@@ -5469,7 +5469,7 @@ fn render_onboarding(
             lines.push(Line::from(vec![
                 Span::styled("     Enter ", Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300)),
                 Span::styled(" save key   ", Style::default().fg(Theme::GREY_400)),
-                Span::styled(" q ", Style::default().fg(Theme::GREY_900).bg(Theme::GREY_600)),
+                Span::styled(" Esc ", Style::default().fg(Theme::GREY_900).bg(Theme::GREY_600)),
                 Span::styled(" quit", Style::default().fg(Theme::GREY_500)),
             ]));
         }

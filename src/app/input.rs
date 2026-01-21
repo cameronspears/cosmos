@@ -124,7 +124,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                 {
                     match *step {
                         OnboardingStep::Entry => match key.code {
-                            KeyCode::Char('q') => {
+                            KeyCode::Esc => {
                                 should_quit = true;
                             }
                             KeyCode::Backspace => {
