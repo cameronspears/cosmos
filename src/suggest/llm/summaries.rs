@@ -1,0 +1,449 @@
+use super::client::call_llm_with_usage;
+use super::models::{Model, Usage};
+use super::parse::parse_summaries_and_terms_response;
+use super::prompts::SUMMARY_BATCH_SYSTEM;
+use crate::cache::DomainGlossary;
+use crate::context::WorkContext;
+use crate::index::{CodebaseIndex, SymbolKind};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+/// Result from a single batch of file summaries
+pub struct SummaryBatchResult {
+    pub summaries: HashMap<PathBuf, String>,
+    /// Domain terms extracted from these files
+    pub terms: HashMap<String, String>,
+    pub usage: Option<Usage>,
+}
+
+/// Discover project context from README and key files
+pub fn discover_project_context(index: &CodebaseIndex) -> String {
+    // Try README first
+    if let Some(readme) = try_read_readme(&index.root) {
+        return extract_readme_summary(&readme);
+    }
+
+    // Try package metadata (Cargo.toml, package.json, pyproject)
+    if let Some(desc) = try_read_package_description(&index.root) {
+        return desc;
+    }
+
+    // Fall back to analyzing directory structure
+    analyze_project_structure(index)
+}
+
+fn try_read_readme(root: &Path) -> Option<String> {
+    let candidates = ["README.md", "readme.md", "README.txt", "README"];
+    for name in candidates {
+        let path = root.join(name);
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                return Some(content);
+            }
+        }
+    }
+    None
+}
+
+fn extract_readme_summary(content: &str) -> String {
+    // Take first 10-15 lines of README, skipping badges
+    let lines: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            let l = line.trim();
+            !l.is_empty()
+                && !l.starts_with("[!")
+                && !l.contains("shields.io")
+                && !l.starts_with("![](")
+        })
+        .take(15)
+        .collect();
+    lines.join("\n")
+}
+
+fn try_read_package_description(root: &Path) -> Option<String> {
+    if let Some(desc) = extract_cargo_description(&root.join("Cargo.toml")) {
+        return Some(desc);
+    }
+    if let Some(desc) = extract_package_json_description(&root.join("package.json")) {
+        return Some(desc);
+    }
+    if let Some(desc) = extract_pyproject_description(&root.join("pyproject.toml")) {
+        return Some(desc);
+    }
+    None
+}
+
+fn extract_cargo_description(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        if line.trim().starts_with("description =") {
+            return Some(
+                line.split('=')
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('"')
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+fn extract_package_json_description(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    json.get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn extract_pyproject_description(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        if line.trim().starts_with("description =") {
+            return Some(
+                line.split('=')
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('"')
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+fn analyze_project_structure(index: &CodebaseIndex) -> String {
+    let mut hints = Vec::new();
+
+    // Basic file structure
+    let mut key_dirs = std::collections::HashSet::new();
+    for path in index.files.keys() {
+        if let Some(parent) = path.parent() {
+            if let Some(dir) = parent.file_name().and_then(|n| n.to_str()) {
+                if ["src", "lib", "app", "cmd", "internal", "pkg"].contains(&dir) {
+                    key_dirs.insert(dir.to_string());
+                }
+            }
+        }
+    }
+    let mut key_dirs: Vec<_> = key_dirs.into_iter().collect();
+    key_dirs.sort();
+
+    if !key_dirs.is_empty() {
+        hints.push(format!("Key directories: {}", key_dirs.join(", ")));
+    }
+
+    // Identify technologies
+    let mut technologies = Vec::new();
+    let files: Vec<_> = index.files.keys().collect();
+
+    if files.iter().any(|p| p.extension().map(|e| e == "rs").unwrap_or(false)) {
+        technologies.push("Rust");
+    }
+    if files.iter().any(|p| p.extension().map(|e| e == "ts" || e == "tsx").unwrap_or(false)) {
+        technologies.push("TypeScript");
+    }
+    if files.iter().any(|p| p.extension().map(|e| e == "js" || e == "jsx").unwrap_or(false)) {
+        technologies.push("JavaScript");
+    }
+    if files.iter().any(|p| p.extension().map(|e| e == "py").unwrap_or(false)) {
+        technologies.push("Python");
+    }
+    if files.iter().any(|p| p.extension().map(|e| e == "go").unwrap_or(false)) {
+        technologies.push("Go");
+    }
+
+    if !technologies.is_empty() {
+        hints.push(format!("Technologies: {}", technologies.join(", ")));
+    }
+
+    // File count summary
+    hints.push(format!(
+        "Total: {} files, {} symbols",
+        index.files.len(),
+        index.symbols.len()
+    ));
+
+    hints.join("\n")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  FILE SUMMARIES GENERATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Generate rich, context-aware summaries for all files in the codebase
+///
+/// Uses batched approach (4 files per call) for reliability.
+/// Returns all summaries, domain glossary, and total usage stats.
+///
+/// DEPRECATED: Use generate_file_summaries_incremental instead for caching support.
+#[allow(dead_code)]
+pub async fn generate_file_summaries(
+    index: &CodebaseIndex,
+) -> anyhow::Result<(HashMap<PathBuf, String>, DomainGlossary, Option<Usage>)> {
+    let project_context = discover_project_context(index);
+    let files: Vec<_> = index.files.keys().cloned().collect();
+    generate_summaries_for_files(index, &files, &project_context).await
+}
+
+/// Generate summaries for a specific list of files with project context
+/// Uses aggressive parallel batch processing for speed
+/// Also extracts domain terminology for the glossary
+pub async fn generate_summaries_for_files(
+    index: &CodebaseIndex,
+    files: &[PathBuf],
+    project_context: &str,
+) -> anyhow::Result<(HashMap<PathBuf, String>, DomainGlossary, Option<Usage>)> {
+    // Large batch size for fewer API calls
+    let batch_size = 16;
+    // Higher concurrency for faster processing (Speed preset handles this well)
+    let concurrency = 4;
+
+    let batches: Vec<_> = files.chunks(batch_size).collect();
+
+    let mut all_summaries = HashMap::new();
+    let mut glossary = DomainGlossary::new();
+    let mut total_usage = Usage::default();
+
+    // Process batches with limited concurrency
+    for batch_group in batches.chunks(concurrency) {
+        // Run concurrent batches
+        let futures: Vec<_> = batch_group
+            .iter()
+            .map(|batch| generate_summary_batch(index, batch, project_context))
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+
+        for result in results {
+            match result {
+                Ok(batch_result) => {
+                    // Collect summaries
+                    all_summaries.extend(batch_result.summaries.clone());
+
+                    // Collect terms into glossary
+                    for (term, definition) in batch_result.terms {
+                        // Associate term with files from this batch
+                        for file in batch_result.summaries.keys() {
+                            glossary.add_term(term.clone(), definition.clone(), file.clone());
+                        }
+                    }
+
+                    if let Some(usage) = batch_result.usage {
+                        total_usage.prompt_tokens += usage.prompt_tokens;
+                        total_usage.completion_tokens += usage.completion_tokens;
+                        total_usage.total_tokens += usage.total_tokens;
+                    }
+                }
+                Err(e) => {
+                    // Log error but continue with other batches
+                    eprintln!("Warning: Failed to generate summaries for batch: {}", e);
+                }
+            }
+        }
+    }
+
+    let final_usage = if total_usage.total_tokens > 0 {
+        Some(total_usage)
+    } else {
+        None
+    };
+
+    Ok((all_summaries, glossary, final_usage))
+}
+
+/// Priority tier for file summarization
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryPriority {
+    /// Tier 1: Changed files, high complexity - summarize immediately
+    High,
+    /// Tier 2: Files with suggestions, focus directories - summarize soon
+    Medium,
+    /// Tier 3: Everything else - background processing
+    Low,
+}
+
+/// Categorize files by priority for smart summarization
+pub fn prioritize_files_for_summary(
+    index: &CodebaseIndex,
+    context: &WorkContext,
+    files_needing_summary: &[PathBuf],
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let mut high_priority = Vec::new();
+    let mut medium_priority = Vec::new();
+    let mut low_priority = Vec::new();
+
+    let changed_files: std::collections::HashSet<_> = context.all_changed_files().into_iter().collect();
+
+    for path in files_needing_summary {
+        // Check if file is in the index
+        let file_index = match index.files.get(path) {
+            Some(fi) => fi,
+            None => {
+                low_priority.push(path.clone());
+                continue;
+            }
+        };
+
+        // Tier 1: Changed files or high complexity
+        if changed_files.contains(path) || file_index.complexity > 20.0 || file_index.loc > 500 {
+            high_priority.push(path.clone());
+            continue;
+        }
+
+        // Tier 2: Recent modification or in focus area
+        let is_recent = file_index.last_modified.timestamp()
+            > (chrono::Utc::now() - chrono::Duration::days(7)).timestamp();
+        let in_focus = context
+            .inferred_focus
+            .as_ref()
+            .map(|focus| path.to_string_lossy().contains(focus))
+            .unwrap_or(false);
+
+        if is_recent || in_focus {
+            medium_priority.push(path.clone());
+            continue;
+        }
+
+        // Tier 3: Everything else
+        low_priority.push(path.clone());
+    }
+
+    (high_priority, medium_priority, low_priority)
+}
+
+/// Generate summaries for a single batch of files
+/// Also extracts domain-specific terminology for the glossary
+async fn generate_summary_batch(
+    index: &CodebaseIndex,
+    files: &[PathBuf],
+    project_context: &str,
+) -> anyhow::Result<SummaryBatchResult> {
+    let user_prompt = build_batch_context(index, files, project_context);
+
+    let response =
+        call_llm_with_usage(SUMMARY_BATCH_SYSTEM, &user_prompt, Model::Speed, true).await?;
+
+    let (summaries, terms) = parse_summaries_and_terms_response(&response.content, &index.root)?;
+
+    Ok(SummaryBatchResult {
+        summaries,
+        terms,
+        usage: response.usage,
+    })
+}
+
+/// Build context for a batch of files
+fn build_batch_context(index: &CodebaseIndex, files: &[PathBuf], project_context: &str) -> String {
+    let project_name = index
+        .root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project");
+
+    let mut sections = Vec::new();
+
+    // Include project context at the top
+    sections.push(format!(
+        "PROJECT: {}\n\n=== PROJECT CONTEXT (use this to understand file purposes) ===\n{}\n=== END PROJECT CONTEXT ===\n\nFILES TO SUMMARIZE:",
+        project_name, project_context
+    ));
+
+    for path in files {
+        if let Some(file_index) = index.files.get(path) {
+            let func_count = file_index
+                .symbols
+                .iter()
+                .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
+                .count();
+
+            let struct_count = file_index
+                .symbols
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.kind,
+                        SymbolKind::Struct
+                            | SymbolKind::Class
+                            | SymbolKind::Interface
+                            | SymbolKind::Trait
+                    )
+                })
+                .count();
+
+            // Get public exports
+            let exports: Vec<_> = file_index
+                .symbols
+                .iter()
+                .filter(|s| s.visibility == crate::index::Visibility::Public)
+                .take(10)
+                .map(|s| s.name.as_str())
+                .collect();
+
+            let exports_str = if exports.is_empty() {
+                "none".to_string()
+            } else {
+                exports.join(", ")
+            };
+
+            let deps: Vec<_> = file_index
+                .dependencies
+                .iter()
+                .filter(|d| !d.is_external)
+                .take(5)
+                .map(|d| d.import_path.as_str())
+                .collect();
+
+            let deps_str = if deps.is_empty() {
+                "none".to_string()
+            } else {
+                deps.join(", ")
+            };
+
+            sections.push(format!(
+                "\n---\nFILE: {}\n{} LOC | {} functions | {} structs\nExports: {}\nImports: {}",
+                path.display(),
+                file_index.loc,
+                func_count,
+                struct_count,
+                exports_str,
+                deps_str
+            ));
+
+            // Add doc comments if available
+            if let Ok(content) = std::fs::read_to_string(index.root.join(path)) {
+                let doc_lines: Vec<_> = content
+                    .lines()
+                    .take(10)
+                    .filter(|l| {
+                        l.starts_with("//!")
+                            || l.starts_with("///")
+                            || l.starts_with("#")
+                            || l.starts_with("\"\"\"")
+                    })
+                    .take(2)
+                    .collect();
+
+                if !doc_lines.is_empty() {
+                    sections.push(format!("Doc: {}", doc_lines.join(" ")));
+                }
+            }
+        }
+    }
+
+    sections.join("")
+}

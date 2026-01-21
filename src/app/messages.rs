@@ -1,0 +1,79 @@
+use crate::safe_apply;
+use crate::suggest;
+use crate::ui;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use uuid::Uuid;
+
+/// Messages from background tasks to the main UI thread
+pub enum BackgroundMessage {
+    SuggestionsReady {
+        suggestions: Vec<suggest::Suggestion>,
+        usage: Option<suggest::llm::Usage>,
+        model: String,
+    },
+    SuggestionsError(String),
+    SummariesReady {
+        summaries: HashMap<PathBuf, String>,
+        usage: Option<suggest::llm::Usage>,
+    },
+    /// Incremental summary progress update
+    SummaryProgress {
+        completed: usize,
+        total: usize,
+        summaries: HashMap<PathBuf, String>,
+    },
+    SummariesError(String),
+    /// Quick preview ready (Phase 1 - fast)
+    PreviewReady {
+        suggestion_id: Uuid,
+        file_path: PathBuf,
+        summary: String,
+        preview: suggest::llm::FixPreview,
+    },
+    PreviewError(String),
+    /// Direct fix applied (Smart preset generated + applied the change)
+    /// Supports both single-file and multi-file changes
+    DirectFixApplied {
+        suggestion_id: Uuid,
+        /// All file changes (path, backup_path, diff)
+        file_changes: Vec<(PathBuf, PathBuf, String)>,
+        description: String,
+        safety_checks: Vec<safe_apply::CheckResult>,
+        usage: Option<suggest::llm::Usage>,
+        branch_name: String,
+        /// Human-friendly title for PR (e.g., "Batch Processing")
+        friendly_title: String,
+        /// Behavior-focused problem description for non-technical readers
+        problem_summary: String,
+        /// What will be different after the fix
+        outcome: String,
+    },
+    DirectFixError(String),
+    /// Ship workflow progress update
+    ShipProgress(ui::ShipStep),
+    /// Ship workflow completed successfully with PR URL
+    ShipComplete(String),
+    /// Ship workflow error
+    ShipError(String),
+    /// Generic error (used for push/etc)
+    Error(String),
+    /// Response to a user question
+    QuestionResponse {
+        question: String,
+        answer: String,
+        usage: Option<suggest::llm::Usage>,
+    },
+    /// Verification review completed (adversarial review of applied changes)
+    VerificationComplete {
+        findings: Vec<suggest::llm::ReviewFinding>,
+        summary: String,
+        usage: Option<suggest::llm::Usage>,
+    },
+    /// Verification fix completed (Smart fixed the selected findings)
+    VerificationFixComplete {
+        new_content: String,
+        description: String,
+        usage: Option<suggest::llm::Usage>,
+    },
+}
