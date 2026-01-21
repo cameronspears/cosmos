@@ -30,7 +30,10 @@ cargo install --path . --locked
 cargo run --release
 ```
 
-## Optional AI Setup (Fastest Path)
+## Required AI Setup (Fastest Path)
+
+Cosmos requires an OpenRouter API key to run. If one isn't configured, the TUI
+will prompt you on startup.
 
 ```bash
 # Option A: one-liner (non-interactive)
@@ -39,13 +42,16 @@ cosmos
 
 # Option B: guided setup
 cosmos --setup
+
+# Option C: launch and follow the TUI prompt
+cosmos
 ```
 
 ## Quick Start
 
 ```bash
 # Launch the TUI
-cosmos
+cosmos  # prompts for OpenRouter key if missing
 
 # Point at a specific project
 cosmos /path/to/project
@@ -151,10 +157,13 @@ On subsequent runs, unchanged files load instantly from cache.
 
 **Categories:** Improvement, BugFix, Optimization, Quality, Feature
 
-## AI Setup (BYOK Mode)
+## AI Setup (OpenRouter)
 
 ```bash
 cosmos --setup
+
+# Or launch cosmos and follow the TUI prompt
+cosmos
 ```
 
 Guides you through getting an [OpenRouter API key](https://openrouter.ai/keys). Your key is saved locally.
@@ -179,7 +188,6 @@ cosmos/
 │   ├── grouping/        # Architectural layer detection
 │   ├── history.rs       # Suggestion history (SQLite)
 │   ├── index/           # AST-based codebase indexing
-│   ├── onboarding.rs    # First-run experience
 │   ├── safe_apply.rs    # Safety checks before applying
 │   ├── suggest/         # Suggestion engine (LLM + static rules)
 │   └── ui/              # TUI components (ratatui)

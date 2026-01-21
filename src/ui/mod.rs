@@ -156,6 +156,13 @@ pub enum RepoMemoryMode {
     Add,
 }
 
+/// Step in the onboarding flow (OpenRouter setup)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingStep {
+    Entry,
+    ConfirmInvalid,
+}
+
 /// Spinner animation frames (braille pattern)
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -249,6 +256,12 @@ pub enum Overlay {
         options: Vec<(crate::cache::ResetOption, bool)>,
         /// Currently focused option index
         selected: usize,
+    },
+    /// Required onboarding for OpenRouter API key
+    Onboarding {
+        input: String,
+        step: OnboardingStep,
+        message: Option<String>,
     },
     /// Startup check - shown when cosmos starts with unsaved work
     StartupCheck {
@@ -1855,6 +1868,15 @@ impl App {
         }
     }
 
+    /// Show the onboarding overlay (required OpenRouter setup)
+    pub fn show_onboarding(&mut self) {
+        self.overlay = Overlay::Onboarding {
+            input: String::new(),
+            step: OnboardingStep::Entry,
+            message: None,
+        };
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  STARTUP CHECK OVERLAY
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3344,6 +3366,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
         Overlay::Reset { options, selected } => {
             render_reset_overlay(frame, options, *selected);
+        }
+        Overlay::Onboarding { input, step, message } => {
+            render_onboarding(frame, input, *step, message.as_deref());
         }
         Overlay::StartupCheck {
             changed_count,
@@ -5365,6 +5390,110 @@ fn render_help(frame: &mut Frame, scroll: usize) {
                 .style(Style::default().bg(Theme::GREY_900)),
         )
         .scroll((scroll as u16, 0));
+
+    frame.render_widget(block, area);
+}
+
+fn render_onboarding(
+    frame: &mut Frame,
+    input: &str,
+    step: OnboardingStep,
+    message: Option<&str>,
+) {
+    let area = centered_rect(70, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    fn mask_api_key(value: &str) -> String {
+        let len = value.chars().count();
+        if len == 0 {
+            return String::new();
+        }
+        if len <= 4 {
+            return "*".repeat(len);
+        }
+        let last_four: String = value.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        format!("{}{}", "*".repeat(len - 4), last_four)
+    }
+
+    let (input_text, input_style) = if input.is_empty() {
+        (
+            "<paste key>".to_string(),
+            Style::default().fg(Theme::GREY_500),
+        )
+    } else {
+        (mask_api_key(input), Style::default().fg(Theme::WHITE))
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("     › ", Style::default().fg(Theme::WHITE)),
+            Span::styled(
+                "OpenRouter setup",
+                Style::default()
+                    .fg(Theme::WHITE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "     Cosmos requires an OpenRouter API key to run.",
+            Style::default().fg(Theme::GREY_200),
+        )]),
+        Line::from(vec![Span::styled(
+            "     Get a key at: https://openrouter.ai/keys",
+            Style::default().fg(Theme::GREY_300),
+        )]),
+        Line::from(vec![Span::styled(
+            "     Paste it below (saved locally).",
+            Style::default().fg(Theme::GREY_400),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("     API key: ", Style::default().fg(Theme::GREY_300)),
+            Span::styled(input_text, input_style),
+        ]),
+    ];
+
+    if let Some(msg) = message {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("     {}", msg),
+            Style::default().fg(Theme::YELLOW),
+        )]));
+    }
+
+    lines.push(Line::from(""));
+    match step {
+        OnboardingStep::Entry => {
+            lines.push(Line::from(vec![
+                Span::styled("     Enter ", Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300)),
+                Span::styled(" save key   ", Style::default().fg(Theme::GREY_400)),
+                Span::styled(" q ", Style::default().fg(Theme::GREY_900).bg(Theme::GREY_600)),
+                Span::styled(" quit", Style::default().fg(Theme::GREY_500)),
+            ]));
+        }
+        OnboardingStep::ConfirmInvalid => {
+            lines.push(Line::from(vec![
+                Span::styled("     y ", Style::default().fg(Theme::GREY_900).bg(Theme::GREEN)),
+                Span::styled(" save anyway   ", Style::default().fg(Theme::GREY_400)),
+                Span::styled(" n ", Style::default().fg(Theme::GREY_900).bg(Theme::GREY_500)),
+                Span::styled(" re-enter   ", Style::default().fg(Theme::GREY_500)),
+                Span::styled(" q ", Style::default().fg(Theme::GREY_900).bg(Theme::GREY_600)),
+                Span::styled(" quit", Style::default().fg(Theme::GREY_500)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+
+    let block = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .title(" › 𝘰𝘯𝘣𝘰𝘢𝘳𝘥𝘪𝘯𝘨 ")
+            .title_style(Style::default().fg(Theme::GREY_100))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Theme::GREY_400))
+            .style(Style::default().bg(Theme::GREY_900)),
+    );
 
     frame.render_widget(block, area);
 }
