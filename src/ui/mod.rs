@@ -784,6 +784,19 @@ impl App {
         }
     }
 
+    /// Apply a new grouping and rebuild grouped trees.
+    pub fn apply_grouping_update(&mut self, grouping: crate::grouping::CodebaseGrouping) {
+        self.index.apply_grouping(&grouping);
+        self.grouping = grouping;
+        self.grouped_tree = build_grouped_tree(&self.grouping, &self.index);
+        self.filtered_grouped_tree = self.grouped_tree.clone();
+
+        if self.project_selected >= self.filtered_grouped_tree.len() {
+            self.project_selected = self.filtered_grouped_tree.len().saturating_sub(1);
+        }
+        self.project_scroll = 0;
+    }
+
     /// Add a pending change from an applied fix
     pub fn add_pending_change(
         &mut self,

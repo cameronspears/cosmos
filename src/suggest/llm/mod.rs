@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod client;
 pub mod fix;
+pub mod grouping;
 pub mod models;
 pub mod parse;
 pub mod prompt_utils;

@@ -16,6 +16,7 @@ const INDEX_CACHE_FILE: &str = "index.json";
 const SUGGESTIONS_CACHE_FILE: &str = "suggestions.json";
 const MEMORY_FILE: &str = "memory.json";
 const GLOSSARY_FILE: &str = "glossary.json";
+const GROUPING_AI_CACHE_FILE: &str = "grouping_ai.json";
 
 /// Options for selective cache reset
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +31,8 @@ pub enum ResetOption {
     Glossary,
     /// Clear memory.json - repo decisions/conventions
     Memory,
+    /// Clear grouping_ai.json - AI grouping cache
+    GroupingAi,
 }
 
 impl ResetOption {
@@ -41,6 +44,7 @@ impl ResetOption {
             ResetOption::Summaries => "File Summaries",
             ResetOption::Glossary => "Domain Glossary",
             ResetOption::Memory => "Repo Memory",
+            ResetOption::GroupingAi => "Grouping AI",
         }
     }
 
@@ -52,6 +56,7 @@ impl ResetOption {
             ResetOption::Summaries => "regenerate with AI",
             ResetOption::Glossary => "extract terminology",
             ResetOption::Memory => "decisions/conventions",
+            ResetOption::GroupingAi => "rebuild AI grouping",
         }
     }
 
@@ -63,6 +68,7 @@ impl ResetOption {
             ResetOption::Summaries,
             ResetOption::Glossary,
             ResetOption::Memory,
+            ResetOption::GroupingAi,
         ]
     }
 
@@ -73,6 +79,7 @@ impl ResetOption {
             ResetOption::Suggestions,
             ResetOption::Summaries,
             ResetOption::Glossary,
+            ResetOption::GroupingAi,
         ]
     }
 }
@@ -275,6 +282,88 @@ impl LlmSummaryCache {
 }
 
 impl Default for LlmSummaryCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  GROUPING AI CACHE - AI-assisted layer classification hints
+// ═══════════════════════════════════════════════════════════════════════════
+
+const GROUPING_AI_CACHE_DAYS: i64 = 30;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupingAiEntry {
+    pub layer: crate::grouping::Layer,
+    pub confidence: f64,
+    pub file_hash: String,
+    pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupingAiCache {
+    pub entries: HashMap<PathBuf, GroupingAiEntry>,
+    pub cached_at: DateTime<Utc>,
+}
+
+impl GroupingAiCache {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            cached_at: Utc::now(),
+        }
+    }
+
+    pub fn is_file_valid(&self, path: &PathBuf, current_hash: &str) -> bool {
+        if let Some(entry) = self.entries.get(path) {
+            if entry.file_hash != current_hash {
+                return false;
+            }
+            let age = Utc::now() - entry.generated_at;
+            age < Duration::days(GROUPING_AI_CACHE_DAYS)
+        } else {
+            false
+        }
+    }
+
+    pub fn set_entry(&mut self, path: PathBuf, entry: GroupingAiEntry) {
+        self.entries.insert(path, entry);
+        self.cached_at = Utc::now();
+    }
+
+    pub fn normalize_paths(&mut self, root: &Path) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+
+        let mut normalized: HashMap<PathBuf, GroupingAiEntry> = HashMap::new();
+        let mut changed = false;
+
+        for (path, entry) in self.entries.iter() {
+            let key = normalize_summary_path(path, root);
+            if &key != path {
+                changed = true;
+            }
+
+            match normalized.get(&key) {
+                Some(existing) if existing.generated_at >= entry.generated_at => {}
+                _ => {
+                    normalized.insert(key, entry.clone());
+                }
+            }
+        }
+
+        if changed {
+            self.entries = normalized;
+            self.cached_at = Utc::now();
+        }
+
+        changed
+    }
+}
+
+impl Default for GroupingAiCache {
     fn default() -> Self {
         Self::new()
     }
@@ -515,6 +604,25 @@ impl Cache {
         Ok(())
     }
 
+    /// Load grouping AI cache
+    pub fn load_grouping_ai_cache(&self) -> Option<GroupingAiCache> {
+        let path = self.cache_dir.join(GROUPING_AI_CACHE_FILE);
+        if !path.exists() {
+            return None;
+        }
+        let content = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    /// Save grouping AI cache
+    pub fn save_grouping_ai_cache(&self, cache: &GroupingAiCache) -> anyhow::Result<()> {
+        self.ensure_dir()?;
+        let path = self.cache_dir.join(GROUPING_AI_CACHE_FILE);
+        let content = serde_json::to_string_pretty(cache)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+
     /// Load repo memory (decisions/conventions) from `.cosmos/memory.json`
     pub fn load_repo_memory(&self) -> RepoMemory {
         let path = self.cache_dir.join(MEMORY_FILE);
@@ -567,6 +675,7 @@ impl Cache {
                 ResetOption::Summaries => vec![LLM_SUMMARIES_CACHE_FILE],
                 ResetOption::Glossary => vec![GLOSSARY_FILE],
                 ResetOption::Memory => vec![MEMORY_FILE],
+                ResetOption::GroupingAi => vec![GROUPING_AI_CACHE_FILE],
             };
 
             for file in files_to_remove {

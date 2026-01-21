@@ -3,8 +3,10 @@ use crate::app::{background, input, RuntimeContext};
 use crate::cache;
 use crate::context::WorkContext;
 use crate::git_ops;
+use crate::grouping::{Confidence, Layer, LayerOverride};
 use crate::index::CodebaseIndex;
 use crate::suggest;
+use crate::suggest::llm::grouping as grouping_llm;
 use crate::suggest::SuggestionEngine;
 use crate::ui::{App, LoadingState};
 use crate::ui;
@@ -72,6 +74,26 @@ pub async fn run_tui(
     // Compute file hashes for change detection
     let file_hashes = cache::compute_file_hashes(&index);
 
+    // Optional AI-assisted grouping (safe fallback, low-confidence only)
+    let grouping_ai_enabled = app.config.enable_grouping_ai;
+    let mut grouping_ai_cache = cache_manager
+        .load_grouping_ai_cache()
+        .unwrap_or_else(cache::GroupingAiCache::new);
+    if grouping_ai_cache.normalize_paths(&index.root) {
+        let _ = cache_manager.save_grouping_ai_cache(&grouping_ai_cache);
+    }
+    if grouping_ai_enabled {
+        let overrides = cached_grouping_overrides(
+            &app.grouping,
+            &grouping_ai_cache,
+            &file_hashes,
+        );
+        if !overrides.is_empty() {
+            let grouping = crate::grouping::generate_grouping_with_overrides(&index, &overrides);
+            app.apply_grouping_update(grouping);
+        }
+    }
+
     // Load cached LLM summaries and apply immediately
     let mut llm_cache = cache_manager
         .load_llm_summaries_cache()
@@ -132,6 +154,99 @@ pub async fn run_tui(
 
     // Create channel for background tasks
     let (tx, rx) = mpsc::channel::<BackgroundMessage>();
+
+    // AI grouping enhancement: low-confidence files only, capped for safety
+    if grouping_ai_enabled && ai_enabled {
+        let max_files =
+            grouping_llm::GROUPING_AI_FILES_PER_REQUEST * grouping_llm::GROUPING_AI_MAX_REQUESTS;
+        let candidates = select_grouping_ai_candidates(
+            &app.grouping,
+            &grouping_ai_cache,
+            &file_hashes,
+            max_files,
+        );
+
+        if !candidates.is_empty() {
+            let index_clone = index.clone();
+            let baseline_grouping = app.grouping.clone();
+            let file_hashes_clone = file_hashes.clone();
+            let tx_grouping = tx.clone();
+            let cache_path = repo_path.clone();
+
+            // Process chunks sequentially in a single task to avoid cache races
+            tokio::spawn(async move {
+                let cache = cache::Cache::new(&cache_path);
+                let mut grouping_cache = cache
+                    .load_grouping_ai_cache()
+                    .unwrap_or_else(cache::GroupingAiCache::new);
+                let _ = grouping_cache.normalize_paths(&index_clone.root);
+
+                let mut total_usage = suggest::llm::Usage::default();
+                let mut saw_usage = false;
+
+                for chunk in candidates
+                    .chunks(grouping_llm::GROUPING_AI_FILES_PER_REQUEST)
+                    .take(grouping_llm::GROUPING_AI_MAX_REQUESTS)
+                {
+                    match grouping_llm::classify_grouping_candidates(&index_clone, chunk).await {
+                        Ok((suggestions, usage)) => {
+                            for suggestion in suggestions {
+                                if let Some(hash) = file_hashes_clone.get(&suggestion.path) {
+                                    grouping_cache.set_entry(
+                                        suggestion.path.clone(),
+                                        cache::GroupingAiEntry {
+                                            layer: suggestion.layer,
+                                            confidence: suggestion.confidence,
+                                            file_hash: hash.clone(),
+                                            generated_at: chrono::Utc::now(),
+                                        },
+                                    );
+                                }
+                            }
+
+                            if let Some(u) = usage {
+                                total_usage.prompt_tokens += u.prompt_tokens;
+                                total_usage.completion_tokens += u.completion_tokens;
+                                total_usage.total_tokens += u.total_tokens;
+                                saw_usage = true;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx_grouping
+                                .send(BackgroundMessage::GroupingEnhanceError(e.to_string()));
+                        }
+                    }
+                }
+
+                let _ = cache.save_grouping_ai_cache(&grouping_cache);
+
+                let overrides = cached_grouping_overrides(
+                    &baseline_grouping,
+                    &grouping_cache,
+                    &file_hashes_clone,
+                );
+                let usage = if saw_usage { Some(total_usage) } else { None };
+
+                if !overrides.is_empty() {
+                    let grouping =
+                        crate::grouping::generate_grouping_with_overrides(&index_clone, &overrides);
+                    let _ = tx_grouping.send(BackgroundMessage::GroupingEnhanced {
+                        grouping,
+                        updated_files: overrides.len(),
+                        usage,
+                        model: "balanced".to_string(),
+                    });
+                } else if usage.is_some() {
+                    let _ = tx_grouping.send(BackgroundMessage::GroupingEnhanced {
+                        grouping: baseline_grouping.clone(),
+                        updated_files: 0,
+                        usage,
+                        model: "balanced".to_string(),
+                    });
+                }
+            });
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  SEQUENTIAL INIT: Summaries first (builds glossary), then suggestions
@@ -385,4 +500,71 @@ fn run_loop<B: Backend>(
             return Ok(());
         }
     }
+}
+
+fn cached_grouping_overrides(
+    grouping: &crate::grouping::CodebaseGrouping,
+    cache: &cache::GroupingAiCache,
+    file_hashes: &HashMap<PathBuf, String>,
+) -> HashMap<PathBuf, LayerOverride> {
+    let mut overrides = HashMap::new();
+
+    for (path, entry) in &cache.entries {
+        let Some(hash) = file_hashes.get(path) else {
+            continue;
+        };
+        if !cache.is_file_valid(path, hash) {
+            continue;
+        }
+        if entry.confidence < grouping_llm::GROUPING_AI_MIN_CONFIDENCE {
+            continue;
+        }
+        let Some(assignment) = grouping.file_assignments.get(path) else {
+            continue;
+        };
+        if assignment.confidence != Confidence::Low {
+            continue;
+        }
+        if !matches!(assignment.layer, Layer::Unknown | Layer::Shared) {
+            continue;
+        }
+        if assignment.layer == entry.layer {
+            continue;
+        }
+        overrides.insert(
+            path.clone(),
+            LayerOverride {
+                layer: entry.layer,
+                confidence: Confidence::from_score(entry.confidence),
+            },
+        );
+    }
+
+    overrides
+}
+
+fn select_grouping_ai_candidates(
+    grouping: &crate::grouping::CodebaseGrouping,
+    cache: &cache::GroupingAiCache,
+    file_hashes: &HashMap<PathBuf, String>,
+    max_files: usize,
+) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = grouping
+        .file_assignments
+        .iter()
+        .filter(|(_, assignment)| assignment.confidence == Confidence::Low)
+        .filter(|(_, assignment)| matches!(assignment.layer, Layer::Unknown | Layer::Shared))
+        .filter(|(path, _)| {
+            if let Some(hash) = file_hashes.get(path) {
+                !cache.is_file_valid(path, hash)
+            } else {
+                false
+            }
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+
+    candidates.sort();
+    candidates.truncate(max_files);
+    candidates
 }

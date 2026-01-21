@@ -44,6 +44,18 @@ impl LayerDetection {
     }
 }
 
+impl Confidence {
+    pub fn from_score(score: f64) -> Self {
+        if score >= 0.8 {
+            Confidence::High
+        } else if score >= 0.6 {
+            Confidence::Medium
+        } else {
+            Confidence::Low
+        }
+    }
+}
+
 /// Categorize all files in a codebase using heuristics
 pub fn categorize_codebase(index: &CodebaseIndex) -> CodebaseGrouping {
     let mut grouping = CodebaseGrouping::new();

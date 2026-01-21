@@ -194,6 +194,38 @@ pub fn drain_messages(
                 app.summary_progress = None;
                 app.show_toast(&format!("Summary error: {}", truncate(&e, 80)));
             }
+            BackgroundMessage::GroupingEnhanced {
+                grouping,
+                updated_files,
+                usage,
+                model,
+            } => {
+                if updated_files > 0 {
+                    app.apply_grouping_update(grouping);
+                }
+
+                if let Some(u) = usage {
+                    let cost = u.calculate_cost(suggest::llm::Model::Balanced);
+                    app.session_cost += cost;
+                    app.session_tokens += u.total_tokens;
+                    let _ = app.config.record_tokens(u.total_tokens);
+                    let _ = app
+                        .config
+                        .allow_ai(app.session_cost)
+                        .map_err(|e| app.show_toast(&e));
+                }
+
+                if updated_files > 0 {
+                    app.show_toast(&format!(
+                        "Grouping updated for {} files ({})",
+                        updated_files, model
+                    ));
+                    app.active_model = Some(model);
+                }
+            }
+            BackgroundMessage::GroupingEnhanceError(e) => {
+                app.show_toast(&format!("Grouping error: {}", truncate(&e, 80)));
+            }
             BackgroundMessage::PreviewReady { preview, .. } => {
                 app.loading = LoadingState::None;
                 // Set the preview in the Verify workflow step

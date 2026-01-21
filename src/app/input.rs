@@ -675,22 +675,25 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                     selections.contains(&crate::cache::ResetOption::Summaries);
                                 let needs_glossary =
                                     selections.contains(&crate::cache::ResetOption::Glossary);
+                                let needs_grouping_ai =
+                                    selections.contains(&crate::cache::ResetOption::GroupingAi);
 
                                 // Perform reindex if needed
                                 if needs_reindex {
                                     match index::CodebaseIndex::new(&app.repo_path) {
                                         Ok(new_index) => {
-                                            // Apply grouping
-                                            let mut idx = new_index;
+                                            let idx = new_index;
                                             let grouping = idx.generate_grouping();
-                                            idx.apply_grouping(&grouping);
                                             app.index = idx;
-                                            app.grouping = grouping;
+                                            app.apply_grouping_update(grouping);
                                         }
                                         Err(e) => {
                                             app.show_toast(&format!("Reindex failed: {}", e));
                                         }
                                     }
+                                } else if needs_grouping_ai {
+                                    let grouping = app.index.generate_grouping();
+                                    app.apply_grouping_update(grouping);
                                 }
 
                                 // Clear in-memory suggestions if needed

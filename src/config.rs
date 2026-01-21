@@ -19,6 +19,9 @@ pub struct Config {
     pub tokens_used_date: Option<String>,
     /// If true, only generate LLM summaries for changed files (and not the whole repo)
     pub summarize_changed_only: bool,
+    /// If true, allow AI-assisted grouping for low-confidence files
+    #[serde(default)]
+    pub enable_grouping_ai: bool,
     /// If true, show a preview of what will be sent before inquiry actions
     #[serde(default = "default_privacy_preview")]
     pub privacy_preview: bool,

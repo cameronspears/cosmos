@@ -217,6 +217,25 @@ PRIORITIZE:
 - Refactoring opportunities that reduce complexity or prevent future bugs
 - Use DOMAIN TERMINOLOGY when provided (use this project's specific business terms, not code terms)"#;
 
+pub const GROUPING_CLASSIFY_SYSTEM: &str = r#"You classify code files into architectural layers.
+
+OUTPUT FORMAT (JSON):
+{
+  "files": [
+    {
+      "path": "relative/path/to/file",
+      "layer": "frontend|backend|api|database|shared|config|tests|infra|unknown",
+      "confidence": 0.0
+    }
+  ]
+}
+
+RULES:
+- Use only the metadata provided (names, symbols, imports, summaries)
+- If unsure, use "unknown" with low confidence
+- Keep confidence between 0.0 and 1.0
+- Do NOT include explanations or extra fields"#;
+
 pub const SUMMARY_BATCH_SYSTEM: &str = r#"You are a senior developer writing documentation. For each file, write a 2-6 sentence summary explaining:
 - What this file IS (its purpose/role)
 - What it DOES (key functionality, main exports)

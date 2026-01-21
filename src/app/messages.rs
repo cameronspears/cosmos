@@ -24,6 +24,14 @@ pub enum BackgroundMessage {
         summaries: HashMap<PathBuf, String>,
     },
     SummariesError(String),
+    /// AI-assisted grouping update ready
+    GroupingEnhanced {
+        grouping: crate::grouping::CodebaseGrouping,
+        updated_files: usize,
+        usage: Option<suggest::llm::Usage>,
+        model: String,
+    },
+    GroupingEnhanceError(String),
     /// Quick preview ready (Phase 1 - fast)
     PreviewReady {
         suggestion_id: Uuid,

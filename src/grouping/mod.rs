@@ -6,6 +6,7 @@
 pub mod heuristics;
 pub mod features;
 
+use crate::index::CodebaseIndex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -127,6 +128,21 @@ impl Layer {
             Layer::Unknown,
         ]
     }
+
+    pub fn parse(raw: &str) -> Option<Layer> {
+        match raw.trim().to_lowercase().as_str() {
+            "frontend" | "ui" => Some(Layer::Frontend),
+            "backend" | "server" => Some(Layer::Backend),
+            "api" | "endpoint" | "endpoints" => Some(Layer::API),
+            "database" | "db" | "data" => Some(Layer::Database),
+            "shared" | "common" => Some(Layer::Shared),
+            "config" | "configuration" => Some(Layer::Config),
+            "tests" | "test" => Some(Layer::Tests),
+            "infra" | "infrastructure" => Some(Layer::Infra),
+            "unknown" | "other" => Some(Layer::Unknown),
+            _ => None,
+        }
+    }
 }
 
 impl Default for Layer {
@@ -222,6 +238,12 @@ impl Default for FileAssignment {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct LayerOverride {
+    pub layer: Layer,
+    pub confidence: Confidence,
+}
+
 /// Complete file grouping for a codebase
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CodebaseGrouping {
@@ -255,6 +277,59 @@ impl CodebaseGrouping {
             .add_file(path);
     }
 
+    /// Reassign a file to a new layer and confidence.
+    /// This is safe to call before feature detection (ungrouped files only).
+    pub fn reassign_file_with_confidence(
+        &mut self,
+        path: &PathBuf,
+        layer: Layer,
+        confidence: Confidence,
+    ) {
+        if let Some(existing) = self.file_assignments.get(path) {
+            let old_layer = existing.layer;
+            if let Some(group) = self.groups.get_mut(&old_layer) {
+                group.ungrouped_files.retain(|p| p != path);
+                for feature in &mut group.features {
+                    feature.files.retain(|p| p != path);
+                }
+                group.features.retain(|f| !f.files.is_empty());
+            }
+        }
+
+        self.file_assignments.insert(path.clone(), FileAssignment {
+            layer,
+            feature: None,
+            confidence,
+        });
+        self.groups
+            .entry(layer)
+            .or_insert_with(|| FileGroup::new(layer))
+            .add_file(path.clone());
+    }
+
+}
+
+pub fn generate_grouping_with_overrides(
+    index: &CodebaseIndex,
+    overrides: &HashMap<PathBuf, LayerOverride>,
+) -> CodebaseGrouping {
+    let mut grouping = heuristics::categorize_codebase(index);
+
+    if !overrides.is_empty() {
+        for (path, override_entry) in overrides {
+            if index.files.contains_key(path) {
+                grouping.reassign_file_with_confidence(
+                    path,
+                    override_entry.layer,
+                    override_entry.confidence,
+                );
+            }
+        }
+        grouping.llm_enhanced = true;
+    }
+
+    features::detect_features(&mut grouping, index);
+    grouping
 }
 
 /// Entry in the flattened grouped tree for UI rendering
