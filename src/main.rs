@@ -59,7 +59,7 @@ struct Args {
     #[arg(long)]
     stats: bool,
 
-    
+
 }
 
 /// Messages from background tasks to the main UI thread
@@ -167,11 +167,11 @@ async fn main() -> Result<()> {
 
     // Initialize cache
     let cache_manager = cache::Cache::new(&path);
-    
+
     // Initialize index (fast, synchronous)
     let index = init_index(&path, &cache_manager)?;
     let context = init_context(&path)?;
-    
+
     // Create empty suggestion engine (will be populated by LLM)
     let suggestions = SuggestionEngine::new(index.clone());
 
@@ -187,41 +187,41 @@ async fn main() -> Result<()> {
 
 /// Initialize the codebase index
 fn init_index(path: &PathBuf, cache_manager: &cache::Cache) -> Result<CodebaseIndex> {
-    eprint!("  Indexing codebase...");
-    
+    eprint!("  Scanning project files (usually instant)...");
+
     let index = CodebaseIndex::new(path)?;
     let stats = index.stats();
-    
+
     // Save index cache
     let index_cache = cache::IndexCache::from_index(&index);
     let _ = cache_manager.save_index_cache(&index_cache);
-    
+
     eprintln!(
         " {} files, {} symbols",
         stats.file_count,
         stats.symbol_count
     );
-    
+
     Ok(index)
 }
 
 /// Initialize the work context
 fn init_context(path: &PathBuf) -> Result<WorkContext> {
-    eprint!("  Loading context...");
-    
+    eprint!("  Checking git status...");
+
     let context = WorkContext::load(path)?;
-    
+
     eprintln!(
         " {} on {}, {} changed",
         context.branch,
-        if context.inferred_focus.is_some() { 
-            context.inferred_focus.as_ref().unwrap() 
-        } else { 
-            "project" 
+        if context.inferred_focus.is_some() {
+            context.inferred_focus.as_ref().unwrap()
+        } else {
+            "project"
         },
         context.modified_count
     );
-    
+
     Ok(context)
 }
 
@@ -258,7 +258,7 @@ fn print_stats(index: &CodebaseIndex, suggestions: &SuggestionEngine, context: &
         println!("  Top suggestions:");
         println!();
         for (i, s) in top.iter().take(5).enumerate() {
-            println!("    {}. {} {}: {}", 
+            println!("    {}. {} {}: {}",
                 i + 1,
                 s.priority.icon(),
                 s.kind.label(),
@@ -298,19 +298,19 @@ async fn run_tui(
     app.repo_memory = cache_manager.load_repo_memory();
     // Load cached domain glossary (auto-extracted terminology)
     app.glossary = cache_manager.load_glossary().unwrap_or_default();
-    
+
     // Check for unsaved work and show startup overlay if needed
     if let Ok(status) = git_ops::current_status(&repo_path) {
         let main_branch = git_ops::get_main_branch_name(&repo_path).unwrap_or_else(|_| "main".to_string());
         let is_on_main = status.branch == main_branch;
         let changed_count = status.staged.len() + status.modified.len();
-        
+
         // Show overlay if not on main or has uncommitted changes
         if !is_on_main || changed_count > 0 {
             app.show_startup_check(changed_count);
         }
     }
-    
+
     // Check if we have API access (and budgets allow it)
     let mut ai_enabled = suggest::llm::is_available();
     if ai_enabled {
@@ -319,35 +319,35 @@ async fn run_tui(
             app.show_toast(&e);
         }
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════════
     //  SMART SUMMARY CACHING
     // ═══════════════════════════════════════════════════════════════════════
-    
+
     // Compute file hashes for change detection
     let file_hashes = cache::compute_file_hashes(&index);
-    
+
     // Load cached LLM summaries and apply immediately
     let mut llm_cache = cache_manager.load_llm_summaries_cache()
         .unwrap_or_else(cache::LlmSummaryCache::new);
     if llm_cache.normalize_paths(&index.root) {
         let _ = cache_manager.save_llm_summaries_cache(&llm_cache);
     }
-    
+
     // Get all valid cached summaries and load them immediately (instant startup!)
     let cached_summaries = llm_cache.get_all_valid_summaries(&file_hashes);
     let cached_count = cached_summaries.len();
     let total_files = file_hashes.len();
-    
+
     if !cached_summaries.is_empty() {
         app.update_summaries(cached_summaries);
         eprintln!("  Loaded {} cached summaries ({} files total)", cached_count, total_files);
     }
-    
+
     // Discover project context (for better quality summaries)
     let project_context = suggest::llm::discover_project_context(&index);
     llm_cache.set_project_context(project_context.clone());
-    
+
     // Find files that need new/updated summaries
     let mut files_needing_summary = llm_cache.get_files_needing_summary(&file_hashes);
 
@@ -372,16 +372,16 @@ async fn run_tui(
         files_needing_summary.retain(|p| wanted.contains(p));
     }
     let needs_summary_count = files_needing_summary.len();
-    
+
     // Track if we need to generate summaries (used to control loading state)
     app.needs_summary_generation = needs_summary_count > 0;
-    
+
     if needs_summary_count > 0 {
         eprintln!("  {} files need summary generation", needs_summary_count);
     } else if cached_count > 0 {
         eprintln!("  All {} summaries loaded from cache", cached_count);
     }
-    
+
     eprintln!();
 
     // Create channel for background tasks
@@ -390,63 +390,63 @@ async fn run_tui(
     // ═══════════════════════════════════════════════════════════════════════
     //  SEQUENTIAL INIT: Summaries first (builds glossary), then suggestions
     // ═══════════════════════════════════════════════════════════════════════
-    
+
     if ai_enabled {
         if !files_needing_summary.is_empty() {
             // Phase 1: Summaries needed - generate them first, suggestions come after
             app.loading = LoadingState::GeneratingSummaries;
             app.pending_suggestions_on_init = true;
             app.summary_progress = Some((0, needs_summary_count));
-            
+
             let index_clone2 = index.clone();
             let context_clone2 = context.clone();
             let tx_summaries = tx.clone();
             let cache_path = repo_path.clone();
             let file_hashes_clone = file_hashes.clone();
-            
+
             // Prioritize files for generation
-            let (high_priority, medium_priority, low_priority) = 
+            let (high_priority, medium_priority, low_priority) =
                 suggest::llm::prioritize_files_for_summary(&index_clone2, &context_clone2, &files_needing_summary);
-            
+
             // Show initial cached count
             if cached_count > 0 {
                 app.show_toast(&format!("{}/{} cached · summarizing {}", cached_count, total_files, needs_summary_count));
             }
-            
+
             // Calculate total file count for progress
             let total_to_process = high_priority.len() + medium_priority.len() + low_priority.len();
-            
+
             tokio::spawn(async move {
                 let cache = cache::Cache::new(&cache_path);
-                
+
                 // Load existing cache to update incrementally
                 let mut llm_cache = cache.load_llm_summaries_cache()
                     .unwrap_or_else(cache::LlmSummaryCache::new);
-                
+
                 // Load existing glossary to merge new terms into
                 let mut glossary = cache.load_glossary()
                     .unwrap_or_else(cache::DomainGlossary::new);
-                
+
                 let mut all_summaries = HashMap::new();
                 let mut total_usage = suggest::llm::Usage::default();
                 let mut completed_count = 0usize;
-                
+
                 // Process all priority tiers with parallel batching within each tier
                 let priority_tiers = [
                     ("high", high_priority),
-                    ("medium", medium_priority), 
+                    ("medium", medium_priority),
                     ("low", low_priority),
                 ];
-                
+
                 for (_tier_name, files) in priority_tiers {
                     if files.is_empty() {
                         continue;
                     }
-                    
+
                     // Use large batch size (16 files) for faster processing
                     let batch_size = 16;
                     let batches: Vec<_> = files.chunks(batch_size).collect();
-                    
+
                     // Process batches sequentially (llm.rs handles internal parallelism)
                     for batch in batches {
                         if let Ok((summaries, batch_glossary, usage)) = suggest::llm::generate_summaries_for_files(
@@ -460,20 +460,20 @@ async fn run_tui(
                             }
                             // Merge new terms into glossary
                             glossary.merge(&batch_glossary);
-                            
+
                             // Save cache incrementally after each batch
                             let _ = cache.save_llm_summaries_cache(&llm_cache);
                             let _ = cache.save_glossary(&glossary);
-                            
+
                             completed_count += summaries.len();
-                            
+
                             // Send progress update with new summaries
                             let _ = tx_summaries.send(BackgroundMessage::SummaryProgress {
                                 completed: completed_count,
                                 total: total_to_process,
                                 summaries: summaries.clone(),
                             });
-                            
+
                             all_summaries.extend(summaries);
                             if let Some(u) = usage {
                                 total_usage.prompt_tokens += u.prompt_tokens;
@@ -483,34 +483,34 @@ async fn run_tui(
                         }
                     }
                 }
-                
+
                 let final_usage = if total_usage.total_tokens > 0 {
                     Some(total_usage)
                 } else {
                     None
                 };
-                
+
                 // Send final message (summaries already sent via progress, so send empty)
-                let _ = tx_summaries.send(BackgroundMessage::SummariesReady { 
-                    summaries: HashMap::new(), 
-                    usage: final_usage 
+                let _ = tx_summaries.send(BackgroundMessage::SummariesReady {
+                    summaries: HashMap::new(),
+                    usage: final_usage
                 });
             });
         } else {
             // Phase 2 only: All summaries cached - generate suggestions directly with cached glossary
             app.loading = LoadingState::GeneratingSuggestions;
-            
+
             let index_clone = index.clone();
             let context_clone = context.clone();
             let tx_suggestions = tx.clone();
             let cache_clone_path = repo_path.clone();
             let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
             let glossary_clone = app.glossary.clone();
-            
+
             if !glossary_clone.is_empty() {
                 app.show_toast(&format!("{} glossary terms · generating suggestions", glossary_clone.len()));
             }
-            
+
             tokio::spawn(async move {
                 let mem = if repo_memory_context.trim().is_empty() {
                     None
@@ -524,7 +524,7 @@ async fn run_tui(
                         let cache = cache::Cache::new(&cache_clone_path);
                         let cache_data = cache::SuggestionsCache::from_suggestions(&suggestions);
                         let _ = cache.save_suggestions_cache(&cache_data);
-                        
+
                         let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                             suggestions,
                             usage,
@@ -566,14 +566,14 @@ fn run_loop<B: Backend>(
     // Track last git status refresh time
     let mut last_git_refresh = std::time::Instant::now();
     const GIT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-    
+
     loop {
         // Clear expired toasts
         app.clear_expired_toast();
 
         // Advance spinner animation
         app.tick_loading();
-        
+
         // Periodically refresh git status (every 2 seconds)
         if last_git_refresh.elapsed() >= GIT_REFRESH_INTERVAL {
             let _ = app.context.refresh();
@@ -600,7 +600,7 @@ app.suggestions.sort_with_context(&app.context);
                         let _ = app.config.record_tokens(u.total_tokens);
                         let _ = app.config.allow_ai(app.session_cost).map_err(|e| app.show_toast(&e));
                     }
-                    
+
                     // If summaries are still generating, switch to that loading state
                     // Otherwise, clear loading
                     if app.needs_summary_generation && app.summary_progress.is_some() {
@@ -608,7 +608,7 @@ app.suggestions.sort_with_context(&app.context);
                     } else {
                         app.loading = LoadingState::None;
                     }
-                    
+
                     // More prominent toast for suggestions
                     app.show_toast(&format!("{} suggestions ready ({})", count, &model));
                     app.active_model = Some(model);
@@ -634,23 +634,23 @@ app.suggestions.sort_with_context(&app.context);
                         let _ = app.config.record_tokens(u.total_tokens);
                         let _ = app.config.allow_ai(app.session_cost).map_err(|e| app.show_toast(&e));
                     }
-                    
+
                     // Reload glossary from cache (it was built during summary generation)
                     let cache = cache::Cache::new(&repo_path);
                     if let Some(new_glossary) = cache.load_glossary() {
                         app.glossary = new_glossary;
                     }
-                    
+
                     app.summary_progress = None;
                     app.needs_summary_generation = false;
-                    
+
                     // If we're waiting to generate suggestions after reset, do it now
                     if app.pending_suggestions_on_init {
                         app.pending_suggestions_on_init = false;
-                        
+
                         // Check if AI is still available
                         let ai_enabled = suggest::llm::is_available() && app.config.allow_ai(app.session_cost).is_ok();
-                        
+
                         if ai_enabled {
                             let index_clone = app.index.clone();
                             let context_clone = app.context.clone();
@@ -658,10 +658,10 @@ app.suggestions.sort_with_context(&app.context);
                             let cache_clone_path = repo_path.clone();
                             let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
                             let glossary_clone = app.glossary.clone();
-                            
+
                             app.loading = LoadingState::GeneratingSuggestions;
                             app.show_toast(&format!("{} terms in glossary · generating suggestions...", glossary_clone.len()));
-                            
+
                             tokio::spawn(async move {
                                 let mem = if repo_memory_context.trim().is_empty() {
                                     None
@@ -675,7 +675,7 @@ app.suggestions.sort_with_context(&app.context);
                                         let cache = cache::Cache::new(&cache_clone_path);
                                         let cache_data = cache::SuggestionsCache::from_suggestions(&suggestions);
                                         let _ = cache.save_suggestions_cache(&cache_data);
-                                        
+
                                         let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                                             suggestions,
                                             usage,
@@ -779,7 +779,7 @@ app.suggestions.sort_with_context(&app.context);
                     let first_original = files_with_content.first().map(|(_, o, _)| o.clone()).unwrap_or_default();
                     let first_new = files_with_content.first().map(|(_, _, n)| n.clone()).unwrap_or_default();
                     app.start_review(first_file, first_original.clone(), first_new.clone());
-                    
+
                     // Trigger verification in background (all files)
                     let tx_verify = tx.clone();
                     tokio::spawn(async move {
@@ -869,22 +869,22 @@ app.suggestions.sort_with_context(&app.context);
                         app.session_tokens += u.total_tokens;
                         let _ = app.config.record_tokens(u.total_tokens);
                     }
-                    
+
                     app.show_toast(&format!("Fixed: {}", truncate(&description, 40)));
-                    
+
                     // Update workflow review state
                     let file_path = app.review_state.file_path.clone();
                     let original_content = app.review_state.original_content.clone();
                     let iteration = app.review_state.review_iteration + 1;
                     let fixed_titles = app.review_state.fixed_titles.clone();
-                    
+
                     app.review_fix_complete(new_content.clone());
-                    
+
                     // Trigger re-review
                     if let Some(fp) = file_path {
                         app.review_state.reviewing = true;
                         app.loading = LoadingState::ReviewingChanges;
-                        
+
                         let tx_verify = tx.clone();
                         tokio::spawn(async move {
                             let files_with_content = vec![(fp, original_content, new_content)];
@@ -929,7 +929,7 @@ app.suggestions.sort_with_context(&app.context);
                     }
                     continue;
                 }
-                
+
                 // Handle question input mode
                 if app.input_mode == InputMode::Question {
                     match key.code {
@@ -970,9 +970,9 @@ app.suggestions.sort_with_context(&app.context);
                                     let context_clone = app.context.clone();
                                     let tx_question = tx.clone();
                                     let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
-                                    
+
                                     app.loading = LoadingState::Answering;
-                                    
+
                                     tokio::spawn(async move {
                                         let mem = if repo_memory_context.trim().is_empty() {
                                             None
@@ -1093,7 +1093,7 @@ app.suggestions.sort_with_context(&app.context);
                             }
                             continue;
                         }
-                        
+
                         match key.code {
                             KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
                             KeyCode::Down => app.overlay_scroll_down(),
@@ -1176,7 +1176,7 @@ app.suggestions.sort_with_context(&app.context);
                         }
                         continue;
                     }
-                    
+
                     // Handle BranchCreate overlay
                     if let Overlay::BranchCreate { branch_name, commit_message, pending_files } = &app.overlay {
                         match key.code {
@@ -1187,10 +1187,10 @@ app.suggestions.sort_with_context(&app.context);
                                 let branch = branch_name.clone();
                                 let message = commit_message.clone();
                                 let files = pending_files.clone();
-                                
+
                                 app.close_overlay();
                                 app.show_toast("Creating branch...");
-                                
+
                                 // Create branch, stage files, commit, and push
                                 match git_ops::create_and_checkout_branch(&repo_path, &branch) {
                                     Ok(()) => {
@@ -1200,12 +1200,12 @@ app.suggestions.sort_with_context(&app.context);
                                                 let _ = git_ops::stage_file(&repo_path, rel_path);
                                             }
                                         }
-                                        
+
                                         // Commit
                                         match git_ops::commit(&repo_path, &message) {
                                             Ok(_) => {
                                                 app.cosmos_branch = Some(branch.clone());
-                                                
+
                                                 // Try to push (non-blocking)
                                                 let repo_for_push = repo_path.clone();
                                                 let branch_for_push = branch.clone();
@@ -1220,7 +1220,7 @@ app.suggestions.sort_with_context(&app.context);
                                                         }
                                                     }
                                                 });
-                                                
+
                                                 app.show_toast("Branch created and committed");
                                             }
                                             Err(e) => {
@@ -1237,7 +1237,7 @@ app.suggestions.sort_with_context(&app.context);
                         }
                         continue;
                     }
-                    
+
                     // Handle ShipDialog overlay - streamlined commit + push + PR flow
                     if let Overlay::ShipDialog { branch_name, commit_message, files, step, .. } = &app.overlay {
                         let step = *step;
@@ -1432,7 +1432,7 @@ app.suggestions.sort_with_context(&app.context);
                         }
                         continue;
                     }
-                    
+
                     // Handle ErrorLog overlay
                     if let Overlay::ErrorLog { .. } = &app.overlay {
                         match key.code {
@@ -1496,13 +1496,13 @@ app.suggestions.sort_with_context(&app.context);
                                     match cache.clear_selective(&selections) {
                                         Ok(cleared) => {
                                             app.close_overlay();
-                                            
+
                                             // Check if we need to regenerate things
                                             let needs_reindex = selections.contains(&crate::cache::ResetOption::Index);
                                             let needs_suggestions = selections.contains(&crate::cache::ResetOption::Suggestions);
                                             let needs_summaries = selections.contains(&crate::cache::ResetOption::Summaries);
                                             let needs_glossary = selections.contains(&crate::cache::ResetOption::Glossary);
-                                            
+
                                             // Perform reindex if needed
                                             if needs_reindex {
                                                 match index::CodebaseIndex::new(&app.repo_path) {
@@ -1519,91 +1519,91 @@ app.suggestions.sort_with_context(&app.context);
                                                     }
                                                 }
                                             }
-                                            
+
                                             // Clear in-memory suggestions if needed
                                             if needs_suggestions {
                                                 app.suggestions = suggest::SuggestionEngine::new(app.index.clone());
                                             }
-                                            
+
                                             // Clear in-memory summaries if needed
                                             if needs_summaries {
                                                 app.llm_summaries.clear();
                                                 app.needs_summary_generation = true;
                                                 app.summary_progress = None;
                                             }
-                                            
+
                                             // Clear in-memory glossary if needed
                                             if needs_glossary {
                                                 app.glossary = crate::cache::DomainGlossary::default();
                                             }
-                                            
+
                                             // Refresh context
                                             let _ = app.context.refresh();
-                                            
+
                                             // Check if AI is available for regeneration
                                             let ai_enabled = suggest::llm::is_available() && app.config.allow_ai(app.session_cost).is_ok();
-                                            
+
                                             // IMPORTANT: Summaries must generate FIRST (they build the glossary),
                                             // THEN suggestions can use the rebuilt glossary.
                                             // We track pending_suggestions_on_init to trigger suggestions after summaries complete.
-                                            
+
                                             // Trigger regeneration of summaries first (builds glossary)
                                             if needs_summaries && ai_enabled {
                                                 let index_clone2 = app.index.clone();
                                                 let context_clone2 = app.context.clone();
                                                 let tx_summaries = tx.clone();
                                                 let cache_path = repo_path.clone();
-                                                
+
                                                 // Compute file hashes for change detection
                                                 let file_hashes = cache::compute_file_hashes(&index_clone2);
                                                 let file_hashes_clone = file_hashes.clone();
-                                                
+
                                                 // All files need summaries after reset
                                                 let files_needing_summary: Vec<PathBuf> = file_hashes.keys().cloned().collect();
-                                                
+
                                                 // Discover project context
                                                 let project_context = suggest::llm::discover_project_context(&index_clone2);
-                                                
+
                                                 // Prioritize files for generation
-                                                let (high_priority, medium_priority, low_priority) = 
+                                                let (high_priority, medium_priority, low_priority) =
                                                     suggest::llm::prioritize_files_for_summary(&index_clone2, &context_clone2, &files_needing_summary);
-                                                
+
                                                 let total_to_process = high_priority.len() + medium_priority.len() + low_priority.len();
-                                                
+
                                                 if total_to_process > 0 {
                                                     app.loading = LoadingState::GeneratingSummaries;
                                                     app.summary_progress = Some((0, total_to_process));
-                                                    
+
                                                     // Flag that suggestions should generate after summaries complete
                                                     if needs_suggestions {
                                                         app.pending_suggestions_on_init = true;
                                                     }
-                                                    
+
                                                     tokio::spawn(async move {
                                                         let cache = cache::Cache::new(&cache_path);
-                                                        
+
                                                         // Start with fresh cache after reset
                                                         let mut llm_cache = cache::LlmSummaryCache::new();
                                                         let mut glossary = cache::DomainGlossary::new();
-                                                        
+
                                                         let mut all_summaries = HashMap::new();
                                                         let mut total_usage = suggest::llm::Usage::default();
                                                         let mut completed_count = 0usize;
-                                                        
+
                                                         let priority_tiers = [
                                                             ("high", high_priority),
-                                                            ("medium", medium_priority), 
+                                                            ("medium", medium_priority),
                                                             ("low", low_priority),
                                                         ];
-                                                        
+
                                                         for (_tier_name, files) in priority_tiers {
                                                             if files.is_empty() {
                                                                 continue;
                                                             }
-                                                            
+
                                                             let batch_size = 16;
                                                             let batches: Vec<_> = files.chunks(batch_size).collect();
-                                                            
+
                                                             for batch in batches {
                                                                 if let Ok((summaries, batch_glossary, usage)) = suggest::llm::generate_summaries_for_files(
                                                                     &index_clone2, batch, &project_context
@@ -1614,18 +1614,18 @@ app.suggestions.sort_with_context(&app.context);
                                                                         }
                                                                     }
                                                                     glossary.merge(&batch_glossary);
-                                                                    
+
                                                                     let _ = cache.save_llm_summaries_cache(&llm_cache);
                                                                     let _ = cache.save_glossary(&glossary);
-                                                                    
+
                                                                     completed_count += summaries.len();
-                                                                    
+
                                                                     let _ = tx_summaries.send(BackgroundMessage::SummaryProgress {
                                                                         completed: completed_count,
                                                                         total: total_to_process,
                                                                         summaries: summaries.clone(),
                                                                     });
-                                                                    
+
                                                                     all_summaries.extend(summaries);
                                                                     if let Some(u) = usage {
                                                                         total_usage.prompt_tokens += u.prompt_tokens;
@@ -1635,16 +1635,16 @@ app.suggestions.sort_with_context(&app.context);
                                                                 }
                                                             }
                                                         }
-                                                        
+
                                                         let final_usage = if total_usage.total_tokens > 0 {
                                                             Some(total_usage)
                                                         } else {
                                                             None
                                                         };
-                                                        
-                                                        let _ = tx_summaries.send(BackgroundMessage::SummariesReady { 
-                                                            summaries: HashMap::new(), 
-                                                            usage: final_usage 
+
+                                                        let _ = tx_summaries.send(BackgroundMessage::SummariesReady {
+                                                            summaries: HashMap::new(),
+                                                            usage: final_usage
                                                         });
                                                     });
                                                 }
@@ -1656,9 +1656,9 @@ app.suggestions.sort_with_context(&app.context);
                                                 let cache_clone_path = repo_path.clone();
                                                 let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
                                                 let glossary_clone = app.glossary.clone();
-                                                
+
                                                 app.loading = LoadingState::GeneratingSuggestions;
-                                                
+
                                                 tokio::spawn(async move {
                                                     let mem = if repo_memory_context.trim().is_empty() {
                                                         None
@@ -1672,7 +1672,7 @@ app.suggestions.sort_with_context(&app.context);
                                                             let cache = cache::Cache::new(&cache_clone_path);
                                                             let cache_data = cache::SuggestionsCache::from_suggestions(&suggestions);
                                                             let _ = cache.save_suggestions_cache(&cache_data);
-                                                            
+
                                                             let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                                                                 suggestions,
                                                                 usage,
@@ -1685,7 +1685,7 @@ app.suggestions.sort_with_context(&app.context);
                                                     }
                                                 });
                                             }
-                                            
+
                                             // Show what was cleared
                                             let count = cleared.len();
                                             if count > 0 {
@@ -1765,7 +1765,7 @@ app.suggestions.sort_with_context(&app.context);
                         }
                         continue;
                     }
-                    
+
                     // Handle other overlays (generic scroll/close)
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
@@ -1836,7 +1836,7 @@ app.suggestions.sort_with_context(&app.context);
                     }
                     KeyCode::Char('f') => {
                         // Fix selected findings in Review step
-                        if app.active_panel == ActivePanel::Suggestions 
+                        if app.active_panel == ActivePanel::Suggestions
                            && app.workflow_step == WorkflowStep::Review
                            && !app.review_state.reviewing
                            && !app.review_state.fixing
@@ -1857,7 +1857,7 @@ app.suggestions.sort_with_context(&app.context);
                                 tokio::spawn(async move {
                                     let orig_ref = if iter > 1 { Some(original.as_str()) } else { None };
                                     match suggest::llm::fix_review_findings(
-                                        &file_path, 
+                                        &file_path,
                                         &content,
                                         orig_ref,
                                         &selected_findings,
@@ -1908,10 +1908,10 @@ app.suggestions.sort_with_context(&app.context);
                                                     let suggestion_clone = suggestion.clone();
                                                     let tx_preview = tx.clone();
                                                     let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
-                                                    
+
                                                     // Move to Verify step (with multi-file support)
                                                     app.start_verify_multi(suggestion_id, file_path.clone(), additional_files, summary.clone());
-                                                    
+
                                                     tokio::spawn(async move {
                                                         let mem = if repo_memory_context.trim().is_empty() {
                                                             None
@@ -1944,18 +1944,18 @@ app.suggestions.sort_with_context(&app.context);
                                                 let tx_apply = tx.clone();
                                                 let repo_path = app.repo_path.clone();
                                                 let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
-                                                
+
                                                 if let (Some(sid), Some(fp)) = (suggestion_id, file_path.clone()) {
                                                     if let Some(suggestion) = app.suggestions.suggestions.iter().find(|s| s.id == sid).cloned() {
                                                         app.loading = LoadingState::GeneratingFix;
-                                                        
+
                                                         tokio::spawn(async move {
                                                             // Create branch from main
                                                             let branch_name = git_ops::generate_fix_branch_name(
                                                                 &suggestion.id.to_string(),
                                                                 &suggestion.summary
                                                             );
-                                                            
+
                                                             let created_branch = match git_ops::create_fix_branch_from_main(&repo_path, &branch_name) {
                                                                 Ok(name) => name,
                                                                 Err(e) => {
@@ -1965,14 +1965,14 @@ app.suggestions.sort_with_context(&app.context);
                                                                     return;
                                                                 }
                                                             };
-                                                            
+
                                                             let mem = if repo_memory_context.trim().is_empty() { None } else { Some(repo_memory_context) };
-                                                            
+
                                                             // Check if this is a multi-file suggestion
                                                             if suggestion.is_multi_file() {
                                                                 // Multi-file fix
                                                                 let all_files = suggestion.affected_files();
-                                                                
+
                                                                 // Read all file contents
                                                                 let mut file_contents: Vec<(PathBuf, String)> = Vec::new();
                                                                 for file_path in &all_files {
@@ -1987,7 +1987,7 @@ app.suggestions.sort_with_context(&app.context);
                                                                         }
                                                                     }
                                                                 }
-                                                                
+
                                                                 // Generate multi-file fix
                                                                 match suggest::llm::generate_multi_file_fix(&file_contents, &suggestion, &preview, mem).await {
                                                                     Ok(multi_fix) => {
@@ -2008,13 +2008,13 @@ app.suggestions.sort_with_context(&app.context);
                                                                             }
                                                                             backups.push((file_edit.path.clone(), backup_path));
                                                                         }
-                                                                        
+
                                                                         // Apply all edits
                                                                         let mut file_changes: Vec<(PathBuf, PathBuf, String)> = Vec::new();
                                                                         for file_edit in &multi_fix.file_edits {
                                                                             let full_path = repo_path.join(&file_edit.path);
                                                                             let backup_path = full_path.with_extension("cosmos.bak");
-                                                                            
+
                                                                             match std::fs::write(&full_path, &file_edit.new_content) {
                                                                                 Ok(_) => {
                                                                                     // Stage the file
@@ -2022,7 +2022,7 @@ app.suggestions.sort_with_context(&app.context);
                                                                                         .map(|p| p.to_string_lossy().to_string())
                                                                                         .unwrap_or_else(|_| file_edit.path.to_string_lossy().to_string());
                                                                                     let _ = git_ops::stage_file(&repo_path, &rel_path);
-                                                                                    
+
                                                                                     let diff = format!("Modified: {}", file_edit.modified_areas.join(", "));
                                                                                     file_changes.push((file_edit.path.clone(), backup_path, diff));
                                                                                 }
@@ -2040,9 +2040,9 @@ app.suggestions.sort_with_context(&app.context);
                                                                                 }
                                                                             }
                                                                         }
-                                                                        
+
                                                                         let safety_checks = crate::safe_apply::run(&repo_path);
-                                                                        
+
                                                                         let _ = tx_apply.send(BackgroundMessage::DirectFixApplied {
                                                                             suggestion_id: sid,
                                                                             file_changes,
@@ -2069,7 +2069,7 @@ app.suggestions.sort_with_context(&app.context);
                                                                         return;
                                                                     }
                                                                 };
-                                                                
+
                                                                 match suggest::llm::generate_fix_content(&fp, &content, &suggestion, &preview, mem).await {
                                                                     Ok(applied_fix) => {
                                                                         let backup_path = full_path.with_extension("cosmos.bak");
@@ -2077,17 +2077,17 @@ app.suggestions.sort_with_context(&app.context);
                                                                             let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!("Failed to create backup: {}", e)));
                                                                             return;
                                                                         }
-                                                                        
+
                                                                         match std::fs::write(&full_path, &applied_fix.new_content) {
                                                                             Ok(_) => {
                                                                                 let rel_path = full_path.strip_prefix(&repo_path)
                                                                                     .map(|p| p.to_string_lossy().to_string())
                                                                                     .unwrap_or_else(|_| fp.to_string_lossy().to_string());
                                                                                 let _ = git_ops::stage_file(&repo_path, &rel_path);
-                                                                                
+
                                                                                 let safety_checks = crate::safe_apply::run(&repo_path);
                                                                                 let diff = format!("Modified: {}", applied_fix.modified_areas.join(", "));
-                                                                                
+
                                                                                 let _ = tx_apply.send(BackgroundMessage::DirectFixApplied {
                                                                                     suggestion_id: sid,
                                                                                     file_changes: vec![(fp, backup_path, diff)],
@@ -2139,7 +2139,7 @@ app.suggestions.sort_with_context(&app.context);
                                                     tokio::spawn(async move {
                                                         let orig_ref = if iter > 1 { Some(original.as_str()) } else { None };
                                                         match suggest::llm::fix_review_findings(
-                                                            &file_path, 
+                                                            &file_path,
                                                             &content,
                                                             orig_ref,
                                                             &selected_findings,
@@ -2286,4 +2286,3 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{}...", &s[..max - 3])
     }
 }
-
