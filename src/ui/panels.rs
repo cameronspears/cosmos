@@ -14,27 +14,100 @@ use ratatui::{
 //  BUTTON COMPONENTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Create a button-style key hint like [a] Apply
-pub fn button<'a>(key: &str, label: &str, highlighted: bool) -> Vec<Span<'a>> {
-    let (key_style, label_style) = if highlighted {
-        (
-            Style::default().fg(Theme::GREY_900).bg(Theme::WHITE).add_modifier(Modifier::BOLD),
-            Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        (
-            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300),
-            Style::default().fg(Theme::GREY_300),
-        )
-    };
-    
+/// Button style variants for consistent appearance across the UI
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ButtonStyle {
+    /// Primary action button (green background) - for main actions like "apply", "ship"
+    Primary,
+    /// Secondary button (grey background) - for standard actions
+    #[default]
+    Secondary,
+    /// Danger button (red background) - for destructive actions like "discard", "reset"
+    Danger,
+    /// Ghost button (no background, just text) - for subtle/tertiary actions
+    Ghost,
+    /// Subtle button (dimmed) - for less prominent actions like "cancel", "back"
+    Subtle,
+}
+
+impl ButtonStyle {
+    /// Get the key style (the [k] part) for this button variant
+    pub fn key_style(&self, highlighted: bool) -> Style {
+        if highlighted {
+            return Style::default()
+                .fg(Theme::GREY_900)
+                .bg(Theme::WHITE)
+                .add_modifier(Modifier::BOLD);
+        }
+
+        match self {
+            ButtonStyle::Primary => Style::default()
+                .fg(Theme::GREY_900)
+                .bg(Theme::GREEN),
+            ButtonStyle::Secondary => Style::default()
+                .fg(Theme::GREY_900)
+                .bg(Theme::GREY_300),
+            ButtonStyle::Danger => Style::default()
+                .fg(Theme::GREY_900)
+                .bg(Theme::RED),
+            ButtonStyle::Ghost => Style::default()
+                .fg(Theme::WHITE)
+                .add_modifier(Modifier::BOLD),
+            ButtonStyle::Subtle => Style::default()
+                .fg(Theme::GREY_900)
+                .bg(Theme::GREY_500),
+        }
+    }
+
+    /// Get the label style (the " Label" part) for this button variant
+    pub fn label_style(&self, highlighted: bool) -> Style {
+        if highlighted {
+            return Style::default()
+                .fg(Theme::WHITE)
+                .add_modifier(Modifier::BOLD);
+        }
+
+        match self {
+            ButtonStyle::Primary => Style::default().fg(Theme::GREY_300),
+            ButtonStyle::Secondary => Style::default().fg(Theme::GREY_300),
+            ButtonStyle::Danger => Style::default().fg(Theme::GREY_400),
+            ButtonStyle::Ghost => Style::default().fg(Theme::GREY_400),
+            ButtonStyle::Subtle => Style::default().fg(Theme::GREY_500),
+        }
+    }
+}
+
+/// Create a styled button with the specified variant
+/// Returns spans like: " k " " label "
+pub fn styled_button<'a>(key: &str, label: &str, style: ButtonStyle, highlighted: bool) -> Vec<Span<'a>> {
     vec![
-        Span::styled(format!(" {} ", key), key_style),
-        Span::styled(format!(" {} ", label), label_style),
+        Span::styled(format!(" {} ", key), style.key_style(highlighted)),
+        Span::styled(format!(" {} ", label), style.label_style(highlighted)),
     ]
 }
 
-/// Create a small/compact button
+/// Create a button-style key hint like [a] Apply
+/// Uses Secondary style by default, or highlighted white when selected
+pub fn button<'a>(key: &str, label: &str, highlighted: bool) -> Vec<Span<'a>> {
+    styled_button(key, label, ButtonStyle::Secondary, highlighted)
+}
+
+/// Create a primary action button (green) like [↵] Apply
+pub fn button_primary<'a>(key: &str, label: &str) -> Vec<Span<'a>> {
+    styled_button(key, label, ButtonStyle::Primary, false)
+}
+
+/// Create a danger button (red) like [d] Delete
+pub fn button_danger<'a>(key: &str, label: &str) -> Vec<Span<'a>> {
+    styled_button(key, label, ButtonStyle::Danger, false)
+}
+
+/// Create a subtle button (dimmed) like [Esc] Cancel
+pub fn button_subtle<'a>(key: &str, label: &str) -> Vec<Span<'a>> {
+    styled_button(key, label, ButtonStyle::Subtle, false)
+}
+
+/// Create a small/compact button (ghost style - no background on key)
 pub fn button_sm<'a>(key: &str, label: &str) -> Vec<Span<'a>> {
     vec![
         Span::styled(format!("{}", key), Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)),
@@ -45,28 +118,28 @@ pub fn button_sm<'a>(key: &str, label: &str) -> Vec<Span<'a>> {
 /// Create an action bar with multiple buttons
 pub fn action_bar<'a>(buttons: Vec<(&str, &str, bool)>) -> Line<'a> {
     let mut spans = vec![Span::styled("  ", Style::default())];
-    
+
     for (i, (key, label, highlighted)) in buttons.into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("  ", Style::default()));
         }
         spans.extend(button(key, label, highlighted));
     }
-    
+
     Line::from(spans)
 }
 
 /// Create a subtle action bar with smaller buttons
 pub fn action_bar_subtle<'a>(buttons: Vec<(&str, &str)>) -> Line<'a> {
     let mut spans = vec![Span::styled("     ", Style::default())];
-    
+
     for (i, (key, label)) in buttons.into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("   ", Style::default()));
         }
         spans.extend(button_sm(key, label));
     }
-    
+
     Line::from(spans)
 }
 
@@ -77,13 +150,13 @@ pub fn action_bar_subtle<'a>(buttons: Vec<(&str, &str)>) -> Line<'a> {
 /// Create a section header with expand/collapse indicator
 pub fn section_header<'a>(
     icon: &str,
-    title: &str, 
+    title: &str,
     count: Option<usize>,
     expanded: bool,
     is_selected: bool,
 ) -> Line<'a> {
     let expand_icon = if expanded { "▼" } else { "▶" };
-    
+
     let (title_style, count_style) = if is_selected {
         (
             Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD),
@@ -95,20 +168,20 @@ pub fn section_header<'a>(
             Style::default().fg(Theme::GREY_500),
         )
     };
-    
+
     let cursor = if is_selected { " › " } else { "   " };
-    
+
     let mut spans = vec![
         Span::styled(cursor, Style::default().fg(Theme::GREY_100)),
         Span::styled(format!("{} ", icon), Style::default().fg(Theme::GREY_400)),
         Span::styled(expand_icon, Style::default().fg(Theme::GREY_500)),
         Span::styled(format!(" {}", title), title_style),
     ];
-    
+
     if let Some(c) = count {
         spans.push(Span::styled(format!(" ({})", c), count_style));
     }
-    
+
     Line::from(spans)
 }
 
@@ -119,18 +192,18 @@ pub fn subsection_header<'a>(title: &str, count: Option<usize>, is_selected: boo
     } else {
         Style::default().fg(Theme::GREY_200).add_modifier(Modifier::ITALIC)
     };
-    
+
     let cursor = if is_selected { "   › " } else { "     " };
-    
+
     let mut spans = vec![
         Span::styled(cursor, Style::default().fg(Theme::GREY_100)),
         Span::styled(title.to_string(), style),
     ];
-    
+
     if let Some(c) = count {
         spans.push(Span::styled(format!(" ({})", c), Style::default().fg(Theme::GREY_500)));
     }
-    
+
     Line::from(spans)
 }
 
@@ -160,7 +233,7 @@ pub fn card_line<'a>(content: &str, width: usize, style: Style) -> Line<'a> {
     } else {
         padded
     };
-    
+
     Line::from(vec![
         Span::styled("     │", Style::default().fg(Theme::GREY_600)),
         Span::styled(truncated, style),
@@ -240,7 +313,7 @@ pub fn separator_labeled<'a>(label: &str, width: usize) -> Line<'a> {
     let label_len = label.chars().count();
     let left_len = 3;
     let right_len = width.saturating_sub(label_len + left_len + 2);
-    
+
     Line::from(vec![
         Span::styled(format!("     {}", "─".repeat(left_len)), Style::default().fg(Theme::GREY_600)),
         Span::styled(format!(" {} ", label), Style::default().fg(Theme::GREY_400).add_modifier(Modifier::ITALIC)),
@@ -309,7 +382,7 @@ pub fn truncate_text(text: &str, max_len: usize) -> String {
 pub fn progress_bar(value: f64, width: usize) -> String {
     let filled = ((value.clamp(0.0, 1.0)) * width as f64) as usize;
     let mut bar = String::new();
-    
+
     for i in 0..width {
         if i < filled {
             bar.push(Theme::BAR_FILLED);
@@ -317,7 +390,7 @@ pub fn progress_bar(value: f64, width: usize) -> String {
             bar.push(Theme::BAR_EMPTY);
         }
     }
-    
+
     bar
 }
 
@@ -335,7 +408,7 @@ pub fn tree_line(
     } else {
         Theme::TREE_FILE
     };
-    
+
     let style = if is_selected {
         Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)
     } else if has_suggestions {
@@ -345,9 +418,9 @@ pub fn tree_line(
     } else {
         Style::default().fg(Theme::GREY_400)
     };
-    
+
     let cursor = if is_selected { "› " } else { "  " };
-    
+
     Line::from(vec![
         Span::styled(cursor, Style::default().fg(Theme::WHITE)),
         Span::styled(format!("{}{} ", indent, icon), Style::default().fg(Theme::GREY_600)),
@@ -367,15 +440,15 @@ pub fn suggestion_line(
         '\u{25D0}' => Style::default().fg(Theme::GREY_300),  // Medium
         _ => Style::default().fg(Theme::GREY_500),  // Low
     };
-    
+
     let text_style = if is_selected {
         Style::default().fg(Theme::WHITE).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Theme::GREY_200)
     };
-    
+
     let cursor = if is_selected { "› " } else { "  " };
-    
+
     Line::from(vec![
         Span::styled(cursor, Style::default().fg(Theme::WHITE)),
         Span::styled(format!("{} ", priority_icon), priority_style),
