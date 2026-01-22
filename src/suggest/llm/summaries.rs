@@ -230,6 +230,12 @@ pub async fn generate_summaries_for_files(
         for (batch_files, result) in results {
             match result {
                 Ok(batch_result) => {
+                    let missing_files: Vec<PathBuf> = batch_files
+                        .iter()
+                        .filter(|p| !batch_result.summaries.contains_key(*p))
+                        .cloned()
+                        .collect();
+
                     // Collect summaries
                     all_summaries.extend(batch_result.summaries.clone());
 
@@ -253,6 +259,16 @@ pub async fn generate_summaries_for_files(
                         total_usage.prompt_tokens += usage.prompt_tokens;
                         total_usage.completion_tokens += usage.completion_tokens;
                         total_usage.total_tokens += usage.total_tokens;
+                    }
+
+                    if !missing_files.is_empty() {
+                        eprintln!(
+                            "Warning: {} summaries missing from batch response",
+                            missing_files.len()
+                        );
+                        for missing in missing_files {
+                            failed_files.insert(missing);
+                        }
                     }
                 }
                 Err(e) => {

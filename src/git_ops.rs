@@ -612,7 +612,7 @@ pub fn stash_and_switch_to_main(repo_path: &Path) -> Result<()> {
 // GitHub CLI (gh) Integration
 // ============================================================================
 
-const GH_TIMEOUT_SECS: u64 = 30;
+const GH_TIMEOUT_SECS: u64 = 60;
 
 fn run_gh_command(repo_path: Option<&Path>, args: &[&str]) -> Result<CommandRunResult> {
     let mut cmd = Command::new("gh");

@@ -106,7 +106,7 @@ pub async fn generate_fix_content(
     let new_content = apply_edits_with_context(content, &edits, "file")?;
 
     // Strip trailing whitespace from each line and ensure file ends with newline
-    let mut new_content = normalize_generated_content(new_content);
+    let new_content = normalize_generated_content(new_content);
 
     // Validate the new content isn't empty
     if new_content.trim().is_empty() {
@@ -393,14 +393,6 @@ impl FixScope {
             FixScope::Small => "small",
             FixScope::Medium => "medium",
             FixScope::Large => "large",
-        }
-    }
-
-    pub fn icon(&self) -> &'static str {
-        match self {
-            FixScope::Small => "·",
-            FixScope::Medium => "◐",
-            FixScope::Large => "●",
         }
     }
 }

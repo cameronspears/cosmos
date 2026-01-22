@@ -36,6 +36,7 @@ pub fn drain_messages(
                     let cost = u.calculate_cost(suggest::llm::Model::Smart);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    ctx.budget_guard.record_usage(cost, u.total_tokens);
                     let _ = app.config.record_tokens(u.total_tokens);
                     let _ = app
                         .config
@@ -95,6 +96,7 @@ pub fn drain_messages(
                     let cost = u.calculate_cost(suggest::llm::Model::Speed);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    ctx.budget_guard.record_usage(cost, u.total_tokens);
                     let _ = app.config.record_tokens(u.total_tokens);
                     let _ = app
                         .config
@@ -131,6 +133,7 @@ pub fn drain_messages(
                         let cache_clone_path = ctx.repo_path.clone();
                         let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
                         let glossary_clone = app.glossary.clone();
+                        let budget_guard = ctx.budget_guard.clone();
 
                         app.loading = LoadingState::GeneratingSuggestions;
                         if failed_count == 0 {
@@ -141,6 +144,12 @@ pub fn drain_messages(
                         }
 
                         spawn_background(ctx.tx.clone(), "suggestions_generation", async move {
+                            let mut config = crate::config::Config::load();
+                            if let Err(e) = budget_guard.allow_ai(&mut config) {
+                                let _ = tx_suggestions
+                                    .send(BackgroundMessage::SuggestionsError(e));
+                                return;
+                            }
                             let mem = if repo_memory_context.trim().is_empty() {
                                 None
                             } else {
@@ -252,6 +261,7 @@ pub fn drain_messages(
                     let cost = u.calculate_cost(suggest::llm::Model::Balanced);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    ctx.budget_guard.record_usage(cost, u.total_tokens);
                     let _ = app.config.record_tokens(u.total_tokens);
                     let _ = app
                         .config
@@ -288,7 +298,6 @@ pub fn drain_messages(
                 suggestion_id,
                 file_changes,
                 description,
-                safety_checks: _,
                 usage,
                 branch_name,
                 friendly_title,
@@ -300,6 +309,7 @@ pub fn drain_messages(
                     let cost = u.calculate_cost(suggest::llm::Model::Smart);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    ctx.budget_guard.record_usage(cost, u.total_tokens);
                     let _ = app.config.record_tokens(u.total_tokens);
                     let _ = app
                         .config
@@ -423,15 +433,16 @@ pub fn drain_messages(
                 app.show_toast(&truncate(&e, 100));
             }
             BackgroundMessage::QuestionResponse {
-                question,
                 answer,
                 usage,
+                ..
             } => {
                 // Track cost (Balanced model for questions)
                 if let Some(u) = usage {
                     let cost = u.calculate_cost(suggest::llm::Model::Balanced);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    ctx.budget_guard.record_usage(cost, u.total_tokens);
                     let _ = app.config.record_tokens(u.total_tokens);
                     let _ = app
                         .config
@@ -441,7 +452,7 @@ pub fn drain_messages(
 
                 app.loading = LoadingState::None;
                 // Show the response in the ask cosmos panel
-                app.show_inquiry(question, answer);
+                app.show_inquiry(answer);
             }
             BackgroundMessage::VerificationComplete {
                 findings,
@@ -453,6 +464,7 @@ pub fn drain_messages(
                     let cost = u.calculate_cost(suggest::llm::Model::Reviewer);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    ctx.budget_guard.record_usage(cost, u.total_tokens);
                     let _ = app.config.record_tokens(u.total_tokens);
                 }
                 // Update the Review workflow step with findings
@@ -468,6 +480,7 @@ pub fn drain_messages(
                     let cost = u.calculate_cost(suggest::llm::Model::Smart);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    ctx.budget_guard.record_usage(cost, u.total_tokens);
                     let _ = app.config.record_tokens(u.total_tokens);
                 }
 
@@ -532,10 +545,17 @@ pub fn spawn_background<F>(
     F: Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
-        if AssertUnwindSafe(fut).catch_unwind().await.is_err() {
+        if let Err(panic) = AssertUnwindSafe(fut).catch_unwind().await {
+            let detail = if let Some(s) = panic.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic payload".to_string()
+            };
             let _ = tx.send(BackgroundMessage::Error(format!(
-                "Background task '{}' crashed unexpectedly.",
-                task_name
+                "Background task '{}' crashed unexpectedly: {}",
+                task_name, detail
             )));
         }
     });

@@ -749,6 +749,44 @@ impl CodebaseIndex {
     
     /// Build the dependency graph (populate used_by for all files)
     pub fn build_dependency_graph(&mut self) {
+        // Precompute lookup tables to avoid quadratic scans
+        let mut path_lookup: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        let mut stem_lookup: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let mut mod_parent_lookup: HashMap<String, Vec<PathBuf>> = HashMap::new();
+
+        for indexed_path in self.files.keys() {
+            let normalized = normalize_path(indexed_path);
+            path_lookup
+                .entry(normalized.clone())
+                .or_default()
+                .push(indexed_path.clone());
+            path_lookup
+                .entry(normalized.with_extension(""))
+                .or_default()
+                .push(indexed_path.clone());
+
+            if let Some(stem) = normalized.file_stem().and_then(|n| n.to_str()) {
+                if !stem.is_empty() {
+                    stem_lookup
+                        .entry(stem.to_string())
+                        .or_default()
+                        .push(indexed_path.clone());
+                }
+                if stem == "mod" {
+                    if let Some(parent) = normalized
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                    {
+                        mod_parent_lookup
+                            .entry(parent.to_string())
+                            .or_default()
+                            .push(indexed_path.clone());
+                    }
+                }
+            }
+        }
+
         // Collect all dependencies first
         let mut used_by_map: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
         
@@ -756,15 +794,41 @@ impl CodebaseIndex {
             for dep in &file_index.summary.depends_on {
                 // Normalize the dependency path
                 let dep_normalized = normalize_path(dep);
-                
-                // Find matching file in index
-                for indexed_path in self.files.keys() {
-                    if paths_match(indexed_path, &dep_normalized) {
-                        used_by_map
-                            .entry(indexed_path.clone())
-                            .or_default()
-                            .push(file_path.clone());
+                let mut matches: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+                if let Some(paths) = path_lookup.get(&dep_normalized) {
+                    matches.extend(paths.iter().cloned());
+                }
+                let dep_no_ext = dep_normalized.with_extension("");
+                if let Some(paths) = path_lookup.get(&dep_no_ext) {
+                    matches.extend(paths.iter().cloned());
+                }
+
+                if let Some(dep_stem) = dep_normalized.file_stem().and_then(|n| n.to_str()) {
+                    if let Some(paths) = stem_lookup.get(dep_stem) {
+                        matches.extend(paths.iter().cloned());
                     }
+                    if let Some(paths) = mod_parent_lookup.get(dep_stem) {
+                        matches.extend(paths.iter().cloned());
+                    }
+                    if dep_stem == "mod" {
+                        if let Some(parent) = dep_normalized
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .and_then(|n| n.to_str())
+                        {
+                            if let Some(paths) = stem_lookup.get(parent) {
+                                matches.extend(paths.iter().cloned());
+                            }
+                        }
+                    }
+                }
+
+                for indexed_path in matches {
+                    used_by_map
+                        .entry(indexed_path)
+                        .or_default()
+                        .push(file_path.clone());
                 }
             }
         }
@@ -778,16 +842,6 @@ impl CodebaseIndex {
     }
 
     /// Get files sorted by suggestion density (most actionable first)
-    pub fn files_by_priority(&self) -> Vec<(&PathBuf, &FileIndex)> {
-        let mut files: Vec<_> = self.files.iter().collect();
-        files.sort_by(|a, b| {
-            b.1.suggestion_density()
-                .partial_cmp(&a.1.suggestion_density())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        files
-    }
-
     /// Get total statistics
     pub fn stats(&self) -> IndexStats {
         IndexStats {
@@ -899,41 +953,6 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 /// Check if two paths match (accounting for src/ prefix and extensions)
-fn paths_match(indexed: &Path, dependency: &Path) -> bool {
-    // Direct match
-    if indexed == dependency {
-        return true;
-    }
-    
-    // Try without extensions
-    let indexed_stem = indexed.with_extension("");
-    let dep_stem = dependency.with_extension("");
-    
-    if indexed_stem == dep_stem {
-        return true;
-    }
-    
-    // Try matching file names only
-    let indexed_name = indexed.file_stem().and_then(|n| n.to_str());
-    let dep_name = dependency.file_stem().and_then(|n| n.to_str());
-    
-    if let (Some(i), Some(d)) = (indexed_name, dep_name) {
-        // Handle mod.rs -> directory mapping
-        if i == "mod" {
-            if let Some(indexed_parent) = indexed.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
-                return indexed_parent == d;
-            }
-        }
-        if d == "mod" {
-            if let Some(dep_parent) = dependency.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
-                return dep_parent == i;
-            }
-        }
-    }
-    
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

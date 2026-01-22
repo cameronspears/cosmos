@@ -5,6 +5,7 @@
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -63,10 +64,21 @@ impl Config {
 
     /// Load config from disk, or return default
     pub fn load() -> Self {
-        Self::config_path()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .and_then(|content| serde_json::from_str(&content).ok())
-            .unwrap_or_default()
+        if let Some(path) = Self::config_path() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                match serde_json::from_str(&content) {
+                    Ok(config) => return config,
+                    Err(err) => {
+                        preserve_corrupt_config(&path, &content);
+                        eprintln!(
+                            "  Warning: Config file was corrupted ({}). A backup was saved and defaults were loaded.",
+                            err
+                        );
+                    }
+                }
+            }
+        }
+        Self::default()
     }
 
     /// Save config to disk
@@ -88,16 +100,17 @@ impl Config {
         let path = dir.join("config.json");
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
-        
-        fs::write(&path, content)
-            .map_err(|e| format!("Failed to write config: {}", e))?;
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
-                eprintln!("  Warning: Failed to set config file permissions: {}", e);
-            }
+            write_config_atomic(&path, &content)
+                .map_err(|e| format!("Failed to write config: {}", e))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            fs::write(&path, content)
+                .map_err(|e| format!("Failed to write config: {}", e))?;
         }
         
         Ok(())
@@ -248,6 +261,40 @@ pub fn setup_api_key_interactive() -> Result<String, String> {
     println!();
 
     Ok(key)
+}
+
+fn preserve_corrupt_config(path: &std::path::Path, content: &str) {
+    let corrupt_path = path.with_extension("json.corrupt");
+    if fs::rename(path, &corrupt_path).is_err() {
+        let _ = fs::write(&corrupt_path, content);
+    }
+}
+
+#[cfg(unix)]
+fn write_config_atomic(path: &std::path::Path, content: &str) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp_path = path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)
+        .map_err(|e| e.to_string())?;
+
+    if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+        eprintln!("  Warning: Failed to set temp config file permissions: {}", e);
+    }
+
+    file.write_all(content.as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

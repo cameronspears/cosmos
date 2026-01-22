@@ -44,15 +44,6 @@ impl Model {
         MODEL_MAX_TOKENS
     }
 
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            Model::Speed => "speed",
-            Model::Balanced => "balanced",
-            Model::Smart => "smart",
-            Model::Reviewer => "reviewer",
-        }
-    }
-
     /// Calculate cost in USD based on token usage
     pub fn calculate_cost(&self, prompt_tokens: u32, completion_tokens: u32) -> f64 {
         let (input_rate, output_rate) = match self {

@@ -185,7 +185,7 @@ pub async fn fix_review_findings(
     let new_content = apply_edits_with_context(content, &edits, "file")?;
 
     // Normalize whitespace
-    let mut new_content = normalize_generated_content(new_content);
+    let new_content = normalize_generated_content(new_content);
 
     if new_content.trim().is_empty() {
         return Err(anyhow::anyhow!("Generated content is empty"));

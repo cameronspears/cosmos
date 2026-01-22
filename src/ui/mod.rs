@@ -64,39 +64,6 @@ impl ViewMode {
     }
 }
 
-/// Sort mode for file explorer
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SortMode {
-    #[default]
-    Name,
-    Priority,
-    Size,
-    Modified,
-    Complexity,
-}
-
-impl SortMode {
-    pub fn label(&self) -> &'static str {
-        match self {
-            SortMode::Name => "name",
-            SortMode::Priority => "priority",
-            SortMode::Size => "size",
-            SortMode::Modified => "modified",
-            SortMode::Complexity => "complexity",
-        }
-    }
-
-    pub fn next(&self) -> Self {
-        match self {
-            SortMode::Name => SortMode::Priority,
-            SortMode::Priority => SortMode::Size,
-            SortMode::Size => SortMode::Modified,
-            SortMode::Modified => SortMode::Complexity,
-            SortMode::Complexity => SortMode::Name,
-        }
-    }
-}
-
 /// Input mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputMode {
@@ -121,39 +88,9 @@ pub enum LoadingState {
 }
 
 impl LoadingState {
-    pub fn message(&self) -> &'static str {
-        match self {
-            LoadingState::None => "",
-            LoadingState::GeneratingSuggestions => "Generating suggestions",
-            LoadingState::GeneratingSummaries => "Summarizing files",
-            LoadingState::GeneratingPreview => "Verifying issue...",
-            LoadingState::GeneratingFix => "Applying fix...",
-            LoadingState::ReviewingChanges => "Reviewing changes",
-            LoadingState::ApplyingReviewFixes => "Applying review fixes",
-            LoadingState::Answering => "Thinking...",
-        }
-    }
-
     pub fn is_loading(&self) -> bool {
         !matches!(self, LoadingState::None)
     }
-}
-
-/// Mode for the apply confirmation overlay
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum ApplyMode {
-    #[default]
-    View, // Default: review diff, y/n to apply
-    Edit, // Inline editing of diff text
-    Chat, // Chat input to refine suggestion
-}
-
-/// Mode for the repo memory overlay
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RepoMemoryMode {
-    #[default]
-    View,
-    Add,
 }
 
 /// Spinner animation frames (braille pattern)
@@ -175,73 +112,15 @@ pub enum Overlay {
     Help {
         scroll: usize,
     },
-    Inquiry {
-        response: String,
-        scroll: usize,
-    },
     /// Privacy preview for inquiry (what will be sent)
     InquiryPreview {
         question: String,
         preview: String,
         scroll: usize,
     },
-    /// Repo memory: local decisions and conventions
-    RepoMemory {
-        mode: RepoMemoryMode,
-        selected: usize,
-        scroll: usize,
-        input: String,
-    },
-    ApplyConfirm {
-        suggestion_id: uuid::Uuid,
-        diff_preview: String,
-        scroll: usize,
-        mode: ApplyMode,
-        edit_buffer: Option<String>,
-        chat_input: String,
-        file_path: PathBuf,
-        summary: String,
-    },
     FileDetail {
         path: PathBuf,
         scroll: usize,
-    },
-    /// Branch creation dialog
-    BranchCreate {
-        branch_name: String,
-        commit_message: String,
-        pending_files: Vec<PathBuf>,
-    },
-    /// Git status panel for viewing and managing changed files
-    GitStatus {
-        staged: Vec<String>,
-        modified: Vec<String>,
-        untracked: Vec<String>,
-        selected: usize,
-        scroll: usize,
-        commit_input: Option<String>,
-    },
-    /// Ship dialog - streamlined commit + push + PR flow
-    ShipDialog {
-        branch_name: String,
-        commit_message: String,
-        files: Vec<PathBuf>,
-        step: ShipStep,
-        scroll: usize,
-    },
-    /// Safe Apply report - what changed, why safe, how to undo
-    SafeApplyReport {
-        description: String,
-        file_path: PathBuf,
-        branch_name: String,
-        backup_path: PathBuf,
-        checks: Vec<crate::safe_apply::CheckResult>,
-        scroll: usize,
-    },
-    /// Error log - view all recent errors
-    ErrorLog {
-        scroll: usize,
-        selected: usize,
     },
     /// Reset cosmos - selective cache/data reset
     Reset {
@@ -285,15 +164,6 @@ pub enum WorkflowStep {
 }
 
 impl WorkflowStep {
-    pub fn label(&self) -> &'static str {
-        match self {
-            WorkflowStep::Suggestions => "Suggestions",
-            WorkflowStep::Verify => "Verify",
-            WorkflowStep::Review => "Review",
-            WorkflowStep::Ship => "Ship",
-        }
-    }
-
     pub fn index(&self) -> usize {
         match self {
             WorkflowStep::Suggestions => 0,
@@ -301,15 +171,6 @@ impl WorkflowStep {
             WorkflowStep::Review => 2,
             WorkflowStep::Ship => 3,
         }
-    }
-
-    pub fn all() -> &'static [WorkflowStep] {
-        &[
-            WorkflowStep::Suggestions,
-            WorkflowStep::Verify,
-            WorkflowStep::Review,
-            WorkflowStep::Ship,
-        ]
     }
 }
 
@@ -322,7 +183,6 @@ pub struct VerifyState {
     pub additional_files: Vec<PathBuf>,
     pub summary: String,
     pub preview: Option<crate::suggest::llm::FixPreview>,
-    pub modifier_input: String,
     pub loading: bool,
     pub scroll: usize,
     /// Whether to show technical details (code evidence, affected areas, etc.)
@@ -377,7 +237,6 @@ pub struct ShipState {
 /// State for the Ask Cosmos panel mode
 #[derive(Debug, Clone, Default)]
 pub struct AskCosmosState {
-    pub question: String,
     pub response: String,
     pub scroll: usize,
 }
@@ -657,7 +516,6 @@ pub struct App {
     // Search and sort state
     pub input_mode: InputMode,
     pub search_query: String,
-    pub sort_mode: SortMode,
     pub view_mode: ViewMode,
 
     // Question input (ask cosmos)
@@ -720,6 +578,10 @@ pub struct App {
 
     // Error log for persistent error viewing
     pub error_log: Vec<ErrorEntry>,
+    /// Last git refresh error message (if any)
+    pub git_refresh_error: Option<String>,
+    /// Last time we surfaced a git refresh error
+    pub git_refresh_error_at: Option<Instant>,
 
     // Flag: generate suggestions once summaries complete (used at init and after reset)
     pub pending_suggestions_on_init: bool,
@@ -728,7 +590,7 @@ pub struct App {
 impl App {
     /// Create a new Cosmos app
     pub fn new(index: CodebaseIndex, suggestions: SuggestionEngine, context: WorkContext) -> Self {
-        let file_tree = build_file_tree(&index, SortMode::Name);
+        let file_tree = build_file_tree(&index);
         let filtered_tree = file_tree.clone();
         let repo_path = index.root.clone();
 
@@ -752,7 +614,6 @@ impl App {
             should_quit: false,
             input_mode: InputMode::Normal,
             search_query: String::new(),
-            sort_mode: SortMode::Name,
             view_mode: ViewMode::Grouped, // Default to grouped view
             question_input: String::new(),
             question_suggestions: Vec::new(),
@@ -785,6 +646,8 @@ impl App {
             ask_cosmos_state: None,
             error_log: Vec::new(),
             pending_suggestions_on_init: false,
+            git_refresh_error: None,
+            git_refresh_error_at: None,
         }
     }
 
@@ -801,77 +664,15 @@ impl App {
         self.project_scroll = 0;
     }
 
-    /// Add a pending change from an applied fix
-    pub fn add_pending_change(
-        &mut self,
-        suggestion_id: uuid::Uuid,
-        file_path: PathBuf,
-        description: String,
-        diff: String,
-        backup_path: PathBuf,
-    ) {
-        self.pending_changes.push(PendingChange::new(
-            suggestion_id,
-            file_path,
-            description,
-            diff,
-            backup_path,
-        ));
-    }
-
-    /// Add a pending change with full human-friendly context from FixPreview
-    pub fn add_pending_change_with_context(
-        &mut self,
-        suggestion_id: uuid::Uuid,
-        file_path: PathBuf,
-        description: String,
-        diff: String,
-        backup_path: PathBuf,
-        friendly_title: String,
-        problem_summary: String,
-        outcome: String,
-    ) {
-        self.pending_changes
-            .push(PendingChange::with_preview_context(
-                suggestion_id,
-                file_path,
-                description,
-                diff,
-                backup_path,
-                friendly_title,
-                problem_summary,
-                outcome,
-            ));
-    }
-
-    /// Get count of pending changes
-    pub fn pending_change_count(&self) -> usize {
-        self.pending_changes.len()
-    }
-
     /// Clear all pending changes (after commit)
     pub fn clear_pending_changes(&mut self) {
+        for change in &self.pending_changes {
+            for file_change in &change.files {
+                let _ = std::fs::remove_file(&file_change.backup_path);
+            }
+        }
         self.pending_changes.clear();
         self.cosmos_branch = None;
-    }
-
-    /// Show the Safe Apply report overlay after applying a fix.
-    pub fn show_safe_apply_report(
-        &mut self,
-        description: String,
-        file_path: PathBuf,
-        branch_name: String,
-        backup_path: PathBuf,
-        checks: Vec<crate::safe_apply::CheckResult>,
-    ) {
-        self.overlay = Overlay::SafeApplyReport {
-            description,
-            file_path,
-            branch_name,
-            backup_path,
-            checks,
-            scroll: 0,
-        };
     }
 
     /// Undo the most recent applied change by restoring all backup files.
@@ -1206,14 +1007,6 @@ impl App {
         result
     }
 
-    /// Cycle to next sort mode
-    pub fn cycle_sort(&mut self) {
-        self.sort_mode = self.sort_mode.next();
-        self.file_tree = build_file_tree(&self.index, self.sort_mode);
-        self.apply_filter();
-        self.show_toast(&format!("Sort: {}", self.sort_mode.label()));
-    }
-
     /// Toggle between flat and grouped view modes
     pub fn toggle_view_mode(&mut self) {
         self.view_mode = self.view_mode.toggle();
@@ -1451,12 +1244,8 @@ impl App {
     }
 
     /// Show inquiry response in the right panel (Ask Cosmos mode)
-    pub fn show_inquiry(&mut self, question: String, response: String) {
-        self.ask_cosmos_state = Some(AskCosmosState {
-            question,
-            response,
-            scroll: 0,
-        });
+    pub fn show_inquiry(&mut self, response: String) {
+        self.ask_cosmos_state = Some(AskCosmosState { response, scroll: 0 });
     }
 
     /// Exit ask cosmos mode and return to suggestions
@@ -1518,221 +1307,6 @@ impl App {
             preview,
             scroll: 0,
         };
-    }
-
-    /// Show repo memory overlay
-    pub fn show_repo_memory(&mut self) {
-        self.overlay = Overlay::RepoMemory {
-            mode: RepoMemoryMode::View,
-            selected: 0,
-            scroll: 0,
-            input: String::new(),
-        };
-    }
-
-    /// Push character into repo memory input (when in Add mode)
-    pub fn memory_input_push(&mut self, c: char) {
-        if let Overlay::RepoMemory { input, mode, .. } = &mut self.overlay {
-            if *mode == RepoMemoryMode::Add {
-                input.push(c);
-            }
-        }
-    }
-
-    pub fn memory_input_pop(&mut self) {
-        if let Overlay::RepoMemory { input, mode, .. } = &mut self.overlay {
-            if *mode == RepoMemoryMode::Add {
-                input.pop();
-            }
-        }
-    }
-
-    pub fn memory_start_add(&mut self) {
-        if let Overlay::RepoMemory { mode, input, .. } = &mut self.overlay {
-            *mode = RepoMemoryMode::Add;
-            input.clear();
-        }
-    }
-
-    pub fn memory_cancel_add(&mut self) {
-        if let Overlay::RepoMemory { mode, input, .. } = &mut self.overlay {
-            *mode = RepoMemoryMode::View;
-            input.clear();
-        }
-    }
-
-    pub fn memory_move(&mut self, delta: isize) {
-        if let Overlay::RepoMemory { selected, .. } = &mut self.overlay {
-            let len = self.repo_memory.entries.len() as isize;
-            if len == 0 {
-                *selected = 0;
-                return;
-            }
-            let mut next = *selected as isize + delta;
-            if next < 0 {
-                next = 0;
-            }
-            if next >= len {
-                next = len - 1;
-            }
-            *selected = next as usize;
-        }
-    }
-
-    /// Save current memory input as a new entry (best-effort persistence).
-    pub fn memory_commit_add(&mut self) -> Result<(), String> {
-        let text = match &mut self.overlay {
-            Overlay::RepoMemory { mode, input, .. } if *mode == RepoMemoryMode::Add => {
-                let t = input.trim().to_string();
-                input.clear();
-                *mode = RepoMemoryMode::View;
-                t
-            }
-            _ => return Err("Not in memory add mode".to_string()),
-        };
-
-        if text.is_empty() {
-            return Err("Memory entry is empty".to_string());
-        }
-
-        self.repo_memory.add(text);
-
-        // Persist to `.cosmos/memory.json` (repo-local)
-        let cache = crate::cache::Cache::new(&self.repo_path);
-        cache
-            .save_repo_memory(&self.repo_memory)
-            .map_err(|e| format!("Failed to save memory: {}", e))?;
-
-        Ok(())
-    }
-
-    /// Show apply confirmation overlay with generated fix
-    pub fn show_apply_confirm(
-        &mut self,
-        suggestion_id: uuid::Uuid,
-        diff_preview: String,
-        file_path: PathBuf,
-        summary: String,
-    ) {
-        self.overlay = Overlay::ApplyConfirm {
-            suggestion_id,
-            diff_preview,
-            scroll: 0,
-            mode: ApplyMode::View,
-            edit_buffer: None,
-            chat_input: String::new(),
-            file_path,
-            summary,
-        };
-    }
-
-    /// Get mutable access to apply confirm edit buffer
-    pub fn apply_edit_push(&mut self, c: char) {
-        if let Overlay::ApplyConfirm { edit_buffer, .. } = &mut self.overlay {
-            if let Some(buf) = edit_buffer {
-                buf.push(c);
-            }
-        }
-    }
-
-    /// Remove character from apply edit buffer
-    pub fn apply_edit_pop(&mut self) {
-        if let Overlay::ApplyConfirm { edit_buffer, .. } = &mut self.overlay {
-            if let Some(buf) = edit_buffer {
-                buf.pop();
-            }
-        }
-    }
-
-    /// Push character to chat input
-    pub fn apply_chat_push(&mut self, c: char) {
-        if let Overlay::ApplyConfirm { chat_input, .. } = &mut self.overlay {
-            chat_input.push(c);
-        }
-    }
-
-    /// Pop character from chat input
-    pub fn apply_chat_pop(&mut self) {
-        if let Overlay::ApplyConfirm { chat_input, .. } = &mut self.overlay {
-            chat_input.pop();
-        }
-    }
-
-    /// Set apply mode
-    pub fn set_apply_mode(&mut self, new_mode: ApplyMode) {
-        if let Overlay::ApplyConfirm {
-            mode,
-            edit_buffer,
-            diff_preview,
-            ..
-        } = &mut self.overlay
-        {
-            // When entering edit mode, populate the edit buffer with the current diff
-            if new_mode == ApplyMode::Edit && edit_buffer.is_none() {
-                *edit_buffer = Some(diff_preview.clone());
-            }
-            *mode = new_mode;
-        }
-    }
-
-    /// Get current apply mode
-    pub fn get_apply_mode(&self) -> Option<&ApplyMode> {
-        if let Overlay::ApplyConfirm { mode, .. } = &self.overlay {
-            Some(mode)
-        } else {
-            None
-        }
-    }
-
-    /// Commit edit buffer back to diff preview
-    pub fn commit_apply_edit(&mut self) {
-        if let Overlay::ApplyConfirm {
-            edit_buffer,
-            diff_preview,
-            mode,
-            ..
-        } = &mut self.overlay
-        {
-            if let Some(buf) = edit_buffer.take() {
-                *diff_preview = buf;
-            }
-            *mode = ApplyMode::View;
-        }
-    }
-
-    /// Discard edit buffer and return to view mode
-    pub fn discard_apply_edit(&mut self) {
-        if let Overlay::ApplyConfirm {
-            edit_buffer, mode, ..
-        } = &mut self.overlay
-        {
-            *edit_buffer = None;
-            *mode = ApplyMode::View;
-        }
-    }
-
-    /// Get chat input for refinement
-    pub fn get_apply_chat_input(&self) -> Option<&str> {
-        if let Overlay::ApplyConfirm { chat_input, .. } = &self.overlay {
-            Some(chat_input.as_str())
-        } else {
-            None
-        }
-    }
-
-    /// Update diff preview (after refinement)
-    pub fn update_apply_diff(&mut self, new_diff: String) {
-        if let Overlay::ApplyConfirm {
-            diff_preview,
-            mode,
-            chat_input,
-            ..
-        } = &mut self.overlay
-        {
-            *diff_preview = new_diff;
-            *mode = ApplyMode::View;
-            chat_input.clear();
-        }
     }
 
     /// Clear expired toast
@@ -1898,13 +1472,8 @@ impl App {
     pub fn overlay_scroll_down(&mut self) {
         match &mut self.overlay {
             Overlay::Help { scroll }
-            | Overlay::Inquiry { scroll, .. }
             | Overlay::InquiryPreview { scroll, .. }
-            | Overlay::RepoMemory { scroll, .. }
-            | Overlay::ApplyConfirm { scroll, .. }
-            | Overlay::SafeApplyReport { scroll, .. }
-            | Overlay::ShipDialog { scroll, .. }
-            | Overlay::ErrorLog { scroll, .. } => {
+            | Overlay::FileDetail { scroll, .. } => {
                 *scroll += 1;
             }
             _ => {}
@@ -1915,13 +1484,8 @@ impl App {
     pub fn overlay_scroll_up(&mut self) {
         match &mut self.overlay {
             Overlay::Help { scroll }
-            | Overlay::Inquiry { scroll, .. }
             | Overlay::InquiryPreview { scroll, .. }
-            | Overlay::RepoMemory { scroll, .. }
-            | Overlay::ApplyConfirm { scroll, .. }
-            | Overlay::SafeApplyReport { scroll, .. }
-            | Overlay::ShipDialog { scroll, .. }
-            | Overlay::ErrorLog { scroll, .. } => {
+            | Overlay::FileDetail { scroll, .. } => {
                 *scroll = scroll.saturating_sub(1);
             }
             _ => {}
@@ -2257,7 +1821,6 @@ impl App {
             additional_files,
             summary,
             preview: None,
-            modifier_input: String::new(),
             loading: true,
             scroll: 0,
             show_technical_details: false,
@@ -2271,16 +1834,6 @@ impl App {
         self.verify_state.preview = Some(preview);
         self.verify_state.loading = false;
         self.loading = LoadingState::None;
-    }
-
-    /// Push character to verify modifier input
-    pub fn verify_modifier_push(&mut self, c: char) {
-        self.verify_state.modifier_input.push(c);
-    }
-
-    /// Pop character from verify modifier input
-    pub fn verify_modifier_pop(&mut self) {
-        self.verify_state.modifier_input.pop();
     }
 
     /// Scroll verify panel down
@@ -2497,423 +2050,6 @@ impl App {
         self.cosmos_branch = None;
     }
 
-    /// Show the git status panel with current changes
-    pub fn show_git_status(&mut self) {
-        use crate::git_ops;
-
-        match git_ops::current_status(&self.repo_path) {
-            Ok(status) => {
-                self.overlay = Overlay::GitStatus {
-                    staged: status.staged,
-                    modified: status.modified,
-                    untracked: status.untracked,
-                    selected: 0,
-                    scroll: 0,
-                    commit_input: None,
-                };
-            }
-            Err(e) => {
-                self.show_toast(&format!("Git error: {}", e));
-            }
-        }
-    }
-
-    /// Refresh git status in the overlay
-    pub fn refresh_git_status(&mut self) {
-        use crate::git_ops;
-
-        if let Overlay::GitStatus {
-            staged,
-            modified,
-            untracked,
-            selected,
-            ..
-        } = &mut self.overlay
-        {
-            if let Ok(status) = git_ops::current_status(&self.repo_path) {
-                *staged = status.staged;
-                *modified = status.modified;
-                *untracked = status.untracked;
-                // Clamp selection to valid range
-                let total = staged.len() + modified.len() + untracked.len();
-                if *selected >= total && total > 0 {
-                    *selected = total - 1;
-                }
-            }
-        }
-    }
-
-    /// Navigate in git status panel
-    pub fn git_status_navigate(&mut self, delta: isize) {
-        if let Overlay::GitStatus {
-            staged,
-            modified,
-            untracked,
-            selected,
-            ..
-        } = &mut self.overlay
-        {
-            let total = staged.len() + modified.len() + untracked.len();
-            if total == 0 {
-                return;
-            }
-
-            let new_sel = (*selected as isize + delta).clamp(0, (total as isize) - 1) as usize;
-            *selected = new_sel;
-        }
-    }
-
-    /// Get the selected file path in git status panel
-    pub fn git_status_selected_file(&self) -> Option<(String, GitFileStatus)> {
-        if let Overlay::GitStatus {
-            staged,
-            modified,
-            untracked,
-            selected,
-            ..
-        } = &self.overlay
-        {
-            let staged_len = staged.len();
-            let modified_len = modified.len();
-
-            if *selected < staged_len {
-                return Some((staged[*selected].clone(), GitFileStatus::Staged));
-            } else if *selected < staged_len + modified_len {
-                return Some((
-                    modified[*selected - staged_len].clone(),
-                    GitFileStatus::Modified,
-                ));
-            } else if *selected < staged_len + modified_len + untracked.len() {
-                return Some((
-                    untracked[*selected - staged_len - modified_len].clone(),
-                    GitFileStatus::Untracked,
-                ));
-            }
-        }
-        None
-    }
-
-    /// Stage the selected file
-    pub fn git_stage_selected(&mut self) {
-        use crate::git_ops;
-
-        if let Some((path, status)) = self.git_status_selected_file() {
-            match status {
-                GitFileStatus::Modified | GitFileStatus::Untracked => {
-                    if let Err(e) = git_ops::stage_file(&self.repo_path, &path) {
-                        self.show_toast(&format!("Stage failed: {}", e));
-                    } else {
-                        self.show_toast(&format!("Staged: {}", path));
-                        self.refresh_git_status();
-                    }
-                }
-                GitFileStatus::Staged => {
-                    self.show_toast("Already staged");
-                }
-            }
-        }
-    }
-
-    /// Unstage the selected file
-    pub fn git_unstage_selected(&mut self) {
-        use std::process::Command;
-
-        if let Some((path, status)) = self.git_status_selected_file() {
-            if status == GitFileStatus::Staged {
-                let output = Command::new("git")
-                    .current_dir(&self.repo_path)
-                    .args(["reset", "HEAD", "--", &path])
-                    .output();
-
-                match output {
-                    Ok(o) if o.status.success() => {
-                        self.show_toast(&format!("Unstaged: {}", path));
-                        self.refresh_git_status();
-                    }
-                    Ok(o) => {
-                        self.show_toast(&format!(
-                            "Unstage failed: {}",
-                            String::from_utf8_lossy(&o.stderr)
-                        ));
-                    }
-                    Err(e) => {
-                        self.show_toast(&format!("Unstage failed: {}", e));
-                    }
-                }
-            } else {
-                self.show_toast("Not staged");
-            }
-        }
-    }
-
-    /// Restore (discard changes) the selected file
-    pub fn git_restore_selected(&mut self) {
-        use crate::git_ops;
-
-        if let Some((path, status)) = self.git_status_selected_file() {
-            match status {
-                GitFileStatus::Modified => {
-                    if let Err(e) = git_ops::reset_file(&self.repo_path, &path) {
-                        self.show_toast(&format!("Restore failed: {}", e));
-                    } else {
-                        self.show_toast(&format!("Restored: {}", path));
-                        self.refresh_git_status();
-                        // Also refresh context
-                        let _ = self.context.refresh();
-                    }
-                }
-                GitFileStatus::Staged => {
-                    self.show_toast("Unstage first (u), then restore");
-                }
-                GitFileStatus::Untracked => {
-                    self.show_toast("Untracked files can't be restored");
-                }
-            }
-        }
-    }
-
-    /// Stage all modified files
-    pub fn git_stage_all(&mut self) {
-        use crate::git_ops;
-
-        if let Err(e) = git_ops::stage_all(&self.repo_path) {
-            self.show_toast(&format!("Stage all failed: {}", e));
-        } else {
-            self.show_toast("All files staged");
-            self.refresh_git_status();
-        }
-    }
-
-    /// Start commit input mode
-    pub fn git_start_commit(&mut self) {
-        if let Overlay::GitStatus {
-            staged,
-            commit_input,
-            ..
-        } = &mut self.overlay
-        {
-            if staged.is_empty() {
-                self.show_toast("No staged files to commit");
-                return;
-            }
-            *commit_input = Some(String::new());
-        }
-    }
-
-    /// Cancel commit input
-    pub fn git_cancel_commit(&mut self) {
-        if let Overlay::GitStatus { commit_input, .. } = &mut self.overlay {
-            *commit_input = None;
-        }
-    }
-
-    /// Push character to commit message
-    pub fn git_commit_push(&mut self, c: char) {
-        if let Overlay::GitStatus {
-            commit_input: Some(input),
-            ..
-        } = &mut self.overlay
-        {
-            input.push(c);
-        }
-    }
-
-    /// Pop character from commit message
-    pub fn git_commit_pop(&mut self) {
-        if let Overlay::GitStatus {
-            commit_input: Some(input),
-            ..
-        } = &mut self.overlay
-        {
-            input.pop();
-        }
-    }
-
-    /// Execute the commit
-    pub fn git_do_commit(&mut self) -> Result<String, String> {
-        use crate::git_ops;
-
-        if let Overlay::GitStatus {
-            commit_input: Some(msg),
-            ..
-        } = &self.overlay
-        {
-            if msg.trim().is_empty() {
-                return Err("Commit message cannot be empty".to_string());
-            }
-
-            match git_ops::commit(&self.repo_path, msg) {
-                Ok(oid) => {
-                    // Clear commit input and refresh
-                    if let Overlay::GitStatus { commit_input, .. } = &mut self.overlay {
-                        *commit_input = None;
-                    }
-                    self.refresh_git_status();
-                    let _ = self.context.refresh();
-                    Ok(oid)
-                }
-                Err(e) => Err(format!("Commit failed: {}", e)),
-            }
-        } else {
-            Err("No commit in progress".to_string())
-        }
-    }
-
-    /// Push current branch
-    pub fn git_push(&mut self) -> Result<String, String> {
-        use crate::git_ops;
-
-        let branch = self.context.branch.clone();
-        match git_ops::push_branch(&self.repo_path, &branch) {
-            Ok(output) => {
-                let _ = self.context.refresh();
-                Ok(output)
-            }
-            Err(e) => Err(format!("Push failed: {}", e)),
-        }
-    }
-
-    /// Check if we're in commit input mode
-    pub fn is_git_commit_mode(&self) -> bool {
-        matches!(
-            &self.overlay,
-            Overlay::GitStatus {
-                commit_input: Some(_),
-                ..
-            }
-        )
-    }
-
-    /// Get the current commit message being typed
-    pub fn get_git_commit_input(&self) -> Option<&str> {
-        if let Overlay::GitStatus {
-            commit_input: Some(input),
-            ..
-        } = &self.overlay
-        {
-            Some(input.as_str())
-        } else {
-            None
-        }
-    }
-
-    /// Delete the selected untracked file
-    pub fn git_delete_untracked(&mut self) {
-        use std::fs;
-
-        if let Some((path, status)) = self.git_status_selected_file() {
-            if status == GitFileStatus::Untracked {
-                let full_path = self.repo_path.join(&path);
-                if full_path.is_dir() {
-                    match fs::remove_dir_all(&full_path) {
-                        Ok(_) => {
-                            self.show_toast(&format!("Deleted: {}", path));
-                            self.refresh_git_status();
-                        }
-                        Err(e) => {
-                            self.show_toast(&format!("Delete failed: {}", e));
-                        }
-                    }
-                } else {
-                    match fs::remove_file(&full_path) {
-                        Ok(_) => {
-                            self.show_toast(&format!("Deleted: {}", path));
-                            self.refresh_git_status();
-                        }
-                        Err(e) => {
-                            self.show_toast(&format!("Delete failed: {}", e));
-                        }
-                    }
-                }
-            } else {
-                self.show_toast("Use 'r' to restore tracked files");
-            }
-        }
-    }
-
-    /// Clean all untracked files (git clean -fd)
-    pub fn git_clean_untracked(&mut self) -> Result<(), String> {
-        use std::process::Command;
-
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
-            .args(["clean", "-fd"])
-            .output()
-            .map_err(|e| format!("Failed to run git clean: {}", e))?;
-
-        if output.status.success() {
-            self.refresh_git_status();
-            let _ = self.context.refresh();
-            Ok(())
-        } else {
-            Err(format!(
-                "git clean failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        }
-    }
-
-    /// Reset branch to clean state (discard all changes + remove untracked)
-    pub fn git_reset_hard(&mut self) -> Result<(), String> {
-        use std::process::Command;
-
-        // First, reset all tracked changes
-        let reset_output = Command::new("git")
-            .current_dir(&self.repo_path)
-            .args(["reset", "--hard", "HEAD"])
-            .output()
-            .map_err(|e| format!("Failed to run git reset: {}", e))?;
-
-        if !reset_output.status.success() {
-            return Err(format!(
-                "git reset failed: {}",
-                String::from_utf8_lossy(&reset_output.stderr)
-            ));
-        }
-
-        // Then clean untracked files
-        let clean_output = Command::new("git")
-            .current_dir(&self.repo_path)
-            .args(["clean", "-fd"])
-            .output()
-            .map_err(|e| format!("Failed to run git clean: {}", e))?;
-
-        if clean_output.status.success() {
-            self.refresh_git_status();
-            let _ = self.context.refresh();
-            Ok(())
-        } else {
-            Err(format!(
-                "git clean failed: {}",
-                String::from_utf8_lossy(&clean_output.stderr)
-            ))
-        }
-    }
-
-    /// Switch to main (or master) branch
-    pub fn git_switch_to_main(&mut self) -> Result<(), String> {
-        use crate::git_ops;
-
-        // Try main first, then master
-        if git_ops::checkout_branch(&self.repo_path, "main").is_ok() {
-            self.context.branch = "main".to_string();
-            self.cosmos_branch = None;
-            self.pending_changes.clear();
-            let _ = self.context.refresh();
-            self.refresh_git_status();
-            Ok(())
-        } else if git_ops::checkout_branch(&self.repo_path, "master").is_ok() {
-            self.context.branch = "master".to_string();
-            self.cosmos_branch = None;
-            self.pending_changes.clear();
-            let _ = self.context.refresh();
-            self.refresh_git_status();
-            Ok(())
-        } else {
-            Err("Could not switch to main or master branch".to_string())
-        }
-    }
-
     /// Check if currently on main/master branch
     pub fn is_on_main_branch(&self) -> bool {
         self.context.branch == "main" || self.context.branch == "master"
@@ -2930,7 +2066,7 @@ fn lowercase_first(s: &str) -> String {
 }
 
 /// Build a flat file tree for display with sorting
-fn build_file_tree(index: &CodebaseIndex, sort_mode: SortMode) -> Vec<FlatTreeEntry> {
+fn build_file_tree(index: &CodebaseIndex) -> Vec<FlatTreeEntry> {
     use std::collections::BTreeSet;
 
     // Collect all unique directories from file paths
@@ -2986,128 +2122,28 @@ fn build_file_tree(index: &CodebaseIndex, sort_mode: SortMode) -> Vec<FlatTreeEn
         });
     }
 
-    // Helper to create a hierarchical sort key for an entry
-    // Returns (parent_path, is_file, name) for consistent ordering
-    fn hierarchical_sort_key(entry: &FlatTreeEntry) -> (String, bool, String) {
-        let parent = entry
-            .path
-            .parent()
-            .map(|p| p.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        // is_file = true means files sort after directories (false < true)
-        let is_file = !entry.is_dir;
-        let name = entry.name.to_lowercase();
-        (parent, is_file, name)
-    }
+    // Hierarchical sort: by path, with directories before files at each level
+    all_entries.sort_by(|a, b| {
+        // Compare by full path, but ensure directories come before their contents
+        // by comparing component by component
+        let a_components: Vec<_> = a.path.components().collect();
+        let b_components: Vec<_> = b.path.components().collect();
 
-    // Sort based on mode
-    match sort_mode {
-        SortMode::Name => {
-            // Hierarchical sort: by path, with directories before files at each level
-            all_entries.sort_by(|a, b| {
-                // Compare by full path, but ensure directories come before their contents
-                // by comparing component by component
-                let a_components: Vec<_> = a.path.components().collect();
-                let b_components: Vec<_> = b.path.components().collect();
+        // Compare each component
+        for i in 0..a_components.len().min(b_components.len()) {
+            let a_comp = a_components[i].as_os_str().to_string_lossy().to_lowercase();
+            let b_comp = b_components[i].as_os_str().to_string_lossy().to_lowercase();
 
-                // Compare each component
-                for i in 0..a_components.len().min(b_components.len()) {
-                    let a_comp = a_components[i].as_os_str().to_string_lossy().to_lowercase();
-                    let b_comp = b_components[i].as_os_str().to_string_lossy().to_lowercase();
-
-                    match a_comp.cmp(&b_comp) {
-                        std::cmp::Ordering::Equal => continue,
-                        other => return other,
-                    }
-                }
-
-                // If all compared components are equal, shorter path (directory) comes first
-                // This ensures parent directories come before their contents
-                a_components.len().cmp(&b_components.len())
-            });
+            match a_comp.cmp(&b_comp) {
+                std::cmp::Ordering::Equal => continue,
+                other => return other,
+            }
         }
-        SortMode::Priority => {
-            // Sort files by priority, but keep hierarchical structure for display
-            // First sort hierarchically, then stable-sort by priority for files only
-            all_entries.sort_by(|a, b| hierarchical_sort_key(a).cmp(&hierarchical_sort_key(b)));
 
-            // Stable sort to bring high-priority files to top while preserving relative order
-            all_entries.sort_by(|a, b| {
-                // Only compare priority between files
-                if a.is_dir || b.is_dir {
-                    return std::cmp::Ordering::Equal;
-                }
-
-                let a_density = index
-                    .files
-                    .get(&a.path)
-                    .map(|f| f.suggestion_density())
-                    .unwrap_or(0.0);
-                let b_density = index
-                    .files
-                    .get(&b.path)
-                    .map(|f| f.suggestion_density())
-                    .unwrap_or(0.0);
-
-                // Higher density comes first
-                b_density
-                    .partial_cmp(&a_density)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-        SortMode::Size => {
-            // Sort by path first for consistent ordering
-            all_entries.sort_by(|a, b| hierarchical_sort_key(a).cmp(&hierarchical_sort_key(b)));
-
-            // Stable sort by size for files
-            all_entries.sort_by(|a, b| {
-                if a.is_dir || b.is_dir {
-                    return std::cmp::Ordering::Equal;
-                }
-                let a_loc = index.files.get(&a.path).map(|f| f.loc).unwrap_or(0);
-                let b_loc = index.files.get(&b.path).map(|f| f.loc).unwrap_or(0);
-                b_loc.cmp(&a_loc)
-            });
-        }
-        SortMode::Modified => {
-            // Sort by path first for consistent ordering
-            all_entries.sort_by(|a, b| hierarchical_sort_key(a).cmp(&hierarchical_sort_key(b)));
-
-            // Stable sort by modified time for files
-            all_entries.sort_by(|a, b| {
-                if a.is_dir || b.is_dir {
-                    return std::cmp::Ordering::Equal;
-                }
-                let a_mod = index.files.get(&a.path).map(|f| f.last_modified);
-                let b_mod = index.files.get(&b.path).map(|f| f.last_modified);
-                b_mod.cmp(&a_mod)
-            });
-        }
-        SortMode::Complexity => {
-            // Sort by path first for consistent ordering
-            all_entries.sort_by(|a, b| hierarchical_sort_key(a).cmp(&hierarchical_sort_key(b)));
-
-            // Stable sort by complexity for files
-            all_entries.sort_by(|a, b| {
-                if a.is_dir || b.is_dir {
-                    return std::cmp::Ordering::Equal;
-                }
-                let a_complexity = index
-                    .files
-                    .get(&a.path)
-                    .map(|f| f.complexity)
-                    .unwrap_or(0.0);
-                let b_complexity = index
-                    .files
-                    .get(&b.path)
-                    .map(|f| f.complexity)
-                    .unwrap_or(0.0);
-                b_complexity
-                    .partial_cmp(&a_complexity)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-    }
+        // If all compared components are equal, shorter path (directory) comes first
+        // This ensures parent directories come before their contents
+        a_components.len().cmp(&b_components.len())
+    });
 
     all_entries
 }
@@ -3188,7 +2224,6 @@ fn build_grouped_tree(
                             &name,
                             file_path.clone(),
                             priority,
-                            2,
                         ));
                     }
                 }
@@ -3227,7 +2262,6 @@ fn build_grouped_tree(
                         &name,
                         file_path.clone(),
                         priority,
-                        1,
                     ));
                 }
             }
@@ -3267,9 +2301,6 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Overlays
     match &app.overlay {
         Overlay::Help { scroll } => render_help(frame, *scroll),
-        Overlay::Inquiry { response, scroll } => {
-            render_inquiry(frame, response, *scroll);
-        }
         Overlay::InquiryPreview {
             question,
             preview,
@@ -3277,95 +2308,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         } => {
             render_inquiry_preview(frame, question, preview, *scroll);
         }
-        Overlay::RepoMemory {
-            mode,
-            selected,
-            scroll,
-            input,
-        } => {
-            render_repo_memory(frame, app, *mode, *selected, *scroll, input);
-        }
-        Overlay::ApplyConfirm {
-            diff_preview,
-            scroll,
-            mode,
-            edit_buffer,
-            chat_input,
-            file_path,
-            summary,
-            ..
-        } => {
-            render_apply_confirm(
-                frame,
-                diff_preview,
-                *scroll,
-                mode,
-                edit_buffer,
-                chat_input,
-                file_path,
-                summary,
-            );
-        }
         Overlay::FileDetail { path, scroll } => {
             if let Some(file_index) = app.index.files.get(path) {
                 render_file_detail(frame, path, file_index, app.get_llm_summary(path), *scroll);
             }
-        }
-        Overlay::BranchCreate {
-            branch_name,
-            commit_message,
-            pending_files,
-        } => {
-            render_branch_dialog(frame, branch_name, commit_message, pending_files);
-        }
-        Overlay::GitStatus {
-            staged,
-            modified,
-            untracked,
-            selected,
-            scroll,
-            commit_input,
-        } => {
-            render_git_status(
-                frame,
-                staged,
-                modified,
-                untracked,
-                *selected,
-                *scroll,
-                commit_input.as_deref(),
-                &app.context.branch,
-            );
-        }
-        Overlay::ShipDialog {
-            branch_name,
-            commit_message,
-            files,
-            step,
-            scroll,
-        } => {
-            render_ship_dialog(frame, branch_name, commit_message, files, *step, *scroll);
-        }
-        Overlay::SafeApplyReport {
-            description,
-            file_path,
-            branch_name,
-            backup_path: _,
-            checks,
-            scroll,
-        } => {
-            render_safe_apply_report(
-                frame,
-                description,
-                file_path,
-                branch_name,
-                checks,
-                *scroll,
-                app.ship_step,
-            );
-        }
-        Overlay::ErrorLog { scroll, selected } => {
-            render_error_log(frame, &app.error_log, *scroll, *selected);
         }
         Overlay::Reset { options, selected } => {
             render_reset_overlay(frame, options, *selected);
@@ -5039,6 +3985,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Theme::GREEN
         }),
     ));
+
+    if app.git_refresh_error.is_some() {
+        spans.push(Span::styled("  status stale", Style::default().fg(Theme::YELLOW)));
+    }
 
     // Cost + budget indicators
     if app.session_cost > 0.0

@@ -10,7 +10,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, Instant};
 
 const CACHE_DIR: &str = ".cosmos";
 const INDEX_CACHE_FILE: &str = "index.json";
@@ -18,6 +20,8 @@ const SUGGESTIONS_CACHE_FILE: &str = "suggestions.json";
 const MEMORY_FILE: &str = "memory.json";
 const GLOSSARY_FILE: &str = "glossary.json";
 const GROUPING_AI_CACHE_FILE: &str = "grouping_ai.json";
+const CACHE_LOCK_TIMEOUT_SECS: u64 = 5;
+const CACHE_LOCK_RETRY_MS: u64 = 50;
 
 /// Options for selective cache reset
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,7 +546,7 @@ struct CacheLock {
 
 impl Drop for CacheLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -591,10 +595,28 @@ impl Cache {
             .create(true)
             .open(&lock_path)?;
 
-        if exclusive {
-            file.lock_exclusive()?;
-        } else {
-            file.lock_shared()?;
+        let start = Instant::now();
+        loop {
+            let result = if exclusive {
+                FileExt::try_lock_exclusive(&file)
+            } else {
+                FileExt::try_lock_shared(&file)
+            };
+            match result {
+                Ok(()) => break,
+                Err(err) => {
+                    if err.kind() != ErrorKind::WouldBlock {
+                        return Err(err.into());
+                    }
+                    if start.elapsed() >= StdDuration::from_secs(CACHE_LOCK_TIMEOUT_SECS) {
+                        return Err(anyhow::anyhow!(
+                            "Timed out waiting for cache lock ({}s)",
+                            CACHE_LOCK_TIMEOUT_SECS
+                        ));
+                    }
+                    std::thread::sleep(StdDuration::from_millis(CACHE_LOCK_RETRY_MS));
+                }
+            }
         }
 
         Ok(CacheLock { file })

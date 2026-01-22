@@ -1,4 +1,3 @@
-use crate::safe_apply;
 use crate::suggest;
 use crate::ui;
 use std::collections::HashMap;
@@ -35,9 +34,6 @@ pub enum BackgroundMessage {
     GroupingEnhanceError(String),
     /// Quick preview ready (Phase 1 - fast)
     PreviewReady {
-        suggestion_id: Uuid,
-        file_path: PathBuf,
-        summary: String,
         preview: suggest::llm::FixPreview,
     },
     PreviewError(String),
@@ -48,7 +44,6 @@ pub enum BackgroundMessage {
         /// All file changes (path, backup_path, diff)
         file_changes: Vec<(PathBuf, PathBuf, String)>,
         description: String,
-        safety_checks: Vec<safe_apply::CheckResult>,
         usage: Option<suggest::llm::Usage>,
         branch_name: String,
         /// Human-friendly title for PR (e.g., "Batch Processing")

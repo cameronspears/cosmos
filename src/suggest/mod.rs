@@ -28,14 +28,6 @@ pub enum SuggestionSource {
 }
 
 impl SuggestionSource {
-    pub fn icon(&self) -> &'static str {
-        match self {
-            SuggestionSource::Static => "  ",
-            SuggestionSource::Cached => " ",
-            SuggestionSource::LlmFast => " ",
-            SuggestionSource::LlmDeep => " ",
-        }
-    }
 }
 
 /// Kind of suggestion
@@ -60,19 +52,6 @@ pub enum SuggestionKind {
 }
 
 impl SuggestionKind {
-    pub fn icon(&self) -> char {
-        match self {
-            SuggestionKind::Improvement => '\u{2728}',  // ✨
-            SuggestionKind::BugFix => '\u{1F41B}',      // 🐛
-            SuggestionKind::Feature => '\u{2795}',      // ➕
-            SuggestionKind::Optimization => '\u{26A1}', // ⚡
-            SuggestionKind::Quality => '\u{2726}',      // ✦
-            SuggestionKind::Documentation => '\u{1F4DD}', // 📝
-            SuggestionKind::Testing => '\u{1F9EA}',     // 🧪
-            SuggestionKind::Refactoring => '\u{1F527}', // 🔧
-        }
-    }
-
     pub fn label(&self) -> &'static str {
         match self {
             SuggestionKind::Improvement => "Improve",
@@ -181,21 +160,6 @@ impl Suggestion {
     /// Get the total number of files affected
     pub fn file_count(&self) -> usize {
         1 + self.additional_files.len()
-    }
-
-    /// Format for display in the suggestion list
-    pub fn display_summary(&self) -> String {
-        let file_indicator = if self.is_multi_file() {
-            format!(" [{}]", self.file_count())
-        } else {
-            String::new()
-        };
-        
-        if let Some(line) = self.line {
-            format!("{}:{}{} - {}", self.file.display(), line, file_indicator, self.summary)
-        } else {
-            format!("{}{} - {}", self.file.display(), file_indicator, self.summary)
-        }
     }
 }
 

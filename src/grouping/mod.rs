@@ -99,21 +99,6 @@ impl Layer {
     }
 
     /// Get layer by index (for quick jumping)
-    pub fn from_index(idx: usize) -> Option<Layer> {
-        match idx {
-            1 => Some(Layer::Frontend),
-            2 => Some(Layer::Backend),
-            3 => Some(Layer::API),
-            4 => Some(Layer::Database),
-            5 => Some(Layer::Shared),
-            6 => Some(Layer::Config),
-            7 => Some(Layer::Tests),
-            8 => Some(Layer::Infra),
-            9 => Some(Layer::Unknown),
-            _ => None,
-        }
-    }
-
     /// Get all layers in display order
     pub fn all() -> &'static [Layer] {
         &[
@@ -338,7 +323,6 @@ pub struct GroupedTreeEntry {
     pub kind: GroupedEntryKind,
     pub name: String,
     pub path: Option<PathBuf>,
-    pub depth: usize,
     pub expanded: bool,
     pub file_count: usize,
     pub priority: char,
@@ -357,7 +341,6 @@ impl GroupedTreeEntry {
             kind: GroupedEntryKind::Layer(layer),
             name: layer.label().to_string(),
             path: None,
-            depth: 0,
             expanded,
             file_count,
             priority: ' ',
@@ -369,19 +352,17 @@ impl GroupedTreeEntry {
             kind: GroupedEntryKind::Feature,
             name: name.to_string(),
             path: None,
-            depth: 1,
             expanded,
             file_count,
             priority: ' ',
         }
     }
 
-    pub fn file(name: &str, path: PathBuf, priority: char, depth: usize) -> Self {
+    pub fn file(name: &str, path: PathBuf, priority: char) -> Self {
         Self {
             kind: GroupedEntryKind::File,
             name: name.to_string(),
             path: Some(path),
-            depth,
             expanded: false,
             file_count: 0,
             priority,

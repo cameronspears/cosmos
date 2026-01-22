@@ -2,25 +2,11 @@
 //!
 //! Tracks the current working state by inferring from git:
 //! - Uncommitted changes
-//! - Recent commits
 //! - Current branch
 //! - Work-in-progress detection
 
-use chrono::{DateTime, Utc};
 use git2::{Repository, StatusOptions};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-
-/// Information about a git commit
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommitInfo {
-    pub sha: String,
-    pub short_sha: String,
-    pub message: String,
-    pub author: String,
-    pub time: DateTime<Utc>,
-    pub files_changed: Vec<String>,
-}
 
 /// Current work context inferred from git state
 #[derive(Debug, Clone)]
@@ -33,8 +19,6 @@ pub struct WorkContext {
     pub staged_files: Vec<PathBuf>,
     /// Untracked files in the working tree
     pub untracked_files: Vec<PathBuf>,
-    /// Recent commits (last 5)
-    pub recent_commits: Vec<CommitInfo>,
     /// Inferred focus area (what the user seems to be working on)
     pub inferred_focus: Option<String>,
     /// Total number of modified files
@@ -54,17 +38,15 @@ impl WorkContext {
 
         let branch = get_current_branch(&repo)?;
         let (uncommitted, staged, untracked) = get_file_statuses(&repo)?;
-        let recent_commits = get_recent_commits(&repo, 5)?;
         let modified_count = uncommitted.len() + staged.len() + untracked.len();
 
-        let inferred_focus = infer_focus(&uncommitted, &staged, &untracked, &recent_commits);
+        let inferred_focus = infer_focus(&uncommitted, &staged, &untracked);
 
         Ok(Self {
             branch,
             uncommitted_files: uncommitted,
             staged_files: staged,
             untracked_files: untracked,
-            recent_commits,
             inferred_focus,
             modified_count,
             repo_root,
@@ -139,91 +121,11 @@ fn get_file_statuses(
 }
 
 /// Get recent commits
-fn get_recent_commits(repo: &Repository, count: usize) -> anyhow::Result<Vec<CommitInfo>> {
-    let mut commits = Vec::new();
-
-    let head = match repo.head() {
-        Ok(h) => h,
-        Err(_) => return Ok(commits), // Empty repo
-    };
-
-    let oid = match head.target() {
-        Some(o) => o,
-        None => return Ok(commits),
-    };
-
-    let mut revwalk = repo.revwalk()?;
-    revwalk.push(oid)?;
-
-    for (i, rev) in revwalk.enumerate() {
-        if i >= count {
-            break;
-        }
-
-        let oid = rev?;
-        let commit = repo.find_commit(oid)?;
-
-        let sha = oid.to_string();
-        let short_sha = sha[..7.min(sha.len())].to_string();
-        let message = commit
-            .message()
-            .unwrap_or("")
-            .lines()
-            .next()
-            .unwrap_or("")
-            .to_string();
-        let author = commit.author().name().unwrap_or("Unknown").to_string();
-        let time = DateTime::from_timestamp(commit.time().seconds(), 0)
-            .unwrap_or_else(|| Utc::now());
-
-        // Get files changed in this commit
-        let files_changed = get_commit_files(repo, &commit)?;
-
-        commits.push(CommitInfo {
-            sha,
-            short_sha,
-            message,
-            author,
-            time,
-            files_changed,
-        });
-    }
-
-    Ok(commits)
-}
-
-/// Get files changed in a commit
-fn get_commit_files(repo: &Repository, commit: &git2::Commit) -> anyhow::Result<Vec<String>> {
-    let mut files = Vec::new();
-
-    let tree = commit.tree()?;
-
-    if let Ok(parent) = commit.parent(0) {
-        let parent_tree = parent.tree()?;
-        let diff = repo.diff_tree_to_tree(Some(&parent_tree), Some(&tree), None)?;
-
-        diff.foreach(
-            &mut |delta, _| {
-                if let Some(path) = delta.new_file().path() {
-                    files.push(path.to_string_lossy().to_string());
-                }
-                true
-            },
-            None,
-            None,
-            None,
-        )?;
-    }
-
-    Ok(files)
-}
-
 /// Infer what the user is focused on based on changes and commits
 fn infer_focus(
     uncommitted: &[PathBuf],
     staged: &[PathBuf],
     untracked: &[PathBuf],
-    recent_commits: &[CommitInfo],
 ) -> Option<String> {
     // Collect all changed files
     let mut all_files: Vec<&str> = uncommitted
@@ -232,13 +134,6 @@ fn infer_focus(
         .chain(untracked.iter())
         .filter_map(|p| p.to_str())
         .collect();
-
-    // Add files from recent commits
-    for commit in recent_commits.iter().take(3) {
-        for file in &commit.files_changed {
-            all_files.push(file);
-        }
-    }
 
     if all_files.is_empty() {
         return None;
@@ -297,9 +192,8 @@ mod tests {
         ];
         let staged = vec![];
         let untracked = vec![];
-        let commits = vec![];
 
-        let focus = infer_focus(&uncommitted, &staged, &untracked, &commits);
+        let focus = infer_focus(&uncommitted, &staged, &untracked);
         assert!(focus.is_some());
         assert!(focus.unwrap().contains("auth"));
     }
