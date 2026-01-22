@@ -739,12 +739,27 @@ fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
     fs::write(&tmp_path, content)?;
     #[cfg(windows)]
     {
+        let backup_path = path.with_extension("bak");
+        if backup_path.exists() {
+            let _ = fs::remove_file(&backup_path);
+        }
         if path.exists() {
-            if let Err(err) = fs::remove_file(path) {
+            if let Err(err) = fs::rename(path, &backup_path) {
                 let _ = fs::remove_file(&tmp_path);
                 return Err(err.into());
             }
         }
+        if let Err(err) = fs::rename(&tmp_path, path) {
+            if backup_path.exists() {
+                let _ = fs::rename(&backup_path, path);
+            }
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
+        if backup_path.exists() {
+            let _ = fs::remove_file(&backup_path);
+        }
+        return Ok(());
     }
     if let Err(err) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);

@@ -97,6 +97,20 @@ fn backoff_secs(retry_count: u32) -> u64 {
     if secs == 0 { 1 } else { secs }
 }
 
+fn is_retryable_network_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect()
+}
+
+fn network_error_label(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connection"
+    } else {
+        "network"
+    }
+}
+
 /// Call LLM API with full response including usage stats
 /// Includes automatic retry with exponential backoff for rate limits
 pub(crate) async fn call_llm_with_usage(
@@ -145,7 +159,7 @@ pub(crate) async fn call_llm_with_usage(
 
     while retry_count <= MAX_RETRIES {
         // Build request with OpenRouter headers
-        let response = client
+        let response = match client
             .post(url)
             .header("Content-Type", "application/json")
             .header("HTTP-Referer", "https://cosmos.dev")
@@ -154,10 +168,48 @@ pub(crate) async fn call_llm_with_usage(
             .json(&request)
             .send()
             .await
-            .map_err(map_timeout_error)?;
+        {
+            Ok(response) => response,
+            Err(err) => {
+                last_error = err.to_string();
+                if is_retryable_network_error(&err) && retry_count < MAX_RETRIES {
+                    retry_count += 1;
+                    let retry_after = backoff_secs(retry_count);
+                    eprintln!(
+                        "  OpenRouter {} error. Retrying in {}s (attempt {}/{})",
+                        network_error_label(&err),
+                        retry_after,
+                        retry_count,
+                        MAX_RETRIES
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(retry_after)).await;
+                    continue;
+                }
+                return Err(map_timeout_error(err));
+            }
+        };
 
         let status = response.status();
-        let text = response.text().await.map_err(map_timeout_error)?;
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(err) => {
+                last_error = err.to_string();
+                if is_retryable_network_error(&err) && retry_count < MAX_RETRIES {
+                    retry_count += 1;
+                    let retry_after = backoff_secs(retry_count);
+                    eprintln!(
+                        "  OpenRouter {} error. Retrying in {}s (attempt {}/{})",
+                        network_error_label(&err),
+                        retry_after,
+                        retry_count,
+                        MAX_RETRIES
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(retry_after)).await;
+                    continue;
+                }
+                return Err(map_timeout_error(err));
+            }
+        };
 
         if status.is_success() {
             let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
@@ -228,6 +280,8 @@ pub(crate) async fn call_llm_with_usage(
 fn map_timeout_error(err: reqwest::Error) -> anyhow::Error {
     if err.is_timeout() {
         anyhow::anyhow!("OpenRouter request timed out. Please try again.")
+    } else if err.is_connect() {
+        anyhow::anyhow!("Could not connect to OpenRouter. Check your network and try again.")
     } else {
         err.into()
     }

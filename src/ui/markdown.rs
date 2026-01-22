@@ -209,6 +209,34 @@ fn parse_inline_markdown(text: &str) -> Line<'static> {
             }
             continue;
         }
+
+        // Check for inline code: `text`
+        if chars[i] == '`' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '`' {
+                j += 1;
+            }
+
+            if j < chars.len() {
+                if !current_text.is_empty() {
+                    spans.push(Span::styled(
+                        current_text.clone(),
+                        Style::default().fg(Theme::GREY_100),
+                    ));
+                    current_text.clear();
+                }
+
+                let code_text: String = chars[i + 1..j].iter().collect();
+                spans.push(Span::styled(
+                    code_text,
+                    Style::default()
+                        .fg(Theme::GREY_200)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                i = j + 1;
+                continue;
+            }
+        }
         
         // Check for italic: *text* or _text_ (single)
         if (chars[i] == '*' || chars[i] == '_') && 

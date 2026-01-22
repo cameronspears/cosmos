@@ -135,9 +135,12 @@ struct CodebaseSuggestionJson {
     file: String,
     #[serde(default)]
     additional_files: Vec<String>,
+    #[serde(default)]
     kind: String,
+    #[serde(default)]
     priority: String,
     summary: String,
+    #[serde(default)]
     detail: String,
     line: Option<usize>,
 }
@@ -168,7 +171,7 @@ fn fix_json_issues(json: &str) -> String {
 /// Try to parse individual suggestion objects if array parsing fails
 fn try_parse_individual_suggestions(json: &str) -> anyhow::Result<Vec<CodebaseSuggestionJson>> {
     let mut suggestions = Vec::new();
-    let mut depth = 0;
+    let mut depth: i32 = 0;
     let mut start = None;
 
     for (i, c) in json.char_indices() {
@@ -180,6 +183,9 @@ fn try_parse_individual_suggestions(json: &str) -> anyhow::Result<Vec<CodebaseSu
                 depth += 1;
             }
             '}' => {
+                if depth == 0 {
+                    continue;
+                }
                 depth -= 1;
                 if depth == 0 {
                     if let Some(s) = start {
@@ -550,4 +556,19 @@ mod tests {
         assert!(truncated.len() < content.len() + 20);
     }
 
+    #[test]
+    fn test_parse_individual_suggestions_ignores_unmatched_braces() {
+        let json = "}\n{\"file\":\"src/lib.rs\",\"kind\":\"bugfix\",\"priority\":\"high\",\"summary\":\"Issue\",\"detail\":\"Details\"}";
+        let parsed = try_parse_individual_suggestions(json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].file, "src/lib.rs");
+    }
+
+    #[test]
+    fn test_parse_codebase_suggestions_missing_detail() {
+        let json = r#"[{"file":"src/lib.rs","kind":"bugfix","priority":"low","summary":"Issue"}]"#;
+        let parsed = parse_codebase_suggestions(json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].summary, "Issue");
+    }
 }

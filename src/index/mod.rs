@@ -167,7 +167,7 @@ pub struct FileSummary {
 
 impl FileSummary {
     /// Generate a static summary from file index data
-    pub fn from_file_index(file_index: &FileIndex, rel_path: &Path) -> Self {
+    pub fn from_file_index(file_index: &FileIndex, rel_path: &Path, root: &Path) -> Self {
         // Infer purpose from filename and exports
         let purpose = infer_purpose(rel_path, &file_index.symbols, file_index.language);
         
@@ -191,9 +191,11 @@ impl FileSummary {
         );
         
         // depends_on will be populated by the codebase index
-        let depends_on: Vec<PathBuf> = file_index.dependencies.iter()
+        let depends_on: Vec<PathBuf> = file_index
+            .dependencies
+            .iter()
             .filter(|d| !d.is_external)
-            .filter_map(|d| resolve_import_path(&d.import_path, rel_path))
+            .filter_map(|d| resolve_import_path(&d.import_path, rel_path, root))
             .collect();
         
         Self {
@@ -481,28 +483,29 @@ fn capitalize(s: &str) -> String {
 }
 
 /// Try to resolve an import path to a file path
-fn resolve_import_path(import: &str, from_file: &Path) -> Option<PathBuf> {
+fn resolve_import_path(import: &str, from_file: &Path, root: &Path) -> Option<PathBuf> {
     // Handle relative imports
     if import.starts_with('.') {
         let parent = from_file.parent()?;
         let base = normalize_path(&parent.join(import));
+        let base_on_disk = root.join(&base);
 
         if base.extension().is_some() {
-            if base.exists() {
+            if base_on_disk.exists() {
                 return Some(base);
             }
         } else {
             // Try common extensions
             for ext in &["rs", "ts", "tsx", "js", "jsx", "py", "go"] {
                 let candidate = base.with_extension(ext);
-                if candidate.exists() {
+                if root.join(&candidate).exists() {
                     return Some(candidate);
                 }
             }
 
             // Try as directory with index
             let dir_candidate = base.join("mod.rs");
-            if dir_candidate.exists() {
+            if root.join(&dir_candidate).exists() {
                 return Some(dir_candidate);
             }
         }
@@ -520,7 +523,15 @@ fn resolve_import_path(import: &str, from_file: &Path) -> Option<PathBuf> {
             
             if !path_parts.is_empty() {
                 let path_str = path_parts.join("/");
-                return Some(PathBuf::from(format!("src/{}.rs", path_str)));
+                let candidate = PathBuf::from(format!("src/{}.rs", path_str));
+                if root.join(&candidate).exists() {
+                    return Some(candidate);
+                }
+                let module_candidate = PathBuf::from(format!("src/{}/mod.rs", path_str));
+                if root.join(&module_candidate).exists() {
+                    return Some(module_candidate);
+                }
+                return Some(candidate);
             }
         }
     }
@@ -731,7 +742,7 @@ impl CodebaseIndex {
         
         // Generate summary (rel_path will be set properly after insertion)
         let rel_path = path.strip_prefix(&self.root).unwrap_or(path);
-        file_index.summary = FileSummary::from_file_index(&file_index, rel_path);
+        file_index.summary = FileSummary::from_file_index(&file_index, rel_path, &self.root);
         
         Ok(file_index)
     }
@@ -926,6 +937,8 @@ fn paths_match(indexed: &Path, dependency: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_language_detection() {
@@ -947,5 +960,24 @@ mod tests {
     #[test]
     fn test_pattern_severity() {
         assert!(PatternKind::DeepNesting.severity() > PatternKind::UnusedImport.severity());
+    }
+
+    #[test]
+    fn test_resolve_import_path_uses_repo_root() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_index_test_{}", nanos));
+
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("foo.rs"), "").unwrap();
+
+        let resolved = resolve_import_path("./foo", Path::new("src/bar.rs"), &root);
+        assert_eq!(resolved, Some(PathBuf::from("src/foo.rs")));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
