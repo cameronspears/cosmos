@@ -103,6 +103,7 @@ EXAMPLE - Renaming a function across files:
 }"#;
 
 pub const FIX_PREVIEW_SYSTEM: &str = r#"You are a code assistant. First VERIFY whether this issue actually exists in the code, then describe what changes would fix it.
+You will receive the current code for the file. Use it to verify the issue.
 
 OUTPUT FORMAT (JSON):
 {

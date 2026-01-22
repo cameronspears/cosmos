@@ -1,6 +1,6 @@
 use super::client::call_llm_with_usage;
 use super::models::{Model, Usage};
-use super::parse::{merge_usage, parse_json_with_retry};
+use super::parse::{merge_usage, parse_json_with_retry, truncate_content};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{FIX_CONTENT_SYSTEM, FIX_PREVIEW_SYSTEM, MULTI_FILE_FIX_SYSTEM};
 use crate::suggest::Suggestion;
@@ -23,6 +23,8 @@ pub struct AppliedFix {
     /// Usage stats
     pub usage: Option<Usage>,
 }
+
+const MAX_PREVIEW_CHARS: usize = 6000;
 
 /// A single search/replace edit operation
 #[derive(Debug, Clone, Deserialize)]
@@ -405,6 +407,7 @@ impl FixScope {
 /// This is Phase 1 of the two-phase fix flow - uses Smart model to thoroughly verify the issue exists before users approve
 pub async fn generate_fix_preview(
     path: &PathBuf,
+    content: &str,
     suggestion: &Suggestion,
     modifier: Option<&str>,
     repo_memory: Option<String>,
@@ -416,13 +419,15 @@ pub async fn generate_fix_preview(
     let memory_section =
         format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
 
+    let preview_content = truncate_content(content, MAX_PREVIEW_CHARS);
     let user = format!(
-        "File: {}\nIssue: {}\n{}{}{}",
+        "File: {}\nIssue: {}\n{}{}{}\n\nCurrent Code:\n```\n{}\n```",
         path.display(),
         suggestion.summary,
         suggestion.detail.as_deref().unwrap_or(""),
         memory_section,
-        modifier_text
+        modifier_text,
+        preview_content
     );
 
     let response = call_llm_with_usage(FIX_PREVIEW_SYSTEM, &user, Model::Balanced, true).await?;

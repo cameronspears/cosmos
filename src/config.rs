@@ -54,6 +54,14 @@ impl Config {
         
         fs::create_dir_all(&dir)
             .map_err(|e| format!("Failed to create config directory: {}", e))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)) {
+                eprintln!("  Warning: Failed to set config directory permissions: {}", e);
+            }
+        }
         
         let path = dir.join("config.json");
         let content = serde_json::to_string_pretty(self)
@@ -61,6 +69,14 @@ impl Config {
         
         fs::write(&path, content)
             .map_err(|e| format!("Failed to write config: {}", e))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+                eprintln!("  Warning: Failed to set config file permissions: {}", e);
+            }
+        }
         
         Ok(())
     }

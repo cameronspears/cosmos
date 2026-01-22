@@ -358,6 +358,7 @@ pub struct ReviewState {
     pub scroll: usize,
     pub reviewing: bool,
     pub fixing: bool,
+    pub confirm_ship: bool,
     pub review_iteration: u32,
     pub fixed_titles: Vec<String>,
 }
@@ -2322,6 +2323,7 @@ impl App {
             scroll: 0,
             reviewing: true,
             fixing: false,
+            confirm_ship: false,
             review_iteration: 1,
             fixed_titles: Vec::new(),
         };
@@ -2338,6 +2340,7 @@ impl App {
         self.review_state.findings = findings.clone();
         self.review_state.summary = summary;
         self.review_state.reviewing = false;
+        self.review_state.confirm_ship = false;
         // Pre-select recommended findings
         for (i, finding) in findings.iter().enumerate() {
             if finding.recommended {
@@ -2357,6 +2360,7 @@ impl App {
                 self.review_state.selected.insert(cursor);
             }
         }
+        self.review_state.confirm_ship = false;
     }
 
     /// Select all findings in review
@@ -2364,11 +2368,13 @@ impl App {
         for i in 0..self.review_state.findings.len() {
             self.review_state.selected.insert(i);
         }
+        self.review_state.confirm_ship = false;
     }
 
     /// Select none in review
     pub fn review_select_none(&mut self) {
         self.review_state.selected.clear();
+        self.review_state.confirm_ship = false;
     }
 
     /// Move cursor up in review
@@ -2377,6 +2383,7 @@ impl App {
         if self.review_state.cursor < self.review_state.scroll {
             self.review_state.scroll = self.review_state.cursor;
         }
+        self.review_state.confirm_ship = false;
     }
 
     /// Move cursor down in review
@@ -2388,6 +2395,7 @@ impl App {
                 self.review_state.scroll = self.review_state.cursor.saturating_sub(visible - 1);
             }
         }
+        self.review_state.confirm_ship = false;
     }
 
     /// Check if review passed (no recommended fixes remaining)
@@ -2432,6 +2440,7 @@ impl App {
         self.review_state.summary.clear();
         self.review_state.reviewing = false;
         self.review_state.fixing = false;
+        self.review_state.confirm_ship = false;
         self.review_state.review_iteration += 1;
         self.loading = LoadingState::None;
     }

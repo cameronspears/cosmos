@@ -6,6 +6,7 @@ use crate::index;
 use crate::suggest;
 use crate::ui::{ActivePanel, App, InputMode, LoadingState, Overlay, WorkflowStep};
 use crate::ui;
+use crate::util::resolve_repo_path;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use std::collections::HashMap;
@@ -1139,6 +1140,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                         let summary = suggestion.summary.clone();
                                         let suggestion_clone = suggestion.clone();
                                         let tx_preview = ctx.tx.clone();
+                                        let repo_root = app.repo_path.clone();
                                         let repo_memory_context =
                                             app.repo_memory.to_prompt_context(12, 900);
 
@@ -1156,8 +1158,40 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                             } else {
                                                 Some(repo_memory_context)
                                             };
+                                            let resolved =
+                                                match resolve_repo_path(&repo_root, &file_path) {
+                                                    Ok(resolved) => resolved,
+                                                    Err(e) => {
+                                                        let _ = tx_preview.send(
+                                                            BackgroundMessage::PreviewError(
+                                                                format!(
+                                                                    "Unsafe path {}: {}",
+                                                                    file_path.display(),
+                                                                    e
+                                                                ),
+                                                            ),
+                                                        );
+                                                        return;
+                                                    }
+                                                };
+                                            let content = match std::fs::read_to_string(
+                                                &resolved.absolute,
+                                            ) {
+                                                Ok(content) => content,
+                                                Err(e) => {
+                                                    let _ = tx_preview.send(
+                                                        BackgroundMessage::PreviewError(format!(
+                                                            "Failed to read {}: {}",
+                                                            resolved.relative.display(),
+                                                            e
+                                                        )),
+                                                    );
+                                                    return;
+                                                }
+                                            };
                                             match suggest::llm::generate_fix_preview(
-                                                &file_path,
+                                                &resolved.relative,
+                                                &content,
                                                 &suggestion_clone,
                                                 None,
                                                 mem,
@@ -1247,11 +1281,30 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                                     let mut file_contents: Vec<(PathBuf, String)> =
                                                         Vec::new();
                                                     for file_path in &all_files {
-                                                        let full_path = repo_path.join(file_path);
-                                                        match std::fs::read_to_string(&full_path) {
+                                                        let resolved = match resolve_repo_path(
+                                                            &repo_path,
+                                                            file_path,
+                                                        ) {
+                                                            Ok(resolved) => resolved,
+                                                            Err(e) => {
+                                                                let _ = tx_apply.send(
+                                                                    BackgroundMessage::DirectFixError(
+                                                                        format!(
+                                                                            "Unsafe path {}: {}",
+                                                                            file_path.display(),
+                                                                            e
+                                                                        ),
+                                                                    ),
+                                                                );
+                                                                return;
+                                                            }
+                                                        };
+                                                        match std::fs::read_to_string(
+                                                            &resolved.absolute,
+                                                        ) {
                                                             Ok(content) => {
                                                                 file_contents.push((
-                                                                    (*file_path).clone(),
+                                                                    resolved.relative,
                                                                     content,
                                                                 ))
                                                             }
@@ -1281,11 +1334,33 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                                     {
                                                         Ok(multi_fix) => {
                                                             // Backup all files first
-                                                            let mut backups: Vec<(PathBuf, PathBuf)> =
-                                                                Vec::new();
+                                                            let mut backups: Vec<(
+                                                                PathBuf,
+                                                                PathBuf,
+                                                                PathBuf,
+                                                            )> = Vec::new();
                                                             for file_edit in &multi_fix.file_edits {
-                                                                let full_path =
-                                                                    repo_path.join(&file_edit.path);
+                                                                let resolved = match resolve_repo_path(
+                                                                    &repo_path,
+                                                                    &file_edit.path,
+                                                                ) {
+                                                                    Ok(resolved) => resolved,
+                                                                    Err(e) => {
+                                                                        let _ = tx_apply.send(
+                                                                            BackgroundMessage::DirectFixError(
+                                                                                format!(
+                                                                                    "Unsafe path {}: {}",
+                                                                                    file_edit
+                                                                                        .path
+                                                                                        .display(),
+                                                                                    e
+                                                                                ),
+                                                                            ),
+                                                                        );
+                                                                        return;
+                                                                    }
+                                                                };
+                                                                let full_path = resolved.absolute;
                                                                 let backup_path = full_path
                                                                     .with_extension("cosmos.bak");
                                                                 if let Err(e) =
@@ -1308,7 +1383,8 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                                                     return;
                                                                 }
                                                                 backups.push((
-                                                                    file_edit.path.clone(),
+                                                                    resolved.relative,
+                                                                    full_path,
                                                                     backup_path,
                                                                 ));
                                                             }
@@ -1320,8 +1396,27 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                                                 String,
                                                             )> = Vec::new();
                                                             for file_edit in &multi_fix.file_edits {
-                                                                let full_path =
-                                                                    repo_path.join(&file_edit.path);
+                                                                let resolved = match resolve_repo_path(
+                                                                    &repo_path,
+                                                                    &file_edit.path,
+                                                                ) {
+                                                                    Ok(resolved) => resolved,
+                                                                    Err(e) => {
+                                                                        let _ = tx_apply.send(
+                                                                            BackgroundMessage::DirectFixError(
+                                                                                format!(
+                                                                                    "Unsafe path {}: {}",
+                                                                                    file_edit
+                                                                                        .path
+                                                                                        .display(),
+                                                                                    e
+                                                                                ),
+                                                                            ),
+                                                                        );
+                                                                        return;
+                                                                    }
+                                                                };
+                                                                let full_path = resolved.absolute;
                                                                 let backup_path = full_path
                                                                     .with_extension("cosmos.bak");
 
@@ -1331,18 +1426,8 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                                                 ) {
                                                                     Ok(_) => {
                                                                         // Stage the file
-                                                                        let rel_path = full_path
-                                                                            .strip_prefix(&repo_path)
-                                                                            .map(|p| {
-                                                                                p.to_string_lossy()
-                                                                                    .to_string()
-                                                                            })
-                                                                            .unwrap_or_else(|_| {
-                                                                                file_edit
-                                                                                    .path
-                                                                                    .to_string_lossy()
-                                                                                    .to_string()
-                                                                            });
+                                                                        let rel_path =
+                                                                            resolved.relative.to_string_lossy().to_string();
                                                                         let _ = git_ops::stage_file(
                                                                             &repo_path,
                                                                             &rel_path,
@@ -1355,19 +1440,17 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                                                                 .join(", ")
                                                                         );
                                                                         file_changes.push((
-                                                                            file_edit.path.clone(),
+                                                                            resolved.relative,
                                                                             backup_path,
                                                                             diff,
                                                                         ));
                                                                     }
                                                                     Err(e) => {
                                                                         // Rollback all changes
-                                                                        for (path, backup) in &backups {
-                                                                            let full =
-                                                                                repo_path.join(path);
+                                                                        for (_path, full, backup) in &backups {
                                                                             let _ = std::fs::copy(
                                                                                 backup,
-                                                                                &full,
+                                                                                full,
                                                                             );
                                                                             let _ =
                                                                                 std::fs::remove_file(backup);
@@ -1418,10 +1501,26 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                                     }
                                                 } else {
                                                     // Single-file fix (original logic)
-                                                    let full_path = repo_path.join(&fp);
-                                                    let content = match std::fs::read_to_string(
-                                                        &full_path,
-                                                    ) {
+                                                    let resolved =
+                                                        match resolve_repo_path(&repo_path, &fp) {
+                                                            Ok(resolved) => resolved,
+                                                            Err(e) => {
+                                                                let _ = tx_apply.send(
+                                                                    BackgroundMessage::DirectFixError(
+                                                                        format!(
+                                                                            "Unsafe path {}: {}",
+                                                                            fp.display(),
+                                                                            e
+                                                                        ),
+                                                                    ),
+                                                                );
+                                                                return;
+                                                            }
+                                                        };
+                                                    let full_path = resolved.absolute;
+                                                    let rel_path = resolved.relative;
+                                                    let content =
+                                                        match std::fs::read_to_string(&full_path) {
                                                         Ok(c) => c,
                                                         Err(e) => {
                                                             let _ = tx_apply.send(
@@ -1437,7 +1536,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                                     };
 
                                                     match suggest::llm::generate_fix_content(
-                                                        &fp,
+                                                        &rel_path,
                                                         &content,
                                                         &suggestion,
                                                         &preview,
@@ -1468,16 +1567,9 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                                                 &applied_fix.new_content,
                                                             ) {
                                                                 Ok(_) => {
-                                                                    let rel_path = full_path
-                                                                        .strip_prefix(&repo_path)
-                                                                        .map(|p| {
-                                                                            p.to_string_lossy()
-                                                                                .to_string()
-                                                                        })
-                                                                        .unwrap_or_else(|_| {
-                                                                            fp.to_string_lossy()
-                                                                                .to_string()
-                                                                        });
+                                                                    let rel_path = rel_path
+                                                                        .to_string_lossy()
+                                                                        .to_string();
                                                                     let _ = git_ops::stage_file(
                                                                         &repo_path,
                                                                         &rel_path,
@@ -1497,7 +1589,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                                                     let _ = tx_apply.send(
                                                                         BackgroundMessage::DirectFixApplied {
                                                                             suggestion_id: sid,
-                                                                            file_changes: vec![(fp, backup_path, diff)],
+                                                                            file_changes: vec![(rel_path.into(), backup_path, diff)],
                                                                             description: applied_fix.description,
                                                                             safety_checks,
                                                                             usage: applied_fix.usage,
@@ -1542,68 +1634,73 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                 }
                             }
                             WorkflowStep::Review => {
-                                // If findings are selected, fix them; otherwise move to Ship
-                                if !app.review_state.reviewing
-                                    && !app.review_state.fixing
-                                    && !app.review_state.selected.is_empty()
-                                {
-                                    // Fix selected findings (same as 'f' key)
-                                    let selected_findings = app.get_selected_review_findings();
-                                    let file = app.review_state.file_path.clone();
-                                    let content = app.review_state.new_content.clone();
-                                    let original = app.review_state.original_content.clone();
-                                    let iter = app.review_state.review_iteration;
-                                    let fixed = app.review_state.fixed_titles.clone();
-                                    let repo_memory_context =
-                                        app.repo_memory.to_prompt_context(12, 900);
-                                    let memory = if repo_memory_context.trim().is_empty() {
-                                        None
+                                if !app.review_state.reviewing && !app.review_state.fixing {
+                                    if !app.review_state.selected.is_empty() {
+                                        // Fix selected findings (same as 'f' key)
+                                        let selected_findings = app.get_selected_review_findings();
+                                        let file = app.review_state.file_path.clone();
+                                        let content = app.review_state.new_content.clone();
+                                        let original = app.review_state.original_content.clone();
+                                        let iter = app.review_state.review_iteration;
+                                        let fixed = app.review_state.fixed_titles.clone();
+                                        let repo_memory_context =
+                                            app.repo_memory.to_prompt_context(12, 900);
+                                        let memory = if repo_memory_context.trim().is_empty() {
+                                            None
+                                        } else {
+                                            Some(repo_memory_context)
+                                        };
+                                        let tx_fix = ctx.tx.clone();
+
+                                        if let Some(file_path) = file {
+                                            app.set_review_fixing(true);
+
+                                            tokio::spawn(async move {
+                                                let orig_ref = if iter > 1 {
+                                                    Some(original.as_str())
+                                                } else {
+                                                    None
+                                                };
+                                                match suggest::llm::fix_review_findings(
+                                                    &file_path,
+                                                    &content,
+                                                    orig_ref,
+                                                    &selected_findings,
+                                                    memory,
+                                                    iter,
+                                                    &fixed,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(fix) => {
+                                                        let _ = tx_fix.send(
+                                                            BackgroundMessage::VerificationFixComplete {
+                                                                new_content: fix.new_content,
+                                                                description: fix.description,
+                                                                usage: fix.usage,
+                                                            },
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx_fix.send(
+                                                            BackgroundMessage::Error(e.to_string()),
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    } else if app.review_passed() {
+                                        // Review passed - move to Ship
+                                        app.start_ship();
+                                    } else if app.review_state.confirm_ship {
+                                        app.review_state.confirm_ship = false;
+                                        app.start_ship();
                                     } else {
-                                        Some(repo_memory_context)
-                                    };
-                                    let tx_fix = ctx.tx.clone();
-
-                                    if let Some(file_path) = file {
-                                        app.set_review_fixing(true);
-
-                                        tokio::spawn(async move {
-                                            let orig_ref = if iter > 1 {
-                                                Some(original.as_str())
-                                            } else {
-                                                None
-                                            };
-                                            match suggest::llm::fix_review_findings(
-                                                &file_path,
-                                                &content,
-                                                orig_ref,
-                                                &selected_findings,
-                                                memory,
-                                                iter,
-                                                &fixed,
-                                            )
-                                            .await
-                                            {
-                                                Ok(fix) => {
-                                                    let _ = tx_fix.send(
-                                                        BackgroundMessage::VerificationFixComplete {
-                                                            new_content: fix.new_content,
-                                                            description: fix.description,
-                                                            usage: fix.usage,
-                                                        },
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    let _ = tx_fix.send(
-                                                        BackgroundMessage::Error(e.to_string()),
-                                                    );
-                                                }
-                                            }
-                                        });
+                                        app.review_state.confirm_ship = true;
+                                        app.show_toast(
+                                            "Review has findings. Select items to fix or press Enter again to ship anyway.",
+                                        );
                                     }
-                                } else if app.review_passed() || app.review_state.selected.is_empty()
-                                {
-                                    // No selections or review passed - move to Ship
-                                    app.start_ship();
                                 }
                             }
                             WorkflowStep::Ship => {

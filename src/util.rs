@@ -1,3 +1,5 @@
+use std::path::{Component, Path, PathBuf};
+
 pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -14,6 +16,56 @@ pub fn truncate(s: &str, max: usize) -> String {
 
     let truncated: String = s.chars().take(max - 3).collect();
     format!("{}...", truncated)
+}
+
+pub struct RepoPath {
+    pub absolute: PathBuf,
+    pub relative: PathBuf,
+}
+
+pub fn resolve_repo_path(repo_root: &Path, candidate: &Path) -> Result<RepoPath, String> {
+    if candidate.as_os_str().is_empty() {
+        return Err("Path is empty".to_string());
+    }
+    if candidate.is_absolute() {
+        return Err(format!(
+            "Absolute paths are not allowed: {}",
+            candidate.display()
+        ));
+    }
+    if candidate
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(format!(
+            "Parent traversal is not allowed: {}",
+            candidate.display()
+        ));
+    }
+
+    let root = repo_root
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve repo root: {}", e))?;
+    let joined = root.join(candidate);
+
+    if !joined.exists() {
+        return Err(format!("File does not exist: {}", candidate.display()));
+    }
+
+    let absolute = joined
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve path {}: {}", candidate.display(), e))?;
+
+    if !absolute.starts_with(&root) {
+        return Err(format!("Path escapes repository: {}", candidate.display()));
+    }
+
+    let relative = absolute
+        .strip_prefix(&root)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|_| candidate.to_path_buf());
+
+    Ok(RepoPath { absolute, relative })
 }
 
 #[cfg(test)]

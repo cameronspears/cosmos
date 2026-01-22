@@ -111,31 +111,41 @@ pub fn create_fix_branch_from_main(repo_path: &Path, branch_name: &str) -> Resul
     let main_commit = main_branch.get().peel_to_commit()
         .context("Failed to get commit from main branch")?;
     
-    // Check if branch already exists (from a previous failed attempt)
-    if let Ok(mut existing) = repo.find_branch(branch_name, git2::BranchType::Local) {
-        // We need to checkout main first - can't delete the currently checked out branch
-        let main_ref = main_branch.get().name()
-            .context("Failed to get main branch ref name")?;
-        let main_object = main_branch.get().peel(git2::ObjectType::Any)
-            .context("Failed to peel main branch")?;
-        repo.checkout_tree(&main_object, None)
-            .context("Failed to checkout main branch tree")?;
-        repo.set_head(main_ref)
-            .context("Failed to set HEAD to main branch")?;
-        
-        // Now we can safely delete the existing branch
-        existing.delete()
-            .context(format!("Failed to delete existing branch '{}'", branch_name))?;
+    // Check if branch already exists (avoid deleting user work)
+    let mut final_name = branch_name.to_string();
+    if let Ok(existing) = repo.find_branch(branch_name, git2::BranchType::Local) {
+        let existing_commit = existing.get().peel_to_commit()
+            .context("Failed to get commit from existing branch")?;
+        if existing_commit.id() == main_commit.id() {
+            // Branch already points at main; just reuse it.
+            checkout_branch(repo_path, branch_name)?;
+            return Ok(branch_name.to_string());
+        }
+
+        final_name = unique_branch_name(&repo, branch_name)?;
     }
     
     // Create the new branch from main
-    repo.branch(branch_name, &main_commit, false)
-        .context(format!("Failed to create branch '{}' from main", branch_name))?;
+    repo.branch(&final_name, &main_commit, false)
+        .context(format!("Failed to create branch '{}' from main", final_name))?;
     
     // Checkout the new branch
-    checkout_branch(repo_path, branch_name)?;
+    checkout_branch(repo_path, &final_name)?;
     
-    Ok(branch_name.to_string())
+    Ok(final_name)
+}
+
+fn unique_branch_name(repo: &Repository, base: &str) -> Result<String> {
+    for suffix in 2..100 {
+        let candidate = format!("{}-{}", base, suffix);
+        if repo.find_branch(&candidate, git2::BranchType::Local).is_err() {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "Failed to find available branch name for '{}'",
+        base
+    ))
 }
 
 /// Generate a branch name from a suggestion summary
