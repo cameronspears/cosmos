@@ -1,6 +1,7 @@
 use super::models::{Model, Usage};
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// OpenRouter direct API URL (BYOK mode)
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -64,6 +65,7 @@ pub fn is_available() -> bool {
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 2000; // 2 seconds
 const BACKOFF_MULTIPLIER: u64 = 2; // Exponential backoff
+const REQUEST_TIMEOUT_SECS: u64 = 60;
 
 /// Extract retry-after hint from OpenRouter response (if present)
 fn parse_retry_after(text: &str) -> Option<u64> {
@@ -99,7 +101,10 @@ pub(crate) async fn call_llm_with_usage(
         anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
     })?;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build()
+        .map_err(map_timeout_error)?;
     let url = OPENROUTER_URL;
 
     let response_format = if json_mode {
@@ -140,10 +145,11 @@ pub(crate) async fn call_llm_with_usage(
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&request)
             .send()
-            .await?;
+            .await
+            .map_err(map_timeout_error)?;
 
         let status = response.status();
-        let text = response.text().await?;
+        let text = response.text().await.map_err(map_timeout_error)?;
 
         if status.is_success() {
             let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
@@ -200,6 +206,14 @@ pub(crate) async fn call_llm_with_usage(
 
     // Should not reach here, but handle it gracefully
     Err(anyhow::anyhow!("{}", last_error))
+}
+
+fn map_timeout_error(err: reqwest::Error) -> anyhow::Error {
+    if err.is_timeout() {
+        anyhow::anyhow!("OpenRouter request timed out. Please try again.")
+    } else {
+        err.into()
+    }
 }
 
 /// Truncate a string for display (Unicode-safe)

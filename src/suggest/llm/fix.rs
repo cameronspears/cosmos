@@ -281,11 +281,13 @@ pub async fn generate_multi_file_fix(
 
     for file_edit_json in file_edits_json {
         let file_path = PathBuf::from(&file_edit_json.file);
-        let new_content = files
-            .iter()
-            .find(|(path, _)| path == &file_path)
-            .map(|(_, content)| content.clone())
-            .unwrap_or_default();
+        let Some((_, content)) = files.iter().find(|(path, _)| path == &file_path) else {
+            return Err(anyhow::anyhow!(
+                "Multi-file fix references missing file: {}",
+                file_path.display()
+            ));
+        };
+        let new_content = content.clone();
 
         let mut modified_areas = Vec::new();
         for edit in &file_edit_json.edits {

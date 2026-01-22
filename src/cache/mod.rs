@@ -373,12 +373,12 @@ impl Default for GroupingAiCache {
 pub fn compute_file_hashes(index: &CodebaseIndex) -> HashMap<PathBuf, String> {
     index.files.iter()
         .map(|(path, file_index)| {
-            // Use only content-based metrics, not mtime (which changes on git checkout, copy, etc.)
-            let hash = format!(
-                "{}-{}",
-                file_index.loc,
-                file_index.symbols.len()
-            );
+            // Use a stable content hash when available; fall back for older data.
+            let hash = if !file_index.content_hash.is_empty() {
+                file_index.content_hash.clone()
+            } else {
+                format!("{}-{}", file_index.loc, file_index.symbols.len())
+            };
             (path.clone(), hash)
         })
         .collect()

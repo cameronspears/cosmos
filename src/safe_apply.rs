@@ -100,10 +100,30 @@ fn run_cmd(repo_path: &Path, name: &str, bin: &str, args: &[&str]) -> CheckResul
 
 fn truncate_output(s: &str, max: usize) -> String {
     let trimmed = s.trim();
-    if trimmed.len() <= max {
+    let char_count = trimmed.chars().count();
+    if char_count <= max {
         trimmed.to_string()
     } else {
-        format!("{}\n… (truncated)", &trimmed[..max])
+        let snippet: String = trimmed.chars().take(max).collect();
+        format!("{}\n… (truncated)", snippet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_output;
+
+    #[test]
+    fn test_truncate_output_unicode_safe() {
+        let input = "错误: 失败 😊";
+        let out = truncate_output(input, 5);
+        assert_eq!(out, "错误: 失\n… (truncated)");
+    }
+
+    #[test]
+    fn test_truncate_output_no_truncation() {
+        let input = "ok";
+        assert_eq!(truncate_output(input, 10), "ok");
     }
 }
 

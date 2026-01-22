@@ -529,6 +529,9 @@ pub struct FileIndex {
     pub language: Language,
     pub loc: usize,
     pub sloc: usize, // Source lines (excluding blanks/comments)
+    /// Stable hash of file contents for cache invalidation
+    #[serde(default)]
+    pub content_hash: String,
     pub symbols: Vec<Symbol>,
     pub dependencies: Vec<Dependency>,
     pub patterns: Vec<Pattern>,
@@ -656,6 +659,7 @@ impl CodebaseIndex {
         let sloc = content.lines()
             .filter(|l| !l.trim().is_empty())
             .count();
+        let content_hash = hash_content(&content);
 
         // Parse with tree-sitter
         let (symbols, deps) = parser::parse_file(path, &content, language)?;
@@ -708,6 +712,7 @@ impl CodebaseIndex {
             language,
             loc,
             sloc,
+            content_hash,
             symbols,
             dependencies: deps,
             patterns,
@@ -827,6 +832,20 @@ fn calculate_complexity(content: &str, _language: Language) -> f64 {
     }
     
     complexity
+}
+
+/// Compute a stable hash of file contents (FNV-1a 64-bit).
+fn hash_content(content: &str) -> String {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in content.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    format!("{:016x}", hash)
 }
 
 /// Check if a path should be ignored
