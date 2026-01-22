@@ -41,9 +41,13 @@ constraints unless they clearly improve safety or user outcomes.
 - Add new crates only when they provide clear value; use latest versions.
 
 ## Testing
-- Add tests for new behavior and bug fixes.
+- **Always run `cargo test` before completing any change** to ensure
+  the codebase compiles and tests pass.
+- Add unit tests for new behavior, bug fixes, and non-trivial logic.
 - For refactors without behavior change, rely on existing tests unless
   risk is high.
+- Test edge cases: empty inputs, error paths, boundary conditions.
+- When fixing a bug, add a regression test that would have caught it.
 
 ## UX text
 - Plain English, avoid jargon.
