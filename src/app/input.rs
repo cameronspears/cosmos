@@ -1,10 +1,13 @@
+use crate::app::bootstrap;
 use crate::app::messages::BackgroundMessage;
 use crate::app::RuntimeContext;
 use crate::cache;
 use crate::git_ops;
 use crate::index;
 use crate::suggest;
-use crate::ui::{ActivePanel, App, InputMode, LoadingState, Overlay, WorkflowStep};
+use crate::ui::{
+    ActivePanel, App, InputMode, LoadingState, OnboardingStep, Overlay, WorkflowStep,
+};
 use crate::ui;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -108,6 +111,103 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
 
     // Handle overlay mode
     if app.overlay != Overlay::None {
+        // Onboarding overlay (required OpenRouter setup)
+        if let Overlay::Onboarding { .. } = &app.overlay {
+            let mut save_key: Option<String> = None;
+            let mut should_quit = false;
+            {
+                if let Overlay::Onboarding {
+                    input,
+                    step,
+                    message,
+                } = &mut app.overlay
+                {
+                    match *step {
+                        OnboardingStep::Entry => match key.code {
+                            KeyCode::Esc => {
+                                should_quit = true;
+                            }
+                            KeyCode::Backspace => {
+                                input.pop();
+                                *message = None;
+                            }
+                            KeyCode::Enter => {
+                                let trimmed = input.trim();
+                                if trimmed.is_empty() {
+                                    *message = Some("API key required to continue.".to_string());
+                                } else if !crate::config::Config::validate_api_key_format(trimmed) {
+                                    *step = OnboardingStep::ConfirmInvalid;
+                                    *message = Some(
+                                        "Key doesn't look like an OpenRouter key (expected sk-). Save anyway? (y/N)"
+                                            .to_string(),
+                                    );
+                                } else {
+                                    save_key = Some(trimmed.to_string());
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                input.push(c);
+                                *message = None;
+                            }
+                            _ => {}
+                        },
+                        OnboardingStep::ConfirmInvalid => match key.code {
+                            KeyCode::Char('q') => {
+                                should_quit = true;
+                            }
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                let trimmed = input.trim();
+                                if !trimmed.is_empty() {
+                                    save_key = Some(trimmed.to_string());
+                                } else {
+                                    *step = OnboardingStep::Entry;
+                                    *message = Some("API key required to continue.".to_string());
+                                }
+                            }
+                            KeyCode::Esc
+                            | KeyCode::Enter
+                            | KeyCode::Char('n')
+                            | KeyCode::Char('N') => {
+                                *step = OnboardingStep::Entry;
+                                *message = Some("Enter a valid key to continue.".to_string());
+                            }
+                            _ => {}
+                        },
+                    }
+                }
+            }
+
+            if should_quit {
+                app.should_quit = true;
+                return Ok(());
+            }
+
+            if let Some(key) = save_key {
+                match app.config.set_api_key(&key) {
+                    Ok(()) => {
+                        app.close_overlay();
+                        app.show_toast("API key saved");
+                        bootstrap::init_ai_pipeline(app, (*ctx.tx).clone());
+
+                        if let Ok(status) = git_ops::current_status(&app.repo_path) {
+                            let main_branch = git_ops::get_main_branch_name(&app.repo_path)
+                                .unwrap_or_else(|_| "main".to_string());
+                            let is_on_main = status.branch == main_branch;
+                            let changed_count = status.staged.len() + status.modified.len();
+                            if !is_on_main || changed_count > 0 {
+                                app.show_startup_check(changed_count);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app.show_toast(&format!("Failed to save key: {}", e));
+                    }
+                }
+            }
+
+            return Ok(());
+        }
+
         // Inquiry privacy preview overlay
         if let Overlay::InquiryPreview { question, .. } = &app.overlay {
             match key.code {
@@ -1127,7 +1227,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                                 let suggestion = app.selected_suggestion().cloned();
                                 if let Some(suggestion) = suggestion {
                                     if !suggest::llm::is_available() {
-                                        app.show_toast("Run: cosmos --setup");
+                                        app.show_onboarding();
                                     } else {
                                         if let Err(e) = app.config.allow_ai(app.session_cost) {
                                             app.show_toast(&e);
@@ -1715,7 +1815,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
         }
         KeyCode::Char('i') => {
             if !suggest::llm::is_available() {
-                app.show_toast("Run: cosmos --setup");
+                app.show_onboarding();
             } else {
                 app.start_question();
             }

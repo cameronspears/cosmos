@@ -1,4 +1,5 @@
 pub mod background;
+pub mod bootstrap;
 pub mod input;
 pub mod messages;
 pub mod runtime;

@@ -10,7 +10,6 @@ mod config;
 mod context;
 mod grouping;
 mod index;
-mod onboarding;
 mod safe_apply;
 mod suggest;
 mod ui;
@@ -59,24 +58,6 @@ async fn main() -> Result<()> {
     // Handle --setup flag (BYOK mode)
     if args.setup {
         return setup_api_key();
-    }
-
-    // Check for first run and show onboarding
-    if onboarding::is_first_run() {
-        match onboarding::run_onboarding() {
-            Ok(true) => {
-                // Setup completed, continue to TUI
-                eprintln!();
-            }
-            Ok(false) => {
-                // Setup skipped, continue to TUI
-                eprintln!();
-            }
-            Err(e) => {
-                eprintln!("  Onboarding error: {}", e);
-                eprintln!("  Continuing without setup...");
-            }
-        }
     }
 
     let path = args.path.canonicalize()?;
