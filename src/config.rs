@@ -207,9 +207,15 @@ impl Config {
         if std::env::var("OPENROUTER_API_KEY").is_ok() {
             return true;
         }
-        // Silently check keychain - warnings will be shown on actual get_api_key() call
-        if let Ok(Some(_)) = read_keyring_key() {
-            return true;
+        match read_keyring_key() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {} // No key stored
+            Err(err) => {
+                eprintln!(
+                    "  Warning: Failed to check system keychain for API key: {}",
+                    err
+                );
+            }
         }
         // Legacy: check for plaintext key in config (will be migrated on get_api_key)
         self.openrouter_api_key.is_some()
