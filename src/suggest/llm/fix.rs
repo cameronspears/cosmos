@@ -124,8 +124,8 @@ pub async fn generate_fix_content(
     // Apply edits sequentially with validation
     let new_content = apply_edits_with_context(content, &edits, "file")?;
 
-    // Strip trailing whitespace from each line and ensure file ends with newline
-    let new_content = normalize_generated_content(new_content);
+    // Preserve whitespace and match trailing newline to original
+    let new_content = normalize_generated_content(content, new_content, is_new_file);
 
     // Validate the new content isn't empty
     if new_content.trim().is_empty() {
@@ -198,15 +198,38 @@ pub(crate) fn apply_edits_with_context(
     Ok(new_content)
 }
 
-pub(crate) fn normalize_generated_content(content: String) -> String {
-    let mut normalized = content
-        .lines()
-        .map(|line| line.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !normalized.ends_with('\n') {
-        normalized.push('\n');
+pub(crate) fn normalize_generated_content(
+    original: &str,
+    content: String,
+    is_new_file: bool,
+) -> String {
+    if is_new_file {
+        return content;
     }
+
+    let original_ends_newline = original.ends_with('\n');
+    let mut normalized = content;
+
+    if original_ends_newline {
+        if !normalized.ends_with('\n') {
+            if original.ends_with("\r\n") {
+                normalized.push_str("\r\n");
+            } else {
+                normalized.push('\n');
+            }
+        }
+    } else {
+        while normalized.ends_with('\n') {
+            if normalized.ends_with("\r\n") {
+                let new_len = normalized.len().saturating_sub(2);
+                normalized.truncate(new_len);
+            } else {
+                let new_len = normalized.len().saturating_sub(1);
+                normalized.truncate(new_len);
+            }
+        }
+    }
+
     normalized
 }
 
@@ -371,8 +394,9 @@ pub async fn generate_multi_file_fix(
         let new_content =
             apply_edits_with_context(&new_content, &file_edit_json.edits, &context)?;
 
-        // Strip trailing whitespace and ensure file ends with newline
-        let new_content = normalize_generated_content(new_content);
+        // Preserve whitespace and match trailing newline to original
+        let new_content =
+            normalize_generated_content(&file_input.content, new_content, file_input.is_new);
 
         file_edits.push(FileEdit {
             path: file_path,
@@ -617,5 +641,37 @@ mod tests {
         }];
         let err = apply_edits_with_context("content", &edits, "file").unwrap_err();
         assert!(err.to_string().contains("old_string is empty"));
+    }
+
+    #[test]
+    fn test_normalize_generated_content_adds_newline_when_original_had() {
+        let original = "line1\n";
+        let updated = "line1".to_string();
+        let normalized = normalize_generated_content(original, updated, false);
+        assert_eq!(normalized, "line1\n");
+    }
+
+    #[test]
+    fn test_normalize_generated_content_strips_newline_when_original_missing() {
+        let original = "line1";
+        let updated = "line1\n\n".to_string();
+        let normalized = normalize_generated_content(original, updated, false);
+        assert_eq!(normalized, "line1");
+    }
+
+    #[test]
+    fn test_normalize_generated_content_preserves_crlf() {
+        let original = "line1\r\n";
+        let updated = "line1".to_string();
+        let normalized = normalize_generated_content(original, updated, false);
+        assert_eq!(normalized, "line1\r\n");
+    }
+
+    #[test]
+    fn test_normalize_generated_content_new_file_is_untouched() {
+        let original = "";
+        let updated = "line1\n".to_string();
+        let normalized = normalize_generated_content(original, updated.clone(), true);
+        assert_eq!(normalized, updated);
     }
 }

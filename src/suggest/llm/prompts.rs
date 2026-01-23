@@ -33,6 +33,13 @@ CRITICAL RULES FOR EDITS:
 - Preserve indentation exactly - spaces and tabs matter
 - Do NOT include line numbers in old_string or new_string
 
+SURGICAL EDITS (MOST IMPORTANT):
+- Make the smallest possible change that fixes the issue
+- Do NOT reformat, reflow, or change whitespace/line breaks unless required for the fix
+- Keep surrounding context lines EXACTLY the same as the original (spacing, blank lines, indentation)
+- Do not rename, reorder, or clean up unrelated code
+- If a large change is truly required, keep it tightly scoped and mention it in "description"
+
 EXAMPLE - Adding a null check:
 {
   "description": "Added null check before accessing user.name",
@@ -71,6 +78,13 @@ CRITICAL RULES FOR EDITS:
 - Preserve indentation exactly - spaces and tabs matter
 - Do NOT include line numbers in old_string or new_string
 - Include ALL files that need changes - don't leave any file half-refactored
+
+SURGICAL EDITS (MOST IMPORTANT):
+- Make the smallest possible change that fixes the issue
+- Do NOT reformat, reflow, or change whitespace/line breaks unless required for the fix
+- Keep surrounding context lines EXACTLY the same as the original (spacing, blank lines, indentation)
+- Do not rename, reorder, or clean up unrelated code
+- If a large change is truly required, keep it tightly scoped and mention it in "description"
 
 MULTI-FILE CONSISTENCY:
 - Ensure renamed symbols match across all files
@@ -422,7 +436,8 @@ CRITICAL RULES FOR EDITS:
 - Preserve indentation exactly
 - Fix the ROOT CAUSE, not just the symptom
 - Don't introduce new issues while fixing old ones
-- If a finding seems incorrect, still make a reasonable improvement"#
+- Keep diffs minimal: no reformatting, no whitespace-only changes, no unrelated cleanup
+- If a finding seems incorrect, make the smallest safe change that addresses the intent"#
             .to_string()
     } else {
         format!(r#"You are a senior developer fixing issues found during code review.
@@ -457,6 +472,7 @@ CRITICAL RULES FOR EDITS:
 - old_string must be EXACT text from the file (copy-paste precision)
 - old_string must be UNIQUE in the file - include enough context
 - Preserve indentation exactly  
+- Keep diffs minimal: no reformatting, no whitespace-only changes, no unrelated cleanup
 - Fix the ROOT CAUSE this time, not just the symptom
 - Consider all edge cases the reviewer might check"#,
             iteration = iteration,
