@@ -1,3 +1,12 @@
+//! TUI runtime for Cosmos
+//!
+//! # Error Handling
+//!
+//! Background tasks use `let _ =` for channel sends and cache operations.
+//! See `background.rs` module docs for the rationale. In short:
+//! - Channel sends can fail if receiver is dropped (shutdown) - safe to ignore
+//! - Cache saves are best-effort - failure means regeneration next time
+
 use crate::app::messages::BackgroundMessage;
 use crate::app::{background, input, BudgetGuard, RuntimeContext};
 use crate::cache;

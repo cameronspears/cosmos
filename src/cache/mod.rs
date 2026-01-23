@@ -2,6 +2,16 @@
 //!
 //! Persists suggestions and index data to .cosmos/ directory
 //! to avoid redundant LLM calls and speed up startup.
+//!
+//! # Error Handling
+//!
+//! Cache operations are designed to be best-effort. Callers typically use
+//! `let _ = cache.save_*()` because:
+//! - Cache failure is recoverable (data will be regenerated next time)
+//! - We don't want to interrupt user workflows for cache issues
+//! - The .cosmos/ directory might not exist or have permission issues
+//!
+//! For critical data, callers should explicitly handle errors.
 
 use crate::index::CodebaseIndex;
 use crate::suggest::Suggestion;

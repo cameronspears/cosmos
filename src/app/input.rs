@@ -1,3 +1,11 @@
+//! Input handling for Cosmos TUI
+//!
+//! # Error Handling
+//!
+//! Background tasks use `let _ =` for channel sends. See `background.rs` module
+//! docs for the rationale: channel sends can fail if receiver is dropped during
+//! shutdown, which is expected and safe to ignore.
+
 use crate::app::background;
 use crate::app::messages::BackgroundMessage;
 use crate::app::RuntimeContext;

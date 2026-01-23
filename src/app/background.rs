@@ -1,3 +1,20 @@
+//! Background task handling for Cosmos
+//!
+//! # Error Handling Patterns
+//!
+//! This module uses `let _ =` in several places. Here's why:
+//!
+//! - **Channel sends** (`tx.send(...)`): If the receiver is dropped (e.g., the app
+//!   is shutting down), the send fails. This is expected and safe to ignore since
+//!   no one is listening for the result anyway.
+//!
+//! - **Cache saves** (`cache.save_*()`): These are best-effort operations. Failure
+//!   means we'll regenerate the data next time. Not ideal but not catastrophic.
+//!
+//! - **Config updates** (`config.record_tokens()`): Budget tracking is best-effort.
+//!   If it fails, the user might slightly exceed their budget, but the core
+//!   functionality continues to work.
+
 use crate::app::messages::BackgroundMessage;
 use crate::app::RuntimeContext;
 use crate::cache;
