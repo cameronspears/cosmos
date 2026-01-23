@@ -98,7 +98,7 @@ pub struct RepoPath {
     pub relative: PathBuf,
 }
 
-pub fn resolve_repo_path(repo_root: &Path, candidate: &Path) -> Result<RepoPath, String> {
+pub fn resolve_repo_path_allow_new(repo_root: &Path, candidate: &Path) -> Result<RepoPath, String> {
     if candidate.as_os_str().is_empty() {
         return Err("Path is empty".to_string());
     }
@@ -122,30 +122,62 @@ pub fn resolve_repo_path(repo_root: &Path, candidate: &Path) -> Result<RepoPath,
         .canonicalize()
         .map_err(|e| format!("Failed to resolve repo root: {}", e))?;
     let joined = root.join(candidate);
+    let parent = joined
+        .parent()
+        .ok_or_else(|| format!("Invalid path: {}", candidate.display()))?;
+    let parent_canon = canonicalize_existing_parent(parent)?;
 
-    if !joined.exists() {
-        return Err(format!("File does not exist: {}", candidate.display()));
-    }
-
-    let absolute = joined
-        .canonicalize()
-        .map_err(|e| format!("Failed to resolve path {}: {}", candidate.display(), e))?;
-
-    if !absolute.starts_with(&root) {
+    if !parent_canon.starts_with(&root) {
         return Err(format!("Path escapes repository: {}", candidate.display()));
     }
 
-    let relative = absolute
+    let relative = joined
         .strip_prefix(&root)
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|_| candidate.to_path_buf());
 
-    Ok(RepoPath { absolute, relative })
+    Ok(RepoPath {
+        absolute: joined,
+        relative,
+    })
+}
+
+fn canonicalize_existing_parent(path: &Path) -> Result<PathBuf, String> {
+    let mut current = path.to_path_buf();
+    while !current.exists() {
+        if !current.pop() {
+            return Err("Path has no existing parent".to_string());
+        }
+    }
+    current
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve path {}: {}", current.display(), e))
+}
+
+/// Compute a stable hash of file contents (FNV-1a 64-bit).
+pub fn hash_bytes(content: &[u8]) -> String {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in content {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    format!("{:016x}", hash)
+}
+
+pub fn hash_str(content: &str) -> String {
+    hash_bytes(content.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::truncate;
+    use super::{hash_str, resolve_repo_path_allow_new, truncate};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_truncate_unicode_safe() {
@@ -158,5 +190,32 @@ mod tests {
         let input = "こんにちは";
         assert_eq!(truncate(input, 3), "こんに");
         assert_eq!(truncate(input, 0), "");
+    }
+
+    #[test]
+    fn test_hash_str_is_stable() {
+        let a = hash_str("hello");
+        let b = hash_str("hello");
+        let c = hash_str("world");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_resolve_repo_path_allow_new_accepts_missing_file() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_repo_path_test_{}", nanos));
+        fs::create_dir_all(&root).unwrap();
+
+        let candidate = PathBuf::from("new_dir/new_file.rs");
+        let resolved = resolve_repo_path_allow_new(&root, &candidate).unwrap();
+        assert_eq!(resolved.relative, candidate);
+        assert!(resolved.absolute.ends_with("new_dir/new_file.rs"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

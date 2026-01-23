@@ -35,14 +35,15 @@ pub enum BackgroundMessage {
     /// Quick preview ready (Phase 1 - fast)
     PreviewReady {
         preview: suggest::llm::FixPreview,
+        file_hashes: HashMap<PathBuf, String>,
     },
     PreviewError(String),
     /// Direct fix applied (Smart preset generated + applied the change)
     /// Supports both single-file and multi-file changes
     DirectFixApplied {
         suggestion_id: Uuid,
-        /// All file changes (path, backup_path, diff)
-        file_changes: Vec<(PathBuf, PathBuf, String)>,
+        /// All file changes (path, backup_path, diff, was_new_file)
+        file_changes: Vec<(PathBuf, PathBuf, String, bool)>,
         description: String,
         usage: Option<suggest::llm::Usage>,
         branch_name: String,
@@ -60,6 +61,10 @@ pub enum BackgroundMessage {
     ShipComplete(String),
     /// Ship workflow error
     ShipError(String),
+    /// Cache reset completed
+    ResetComplete {
+        options: Vec<crate::cache::ResetOption>,
+    },
     /// Generic error (used for push/etc)
     Error(String),
     /// Response to a user question

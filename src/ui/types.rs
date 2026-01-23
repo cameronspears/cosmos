@@ -3,7 +3,7 @@
 //! Contains enums, structs, and their implementations for UI state management.
 
 use crate::suggest::llm::FixPreview;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -69,6 +69,7 @@ pub enum LoadingState {
     GeneratingFix,       // Full fix generation (slower)
     ReviewingChanges,    // Adversarial review or PR review
     ApplyingReviewFixes, // Applying fixes from review
+    Resetting,           // Clearing cache/data
     Answering,           // For question answering
 }
 
@@ -172,6 +173,8 @@ pub struct VerifyState {
     pub scroll: usize,
     /// Whether to show technical details (code evidence, affected areas, etc.)
     pub show_technical_details: bool,
+    /// File content hashes captured during preview (for change detection)
+    pub preview_hashes: HashMap<PathBuf, String>,
 }
 
 impl VerifyState {
@@ -301,14 +304,16 @@ pub struct FileChange {
     pub path: PathBuf,
     pub diff: String,
     pub backup_path: PathBuf,
+    pub was_new_file: bool,
 }
 
 impl FileChange {
-    pub fn new(path: PathBuf, diff: String, backup_path: PathBuf) -> Self {
+    pub fn new(path: PathBuf, diff: String, backup_path: PathBuf, was_new_file: bool) -> Self {
         Self {
             path,
             diff,
             backup_path,
+            was_new_file,
         }
     }
 }

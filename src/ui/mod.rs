@@ -249,13 +249,25 @@ impl App {
         // Restore all files from their backups
         for file_change in &change.files {
             let target = self.repo_path.join(&file_change.path);
-            std::fs::copy(&file_change.backup_path, &target).map_err(|e| {
-                format!(
-                    "Failed to restore backup for {}: {}",
-                    file_change.path.display(),
-                    e
-                )
-            })?;
+            if file_change.was_new_file {
+                if target.exists() {
+                    std::fs::remove_file(&target).map_err(|e| {
+                        format!(
+                            "Failed to remove new file {}: {}",
+                            file_change.path.display(),
+                            e
+                        )
+                    })?;
+                }
+            } else {
+                std::fs::copy(&file_change.backup_path, &target).map_err(|e| {
+                    format!(
+                        "Failed to restore backup for {}: {}",
+                        file_change.path.display(),
+                        e
+                    )
+                })?;
+            }
             let _ = std::fs::remove_file(&file_change.backup_path);
         }
 
@@ -1108,15 +1120,21 @@ impl App {
             loading: true,
             scroll: 0,
             show_technical_details: false,
+            preview_hashes: std::collections::HashMap::new(),
         };
         self.workflow_step = WorkflowStep::Verify;
         self.loading = LoadingState::GeneratingPreview;
     }
 
     /// Set the preview result in the Verify step
-    pub fn set_verify_preview(&mut self, preview: crate::suggest::llm::FixPreview) {
+    pub fn set_verify_preview(
+        &mut self,
+        preview: crate::suggest::llm::FixPreview,
+        file_hashes: std::collections::HashMap<PathBuf, String>,
+    ) {
         self.verify_state.preview = Some(preview);
         self.verify_state.loading = false;
+        self.verify_state.preview_hashes = file_hashes;
         self.loading = LoadingState::None;
     }
 

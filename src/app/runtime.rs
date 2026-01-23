@@ -512,7 +512,13 @@ fn run_loop<B: Backend>(
 ) -> Result<()> {
     // Track last git status refresh time
     let mut last_git_refresh = std::time::Instant::now();
-    const GIT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    let git_refresh_interval = if index.stats().file_count > 20000 {
+        std::time::Duration::from_secs(10)
+    } else if index.stats().file_count > 5000 {
+        std::time::Duration::from_secs(5)
+    } else {
+        std::time::Duration::from_secs(2)
+    };
 
     let ctx = RuntimeContext {
         index: &index,
@@ -529,7 +535,7 @@ fn run_loop<B: Backend>(
         app.tick_loading();
 
         // Periodically refresh git status (every 2 seconds)
-        if last_git_refresh.elapsed() >= GIT_REFRESH_INTERVAL {
+        if last_git_refresh.elapsed() >= git_refresh_interval {
             match app.context.refresh() {
                 Ok(_) => {
                     app.git_refresh_error = None;

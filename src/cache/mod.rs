@@ -112,19 +112,6 @@ pub struct IndexCache {
     pub file_hashes: HashMap<PathBuf, String>,
 }
 
-impl IndexCache {
-    /// Create from a CodebaseIndex
-    pub fn from_index(index: &CodebaseIndex) -> Self {
-        Self {
-            root: index.root.clone(),
-            file_count: index.files.len(),
-            symbol_count: index.symbols.len(),
-            cached_at: Utc::now(),
-            file_hashes: compute_file_hashes(index),
-        }
-    }
-
-}
 
 /// Cached suggestions
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -623,13 +610,39 @@ impl Cache {
         Ok(CacheLock { file })
     }
 
-    /// Save index cache
-    pub fn save_index_cache(&self, cache: &IndexCache) -> anyhow::Result<()> {
+    /// Save full index cache (CodebaseIndex)
+    pub fn save_index_cache(&self, index: &CodebaseIndex) -> anyhow::Result<()> {
         let _lock = self.lock(true)?;
         let path = self.cache_dir.join(INDEX_CACHE_FILE);
-        let content = serde_json::to_string_pretty(cache)?;
+        let content = serde_json::to_string_pretty(index)?;
         write_atomic(&path, &content)?;
         Ok(())
+    }
+
+    /// Load index cache if valid for current repo state
+    pub fn load_index_cache(&self, root: &Path) -> Option<CodebaseIndex> {
+        let path = self.cache_dir.join(INDEX_CACHE_FILE);
+        if !path.exists() {
+            return None;
+        }
+
+        let _lock = self.lock(false).ok()?;
+        let content = fs::read_to_string(&path).ok()?;
+
+        // Try to parse as full CodebaseIndex (current format)
+        if let Ok(index) = serde_json::from_str::<CodebaseIndex>(&content) {
+            if index.root != root {
+                return None;
+            }
+            if is_index_cache_valid(root, &index) {
+                return Some(index);
+            }
+            return None;
+        }
+
+        // Legacy format (IndexCache metadata only) - treat as miss
+        let _legacy: IndexCache = serde_json::from_str(&content).ok()?;
+        None
     }
 
     /// Save suggestions cache
@@ -748,6 +761,83 @@ impl Cache {
 
 }
 
+/// Reset selected Cosmos cache files for the given repository.
+pub async fn reset_cosmos(
+    repo_root: &Path,
+    options: &[ResetOption],
+) -> anyhow::Result<Vec<String>> {
+    let cache = Cache::new(repo_root);
+    cache.clear_selective(options)
+}
+
+fn is_index_cache_valid(root: &Path, index: &CodebaseIndex) -> bool {
+    let cached_hashes = compute_file_hashes(index);
+    let current_hashes = match compute_current_hashes(root) {
+        Ok(map) => map,
+        Err(_) => return false,
+    };
+    cached_hashes == current_hashes
+}
+
+fn compute_current_hashes(root: &Path) -> anyhow::Result<HashMap<PathBuf, String>> {
+    let mut hashes = HashMap::new();
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !is_ignored_path(e.path()))
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let language = crate::index::Language::from_extension(ext);
+        if language == crate::index::Language::Unknown {
+            continue;
+        }
+
+        let metadata = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if metadata.len() > crate::index::MAX_INDEX_FILE_BYTES {
+            continue;
+        }
+
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if bytes.len() as u64 > crate::index::MAX_INDEX_FILE_BYTES {
+            continue;
+        }
+
+        if std::str::from_utf8(&bytes).is_err() {
+            continue;
+        }
+
+        let rel_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+        let hash = crate::util::hash_bytes(&bytes);
+        hashes.insert(rel_path, hash);
+    }
+    Ok(hashes)
+}
+
+fn is_ignored_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let ignored = [
+        "target", "node_modules", ".git", ".svn", ".hg",
+        "dist", "build", "__pycache__", ".pytest_cache",
+        "vendor", ".idea", ".vscode", ".cosmos",
+    ];
+
+    ignored.contains(&name) || name.starts_with('.')
+}
+
 /// Write content atomically by writing to a temp file first, then renaming.
 ///
 /// # Platform Notes
@@ -796,6 +886,40 @@ fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
             return Err(err.into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn test_index_cache_round_trip_and_invalidation() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_index_cache_test_{}", nanos));
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let file_path = src_dir.join("lib.rs");
+        fs::write(&file_path, "pub fn hello() {}").unwrap();
+
+        let index = CodebaseIndex::new(&root).unwrap();
+        let cache = Cache::new(&root);
+        cache.save_index_cache(&index).unwrap();
+
+        let loaded = cache.load_index_cache(&root);
+        assert!(loaded.is_some());
+
+        fs::write(&file_path, "pub fn hello() { println!(\"hi\"); }").unwrap();
+        let invalidated = cache.load_index_cache(&root);
+        assert!(invalidated.is_none());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
 

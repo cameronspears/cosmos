@@ -27,6 +27,8 @@ pub struct AppliedFix {
 }
 
 const MAX_PREVIEW_CHARS: usize = 6000;
+const MAX_FIX_FILE_CHARS: usize = 20000;
+const MAX_MULTI_FILE_TOTAL_CHARS: usize = 60000;
 
 /// A single search/replace edit operation
 #[derive(Debug, Clone, Deserialize)]
@@ -56,7 +58,17 @@ pub async fn generate_fix_content(
     suggestion: &Suggestion,
     plan: &FixPreview,
     repo_memory: Option<String>,
+    is_new_file: bool,
 ) -> anyhow::Result<AppliedFix> {
+    let content_len = content.chars().count();
+    if content_len > MAX_FIX_FILE_CHARS {
+        return Err(anyhow::anyhow!(
+            "File too large to auto-fix safely ({} chars, limit {}). Try narrowing the scope.",
+            content_len,
+            MAX_FIX_FILE_CHARS
+        ));
+    }
+
     let plan_text = format!(
         "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
         if plan.verified { "CONFIRMED" } else { "UNCONFIRMED" },
@@ -73,9 +85,16 @@ pub async fn generate_fix_content(
     let memory_section =
         format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
 
+    let new_file_note = if is_new_file {
+        "\nNOTE: This file is new (currently empty). Use old_string=\"\" to insert full content."
+    } else {
+        ""
+    };
+
     let user = format!(
-        "File: {}\n\nOriginal Issue: {}\n{}\n{}\n\n{}\n\nCurrent Code:\n```\n{}\n```\n\nImplement the fix using search/replace edits. Be precise with old_string - it must match exactly.",
+        "File: {}\n{}\n\nOriginal Issue: {}\n{}\n{}\n\n{}\n\nCurrent Code:\n```\n{}\n```\n\nImplement the fix using search/replace edits. Be precise with old_string - it must match exactly.",
         path.display(),
+        new_file_note,
         suggestion.summary,
         suggestion.detail.as_deref().unwrap_or(""),
         memory_section,
@@ -140,6 +159,18 @@ pub(crate) fn apply_edits_with_context(
 ) -> anyhow::Result<String> {
     let mut new_content = content.to_string();
     for (i, edit) in edits.iter().enumerate() {
+        if edit.old_string.is_empty() {
+            if new_content.is_empty() {
+                new_content = edit.new_string.clone();
+                continue;
+            }
+            return Err(anyhow::anyhow!(
+                "Edit {}: old_string is empty for non-empty {}. Provide more context.",
+                i + 1,
+                context_label
+            ));
+        }
+
         let matches: Vec<_> = new_content.match_indices(&edit.old_string).collect();
 
         if matches.is_empty() {
@@ -202,6 +233,14 @@ pub struct MultiFileAppliedFix {
     pub usage: Option<Usage>,
 }
 
+/// Input for a single file in a multi-file fix
+#[derive(Debug, Clone)]
+pub struct FileInput {
+    pub path: PathBuf,
+    pub content: String,
+    pub is_new: bool,
+}
+
 /// Edits for a single file in the JSON response
 #[derive(Debug, Clone, Deserialize)]
 struct FileEditsJson {
@@ -224,11 +263,31 @@ struct MultiFileFixResponse {
 /// - Extracting shared code and updating imports
 /// - Interface changes that affect multiple files
 pub async fn generate_multi_file_fix(
-    files: &[(PathBuf, String)], // (path, content) pairs
+    files: &[FileInput],
     suggestion: &Suggestion,
     plan: &FixPreview,
     repo_memory: Option<String>,
 ) -> anyhow::Result<MultiFileAppliedFix> {
+    let mut total_chars = 0usize;
+    for file in files {
+        let count = file.content.chars().count();
+        if count > MAX_FIX_FILE_CHARS {
+            return Err(anyhow::anyhow!(
+                "File too large to auto-fix safely ({} chars in {}). Try narrowing the scope.",
+                count,
+                file.path.display()
+            ));
+        }
+        total_chars = total_chars.saturating_add(count);
+    }
+    if total_chars > MAX_MULTI_FILE_TOTAL_CHARS {
+        return Err(anyhow::anyhow!(
+            "Multi-file fix too large to auto-fix safely ({} chars total, limit {}). Try splitting the change.",
+            total_chars,
+            MAX_MULTI_FILE_TOTAL_CHARS
+        ));
+    }
+
     let plan_text = format!(
         "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
         if plan.verified { "CONFIRMED" } else { "UNCONFIRMED" },
@@ -248,12 +307,20 @@ pub async fn generate_multi_file_fix(
     // Build the files section
     let files_section: String = files
         .iter()
-        .map(|(path, content)| format!("=== {} ===\n```\n{}\n```", path.display(), content))
+        .map(|file| {
+            let new_note = if file.is_new { "(NEW FILE)" } else { "" };
+            format!(
+                "=== {} {} ===\n```\n{}\n```",
+                file.path.display(),
+                new_note,
+                file.content
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
 
     let user = format!(
-        "Original Issue: {}\n{}\n{}\n\n{}\n\nFILES TO MODIFY:\n\n{}\n\nImplement the fix using search/replace edits for each file. Ensure consistency across all files.",
+        "Original Issue: {}\n{}\n{}\n\n{}\n\nFILES TO MODIFY:\n\n{}\n\nImplement the fix using search/replace edits for each file. For new files, use old_string=\"\" to insert full content. Ensure consistency across all files.",
         suggestion.summary,
         suggestion.detail.as_deref().unwrap_or(""),
         memory_section,
@@ -285,13 +352,13 @@ pub async fn generate_multi_file_fix(
 
     for file_edit_json in file_edits_json {
         let file_path = PathBuf::from(&file_edit_json.file);
-        let Some((_, content)) = files.iter().find(|(path, _)| path == &file_path) else {
+        let Some(file_input) = files.iter().find(|f| f.path == file_path) else {
             return Err(anyhow::anyhow!(
                 "Multi-file fix references missing file: {}",
                 file_path.display()
             ));
         };
-        let new_content = content.clone();
+        let new_content = file_input.content.clone();
 
         let mut modified_areas = Vec::new();
         for edit in &file_edit_json.edits {
@@ -526,4 +593,29 @@ fn build_fix_preview(
         scope,
         modifier,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_apply_edits_with_empty_old_string_on_empty_file() {
+        let edits = vec![EditOp {
+            old_string: "".to_string(),
+            new_string: "hello".to_string(),
+        }];
+        let updated = apply_edits_with_context("", &edits, "file").unwrap();
+        assert_eq!(updated, "hello");
+    }
+
+    #[test]
+    fn test_apply_edits_empty_old_string_on_non_empty_file_fails() {
+        let edits = vec![EditOp {
+            old_string: "".to_string(),
+            new_string: "hello".to_string(),
+        }];
+        let err = apply_edits_with_context("content", &edits, "file").unwrap_err();
+        assert!(err.to_string().contains("old_string is empty"));
+    }
 }

@@ -793,6 +793,7 @@ mod tests {
             dependencies: Vec::new(),
             patterns: Vec::new(),
             cached_at: Utc::now(),
+            index_errors: Vec::new(),
         };
         
         assert_eq!(generate_cluster_name(&files, &index, 0), "user");
