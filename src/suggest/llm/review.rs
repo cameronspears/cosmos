@@ -200,8 +200,8 @@ pub async fn fix_review_findings(
     // Apply edits sequentially with validation
     let new_content = apply_edits_with_context(content, &edits, "file")?;
 
-    // Normalize whitespace
-    let new_content = normalize_generated_content(new_content);
+    // Preserve whitespace and match trailing newline to original
+    let new_content = normalize_generated_content(content, new_content, false);
 
     if new_content.trim().is_empty() {
         return Err(anyhow::anyhow!("Generated content is empty"));
