@@ -612,11 +612,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
         }
         KeyCode::Char(' ') => {
             // Space toggles finding selection in Review step
-            if app.active_panel == ActivePanel::Suggestions && app.workflow_step == WorkflowStep::Review
+            if app.active_panel == ActivePanel::Suggestions
+                && app.workflow_step == WorkflowStep::Review
+                && !app.review_state.reviewing
+                && !app.review_state.fixing
             {
-                if !app.review_state.reviewing && !app.review_state.fixing {
-                    app.review_toggle_finding();
-                }
+                app.review_toggle_finding();
             }
         }
         KeyCode::Char('f') => {
@@ -1376,11 +1377,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
         KeyCode::Char('?') => app.toggle_help(),
         KeyCode::Char('a') => {
             // Select all findings in Review step
-            if app.active_panel == ActivePanel::Suggestions && app.workflow_step == WorkflowStep::Review
+            if app.active_panel == ActivePanel::Suggestions
+                && app.workflow_step == WorkflowStep::Review
+                && !app.review_state.reviewing
+                && !app.review_state.fixing
             {
-                if !app.review_state.reviewing && !app.review_state.fixing {
-                    app.review_select_all();
-                }
+                app.review_select_all();
             }
         }
         KeyCode::Char('i') => {

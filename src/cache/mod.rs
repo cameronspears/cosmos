@@ -583,6 +583,7 @@ impl Cache {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false) // Lock file content doesn't matter, just the lock
             .open(&lock_path)?;
 
         let start = Instant::now();

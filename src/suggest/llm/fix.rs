@@ -7,7 +7,7 @@ use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{FIX_CONTENT_SYSTEM, FIX_PREVIEW_SYSTEM, MULTI_FILE_FIX_SYSTEM};
 use crate::suggest::Suggestion;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  DIRECT CODE GENERATION (Human plan → Smart model applies changes)
@@ -51,7 +51,7 @@ pub(crate) struct FixResponse {
 /// Uses a search/replace approach for precise, validated edits.
 /// This is Phase 2 of the two-phase fix flow - Smart preset generates the actual changes
 pub async fn generate_fix_content(
-    path: &PathBuf,
+    path: &Path,
     content: &str,
     suggestion: &Suggestion,
     plan: &FixPreview,
@@ -400,7 +400,7 @@ impl FixScope {
 /// Generate a preview of what the fix will do with smart verification
 /// This is Phase 1 of the two-phase fix flow - uses Smart model to thoroughly verify the issue exists before users approve
 pub async fn generate_fix_preview(
-    path: &PathBuf,
+    path: &Path,
     content: &str,
     suggestion: &Suggestion,
     modifier: Option<&str>,
@@ -444,11 +444,10 @@ fn build_fix_preview(
         .and_then(|v| v.as_bool())
         .or_else(|| {
             // Handle string "true"/"false" in case of JSON issues
-            if let Some(s) = parsed.get("verified").and_then(|v| v.as_str()) {
-                Some(s.eq_ignore_ascii_case("true"))
-            } else {
-                None
-            }
+            parsed
+                .get("verified")
+                .and_then(|v| v.as_str())
+                .map(|s| s.eq_ignore_ascii_case("true"))
         })
         .unwrap_or(true); // Default to true for backwards compatibility
 

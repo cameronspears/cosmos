@@ -686,15 +686,14 @@ impl CodebaseIndex {
         
         // Check for long functions
         for sym in &symbols {
-            if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
-                if sym.line_count() > 50 {
-                    patterns.push(Pattern {
-                        kind: PatternKind::LongFunction,
-                        file: path.to_path_buf(),
-                        line: sym.line,
-                        description: format!("{} is {} lines", sym.name, sym.line_count()),
-                    });
-                }
+            if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) && sym.line_count() > 50
+            {
+                patterns.push(Pattern {
+                    kind: PatternKind::LongFunction,
+                    file: path.to_path_buf(),
+                    line: sym.line,
+                    description: format!("{} is {} lines", sym.name, sym.line_count()),
+                });
             }
         }
         

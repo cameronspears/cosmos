@@ -301,7 +301,7 @@ fn get_misc_name(layer: Layer) -> &'static str {
     match layer {
         Layer::Frontend => "other ui files",
         Layer::Backend => "other services",
-        Layer::API => "other endpoints",
+        Layer::Api => "other endpoints",
         Layer::Database => "other data files",
         Layer::Shared => "other utilities",
         Layer::Tests => "other tests",
@@ -413,10 +413,8 @@ fn extract_feature_directory(path: &Path) -> Option<String> {
 
     // Check for explicit feature directories (features/auth/...)
     for (i, comp) in components.iter().enumerate() {
-        if feature_dirs.contains(&comp.to_lowercase().as_str()) {
-            if i + 1 < components.len() {
-                return Some(components[i + 1].to_string());
-            }
+        if feature_dirs.contains(&comp.to_lowercase().as_str()) && i + 1 < components.len() {
+            return Some(components[i + 1].to_string());
         }
     }
 

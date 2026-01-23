@@ -23,7 +23,7 @@ use anyhow::Result;
 use clap::Parser;
 use context::WorkContext;
 use index::CodebaseIndex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use suggest::SuggestionEngine;
 use util::truncate;
 
@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
 }
 
 /// Initialize the codebase index
-fn init_index(path: &PathBuf, cache_manager: &cache::Cache) -> Result<CodebaseIndex> {
+fn init_index(path: &Path, cache_manager: &cache::Cache) -> Result<CodebaseIndex> {
     eprint!("  Indexing codebase...");
 
     let index = CodebaseIndex::new(path)?;
@@ -135,7 +135,7 @@ fn init_index(path: &PathBuf, cache_manager: &cache::Cache) -> Result<CodebaseIn
 }
 
 /// Initialize the work context
-fn init_context(path: &PathBuf) -> Result<WorkContext> {
+fn init_context(path: &Path) -> Result<WorkContext> {
     eprint!("  Loading context...");
 
     let context = WorkContext::load(path)?;
@@ -143,11 +143,7 @@ fn init_context(path: &PathBuf) -> Result<WorkContext> {
     eprintln!(
         " {} on {}, {} changed",
         context.branch,
-        if context.inferred_focus.is_some() {
-            context.inferred_focus.as_ref().unwrap()
-        } else {
-            "project"
-        },
+        context.inferred_focus.as_deref().unwrap_or("project"),
         context.modified_count
     );
 

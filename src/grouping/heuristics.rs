@@ -243,13 +243,13 @@ fn detect_by_file_pattern(path: &Path) -> Option<Layer> {
         "+server.ts", "+server.js", "+page.server.ts", "+page.server.js",
     ];
     if api_file_patterns.iter().any(|p| filename == *p) {
-        return Some(Layer::API);
+        return Some(Layer::Api);
     }
     
     // API naming patterns
     let api_patterns = [".api.", "api.", "endpoint.", "handler."];
     if api_patterns.iter().any(|p| filename.contains(p)) {
-        return Some(Layer::API);
+        return Some(Layer::Api);
     }
 
     // === Backend patterns ===
@@ -290,11 +290,16 @@ fn detect_by_file_pattern(path: &Path) -> Option<Layer> {
     // React hooks pattern - "use" followed by uppercase letter
     if original_filename.len() > 3 {
         let chars: Vec<char> = original_filename.chars().collect();
-        if chars[0] == 'u' && chars[1] == 's' && chars[2] == 'e' && chars[3].is_ascii_uppercase() {
-            if filename.ends_with(".ts") || filename.ends_with(".tsx") 
-                || filename.ends_with(".js") || filename.ends_with(".jsx") {
-                return Some(Layer::Frontend);
-            }
+        if chars[0] == 'u'
+            && chars[1] == 's'
+            && chars[2] == 'e'
+            && chars[3].is_ascii_uppercase()
+            && (filename.ends_with(".ts")
+                || filename.ends_with(".tsx")
+                || filename.ends_with(".js")
+                || filename.ends_with(".jsx"))
+        {
+            return Some(Layer::Frontend);
         }
     }
 
@@ -375,11 +380,13 @@ fn detect_by_symbols(file_index: &FileIndex) -> Option<Layer> {
         }
         
         // Model/Entity patterns
-        if matches!(symbol.kind, SymbolKind::Struct | SymbolKind::Class) {
-            if name_lower.contains("model") || name_lower.contains("entity")
-                || name_lower.contains("schema") || name_lower.contains("record") {
-                has_model = true;
-            }
+        if matches!(symbol.kind, SymbolKind::Struct | SymbolKind::Class)
+            && (name_lower.contains("model")
+                || name_lower.contains("entity")
+                || name_lower.contains("schema")
+                || name_lower.contains("record"))
+        {
+            has_model = true;
         }
     }
 
@@ -407,7 +414,7 @@ fn detect_by_directory_segments(path: &Path) -> Option<Layer> {
     // Check for API first (before frontend, since app/api should be API not Frontend)
     let api_segments = ["api", "routes", "endpoints", "rest", "graphql", "trpc", "rpc"];
     if segments.iter().any(|s| api_segments.contains(&s.as_str())) {
-        return Some(Layer::API);
+        return Some(Layer::Api);
     }
 
     // Database directories
@@ -551,7 +558,7 @@ fn detect_by_language_conventions(path: &Path, file_index: &FileIndex) -> Layer 
                     .to_lowercase();
                 
                 if ["api", "routes", "handlers"].contains(&parent.as_str()) {
-                    Layer::API
+                    Layer::Api
                 } else if ["models", "db", "schema", "entities"].contains(&parent.as_str()) {
                     Layer::Database
                 } else if ["utils", "helpers", "types"].contains(&parent.as_str()) {
@@ -629,7 +636,7 @@ mod tests {
         // API should be detected before frontend for app/api paths
         assert_eq!(
             detect_by_directory_segments(Path::new("app/api/users/route.ts")),
-            Some(Layer::API)
+            Some(Layer::Api)
         );
         assert_eq!(
             detect_by_directory_segments(Path::new("src/components/Button.tsx")),
@@ -653,7 +660,7 @@ mod tests {
         );
         assert_eq!(
             detect_by_file_pattern(Path::new("route.ts")),
-            Some(Layer::API)
+            Some(Layer::Api)
         );
         assert_eq!(
             detect_by_file_pattern(Path::new("user.service.ts")),
@@ -670,7 +677,7 @@ mod tests {
         // route.ts should be API even if in components directory
         assert_eq!(
             detect_by_file_pattern(Path::new("src/components/api/route.ts")),
-            Some(Layer::API)
+            Some(Layer::Api)
         );
     }
 }

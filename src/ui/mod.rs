@@ -28,7 +28,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use theme::Theme;
 
@@ -602,7 +602,7 @@ impl App {
     }
 
     /// Get LLM summary for a file
-    pub fn get_llm_summary(&self, path: &PathBuf) -> Option<&String> {
+    pub fn get_llm_summary(&self, path: &Path) -> Option<&String> {
         self.llm_summaries.get(path)
     }
 
@@ -771,12 +771,9 @@ impl App {
                             match &entry.kind {
                                 // Always show layer headers that contain matches
                                 GroupedEntryKind::Layer(layer) => matching_layers.contains(layer),
-                                // Show features if they contain matching files
-                                GroupedEntryKind::Feature => {
-                                    // Feature names don't have paths, check if name matches
-                                    // or if any child files match (they'll be shown separately)
-                                    entry.name.to_lowercase().contains(&query) || true
-                                }
+                                // Include all features initially; filter_empty_features()
+                                // removes features without matching child files
+                                GroupedEntryKind::Feature => true,
                                 // Show files that match the query
                                 GroupedEntryKind::File => {
                                     entry.name.to_lowercase().contains(&query)
@@ -1119,12 +1116,10 @@ impl App {
     /// Show a toast message (errors, rate limits, and success messages are displayed)
     pub fn show_toast(&mut self, message: &str) {
         let toast = Toast::new(message);
-        if toast.is_error() {
-            self.toast = Some(toast);
-        } else if matches!(toast.kind, ToastKind::Success) {
+        // Display error and success toasts; info toasts are silently ignored
+        if toast.is_error() || matches!(toast.kind, ToastKind::Success) {
             self.toast = Some(toast);
         }
-        // Info toasts are silently ignored
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3959,7 +3954,7 @@ fn render_inquiry_preview(frame: &mut Frame, question: &str, preview: &str, scro
 
 fn render_file_detail(
     frame: &mut Frame,
-    path: &PathBuf,
+    path: &Path,
     file_index: &crate::index::FileIndex,
     llm_summary: Option<&String>,
     _scroll: usize,

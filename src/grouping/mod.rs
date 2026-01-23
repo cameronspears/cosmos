@@ -60,14 +60,14 @@ pub fn display_name_with_context(path: &Path) -> String {
 }
 
 /// Architectural layer classification
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord, Default)]
 pub enum Layer {
     /// UI components, pages, layouts, styles
     Frontend,
     /// Server logic, handlers, middleware
     Backend,
     /// Route definitions, API endpoints
-    API,
+    Api,
     /// Models, migrations, queries, schemas
     Database,
     /// Shared types, utilities, constants
@@ -79,6 +79,7 @@ pub enum Layer {
     /// CI/CD, Docker, scripts, infrastructure
     Infra,
     /// Files that couldn't be categorized
+    #[default]
     Unknown,
 }
 
@@ -88,7 +89,7 @@ impl Layer {
         match self {
             Layer::Frontend => "User Interface",
             Layer::Backend => "Server Logic",
-            Layer::API => "Endpoints",
+            Layer::Api => "Endpoints",
             Layer::Database => "Data Layer",
             Layer::Shared => "Shared Code",
             Layer::Config => "Settings",
@@ -104,7 +105,7 @@ impl Layer {
         &[
             Layer::Frontend,
             Layer::Backend,
-            Layer::API,
+            Layer::Api,
             Layer::Database,
             Layer::Shared,
             Layer::Config,
@@ -118,7 +119,7 @@ impl Layer {
         match raw.trim().to_lowercase().as_str() {
             "frontend" | "ui" => Some(Layer::Frontend),
             "backend" | "server" => Some(Layer::Backend),
-            "api" | "endpoint" | "endpoints" => Some(Layer::API),
+            "api" | "endpoint" | "endpoints" => Some(Layer::Api),
             "database" | "db" | "data" => Some(Layer::Database),
             "shared" | "common" => Some(Layer::Shared),
             "config" | "configuration" => Some(Layer::Config),
@@ -130,11 +131,6 @@ impl Layer {
     }
 }
 
-impl Default for Layer {
-    fn default() -> Self {
-        Layer::Unknown
-    }
-}
 
 /// A feature grouping within a layer
 #[derive(Debug, Clone, Serialize, Deserialize)]
