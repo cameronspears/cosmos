@@ -13,100 +13,117 @@ use crossterm::event::{KeyCode, KeyEvent};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  MAIN INPUT DISPATCHER
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Main key event handler - dispatches to mode-specific handlers
 pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> Result<()> {
-    // Handle search input mode
-    if app.input_mode == InputMode::Search {
-        match key.code {
-            KeyCode::Esc => app.exit_search(),
-            KeyCode::Enter => {
-                app.input_mode = InputMode::Normal;
-            }
-            KeyCode::Backspace => app.search_pop(),
-            KeyCode::Char(c) => app.search_push(c),
-            _ => {}
-        }
+    // Dispatch based on current input mode
+    match app.input_mode {
+        InputMode::Search => return handle_search_input(app, key),
+        InputMode::Question => return handle_question_input(app, key, ctx),
+        InputMode::Normal => {}
+    }
+
+    // Handle overlay mode if active
+    if app.overlay != Overlay::None {
+        return handle_overlay_input(app, key, ctx);
+    }
+
+    // Normal mode handling
+    handle_normal_mode(app, key, ctx)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SEARCH MODE
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Handle key events in search mode
+fn handle_search_input(app: &mut App, key: KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => app.exit_search(),
+        KeyCode::Enter => app.input_mode = InputMode::Normal,
+        KeyCode::Backspace => app.search_pop(),
+        KeyCode::Char(c) => app.search_push(c),
+        _ => {}
+    }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  QUESTION MODE
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Handle key events in question (ask cosmos) mode
+fn handle_question_input(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => app.exit_question(),
+        KeyCode::Up if app.question_input.is_empty() => app.question_suggestion_up(),
+        KeyCode::Down if app.question_input.is_empty() => app.question_suggestion_down(),
+        KeyCode::Tab => app.use_selected_suggestion(),
+        KeyCode::Enter => submit_question(app, ctx)?,
+        KeyCode::Backspace => app.question_pop(),
+        KeyCode::Char(c) => app.question_push(c),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Submit a question to the LLM
+fn submit_question(app: &mut App, ctx: &RuntimeContext) -> Result<()> {
+    // If input is empty, use the selected suggestion first
+    if app.question_input.is_empty() && !app.question_suggestions.is_empty() {
+        app.use_selected_suggestion();
+    }
+    let question = app.take_question();
+    if question.is_empty() {
         return Ok(());
     }
 
-    // Handle question input mode
-    if app.input_mode == InputMode::Question {
-        match key.code {
-            KeyCode::Esc => app.exit_question(),
-            KeyCode::Up => {
-                // Navigate suggestions when input is empty
-                if app.question_input.is_empty() {
-                    app.question_suggestion_up();
-                }
-            }
-            KeyCode::Down => {
-                // Navigate suggestions when input is empty
-                if app.question_input.is_empty() {
-                    app.question_suggestion_down();
-                }
-            }
-            KeyCode::Tab => {
-                // Use selected suggestion
-                app.use_selected_suggestion();
-            }
-            KeyCode::Enter => {
-                // If input is empty, use the selected suggestion first
-                if app.question_input.is_empty() && !app.question_suggestions.is_empty() {
-                    app.use_selected_suggestion();
-                }
-                let question = app.take_question();
-                if !question.is_empty() {
-                    // Privacy preview (what will be sent) before the network call
-                    if app.config.privacy_preview {
-                        app.show_inquiry_preview(question);
-                    } else {
-                        if let Err(e) = app.config.allow_ai(app.session_cost) {
-                            app.show_toast(&e);
-                            return Ok(());
-                        }
-                        // Send question to LLM
-                        let index_clone = ctx.index.clone();
-                        let context_clone = app.context.clone();
-                        let tx_question = ctx.tx.clone();
-                        let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
-
-                        app.loading = LoadingState::Answering;
-
-                        background::spawn_background(ctx.tx.clone(), "ask_question", async move {
-                            let mem = if repo_memory_context.trim().is_empty() {
-                                None
-                            } else {
-                                Some(repo_memory_context)
-                            };
-                            match suggest::llm::ask_question(
-                                &index_clone,
-                                &context_clone,
-                                &question,
-                                mem,
-                            )
-                            .await
-                            {
-                                Ok((answer, usage)) => {
-                                    let _ = tx_question.send(BackgroundMessage::QuestionResponse {
-                                        answer,
-                                        usage,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx_question
-                                        .send(BackgroundMessage::Error(e.to_string()));
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-            KeyCode::Backspace => app.question_pop(),
-            KeyCode::Char(c) => app.question_push(c),
-            _ => {}
-        }
+    // Privacy preview (what will be sent) before the network call
+    if app.config.privacy_preview {
+        app.show_inquiry_preview(question);
         return Ok(());
     }
 
+    if let Err(e) = app.config.allow_ai(app.session_cost) {
+        app.show_toast(&e);
+        return Ok(());
+    }
+
+    // Send question to LLM
+    let index_clone = ctx.index.clone();
+    let context_clone = app.context.clone();
+    let tx_question = ctx.tx.clone();
+    let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
+
+    app.loading = LoadingState::Answering;
+
+    background::spawn_background(ctx.tx.clone(), "ask_question", async move {
+        let mem = if repo_memory_context.trim().is_empty() {
+            None
+        } else {
+            Some(repo_memory_context)
+        };
+        match suggest::llm::ask_question(&index_clone, &context_clone, &question, mem).await {
+            Ok((answer, usage)) => {
+                let _ = tx_question.send(BackgroundMessage::QuestionResponse { answer, usage });
+            }
+            Err(e) => {
+                let _ = tx_question.send(BackgroundMessage::Error(e.to_string()));
+            }
+        }
+    });
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  OVERLAY MODE
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Handle key events when an overlay is active
+fn handle_overlay_input(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> Result<()> {
     // Handle overlay mode
     if app.overlay != Overlay::None {
         // Inquiry privacy preview overlay
@@ -556,7 +573,15 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
         return Ok(());
     }
 
-    // Normal mode
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  NORMAL MODE
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Handle key events in normal mode (no special input active)
+fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> Result<()> {
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Tab => app.toggle_panel(),
