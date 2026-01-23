@@ -84,3 +84,60 @@ impl Usage {
         model.calculate_cost(self.prompt_tokens, self.completion_tokens)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_model_ids() {
+        assert!(Model::Speed.id().contains("gpt"));
+        assert!(Model::Balanced.id().contains("claude"));
+        assert!(Model::Smart.id().contains("claude"));
+        assert!(Model::Reviewer.id().contains("gpt"));
+    }
+
+    #[test]
+    fn test_model_max_tokens() {
+        assert_eq!(Model::Speed.max_tokens(), MODEL_MAX_TOKENS);
+        assert_eq!(Model::Smart.max_tokens(), MODEL_MAX_TOKENS);
+    }
+
+    #[test]
+    fn test_cost_calculation() {
+        // 1000 tokens at Speed tier should cost very little
+        let cost = Model::Speed.calculate_cost(1000, 1000);
+        assert!(cost > 0.0);
+        assert!(cost < 0.01);
+
+        // Smart tier should cost more than Speed
+        let smart_cost = Model::Smart.calculate_cost(1000, 1000);
+        let speed_cost = Model::Speed.calculate_cost(1000, 1000);
+        assert!(smart_cost > speed_cost);
+    }
+
+    #[test]
+    fn test_usage_prefers_actual_cost() {
+        let usage = Usage {
+            prompt_tokens: 1000,
+            completion_tokens: 1000,
+            total_tokens: 2000,
+            cost: Some(0.05),
+        };
+        // Should return the actual cost, not calculated
+        assert_eq!(usage.calculate_cost(Model::Speed), 0.05);
+    }
+
+    #[test]
+    fn test_usage_falls_back_to_calculated() {
+        let usage = Usage {
+            prompt_tokens: 1000,
+            completion_tokens: 1000,
+            total_tokens: 2000,
+            cost: None,
+        };
+        // Should calculate cost since no actual cost provided
+        let cost = usage.calculate_cost(Model::Speed);
+        assert!(cost > 0.0);
+    }
+}

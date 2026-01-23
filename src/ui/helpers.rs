@@ -110,3 +110,72 @@ pub fn lowercase_first(s: &str) -> String {
         Some(c) => c.to_lowercase().chain(chars).collect(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_short_string() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_long_string() {
+        assert_eq!(truncate("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn test_truncate_exact_length() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_wrap_text_single_line() {
+        let result = wrap_text("hello", 10);
+        assert_eq!(result, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_wrap_text_multiple_lines() {
+        let result = wrap_text("hello world foo bar", 10);
+        assert!(result.len() > 1);
+        for line in &result {
+            assert!(line.len() <= 10);
+        }
+    }
+
+    #[test]
+    fn test_wrap_text_empty() {
+        let result = wrap_text("", 10);
+        assert_eq!(result, vec![""]);
+    }
+
+    #[test]
+    fn test_lowercase_first_basic() {
+        assert_eq!(lowercase_first("Hello"), "hello");
+        assert_eq!(lowercase_first("WORLD"), "wORLD");
+    }
+
+    #[test]
+    fn test_lowercase_first_empty() {
+        assert_eq!(lowercase_first(""), "");
+    }
+
+    #[test]
+    fn test_lowercase_first_already_lowercase() {
+        assert_eq!(lowercase_first("already"), "already");
+    }
+
+    #[test]
+    fn test_centered_rect() {
+        use ratatui::layout::Rect;
+        let parent = Rect::new(0, 0, 100, 100);
+        let centered = centered_rect(50, 50, parent);
+        // Should be centered
+        assert!(centered.x > 0);
+        assert!(centered.y > 0);
+        assert!(centered.width < 100);
+        assert!(centered.height < 100);
+    }
+}

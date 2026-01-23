@@ -136,7 +136,10 @@ impl Config {
             }
         }
 
-        // Legacy: migrate plaintext key to keychain if present
+        // DEPRECATED: Legacy migration of plaintext API keys to system keychain.
+        // This code path exists to migrate users who stored keys in config before
+        // keychain support was added. Once migrated, the plaintext key is removed.
+        // TODO: Remove this migration code after 2026-06-01 (6 months from keychain release)
         if let Some(key) = self.openrouter_api_key.clone() {
             eprintln!("  Migrating API key from config file to system keychain...");
             match write_keyring_key(&key) {
