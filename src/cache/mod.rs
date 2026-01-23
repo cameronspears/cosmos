@@ -403,16 +403,6 @@ pub struct MemoryEntry {
 }
 
 impl RepoMemory {
-    pub fn add(&mut self, text: String) -> uuid::Uuid {
-        let id = uuid::Uuid::new_v4();
-        self.entries.push(MemoryEntry {
-            id,
-            text,
-            created_at: Utc::now(),
-        });
-        id
-    }
-
     /// Render a concise memory context for LLM prompts.
     pub fn to_prompt_context(&self, max_entries: usize, max_chars: usize) -> String {
         let mut entries = self.entries.clone();
@@ -695,15 +685,6 @@ impl Cache {
             .ok()
             .and_then(|content| serde_json::from_str(&content).ok())
             .unwrap_or_default()
-    }
-
-    /// Save repo memory to `.cosmos/memory.json`
-    pub fn save_repo_memory(&self, memory: &RepoMemory) -> anyhow::Result<()> {
-        let _lock = self.lock(true)?;
-        let path = self.cache_dir.join(MEMORY_FILE);
-        let content = serde_json::to_string_pretty(memory)?;
-        write_atomic(&path, &content)?;
-        Ok(())
     }
 
     /// Load domain glossary from `.cosmos/glossary.json`

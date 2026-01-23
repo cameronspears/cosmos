@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use crate::util::{run_command_with_timeout, CommandRunResult};
-use git2::{IndexAddOption, Repository, Signature, StatusOptions};
+use git2::{Repository, Signature, StatusOptions};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -76,18 +76,6 @@ pub fn current_status(repo_path: &Path) -> Result<GitStatus> {
     Ok(status)
 }
 
-/// Create a new branch from current HEAD
-pub fn create_branch(repo_path: &Path, name: &str) -> Result<()> {
-    let repo = Repository::open(repo_path)?;
-    let head = repo.head()?;
-    let commit = head.peel_to_commit()?;
-    
-    repo.branch(name, &commit, false)
-        .context(format!("Failed to create branch '{}'", name))?;
-    
-    Ok(())
-}
-
 /// Checkout an existing branch
 pub fn checkout_branch(repo_path: &Path, name: &str) -> Result<()> {
     let repo = Repository::open(repo_path)?;
@@ -102,13 +90,6 @@ pub fn checkout_branch(repo_path: &Path, name: &str) -> Result<()> {
         None => repo.set_head_detached(object.id())?,
     }
     
-    Ok(())
-}
-
-/// Create branch and checkout in one step
-pub fn create_and_checkout_branch(repo_path: &Path, name: &str) -> Result<()> {
-    create_branch(repo_path, name)?;
-    checkout_branch(repo_path, name)?;
     Ok(())
 }
 
@@ -249,17 +230,6 @@ pub fn stage_file(repo_path: &Path, file_path: &str) -> Result<()> {
     let mut index = repo.index()?;
     
     index.add_path(Path::new(file_path))?;
-    index.write()?;
-    
-    Ok(())
-}
-
-/// Stage all modified files
-pub fn stage_all(repo_path: &Path) -> Result<()> {
-    let repo = Repository::open(repo_path)?;
-    let mut index = repo.index()?;
-    
-    index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
     index.write()?;
     
     Ok(())
@@ -441,24 +411,6 @@ fn resolve_push_remote(repo: &Repository, branch: &str) -> Result<String> {
     }
 
     Ok("origin".to_string())
-}
-
-/// Reset a file to HEAD (discard changes)
-pub fn reset_file(repo_path: &Path, file_path: &str) -> Result<()> {
-    let output = Command::new("git")
-        .current_dir(repo_path)
-        .args(["checkout", "HEAD", "--", file_path])
-        .output()
-        .context("Failed to reset file")?;
-    
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "git checkout failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
 }
 
 // ============================================================================

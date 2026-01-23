@@ -128,7 +128,7 @@ fn infer_focus(
     untracked: &[PathBuf],
 ) -> Option<String> {
     // Collect all changed files
-    let mut all_files: Vec<&str> = uncommitted
+    let all_files: Vec<&str> = uncommitted
         .iter()
         .chain(staged.iter())
         .chain(untracked.iter())

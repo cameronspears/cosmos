@@ -64,7 +64,6 @@ pub enum BackgroundMessage {
     Error(String),
     /// Response to a user question
     QuestionResponse {
-        question: String,
         answer: String,
         usage: Option<suggest::llm::Usage>,
     },

@@ -11,7 +11,6 @@ mod context;
 mod grouping;
 mod index;
 mod onboarding;
-mod safe_apply;
 mod suggest;
 mod ui;
 mod app;

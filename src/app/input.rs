@@ -87,7 +87,6 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                             {
                                 Ok((answer, usage)) => {
                                     let _ = tx_question.send(BackgroundMessage::QuestionResponse {
-                                        question,
                                         answer,
                                         usage,
                                     });
@@ -144,7 +143,6 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> R
                         {
                             Ok((answer, usage)) => {
                                 let _ = tx_question.send(BackgroundMessage::QuestionResponse {
-                                    question,
                                     answer,
                                     usage,
                                 });

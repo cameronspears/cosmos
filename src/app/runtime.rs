@@ -534,7 +534,7 @@ fn run_loop<B: Backend>(
                         .map(|t| t.elapsed() >= Duration::from_secs(30))
                         .unwrap_or(true);
                     if should_log {
-                        app.log_error(&message, Some("git status refresh"));
+                        app.show_toast(&message);
                         app.git_refresh_error_at = Some(std::time::Instant::now());
                     }
                     app.git_refresh_error = Some(message);

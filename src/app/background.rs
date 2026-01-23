@@ -74,23 +74,6 @@ pub fn drain_messages(
                 app.update_summaries(summaries);
                 let failed_count = failed_files.len();
                 app.summary_failed_files = failed_files;
-                let failure_context = if failed_count > 0 {
-                    let sample: Vec<String> = app
-                        .summary_failed_files
-                        .iter()
-                        .take(10)
-                        .map(|p| p.display().to_string())
-                        .collect();
-                    let mut context = String::from("Failed files:\n");
-                    context.push_str(&sample.join("\n"));
-                    if failed_count > sample.len() {
-                        context.push_str(&format!("\n... +{} more", failed_count - sample.len()));
-                    }
-                    Some(context)
-                } else {
-                    None
-                };
-
                 // Track cost (using Speed preset for summaries)
                 if let Some(u) = usage {
                     let cost = u.calculate_cost(suggest::llm::Model::Speed);
@@ -195,7 +178,7 @@ pub fn drain_messages(
                                 "Summaries incomplete: {} files failed. Press 'R' to retry.",
                                 failed_count
                             );
-                            app.log_error(&message, failure_context.as_deref());
+                            app.show_toast(&message);
                         } else if new_count > 0 {
                             app.show_toast(&format!(
                                 "{} summaries · {} glossary terms",
@@ -214,7 +197,7 @@ pub fn drain_messages(
                             "Summaries incomplete: {} files failed. Press 'R' to retry.",
                             failed_count
                         );
-                        app.log_error(&message, failure_context.as_deref());
+                        app.show_toast(&message);
                     } else if new_count > 0 {
                         app.show_toast(&format!(
                             "{} summaries · {} glossary terms",
@@ -407,7 +390,6 @@ pub fn drain_messages(
                 if app.workflow_step == WorkflowStep::Ship {
                     app.set_ship_step(step);
                 } else {
-                    app.update_ship_step(step);
                     app.ship_step = Some(step);
                 }
             }
@@ -417,7 +399,6 @@ pub fn drain_messages(
                     app.set_ship_pr_url(url.clone());
                     app.show_toast("PR created!");
                 } else {
-                    app.update_ship_step(ui::ShipStep::Done);
                     app.ship_step = Some(ui::ShipStep::Done);
                     app.pr_url = Some(url.clone());
                     app.clear_pending_changes();
