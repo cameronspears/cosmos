@@ -82,20 +82,20 @@ Use `if let` pattern or `.as_ref().map(...).unwrap_or("project")` for safer code
 
 ---
 
-## 4. **[HIGH]** Dependency Version Incompatibility (Transitive)
+## 4. **[HIGH]** Minimum Rust Version Not Documented
 
-**File:** `Cargo.toml` (transitive dependencies)
+**File:** `Cargo.toml`
 
 **Description:**
-Several transitive dependencies (`moxcms`, `pxfm`, `icu_*` crates) require Rust edition 2024 or newer Rust versions (1.83+), causing build failures on stable Rust 1.82.
+The project requires Rust 1.83+ due to transitive dependencies (`moxcms`, `pxfm`, `icu_*` crates) that use Rust edition 2024 features, but there is no `rust-version` field in `Cargo.toml` to document this requirement.
 
 **Impact:**
-- New contributors cannot build the project on stable Rust
-- CI/CD pipelines may fail unexpectedly
-- Blocks project development for users without nightly Rust
+- New contributors on older Rust versions get confusing build errors
+- CI/CD pipelines may fail unexpectedly if using older Rust
+- No clear guidance on minimum supported Rust version
 
 **Fix:**
-Pin dependency versions in `Cargo.lock` or add version constraints to avoid pulling in incompatible versions. Consider using `cargo update -p <pkg> --precise <version>` to pin to compatible versions.
+Add `rust-version = "1.83"` (or higher) to `Cargo.toml` to clearly document the minimum required Rust version. This provides clear error messages when users try to build with an older version.
 
 ---
 
@@ -259,7 +259,7 @@ Add `#[derive(Default)]` to the enum and `#[default]` to the `Unknown` variant.
 | 1 | CRITICAL | Search filter always true | `ui/mod.rs:778` | Logic Bug |
 | 2 | HIGH | Missing truncate on lock file | `cache/mod.rs:585` | File I/O |
 | 3 | HIGH | Unsafe unwrap on Option | `main.rs:147` | Safety |
-| 4 | HIGH | Dependency version incompatibility | `Cargo.toml` | Build |
+| 4 | HIGH | Minimum Rust version not documented | `Cargo.toml` | Build/Docs |
 | 5 | MEDIUM | Redundant toast conditions | `ui/mod.rs:1122` | Dead Code |
 | 6 | MEDIUM | &PathBuf instead of &Path | Multiple files | API Design |
 | 7 | MEDIUM | Manual Option::map | `fix.rs:447` | Idiomaticity |
