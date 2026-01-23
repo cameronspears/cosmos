@@ -37,8 +37,14 @@ SURGICAL EDITS (MOST IMPORTANT):
 - Make the smallest possible change that fixes the issue
 - Do NOT reformat, reflow, or change whitespace/line breaks unless required for the fix
 - Keep surrounding context lines EXACTLY the same as the original (spacing, blank lines, indentation)
-- Do not rename, reorder, or clean up unrelated code
-- If a large change is truly required, keep it tightly scoped and mention it in "description"
+- Do not rename, reorder, or clean up unrelated code unless required for the fix
+- If a large change is required to make the fix correct, do it, keep it tightly scoped, and mention it in "description"
+
+SCOPE & TRUST (IMPORTANT):
+- Treat the plan + scope as a contract. Implement ONLY what it describes.
+- Match scope to edits: small = a few lines, medium = 1-2 functions/blocks, large = multi-function or structural changes.
+- Do not under-fix: choose correctness over minimalism, but expand ONLY as far as needed.
+- Avoid opportunistic improvements (cleanup, refactors, renames, style changes) unless required for correctness.
 
 EXAMPLE - Adding a null check:
 {
@@ -83,8 +89,14 @@ SURGICAL EDITS (MOST IMPORTANT):
 - Make the smallest possible change that fixes the issue
 - Do NOT reformat, reflow, or change whitespace/line breaks unless required for the fix
 - Keep surrounding context lines EXACTLY the same as the original (spacing, blank lines, indentation)
-- Do not rename, reorder, or clean up unrelated code
-- If a large change is truly required, keep it tightly scoped and mention it in "description"
+- Do not rename, reorder, or clean up unrelated code unless required for the fix
+- If a large change is required to make the fix correct, do it, keep it tightly scoped, and mention it in "description"
+
+SCOPE & TRUST (IMPORTANT):
+- Treat the plan + scope as a contract. Implement ONLY what it describes.
+- Match scope to edits: small = a few lines, medium = 1-2 functions/blocks, large = multi-function or structural changes.
+- Do not under-fix: choose correctness over minimalism, but expand ONLY as far as needed.
+- Avoid opportunistic improvements (cleanup, refactors, renames, style changes) unless required for correctness.
 
 MULTI-FILE CONSISTENCY:
 - Ensure renamed symbols match across all files
@@ -142,6 +154,8 @@ RULES:
 - evidence_snippet: 1-3 lines of the ACTUAL code from the file that proves your claim. Only include the relevant code, not surrounding context. Omit if no specific code evidence is needed.
 - evidence_line: the line number where the evidence snippet starts
 - scope: one of "small", "medium", or "large"
+- scope should reflect expected change size: small = a few lines, medium = 1-2 functions/blocks, large = multi-function or multi-file/structural change
+- If unsure, choose the larger scope rather than underestimating
 
 IMPORTANT for friendly_title, problem_summary, and outcome:
 - Write for a NON-TECHNICAL audience who doesn't know programming
@@ -436,7 +450,9 @@ CRITICAL RULES FOR EDITS:
 - Preserve indentation exactly
 - Fix the ROOT CAUSE, not just the symptom
 - Don't introduce new issues while fixing old ones
-- Keep diffs minimal: no reformatting, no whitespace-only changes, no unrelated cleanup
+- Keep diffs minimal: no reformatting, no whitespace-only changes, no unrelated cleanup unless required for correctness
+- Focus ONLY on the listed findings; avoid opportunistic fixes
+- Do not under-fix: if a minimal change won't fully resolve a finding, expand as needed and note it in "description"
 - If a finding seems incorrect, make the smallest safe change that addresses the intent"#
             .to_string()
     } else {
@@ -472,7 +488,9 @@ CRITICAL RULES FOR EDITS:
 - old_string must be EXACT text from the file (copy-paste precision)
 - old_string must be UNIQUE in the file - include enough context
 - Preserve indentation exactly  
-- Keep diffs minimal: no reformatting, no whitespace-only changes, no unrelated cleanup
+- Keep diffs minimal: no reformatting, no whitespace-only changes, no unrelated cleanup unless required for correctness
+- Focus ONLY on the listed findings; avoid opportunistic fixes
+- Do not under-fix: if a minimal change won't fully resolve a finding, expand as needed and note it in "description"
 - Fix the ROOT CAUSE this time, not just the symptom
 - Consider all edge cases the reviewer might check"#,
             iteration = iteration,
