@@ -489,6 +489,7 @@ fn render_suggestions_content<'a>(
                 Some("Summarizing files...".to_string())
             }
         }
+        LoadingState::Resetting => Some("Resetting cache...".to_string()),
         LoadingState::Answering => Some("Thinking...".to_string()),
         _ => None,
     };

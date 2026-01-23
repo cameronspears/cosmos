@@ -774,6 +774,15 @@ impl Cache {
 
 }
 
+/// Reset selected Cosmos cache files for the given repository.
+pub async fn reset_cosmos(
+    repo_root: &Path,
+    options: &[ResetOption],
+) -> anyhow::Result<Vec<String>> {
+    let cache = Cache::new(repo_root);
+    cache.clear_selective(options)
+}
+
 fn is_index_cache_valid(root: &Path, index: &CodebaseIndex) -> bool {
     let cached_hashes = compute_file_hashes(index);
     let current_hashes = match compute_current_hashes(root) {

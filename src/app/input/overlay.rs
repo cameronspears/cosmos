@@ -89,8 +89,9 @@ pub(super) fn handle_overlay_input(
                     app.close_overlay();
 
                     let tx_reset = ctx.tx.clone();
+                    let repo_path = app.repo_path.clone();
                     background::spawn_background(ctx.tx.clone(), "reset_cosmos", async move {
-                        match crate::cache::reset_cosmos(&selected).await {
+                        match crate::cache::reset_cosmos(&repo_path, &selected).await {
                             Ok(_) => {
                                 let _ =
                                     tx_reset.send(BackgroundMessage::ResetComplete { options: selected });

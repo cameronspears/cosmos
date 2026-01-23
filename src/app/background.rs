@@ -353,7 +353,7 @@ pub fn drain_messages(
                 // Read original (backup) and new content for verification (all files)
                 let files_with_content: Vec<(PathBuf, String, String)> = file_changes
                     .iter()
-                    .map(|(path, backup, _diff)| {
+                    .map(|(path, backup, _diff, _was_new)| {
                         let original = std::fs::read_to_string(backup).unwrap_or_default();
                         let full_path = app.repo_path.join(path);
                         let new_content =
@@ -365,7 +365,7 @@ pub fn drain_messages(
                 // Transition to Review workflow step (use first file for display)
                 let first_file = file_changes
                     .first()
-                    .map(|(p, _, _)| p.clone())
+                    .map(|(p, _, _, _)| p.clone())
                     .unwrap_or_default();
                 let first_original = files_with_content
                     .first()
@@ -433,6 +433,15 @@ pub fn drain_messages(
                 app.ship_step = None;
                 app.close_overlay();
                 app.show_toast(&format!("Ship failed: {}", truncate(&e, 80)));
+            }
+            BackgroundMessage::ResetComplete { options } => {
+                app.loading = LoadingState::None;
+                let labels: Vec<&str> = options.iter().map(|o| o.label()).collect();
+                if labels.is_empty() {
+                    app.show_toast("Reset complete");
+                } else {
+                    app.show_toast(&format!("Reset complete: {}", labels.join(", ")));
+                }
             }
             BackgroundMessage::Error(e) => {
                 app.loading = LoadingState::None;

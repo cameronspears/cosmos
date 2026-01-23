@@ -69,6 +69,7 @@ pub enum LoadingState {
     GeneratingFix,       // Full fix generation (slower)
     ReviewingChanges,    // Adversarial review or PR review
     ApplyingReviewFixes, // Applying fixes from review
+    Resetting,           // Clearing cache/data
     Answering,           // For question answering
 }
 
@@ -173,7 +174,7 @@ pub struct VerifyState {
     /// Whether to show technical details (code evidence, affected areas, etc.)
     pub show_technical_details: bool,
     /// File content hashes captured during preview (for change detection)
-    pub preview_hashes: std::collections::HashMap<PathBuf, String>,
+    pub preview_hashes: HashMap<PathBuf, String>,
 }
 
 impl VerifyState {

@@ -1,9 +1,7 @@
 use crate::app::background;
 use crate::app::messages::BackgroundMessage;
 use crate::app::RuntimeContext;
-use crate::cache;
 use crate::git_ops;
-use crate::index;
 use crate::suggest;
 use crate::ui::{ActivePanel, App, LoadingState, Overlay, ShipStep, WorkflowStep};
 use crate::util::{hash_bytes, resolve_repo_path_allow_new};

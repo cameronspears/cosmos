@@ -61,6 +61,10 @@ pub enum BackgroundMessage {
     ShipComplete(String),
     /// Ship workflow error
     ShipError(String),
+    /// Cache reset completed
+    ResetComplete {
+        options: Vec<crate::cache::ResetOption>,
+    },
     /// Generic error (used for push/etc)
     Error(String),
     /// Response to a user question
