@@ -11,7 +11,14 @@ pub mod summaries;
 
 pub use analysis::{analyze_codebase, ask_question};
 pub use client::is_available;
-pub use fix::{generate_fix_content, generate_fix_preview, generate_multi_file_fix, FixPreview, FixScope};
+pub use fix::{
+    generate_fix_content,
+    generate_fix_preview,
+    generate_multi_file_fix,
+    FileInput,
+    FixPreview,
+    FixScope,
+};
 pub use models::{Model, Usage};
 pub use review::{fix_review_findings, verify_changes, ReviewFinding};
 pub use summaries::{

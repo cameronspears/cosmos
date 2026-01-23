@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+use crate::util::hash_str;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  PATTERN DETECTION THRESHOLDS
@@ -20,6 +21,9 @@ pub const LONG_FUNCTION_THRESHOLD: usize = 50;
 
 /// Number of lines above which a file is considered a "god module"
 pub const GOD_MODULE_LOC_THRESHOLD: usize = 500;
+
+/// Maximum file size (bytes) to index for AST parsing
+pub const MAX_INDEX_FILE_BYTES: u64 = 1_000_000;
 
 /// Supported programming languages
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -112,6 +116,13 @@ pub struct Pattern {
     pub file: PathBuf,
     pub line: usize,
     pub description: String,
+}
+
+/// A file that was skipped during indexing (with a reason)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexError {
+    pub path: PathBuf,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -539,7 +550,7 @@ fn resolve_import_path(import: &str, from_file: &Path, root: &Path) -> Option<Pa
                 if root.join(&module_candidate).exists() {
                     return Some(module_candidate);
                 }
-                return Some(candidate);
+                return None;
             }
         }
     }
@@ -615,6 +626,8 @@ pub struct CodebaseIndex {
     pub dependencies: Vec<Dependency>,
     pub patterns: Vec<Pattern>,
     pub cached_at: DateTime<Utc>,
+    #[serde(default)]
+    pub index_errors: Vec<IndexError>,
 }
 
 impl CodebaseIndex {
@@ -627,6 +640,7 @@ impl CodebaseIndex {
             dependencies: Vec::new(),
             patterns: Vec::new(),
             cached_at: Utc::now(),
+            index_errors: Vec::new(),
         };
 
         index.scan(root)?;
@@ -658,14 +672,23 @@ impl CodebaseIndex {
                 continue;
             }
 
-            if let Ok(file_index) = self.index_file(path, language) {
-                // Aggregate symbols, dependencies, patterns
-                self.symbols.extend(file_index.symbols.clone());
-                self.dependencies.extend(file_index.dependencies.clone());
-                self.patterns.extend(file_index.patterns.clone());
-                
-                let rel_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
-                self.files.insert(rel_path, file_index);
+            match self.index_file(path, language) {
+                Ok(file_index) => {
+                    // Aggregate symbols, dependencies, patterns
+                    self.symbols.extend(file_index.symbols.clone());
+                    self.dependencies.extend(file_index.dependencies.clone());
+                    self.patterns.extend(file_index.patterns.clone());
+                    
+                    let rel_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+                    self.files.insert(rel_path, file_index);
+                }
+                Err(err) => {
+                    let rel_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+                    self.index_errors.push(IndexError {
+                        path: rel_path,
+                        reason: err.to_string(),
+                    });
+                }
             }
         }
 
@@ -674,8 +697,28 @@ impl CodebaseIndex {
 
     /// Index a single file
     fn index_file(&self, path: &Path, language: Language) -> anyhow::Result<FileIndex> {
-        let content = std::fs::read_to_string(path)?;
         let metadata = std::fs::metadata(path)?;
+        if metadata.len() > MAX_INDEX_FILE_BYTES {
+            return Err(anyhow::anyhow!(
+                "File too large to index ({} bytes, limit {} bytes)",
+                metadata.len(),
+                MAX_INDEX_FILE_BYTES
+            ));
+        }
+
+        let bytes = std::fs::read(path)?;
+        if bytes.len() as u64 > MAX_INDEX_FILE_BYTES {
+            return Err(anyhow::anyhow!(
+                "File too large to index ({} bytes, limit {} bytes)",
+                bytes.len(),
+                MAX_INDEX_FILE_BYTES
+            ));
+        }
+
+        let content = String::from_utf8(bytes).map_err(|_| {
+            anyhow::anyhow!("File is not valid UTF-8, skipping")
+        })?;
+
         let modified = metadata.modified()
             .map(DateTime::<Utc>::from)
             .unwrap_or_else(|_| Utc::now());
@@ -684,7 +727,7 @@ impl CodebaseIndex {
         let sloc = content.lines()
             .filter(|l| !l.trim().is_empty())
             .count();
-        let content_hash = hash_content(&content);
+        let content_hash = hash_str(&content);
 
         // Parse with tree-sitter
         let (symbols, deps) = parser::parse_file(path, &content, language)?;
@@ -857,6 +900,7 @@ impl CodebaseIndex {
             total_loc: self.files.values().map(|f| f.loc).sum(),
             symbol_count: self.symbols.len(),
             pattern_count: self.patterns.len(),
+            skipped_files: self.index_errors.len(),
         }
     }
 
@@ -884,6 +928,7 @@ pub struct IndexStats {
     pub total_loc: usize,
     pub symbol_count: usize,
     pub pattern_count: usize,
+    pub skipped_files: usize,
 }
 
 /// Flattened file tree entry for UI display
@@ -914,18 +959,6 @@ fn calculate_complexity(content: &str, _language: Language) -> f64 {
 }
 
 /// Compute a stable hash of file contents (FNV-1a 64-bit).
-fn hash_content(content: &str) -> String {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in content.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-
-    format!("{:016x}", hash)
-}
 
 /// Check if a path should be ignored
 fn is_ignored(path: &Path) -> bool {

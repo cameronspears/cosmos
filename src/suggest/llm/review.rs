@@ -1,7 +1,7 @@
 use super::client::call_llm_with_usage;
 use super::fix::{apply_edits_with_context, normalize_generated_content, AppliedFix, FixResponse};
 use super::models::{Model, Usage};
-use super::parse::{merge_usage, parse_json_with_retry};
+use super::parse::{merge_usage, parse_json_with_retry, truncate_content};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{review_fix_system_prompt, review_system_prompt};
 use serde::{Deserialize, Serialize};
@@ -55,22 +55,38 @@ pub async fn verify_changes(
 
     // Build the diff context
     let mut changes_text = String::new();
+    const MAX_REVIEW_CHARS_PER_FILE: usize = 12000;
+
     for (path, old_content, new_content) in files_with_content {
         let file_name = path.display().to_string();
 
         // Create a simple diff view
         changes_text.push_str(&format!("\n=== {} ===\n", file_name));
 
+        let old_truncated = old_content.chars().count() > MAX_REVIEW_CHARS_PER_FILE;
+        let new_truncated = new_content.chars().count() > MAX_REVIEW_CHARS_PER_FILE;
+        let old_view = truncate_content(old_content, MAX_REVIEW_CHARS_PER_FILE);
+        let new_view = truncate_content(new_content, MAX_REVIEW_CHARS_PER_FILE);
+
         if old_content.is_empty() {
             // New file
             changes_text.push_str("(NEW FILE)\n");
-            changes_text.push_str(&add_line_numbers(new_content));
+            if new_truncated {
+                changes_text.push_str("(CONTENT TRUNCATED)\n");
+            }
+            changes_text.push_str(&add_line_numbers(&new_view));
         } else {
             // Show old and new with line numbers
             changes_text.push_str("--- BEFORE ---\n");
-            changes_text.push_str(&add_line_numbers(old_content));
+            if old_truncated {
+                changes_text.push_str("(CONTENT TRUNCATED)\n");
+            }
+            changes_text.push_str(&add_line_numbers(&old_view));
             changes_text.push_str("\n--- AFTER ---\n");
-            changes_text.push_str(&add_line_numbers(new_content));
+            if new_truncated {
+                changes_text.push_str("(CONTENT TRUNCATED)\n");
+            }
+            changes_text.push_str(&add_line_numbers(&new_view));
         }
         changes_text.push('\n');
     }

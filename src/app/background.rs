@@ -280,10 +280,13 @@ pub fn drain_messages(
             BackgroundMessage::GroupingEnhanceError(e) => {
                 app.show_toast(&format!("Grouping error: {}", truncate(&e, 80)));
             }
-            BackgroundMessage::PreviewReady { preview, .. } => {
+            BackgroundMessage::PreviewReady {
+                preview,
+                file_hashes,
+            } => {
                 app.loading = LoadingState::None;
                 // Set the preview in the Verify workflow step
-                app.set_verify_preview(preview);
+                app.set_verify_preview(preview, file_hashes);
             }
             BackgroundMessage::PreviewError(e) => {
                 app.loading = LoadingState::None;
@@ -326,8 +329,13 @@ pub fn drain_messages(
                 // Convert file_changes to FileChange structs for multi-file support
                 let ui_file_changes: Vec<ui::FileChange> = file_changes
                     .iter()
-                    .map(|(path, backup, diff)| {
-                        ui::FileChange::new(path.clone(), diff.clone(), backup.clone())
+                    .map(|(path, backup, diff, was_new_file)| {
+                        ui::FileChange::new(
+                            path.clone(),
+                            diff.clone(),
+                            backup.clone(),
+                            *was_new_file,
+                        )
                     })
                     .collect();
 

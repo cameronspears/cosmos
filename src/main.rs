@@ -117,19 +117,45 @@ async fn main() -> Result<()> {
 
 /// Initialize the codebase index
 fn init_index(path: &Path, cache_manager: &cache::Cache) -> Result<CodebaseIndex> {
+    if let Some(index) = cache_manager.load_index_cache(path) {
+        let stats = index.stats();
+        eprintln!(
+            "  Loaded index cache: {} files, {} symbols",
+            stats.file_count, stats.symbol_count
+        );
+        if stats.skipped_files > 0 {
+            eprintln!("  Skipped {} files during last index build", stats.skipped_files);
+            for err in index.index_errors.iter().take(3) {
+                eprintln!("    - {}: {}", err.path.display(), err.reason);
+            }
+            if stats.skipped_files > 3 {
+                eprintln!("    ({} more)", stats.skipped_files - 3);
+            }
+        }
+        return Ok(index);
+    }
+
     eprint!("  Indexing codebase...");
 
     let index = CodebaseIndex::new(path)?;
     let stats = index.stats();
 
     // Save index cache
-    let index_cache = cache::IndexCache::from_index(&index);
-    let _ = cache_manager.save_index_cache(&index_cache);
+    let _ = cache_manager.save_index_cache(&index);
 
     eprintln!(
         " {} files, {} symbols",
         stats.file_count, stats.symbol_count
     );
+    if stats.skipped_files > 0 {
+        eprintln!("  Skipped {} files during indexing", stats.skipped_files);
+        for err in index.index_errors.iter().take(3) {
+            eprintln!("    - {}: {}", err.path.display(), err.reason);
+        }
+        if stats.skipped_files > 3 {
+            eprintln!("    ({} more)", stats.skipped_files - 3);
+        }
+    }
 
     Ok(index)
 }
@@ -175,6 +201,10 @@ fn print_stats(index: &CodebaseIndex, suggestions: &SuggestionEngine, context: &
     println!(
         "  ║  Patterns:  {:>6}                               ║",
         stats.pattern_count
+    );
+    println!(
+        "  ║  Skipped:   {:>6}                               ║",
+        stats.skipped_files
     );
     println!("  ║                                                  ║");
     println!("  ║  Suggestions:                                    ║");

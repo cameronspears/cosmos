@@ -6,7 +6,7 @@ use crate::git_ops;
 use crate::index;
 use crate::suggest;
 use crate::ui::{ActivePanel, App, LoadingState, Overlay, ShipStep, WorkflowStep};
-use crate::util::resolve_repo_path;
+use crate::util::{hash_bytes, resolve_repo_path_allow_new};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use std::collections::HashMap;
@@ -176,6 +176,7 @@ pub(super) fn handle_normal_mode(
                                         let suggestion_id = suggestion.id;
                                         let file_path = suggestion.file.clone();
                                         let additional_files = suggestion.additional_files.clone();
+                                        let additional_files_for_preview = additional_files.clone();
                                         let summary = suggestion.summary.clone();
                                         let suggestion_clone = suggestion.clone();
                                         let tx_preview = ctx.tx.clone();
@@ -200,27 +201,43 @@ pub(super) fn handle_normal_mode(
                                                 } else {
                                                     Some(repo_memory_context)
                                                 };
-                                                let resolved = match resolve_repo_path(
-                                                    &repo_root,
-                                                    &file_path,
-                                                ) {
-                                                    Ok(resolved) => resolved,
-                                                    Err(e) => {
-                                                        let _ = tx_preview.send(
-                                                            BackgroundMessage::PreviewError(
-                                                                format!(
-                                                                    "Unsafe path {}: {}",
-                                                                    file_path.display(),
-                                                                    e
+                                                let mut file_hashes = HashMap::new();
+                                                let mut primary_content = String::new();
+                                                let mut primary_rel = None;
+
+                                                let mut all_files = Vec::new();
+                                                all_files.push(file_path.clone());
+                                                all_files.extend(additional_files_for_preview.clone());
+
+                                                for target in &all_files {
+                                                    let resolved = match resolve_repo_path_allow_new(
+                                                        &repo_root,
+                                                        target,
+                                                    ) {
+                                                        Ok(resolved) => resolved,
+                                                        Err(e) => {
+                                                            let _ = tx_preview.send(
+                                                                BackgroundMessage::PreviewError(
+                                                                    format!(
+                                                                        "Unsafe path {}: {}",
+                                                                        target.display(),
+                                                                        e
+                                                                    ),
                                                                 ),
-                                                            ),
-                                                        );
-                                                        return;
-                                                    }
-                                                };
-                                                let content =
-                                                    match std::fs::read_to_string(&resolved.absolute) {
+                                                            );
+                                                            return;
+                                                        }
+                                                    };
+
+                                                    let bytes = match std::fs::read(&resolved.absolute)
+                                                    {
                                                         Ok(content) => content,
+                                                        Err(e)
+                                                            if e.kind()
+                                                                == std::io::ErrorKind::NotFound =>
+                                                        {
+                                                            Vec::new()
+                                                        }
                                                         Err(e) => {
                                                             let _ = tx_preview.send(
                                                                 BackgroundMessage::PreviewError(
@@ -234,9 +251,39 @@ pub(super) fn handle_normal_mode(
                                                             return;
                                                         }
                                                     };
+
+                                                    file_hashes.insert(
+                                                        resolved.relative.clone(),
+                                                        hash_bytes(&bytes),
+                                                    );
+
+                                                    if target == &file_path {
+                                                        match String::from_utf8(bytes) {
+                                                            Ok(content) => {
+                                                                primary_content = content;
+                                                                primary_rel =
+                                                                    Some(resolved.relative.clone());
+                                                            }
+                                                            Err(_) => {
+                                                                let _ = tx_preview.send(
+                                                                    BackgroundMessage::PreviewError(
+                                                                        format!(
+                                                                            "Failed to read {}: file is not valid UTF-8",
+                                                                            resolved.relative.display(),
+                                                                        ),
+                                                                    ),
+                                                                );
+                                                                return;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                let resolved_rel =
+                                                    primary_rel.unwrap_or_else(|| file_path.clone());
                                                 match suggest::llm::generate_fix_preview(
-                                                    &resolved.relative,
-                                                    &content,
+                                                    &resolved_rel,
+                                                    &primary_content,
                                                     &suggestion_clone,
                                                     None,
                                                     mem,
@@ -245,7 +292,10 @@ pub(super) fn handle_normal_mode(
                                                 {
                                                     Ok(preview) => {
                                                         let _ = tx_preview.send(
-                                                            BackgroundMessage::PreviewReady { preview },
+                                                            BackgroundMessage::PreviewReady {
+                                                                preview,
+                                                                file_hashes,
+                                                            },
                                                         );
                                                     }
                                                     Err(e) => {
@@ -285,6 +335,92 @@ pub(super) fn handle_normal_mode(
                                                 app.show_toast(&e);
                                                 return Ok(());
                                             }
+                                            if let Ok(status) =
+                                                git_ops::current_status(&app.repo_path)
+                                            {
+                                                let changed_count = status.staged.len()
+                                                    + status.modified.len()
+                                                    + status.untracked.len();
+                                                if changed_count > 0 {
+                                                    app.show_toast(
+                                                        "Working tree has uncommitted changes. Commit or stash before applying a fix.",
+                                                    );
+                                                    return Ok(());
+                                                }
+                                            }
+
+                                            let mut changed_files = Vec::new();
+                                            let mut all_files = Vec::new();
+                                            all_files.push(fp.clone());
+                                            all_files.extend(
+                                                app.verify_state.additional_files.clone(),
+                                            );
+                                            for target in &all_files {
+                                                let resolved = match resolve_repo_path_allow_new(
+                                                    &app.repo_path,
+                                                    target,
+                                                ) {
+                                                    Ok(resolved) => resolved,
+                                                    Err(e) => {
+                                                        app.show_toast(&format!(
+                                                            "Unsafe path {}: {}",
+                                                            target.display(),
+                                                            e
+                                                        ));
+                                                        return Ok(());
+                                                    }
+                                                };
+                                                let bytes = match std::fs::read(&resolved.absolute)
+                                                {
+                                                    Ok(content) => content,
+                                                    Err(e)
+                                                        if e.kind()
+                                                            == std::io::ErrorKind::NotFound =>
+                                                    {
+                                                        Vec::new()
+                                                    }
+                                                    Err(e) => {
+                                                        app.show_toast(&format!(
+                                                            "Failed to read {}: {}",
+                                                            resolved.relative.display(),
+                                                            e
+                                                        ));
+                                                        return Ok(());
+                                                    }
+                                                };
+                                                let current_hash = hash_bytes(&bytes);
+                                                match app
+                                                    .verify_state
+                                                    .preview_hashes
+                                                    .get(&resolved.relative)
+                                                {
+                                                    Some(expected)
+                                                        if expected == &current_hash => {}
+                                                    _ => changed_files.push(
+                                                        resolved.relative.clone(),
+                                                    ),
+                                                }
+                                            }
+                                            if !changed_files.is_empty() {
+                                                let names: Vec<String> = changed_files
+                                                    .iter()
+                                                    .take(3)
+                                                    .map(|p| p.display().to_string())
+                                                    .collect();
+                                                let more = changed_files.len().saturating_sub(3);
+                                                let suffix = if more > 0 {
+                                                    format!(" (and {} more)", more)
+                                                } else {
+                                                    String::new()
+                                                };
+                                                app.show_toast(&format!(
+                                                    "Files changed since preview: {}{}",
+                                                    names.join(", "),
+                                                    suffix
+                                                ));
+                                                return Ok(());
+                                            }
+
                                             app.loading = LoadingState::GeneratingFix;
 
                                             background::spawn_background(
@@ -329,35 +465,38 @@ pub(super) fn handle_normal_mode(
                                                         let all_files = suggestion.affected_files();
 
                                                         // Read all file contents
-                                                        let mut file_contents: Vec<(PathBuf, String)> =
+                                                        let mut file_inputs: Vec<suggest::llm::FileInput> =
                                                             Vec::new();
                                                         for file_path in &all_files {
-                                                            let resolved = match resolve_repo_path(
-                                                                &repo_path,
-                                                                file_path,
-                                                            ) {
-                                                                Ok(resolved) => resolved,
-                                                                Err(e) => {
-                                                                    let _ = tx_apply.send(
-                                                                        BackgroundMessage::DirectFixError(
-                                                                            format!(
-                                                                                "Unsafe path {}: {}",
-                                                                                file_path.display(),
-                                                                                e
+                                                            let resolved =
+                                                                match resolve_repo_path_allow_new(
+                                                                    &repo_path,
+                                                                    file_path,
+                                                                ) {
+                                                                    Ok(resolved) => resolved,
+                                                                    Err(e) => {
+                                                                        let _ = tx_apply.send(
+                                                                            BackgroundMessage::DirectFixError(
+                                                                                format!(
+                                                                                    "Unsafe path {}: {}",
+                                                                                    file_path.display(),
+                                                                                    e
+                                                                                ),
                                                                             ),
-                                                                        ),
-                                                                    );
-                                                                    return;
-                                                                }
-                                                            };
-                                                            match std::fs::read_to_string(
+                                                                        );
+                                                                        return;
+                                                                    }
+                                                                };
+                                                            let is_new = !resolved.absolute.exists();
+                                                            let content = match std::fs::read_to_string(
                                                                 &resolved.absolute,
                                                             ) {
-                                                                Ok(content) => {
-                                                                    file_contents.push((
-                                                                        resolved.relative,
-                                                                        content,
-                                                                    ))
+                                                                Ok(content) => content,
+                                                                Err(e)
+                                                                    if e.kind()
+                                                                        == std::io::ErrorKind::NotFound =>
+                                                                {
+                                                                    String::new()
                                                                 }
                                                                 Err(e) => {
                                                                     let _ = tx_apply.send(
@@ -371,12 +510,17 @@ pub(super) fn handle_normal_mode(
                                                                     );
                                                                     return;
                                                                 }
-                                                            }
+                                                            };
+                                                            file_inputs.push(suggest::llm::FileInput {
+                                                                path: resolved.relative,
+                                                                content,
+                                                                is_new,
+                                                            });
                                                         }
 
                                                         // Generate multi-file fix
                                                         match suggest::llm::generate_multi_file_fix(
-                                                            &file_contents,
+                                                            &file_inputs,
                                                             &suggestion,
                                                             &preview,
                                                             mem,
@@ -389,9 +533,10 @@ pub(super) fn handle_normal_mode(
                                                                     PathBuf,
                                                                     PathBuf,
                                                                     PathBuf,
+                                                                    bool,
                                                                 )> = Vec::new();
                                                                 for file_edit in &multi_fix.file_edits {
-                                                                    let resolved = match resolve_repo_path(
+                                                                    let resolved = match resolve_repo_path_allow_new(
                                                                         &repo_path,
                                                                         &file_edit.path,
                                                                     ) {
@@ -414,12 +559,23 @@ pub(super) fn handle_normal_mode(
                                                                     let full_path = resolved.absolute;
                                                                     let backup_path = full_path
                                                                         .with_extension("cosmos.bak");
-                                                                    if let Err(e) = std::fs::copy(
-                                                                        &full_path,
-                                                                        &backup_path,
-                                                                    ) {
+                                                                    if let Some(parent) = full_path.parent() {
+                                                                        let _ = std::fs::create_dir_all(parent);
+                                                                    }
+                                                                    let was_new_file = file_inputs
+                                                                        .iter()
+                                                                        .find(|f| f.path == resolved.relative)
+                                                                        .map(|f| f.is_new)
+                                                                        .unwrap_or(false);
+                                                                    let backup_result = if was_new_file {
+                                                                        std::fs::write(&backup_path, "")
+                                                                    } else {
+                                                                        std::fs::copy(&full_path, &backup_path)
+                                                                            .map(|_| ())
+                                                                    };
+                                                                    if let Err(e) = backup_result {
                                                                         // Rollback any backups we made
-                                                                        for (_, bp, _) in &backups {
+                                                                        for (_, bp, _, _) in &backups {
                                                                             let _ =
                                                                                 std::fs::remove_file(bp);
                                                                         }
@@ -438,6 +594,7 @@ pub(super) fn handle_normal_mode(
                                                                         resolved.relative,
                                                                         full_path,
                                                                         backup_path,
+                                                                        was_new_file,
                                                                     ));
                                                                 }
 
@@ -446,9 +603,10 @@ pub(super) fn handle_normal_mode(
                                                                     PathBuf,
                                                                     PathBuf,
                                                                     String,
+                                                                    bool,
                                                                 )> = Vec::new();
                                                                 for file_edit in &multi_fix.file_edits {
-                                                                    let resolved = match resolve_repo_path(
+                                                                    let resolved = match resolve_repo_path_allow_new(
                                                                         &repo_path,
                                                                         &file_edit.path,
                                                                     ) {
@@ -471,7 +629,15 @@ pub(super) fn handle_normal_mode(
                                                                     let full_path = resolved.absolute;
                                                                     let backup_path = full_path
                                                                         .with_extension("cosmos.bak");
+                                                                    let was_new_file = backups
+                                                                        .iter()
+                                                                        .find(|(path, _, _, _)| path == &resolved.relative)
+                                                                        .map(|(_, _, _, is_new)| *is_new)
+                                                                        .unwrap_or(false);
 
+                                                                    if let Some(parent) = full_path.parent() {
+                                                                        let _ = std::fs::create_dir_all(parent);
+                                                                    }
                                                                     match std::fs::write(
                                                                         &full_path,
                                                                         &file_edit.new_content,
@@ -498,16 +664,21 @@ pub(super) fn handle_normal_mode(
                                                                                 resolved.relative,
                                                                                 backup_path,
                                                                                 diff,
+                                                                                was_new_file,
                                                                             ));
                                                                         }
                                                                         Err(e) => {
                                                                             // Rollback all changes
-                                                                            for (_path, full, backup) in &backups {
-                                                                                let _ =
-                                                                                    std::fs::copy(
-                                                                                        backup,
-                                                                                        full,
-                                                                                    );
+                                                                            for (_path, full, backup, is_new) in &backups {
+                                                                                if *is_new {
+                                                                                    let _ = std::fs::remove_file(full);
+                                                                                } else {
+                                                                                    let _ =
+                                                                                        std::fs::copy(
+                                                                                            backup,
+                                                                                            full,
+                                                                                        );
+                                                                                }
                                                                                 let _ =
                                                                                     std::fs::remove_file(backup);
                                                                             }
@@ -554,7 +725,7 @@ pub(super) fn handle_normal_mode(
                                                     } else {
                                                         // Single-file fix (original logic)
                                                         let resolved =
-                                                            match resolve_repo_path(&repo_path, &fp) {
+                                                            match resolve_repo_path_allow_new(&repo_path, &fp) {
                                                                 Ok(resolved) => resolved,
                                                                 Err(e) => {
                                                                     let _ = tx_apply.send(
@@ -571,9 +742,16 @@ pub(super) fn handle_normal_mode(
                                                             };
                                                         let full_path = resolved.absolute;
                                                         let rel_path = resolved.relative;
+                                                        let is_new_file = !full_path.exists();
                                                         let content =
                                                             match std::fs::read_to_string(&full_path) {
                                                                 Ok(c) => c,
+                                                                Err(e)
+                                                                    if e.kind()
+                                                                        == std::io::ErrorKind::NotFound =>
+                                                                {
+                                                                    String::new()
+                                                                }
                                                                 Err(e) => {
                                                                     let _ = tx_apply.send(
                                                                         BackgroundMessage::DirectFixError(
@@ -593,16 +771,23 @@ pub(super) fn handle_normal_mode(
                                                             &suggestion,
                                                             &preview,
                                                             mem,
+                                                            is_new_file,
                                                         )
                                                         .await
                                                         {
                                                             Ok(applied_fix) => {
                                                                 let backup_path = full_path
                                                                     .with_extension("cosmos.bak");
-                                                                if let Err(e) = std::fs::copy(
-                                                                    &full_path,
-                                                                    &backup_path,
-                                                                ) {
+                                                                if let Some(parent) = full_path.parent() {
+                                                                    let _ = std::fs::create_dir_all(parent);
+                                                                }
+                                                                let backup_result = if is_new_file {
+                                                                    std::fs::write(&backup_path, "")
+                                                                } else {
+                                                                    std::fs::copy(&full_path, &backup_path)
+                                                                        .map(|_| ())
+                                                                };
+                                                                if let Err(e) = backup_result {
                                                                     let _ = tx_apply.send(
                                                                         BackgroundMessage::DirectFixError(
                                                                             format!(
@@ -614,6 +799,9 @@ pub(super) fn handle_normal_mode(
                                                                     return;
                                                                 }
 
+                                                                if let Some(parent) = full_path.parent() {
+                                                                    let _ = std::fs::create_dir_all(parent);
+                                                                }
                                                                 match std::fs::write(
                                                                     &full_path,
                                                                     &applied_fix.new_content,
@@ -641,6 +829,7 @@ pub(super) fn handle_normal_mode(
                                                                                     rel_path.into(),
                                                                                     backup_path,
                                                                                     diff,
+                                                                                    is_new_file,
                                                                                 )],
                                                                                 description: applied_fix.description,
                                                                                 usage: applied_fix.usage,
@@ -656,10 +845,14 @@ pub(super) fn handle_normal_mode(
                                                                         );
                                                                     }
                                                                     Err(e) => {
-                                                                        let _ = std::fs::copy(
-                                                                            &backup_path,
-                                                                            &full_path,
-                                                                        );
+                                                                        if is_new_file {
+                                                                            let _ = std::fs::remove_file(&full_path);
+                                                                        } else {
+                                                                            let _ = std::fs::copy(
+                                                                                &backup_path,
+                                                                                &full_path,
+                                                                            );
+                                                                        }
                                                                         let _ = std::fs::remove_file(
                                                                             &backup_path,
                                                                         );
