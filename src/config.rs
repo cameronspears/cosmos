@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -29,22 +31,77 @@ pub struct Config {
 const KEYRING_SERVICE: &str = "codecosmos";
 const KEYRING_USERNAME: &str = "openrouter_api_key";
 
+type KeyringReadResult = Result<Option<String>, String>;
+
+#[derive(Debug, Default)]
+struct KeyringCache {
+    cached: Option<KeyringReadResult>,
+}
+
+static KEYRING_CACHE: OnceLock<Mutex<KeyringCache>> = OnceLock::new();
+static KEYRING_ERROR_WARNED: AtomicBool = AtomicBool::new(false);
+
 fn keyring_entry() -> Result<Entry, keyring::Error> {
     Entry::new(KEYRING_SERVICE, KEYRING_USERNAME)
 }
 
-fn read_keyring_key() -> Result<Option<String>, keyring::Error> {
-    let entry = keyring_entry()?;
+fn keyring_cache() -> &'static Mutex<KeyringCache> {
+    KEYRING_CACHE.get_or_init(|| Mutex::new(KeyringCache::default()))
+}
+
+fn warn_keychain_error_once(err: &str) {
+    if KEYRING_ERROR_WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!("  Warning: Couldn't access your system keychain: {}", err);
+    eprintln!("  Tip: When macOS prompts, choose \"Always Allow\" for the \"cosmos\" app.");
+    eprintln!("  Tip: You can also set OPENROUTER_API_KEY to bypass keychain access.");
+}
+
+fn read_keyring_key_with<F>(read_fn: F) -> KeyringReadResult
+where
+    F: FnOnce() -> KeyringReadResult,
+{
+    let cache = keyring_cache();
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(cached) = guard.cached.clone() {
+        return cached;
+    }
+    let result = read_fn();
+    guard.cached = Some(result.clone());
+    result
+}
+
+fn read_keyring_key_uncached() -> KeyringReadResult {
+    let entry = keyring_entry().map_err(|err| err.to_string())?;
     match entry.get_password() {
         Ok(key) => Ok(Some(key)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(err) => Err(err),
+        Err(err) => Err(err.to_string()),
     }
+}
+
+fn read_keyring_key() -> KeyringReadResult {
+    read_keyring_key_with(read_keyring_key_uncached)
+}
+
+fn update_keyring_cache_after_write(key: &str) {
+    let cache = keyring_cache();
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.cached = Some(Ok(Some(key.to_string())));
 }
 
 fn write_keyring_key(key: &str) -> Result<(), keyring::Error> {
     let entry = keyring_entry()?;
-    entry.set_password(key)
+    entry.set_password(key)?;
+    update_keyring_cache_after_write(key);
+    Ok(())
 }
 
 fn default_privacy_preview() -> bool {
@@ -128,11 +185,7 @@ impl Config {
             Ok(Some(key)) => return Some(key),
             Ok(None) => {} // No key stored, continue
             Err(err) => {
-                eprintln!(
-                    "  Warning: Failed to read API key from system keychain: {}",
-                    err
-                );
-                eprintln!("  Tip: Set the OPENROUTER_API_KEY environment variable as a workaround.");
+                warn_keychain_error_once(&err);
             }
         }
 
@@ -214,10 +267,7 @@ impl Config {
             Ok(Some(_)) => return true,
             Ok(None) => {} // No key stored
             Err(err) => {
-                eprintln!(
-                    "  Warning: Failed to check system keychain for API key: {}",
-                    err
-                );
+                warn_keychain_error_once(&err);
             }
         }
         // Legacy: check for plaintext key in config (will be migrated on get_api_key)
@@ -357,11 +407,52 @@ fn write_config_atomic(path: &std::path::Path, content: &str) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn test_config_default() {
         let config = Config::default();
         assert!(config.openrouter_api_key.is_none());
+    }
+
+    fn reset_keyring_cache_for_test() {
+        let cache = super::keyring_cache();
+        let mut guard = match cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.cached = None;
+    }
+
+    #[test]
+    fn test_keyring_cache_read_once_and_updates_after_write() {
+        reset_keyring_cache_for_test();
+
+        let call_count = Cell::new(0);
+        let first = super::read_keyring_key_with(|| {
+            call_count.set(call_count.get() + 1);
+            Ok(Some("first-key".to_string()))
+        });
+
+        assert_eq!(call_count.get(), 1);
+        assert_eq!(first, Ok(Some("first-key".to_string())));
+
+        let second = super::read_keyring_key_with(|| {
+            call_count.set(call_count.get() + 1);
+            Ok(Some("second-key".to_string()))
+        });
+
+        assert_eq!(call_count.get(), 1);
+        assert_eq!(second, Ok(Some("first-key".to_string())));
+
+        super::update_keyring_cache_after_write("updated-key");
+        let third = super::read_keyring_key_with(|| {
+            call_count.set(call_count.get() + 1);
+            Ok(Some("third-key".to_string()))
+        });
+
+        assert_eq!(call_count.get(), 1);
+        assert_eq!(third, Ok(Some("updated-key".to_string())));
     }
 }
 
