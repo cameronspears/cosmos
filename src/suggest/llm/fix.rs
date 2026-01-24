@@ -1,4 +1,4 @@
-use super::client::call_llm_with_usage;
+use super::client::{call_llm_with_usage, LlmResponse};
 use super::models::{Model, Usage};
 use super::parse::{
     merge_usage, parse_json_with_retry, truncate_content, truncate_content_around_line,
@@ -28,8 +28,205 @@ pub struct AppliedFix {
 }
 
 const MAX_PREVIEW_CHARS: usize = 6000;
-const MAX_FIX_FILE_CHARS: usize = 20000;
-const MAX_MULTI_FILE_TOTAL_CHARS: usize = 60000;
+// Excerpt caps used only when the full prompt exceeds model limits.
+const MAX_FIX_EXCERPT_CHARS: usize = 20000;
+const MAX_MULTI_FILE_EXCERPT_CHARS: usize = 60000;
+
+struct PromptContent {
+    content: String,
+    note: Option<String>,
+}
+
+fn prompt_budget_per_file(file_count: usize) -> usize {
+    if file_count == 0 {
+        return 0;
+    }
+    let per_file = MAX_MULTI_FILE_EXCERPT_CHARS / file_count;
+    per_file.min(MAX_FIX_EXCERPT_CHARS).max(1)
+}
+
+fn choose_fix_anchor_line(
+    lines: &[&str],
+    suggestion_line: Option<usize>,
+    evidence_line: Option<u32>,
+    hint_tokens: &[String],
+) -> usize {
+    let evidence_line = evidence_line.and_then(|line| {
+        let line = line as usize;
+        if line > 0 && line <= lines.len() {
+            Some(line)
+        } else {
+            None
+        }
+    });
+    if let Some(line) = evidence_line {
+        return line;
+    }
+    choose_preview_anchor_line(lines, suggestion_line, hint_tokens)
+}
+
+fn build_fix_prompt_content(
+    content: &str,
+    file_path: &Path,
+    suggestion: &Suggestion,
+    plan: &FixPreview,
+    max_chars: usize,
+    is_primary_file: bool,
+) -> PromptContent {
+    if content.trim().is_empty() {
+        return PromptContent {
+            content: String::new(),
+            note: None,
+        };
+    }
+
+    let content_len = content.chars().count();
+    if content_len <= max_chars {
+        return PromptContent {
+            content: content.to_string(),
+            note: None,
+        };
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return PromptContent {
+            content: truncate_content(content, max_chars),
+            note: Some(format!(
+                "NOTE: This file is large ({} chars). Showing a shortened excerpt to fit model input limits.",
+                content_len
+            )),
+        };
+    }
+
+    let mut extra_texts = Vec::new();
+    extra_texts.push(plan.description.as_str());
+    extra_texts.extend(plan.affected_areas.iter().map(|area| area.as_str()));
+    if let Some(snippet) = plan.evidence_snippet.as_deref() {
+        extra_texts.push(snippet);
+    }
+    if let Some(modifier) = plan.modifier.as_deref() {
+        extra_texts.push(modifier);
+    }
+
+    let hint_tokens = extract_hint_tokens_with_extras(
+        &suggestion.summary,
+        suggestion.detail.as_deref(),
+        file_path,
+        &extra_texts,
+    );
+    let suggestion_line = if is_primary_file {
+        suggestion.line
+    } else {
+        None
+    };
+    let evidence_line = if is_primary_file {
+        plan.evidence_line
+    } else {
+        None
+    };
+    let anchor_line = choose_fix_anchor_line(&lines, suggestion_line, evidence_line, &hint_tokens);
+    let snippet = truncate_content_around_line(content, anchor_line, max_chars)
+        .unwrap_or_else(|| truncate_content(content, max_chars));
+
+    PromptContent {
+        content: snippet,
+        note: Some(format!(
+            "NOTE: This file is large ({} chars). Showing an excerpt around line {} to fit model input limits.",
+            content_len, anchor_line
+        )),
+    }
+}
+
+fn format_excerpt_guidance(note: Option<&str>) -> String {
+    note.map(|note| {
+        format!(
+            "{}\nIMPORTANT: Only a focused excerpt is shown. Use search/replace edits anchored in the excerpt, but make old_string unique in the full file by including enough surrounding context.\n",
+            note
+        )
+    })
+    .unwrap_or_default()
+}
+
+fn build_fix_user_prompt(
+    path: &Path,
+    new_file_note: &str,
+    suggestion: &Suggestion,
+    memory_section: &str,
+    plan_text: &str,
+    excerpt_guidance: &str,
+    content: &str,
+) -> String {
+    format!(
+        "File: {}\n{}\n\nOriginal Issue: {}\n{}\n{}\n\n{}\n{}\nCurrent Code:\n```\n{}\n```\n\nImplement the fix using search/replace edits. Be precise with old_string - it must match exactly.",
+        path.display(),
+        new_file_note,
+        suggestion.summary,
+        suggestion.detail.as_deref().unwrap_or(""),
+        memory_section,
+        plan_text,
+        excerpt_guidance,
+        content
+    )
+}
+
+fn build_multi_file_user_prompt(
+    suggestion: &Suggestion,
+    memory_section: &str,
+    plan_text: &str,
+    files_section: &str,
+) -> String {
+    format!(
+        "Original Issue: {}\n{}\n{}\n\n{}\n\nFILES TO MODIFY:\n\n{}\n\nImplement the fix using search/replace edits for each file. For new files, use old_string=\"\" to insert full content. Ensure consistency across all files.",
+        suggestion.summary,
+        suggestion.detail.as_deref().unwrap_or(""),
+        memory_section,
+        plan_text,
+        files_section
+    )
+}
+
+fn is_context_limit_error(message: &str) -> bool {
+    let msg = message.to_lowercase();
+    if msg.contains("context length") || msg.contains("context window") {
+        return true;
+    }
+    if msg.contains("request too large") || msg.contains("payload too large") || msg.contains("413") {
+        return true;
+    }
+    let has_context = msg.contains("context")
+        || msg.contains("token")
+        || msg.contains("tokens")
+        || msg.contains("prompt")
+        || msg.contains("input");
+    let has_limit = msg.contains("limit")
+        || msg.contains("exceed")
+        || msg.contains("too long")
+        || msg.contains("too large")
+        || msg.contains("length")
+        || msg.contains("maximum");
+    has_context && has_limit
+}
+
+async fn call_llm_with_fallback(
+    system: &str,
+    user_full: &str,
+    user_excerpt: &str,
+    model: Model,
+    json_mode: bool,
+) -> anyhow::Result<LlmResponse> {
+    match call_llm_with_usage(system, user_full, model, json_mode).await {
+        Ok(response) => Ok(response),
+        Err(err) => {
+            let message = err.to_string();
+            if is_context_limit_error(&message) && user_full != user_excerpt {
+                call_llm_with_usage(system, user_excerpt, model, json_mode).await
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
 
 /// A single search/replace edit operation
 #[derive(Debug, Clone, Deserialize)]
@@ -61,15 +258,6 @@ pub async fn generate_fix_content(
     repo_memory: Option<String>,
     is_new_file: bool,
 ) -> anyhow::Result<AppliedFix> {
-    let content_len = content.chars().count();
-    if content_len > MAX_FIX_FILE_CHARS {
-        return Err(anyhow::anyhow!(
-            "File too large to auto-fix safely ({} chars, limit {}). Try narrowing the scope.",
-            content_len,
-            MAX_FIX_FILE_CHARS
-        ));
-    }
-
     let plan_text = format!(
         "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
         if plan.verified { "CONFIRMED" } else { "UNCONFIRMED" },
@@ -92,18 +280,42 @@ pub async fn generate_fix_content(
         ""
     };
 
-    let user = format!(
-        "File: {}\n{}\n\nOriginal Issue: {}\n{}\n{}\n\n{}\n\nCurrent Code:\n```\n{}\n```\n\nImplement the fix using search/replace edits. Be precise with old_string - it must match exactly.",
-        path.display(),
+    let prompt_content = build_fix_prompt_content(
+        content,
+        path,
+        suggestion,
+        plan,
+        MAX_FIX_EXCERPT_CHARS,
+        true,
+    );
+    let excerpt_guidance = format_excerpt_guidance(prompt_content.note.as_deref());
+    let user_full = build_fix_user_prompt(
+        path,
         new_file_note,
-        suggestion.summary,
-        suggestion.detail.as_deref().unwrap_or(""),
-        memory_section,
-        plan_text,
-        content
+        suggestion,
+        &memory_section,
+        &plan_text,
+        "",
+        content,
+    );
+    let user_excerpt = build_fix_user_prompt(
+        path,
+        new_file_note,
+        suggestion,
+        &memory_section,
+        &plan_text,
+        &excerpt_guidance,
+        &prompt_content.content,
     );
 
-    let response = call_llm_with_usage(FIX_CONTENT_SYSTEM, &user, Model::Smart, true).await?;
+    let response = call_llm_with_fallback(
+        FIX_CONTENT_SYSTEM,
+        &user_full,
+        &user_excerpt,
+        Model::Smart,
+        true,
+    )
+    .await?;
 
     // Parse the JSON response with self-correction on failure
     let (parsed, correction_usage): (FixResponse, _) =
@@ -292,25 +504,10 @@ pub async fn generate_multi_file_fix(
     plan: &FixPreview,
     repo_memory: Option<String>,
 ) -> anyhow::Result<MultiFileAppliedFix> {
-    let mut total_chars = 0usize;
-    for file in files {
-        let count = file.content.chars().count();
-        if count > MAX_FIX_FILE_CHARS {
-            return Err(anyhow::anyhow!(
-                "File too large to auto-fix safely ({} chars in {}). Try narrowing the scope.",
-                count,
-                file.path.display()
-            ));
-        }
-        total_chars = total_chars.saturating_add(count);
+    if files.is_empty() {
+        return Err(anyhow::anyhow!("No files provided for multi-file fix"));
     }
-    if total_chars > MAX_MULTI_FILE_TOTAL_CHARS {
-        return Err(anyhow::anyhow!(
-            "Multi-file fix too large to auto-fix safely ({} chars total, limit {}). Try splitting the change.",
-            total_chars,
-            MAX_MULTI_FILE_TOTAL_CHARS
-        ));
-    }
+    let per_file_budget = prompt_budget_per_file(files.len());
 
     let plan_text = format!(
         "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
@@ -328,8 +525,8 @@ pub async fn generate_multi_file_fix(
     let memory_section =
         format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
 
-    // Build the files section
-    let files_section: String = files
+    // Build full and excerpted file sections
+    let files_section_full: String = files
         .iter()
         .map(|file| {
             let new_note = if file.is_new { "(NEW FILE)" } else { "" };
@@ -343,17 +540,57 @@ pub async fn generate_multi_file_fix(
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    let user = format!(
-        "Original Issue: {}\n{}\n{}\n\n{}\n\nFILES TO MODIFY:\n\n{}\n\nImplement the fix using search/replace edits for each file. For new files, use old_string=\"\" to insert full content. Ensure consistency across all files.",
-        suggestion.summary,
-        suggestion.detail.as_deref().unwrap_or(""),
-        memory_section,
-        plan_text,
-        files_section
+    let files_section_excerpt: String = files
+        .iter()
+        .map(|file| {
+            let new_note = if file.is_new { "(NEW FILE)" } else { "" };
+            let is_primary = file.path == suggestion.file;
+            let prompt_content = build_fix_prompt_content(
+                &file.content,
+                &file.path,
+                suggestion,
+                plan,
+                per_file_budget,
+                is_primary,
+            );
+            let excerpt_guidance = format_excerpt_guidance(prompt_content.note.as_deref());
+            if excerpt_guidance.is_empty() {
+                format!(
+                    "=== {} {} ===\n```\n{}\n```",
+                    file.path.display(),
+                    new_note,
+                    prompt_content.content
+                )
+            } else {
+                format!(
+                    "=== {} {} ===\n{}\n```\n{}\n```",
+                    file.path.display(),
+                    new_note,
+                    excerpt_guidance,
+                    prompt_content.content
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let user_full =
+        build_multi_file_user_prompt(suggestion, &memory_section, &plan_text, &files_section_full);
+    let user_excerpt = build_multi_file_user_prompt(
+        suggestion,
+        &memory_section,
+        &plan_text,
+        &files_section_excerpt,
     );
 
-    let response =
-        call_llm_with_usage(MULTI_FILE_FIX_SYSTEM, &user, Model::Smart, true).await?;
+    let response = call_llm_with_fallback(
+        MULTI_FILE_FIX_SYSTEM,
+        &user_full,
+        &user_excerpt,
+        Model::Smart,
+        true,
+    )
+    .await?;
 
     // Parse the JSON response with self-correction on failure
     let (parsed, correction_usage): (MultiFileFixResponse, _) =
@@ -660,6 +897,15 @@ fn find_first_impl_or_fn_line(lines: &[&str]) -> Option<usize> {
 }
 
 fn extract_hint_tokens(summary: &str, detail: Option<&str>, path: &Path) -> Vec<String> {
+    extract_hint_tokens_with_extras(summary, detail, path, &[])
+}
+
+fn extract_hint_tokens_with_extras(
+    summary: &str,
+    detail: Option<&str>,
+    path: &Path,
+    extra_texts: &[&str],
+) -> Vec<String> {
     let mut tokens = Vec::new();
     if let Some(detail) = detail {
         tokens.extend(extract_backtick_tokens(detail));
@@ -667,7 +913,14 @@ fn extract_hint_tokens(summary: &str, detail: Option<&str>, path: &Path) -> Vec<
     }
     tokens.extend(extract_identifier_tokens(summary));
     tokens.extend(extract_path_tokens(path));
+    for extra in extra_texts {
+        tokens.extend(extract_backtick_tokens(extra));
+        tokens.extend(extract_identifier_tokens(extra));
+    }
+    normalize_hint_tokens(tokens)
+}
 
+fn normalize_hint_tokens(tokens: Vec<String>) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     tokens
         .into_iter()
@@ -820,6 +1073,35 @@ fn build_fix_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::suggest::{Priority, SuggestionKind, SuggestionSource};
+    use std::path::{Path, PathBuf};
+
+    fn sample_preview(evidence_line: Option<u32>) -> FixPreview {
+        FixPreview {
+            verified: true,
+            friendly_title: "Issue".to_string(),
+            problem_summary: "Problem".to_string(),
+            outcome: "Outcome".to_string(),
+            verification_note: "Verified".to_string(),
+            evidence_snippet: None,
+            evidence_line,
+            description: "Update behavior".to_string(),
+            affected_areas: vec!["update_behavior".to_string()],
+            scope: FixScope::Medium,
+            modifier: None,
+        }
+    }
+
+    fn sample_suggestion(path: PathBuf) -> Suggestion {
+        Suggestion::new(
+            SuggestionKind::BugFix,
+            Priority::Medium,
+            path,
+            "Fix issue".to_string(),
+            SuggestionSource::LlmDeep,
+        )
+        .with_detail("Details".to_string())
+    }
 
     #[test]
     fn test_apply_edits_with_empty_old_string_on_empty_file() {
@@ -910,5 +1192,48 @@ mod tests {
 
         let line = choose_preview_anchor_line(&lines, None, &[]);
         assert_eq!(line, 4);
+    }
+
+    #[test]
+    fn test_build_fix_prompt_content_uses_full_when_under_budget() {
+        let content = "line1\nline2";
+        let path = Path::new("src/lib.rs");
+        let suggestion = sample_suggestion(path.to_path_buf());
+        let plan = sample_preview(None);
+
+        let prompt =
+            build_fix_prompt_content(content, path, &suggestion, &plan, 200, true);
+
+        assert_eq!(prompt.content, content);
+        assert!(prompt.note.is_none());
+    }
+
+    #[test]
+    fn test_build_fix_prompt_content_truncates_large_file() {
+        let content = (1..=200)
+            .map(|i| format!("fn line_{}() {{}}\n", i))
+            .collect::<String>();
+        let path = Path::new("src/lib.rs");
+        let suggestion = sample_suggestion(path.to_path_buf());
+        let plan = sample_preview(Some(150));
+
+        let prompt =
+            build_fix_prompt_content(&content, path, &suggestion, &plan, 200, true);
+
+        assert!(prompt.content.chars().count() <= 200);
+        let note = prompt.note.expect("expected truncation note");
+        assert!(note.contains("line 150"));
+    }
+
+    #[test]
+    fn test_is_context_limit_error_detects_context_length() {
+        let msg = "API error 400: context length exceeded";
+        assert!(is_context_limit_error(msg));
+    }
+
+    #[test]
+    fn test_is_context_limit_error_ignores_unrelated_error() {
+        let msg = "API error 400: invalid request payload";
+        assert!(!is_context_limit_error(msg));
     }
 }
