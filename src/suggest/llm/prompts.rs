@@ -40,6 +40,19 @@ SURGICAL EDITS (MOST IMPORTANT):
 - Do not rename, reorder, or clean up unrelated code
 - If a large change is truly required, keep it tightly scoped and mention it in "description"
 
+TESTING:
+- When adding new functions, include unit tests for them
+- Test edge cases: empty inputs, error paths, boundary conditions
+- If modifying existing code, consider whether tests need updating
+
+CACHING & PERSISTENCE:
+- When adding file-based caches or persisted state, include a version field for format changes
+- Check for existing fields that could be reused (e.g., content hashes, checksums)
+- Cache failures should fall back gracefully, not crash
+
+OBSERVABILITY:
+- For operations that can fail silently (cache writes, optional network calls), add debug logging
+
 EXAMPLE - Adding a null check:
 {
   "description": "Added null check before accessing user.name",
@@ -85,6 +98,19 @@ SURGICAL EDITS (MOST IMPORTANT):
 - Keep surrounding context lines EXACTLY the same as the original (spacing, blank lines, indentation)
 - Do not rename, reorder, or clean up unrelated code
 - If a large change is truly required, keep it tightly scoped and mention it in "description"
+
+TESTING:
+- When adding new functions, include unit tests for them
+- Test edge cases: empty inputs, error paths, boundary conditions
+- If modifying existing code, consider whether tests need updating
+
+CACHING & PERSISTENCE:
+- When adding file-based caches or persisted state, include a version field for format changes
+- Check for existing fields that could be reused (e.g., content hashes, checksums)
+- Cache failures should fall back gracefully, not crash
+
+OBSERVABILITY:
+- For operations that can fail silently (cache writes, optional network calls), add debug logging
 
 MULTI-FILE CONSISTENCY:
 - Ensure renamed symbols match across all files
@@ -505,7 +531,12 @@ CRITICAL RULES FOR EDITS:
 - Fix the ROOT CAUSE, not just the symptom
 - Don't introduce new issues while fixing old ones
 - Keep diffs minimal: no reformatting, no whitespace-only changes, no unrelated cleanup
-- If a finding seems incorrect, make the smallest safe change that addresses the intent"#
+- If a finding seems incorrect, make the smallest safe change that addresses the intent
+
+COMPLETENESS:
+- When adding new functions, include unit tests
+- When adding caches/persistence, include version fields for forward compatibility
+- For silent operations, add debug logging so failures are discoverable"#
             .to_string()
     } else {
         format!(r#"You are a senior developer fixing issues found during code review.
@@ -542,7 +573,12 @@ CRITICAL RULES FOR EDITS:
 - Preserve indentation exactly  
 - Keep diffs minimal: no reformatting, no whitespace-only changes, no unrelated cleanup
 - Fix the ROOT CAUSE this time, not just the symptom
-- Consider all edge cases the reviewer might check"#,
+- Consider all edge cases the reviewer might check
+
+COMPLETENESS:
+- When adding new functions, include unit tests
+- When adding caches/persistence, include version fields for forward compatibility
+- For silent operations, add debug logging so failures are discoverable"#,
             iteration = iteration,
             fixed_list = if fixed_titles.is_empty() {
                 "(none recorded)".to_string()
