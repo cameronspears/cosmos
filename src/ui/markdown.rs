@@ -4,18 +4,18 @@
 
 #![allow(unused_mut)]
 
+use super::theme::Theme;
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
 use unicode_width::UnicodeWidthStr;
-use super::theme::Theme;
 
 /// Parse markdown text and convert to styled Lines
 pub fn parse_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut in_code_block = false;
-    
+
     for line in text.lines() {
         // Handle code blocks
         if line.starts_with("```") {
@@ -28,11 +28,11 @@ pub fn parse_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
             }
             continue;
         }
-        
+
         if in_code_block {
             continue;
         }
-        
+
         // Handle different line types
         if line.is_empty() {
             lines.push(Line::from(""));
@@ -56,12 +56,13 @@ pub fn parse_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
                 let content = &line[num_end + 2..];
                 let wrapped = wrap_and_parse_inline(content, max_width.saturating_sub(5));
                 for (i, styled_line) in wrapped.into_iter().enumerate() {
-                    let prefix = if i == 0 { 
+                    let prefix = if i == 0 {
                         format!("  {}. ", &line[..num_end])
-                    } else { 
-                        "     ".to_string() 
+                    } else {
+                        "     ".to_string()
                     };
-                    let mut spans = vec![Span::styled(prefix, Style::default().fg(Theme::GREY_400))];
+                    let mut spans =
+                        vec![Span::styled(prefix, Style::default().fg(Theme::GREY_400))];
                     spans.extend(styled_line.spans);
                     lines.push(Line::from(spans));
                 }
@@ -82,51 +83,46 @@ pub fn parse_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
             lines.extend(wrap_and_parse_inline(line, max_width));
         }
     }
-    
+
     lines
 }
 
 /// Render a header level 1
 fn render_h1(text: &str, _max_width: usize) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            text.to_string(),
-            Style::default()
-                .fg(Theme::WHITE)
-                .add_modifier(Modifier::BOLD)
-        ),
-    ])
+    Line::from(vec![Span::styled(
+        text.to_string(),
+        Style::default()
+            .fg(Theme::WHITE)
+            .add_modifier(Modifier::BOLD),
+    )])
 }
 
 /// Render a header level 2
 fn render_h2(text: &str, _max_width: usize) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            text.to_string(),
-            Style::default()
-                .fg(Theme::GREY_100)
-                .add_modifier(Modifier::BOLD)
-        ),
-    ])
+    Line::from(vec![Span::styled(
+        text.to_string(),
+        Style::default()
+            .fg(Theme::GREY_100)
+            .add_modifier(Modifier::BOLD),
+    )])
 }
 
 /// Render a header level 3
 fn render_h3(text: &str, _max_width: usize) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("• {}", text),
-            Style::default()
-                .fg(Theme::GREY_200)
-                .add_modifier(Modifier::BOLD)
-        ),
-    ])
+    Line::from(vec![Span::styled(
+        format!("• {}", text),
+        Style::default()
+            .fg(Theme::GREY_200)
+            .add_modifier(Modifier::BOLD),
+    )])
 }
 
 /// Parse inline markdown (bold, italic, code) and wrap text
 fn wrap_and_parse_inline(text: &str, max_width: usize) -> Vec<Line<'static>> {
     // First wrap the text, then parse inline elements
     let wrapped = wrap_text_simple(text, max_width);
-    wrapped.into_iter()
+    wrapped
+        .into_iter()
         .map(|line| parse_inline_markdown(&line))
         .collect()
 }
@@ -136,11 +132,11 @@ fn wrap_text_simple(text: &str, max_width: usize) -> Vec<String> {
     if max_width == 0 {
         return vec![text.to_string()];
     }
-    
+
     let mut lines = Vec::new();
     let mut current_line = String::new();
     let mut current_width: usize = 0;
-    
+
     for word in text.split_whitespace() {
         let word_width = word.width();
         if current_line.is_empty() {
@@ -156,18 +152,17 @@ fn wrap_text_simple(text: &str, max_width: usize) -> Vec<String> {
             current_width = word_width;
         }
     }
-    
+
     if !current_line.is_empty() {
         lines.push(current_line);
     }
-    
+
     if lines.is_empty() {
         lines.push(String::new());
     }
-    
+
     lines
 }
-
 
 /// Parse inline markdown elements (bold, italic, code)
 fn parse_inline_markdown(text: &str) -> Line<'static> {
@@ -175,35 +170,38 @@ fn parse_inline_markdown(text: &str) -> Line<'static> {
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
     let mut current_text = String::new();
-    
+
     while i < chars.len() {
-        
         // Check for bold: **text** or __text__
-        if i + 1 < chars.len() && 
-           ((chars[i] == '*' && chars[i + 1] == '*') || 
-            (chars[i] == '_' && chars[i + 1] == '_')) {
+        if i + 1 < chars.len()
+            && ((chars[i] == '*' && chars[i + 1] == '*')
+                || (chars[i] == '_' && chars[i + 1] == '_'))
+        {
             let marker = chars[i];
-            
+
             // Flush current text
             if !current_text.is_empty() {
-                spans.push(Span::styled(current_text.clone(), Style::default().fg(Theme::GREY_100)));
+                spans.push(Span::styled(
+                    current_text.clone(),
+                    Style::default().fg(Theme::GREY_100),
+                ));
                 current_text.clear();
             }
-            
+
             // Find closing **
             let start = i + 2;
             i += 2;
             while i + 1 < chars.len() && !(chars[i] == marker && chars[i + 1] == marker) {
                 i += 1;
             }
-            
+
             if i + 1 < chars.len() {
                 let bold_text: String = chars[start..i].iter().collect();
                 spans.push(Span::styled(
                     bold_text,
                     Style::default()
                         .fg(Theme::WHITE)
-                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::BOLD),
                 ));
                 i += 2;
             }
@@ -237,51 +235,58 @@ fn parse_inline_markdown(text: &str) -> Line<'static> {
                 continue;
             }
         }
-        
+
         // Check for italic: *text* or _text_ (single)
-        if (chars[i] == '*' || chars[i] == '_') && 
-           (i + 1 >= chars.len() || (chars[i + 1] != chars[i])) {
+        if (chars[i] == '*' || chars[i] == '_')
+            && (i + 1 >= chars.len() || (chars[i + 1] != chars[i]))
+        {
             let marker = chars[i];
-            
+
             // Look ahead to see if there's a closing marker
             let mut j = i + 1;
             while j < chars.len() && chars[j] != marker {
                 j += 1;
             }
-            
+
             if j < chars.len() && j > i + 1 {
                 // Found closing marker
                 if !current_text.is_empty() {
-                    spans.push(Span::styled(current_text.clone(), Style::default().fg(Theme::GREY_100)));
+                    spans.push(Span::styled(
+                        current_text.clone(),
+                        Style::default().fg(Theme::GREY_100),
+                    ));
                     current_text.clear();
                 }
-                
+
                 let italic_text: String = chars[i + 1..j].iter().collect();
                 spans.push(Span::styled(
                     italic_text,
                     Style::default()
                         .fg(Theme::GREY_200)
-                        .add_modifier(Modifier::ITALIC)
+                        .add_modifier(Modifier::ITALIC),
                 ));
                 i = j + 1;
                 continue;
             }
         }
-        
+
         // Regular character (no inline code styling)
         current_text.push(chars[i]);
         i += 1;
     }
-    
+
     // Flush remaining text
     if !current_text.is_empty() {
-        spans.push(Span::styled(current_text, Style::default().fg(Theme::GREY_100)));
+        spans.push(Span::styled(
+            current_text,
+            Style::default().fg(Theme::GREY_100),
+        ));
     }
-    
+
     if spans.is_empty() {
         spans.push(Span::styled("", Style::default()));
     }
-    
+
     Line::from(spans)
 }
 
@@ -313,4 +318,3 @@ mod tests {
         assert_eq!(lines.len(), 2);
     }
 }
-

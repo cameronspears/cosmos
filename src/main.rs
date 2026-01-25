@@ -5,6 +5,7 @@
 //! An AI-powered IDE in the terminal that uses codebase indexing
 //! to suggest improvements, bug fixes, and optimizations.
 
+mod app;
 mod cache;
 mod config;
 mod context;
@@ -13,7 +14,6 @@ mod index;
 mod onboarding;
 mod suggest;
 mod ui;
-mod app;
 mod util;
 
 // Keep these for compatibility during transition
@@ -114,7 +114,10 @@ fn init_index(path: &Path, cache_manager: &cache::Cache) -> Result<CodebaseIndex
             stats.file_count, stats.symbol_count
         );
         if stats.skipped_files > 0 {
-            eprintln!("  Skipped {} files during last index build", stats.skipped_files);
+            eprintln!(
+                "  Skipped {} files during last index build",
+                stats.skipped_files
+            );
             for err in index.index_errors.iter().take(3) {
                 eprintln!("    - {}: {}", err.path.display(), err.reason);
             }
@@ -245,7 +248,7 @@ fn print_stats(index: &CodebaseIndex, suggestions: &SuggestionEngine, context: &
 /// Set up the API key interactively
 fn setup_api_key() -> Result<()> {
     config::setup_api_key_interactive().map_err(|e| anyhow::anyhow!("{}", e))?;
-    
+
     // Verify the key is readable
     let mut config = config::Config::load();
     match config.get_api_key() {
@@ -263,6 +266,6 @@ fn setup_api_key() -> Result<()> {
             return Err(anyhow::anyhow!("API key verification failed"));
         }
     }
-    
+
     Ok(())
 }

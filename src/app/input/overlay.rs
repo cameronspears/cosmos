@@ -32,31 +32,36 @@ pub(super) fn handle_overlay_input(
                     let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
                     app.loading = LoadingState::Answering;
                     app.close_overlay();
-                    background::spawn_background(ctx.tx.clone(), "ask_question_preview", async move {
-                        let mem = if repo_memory_context.trim().is_empty() {
-                            None
-                        } else {
-                            Some(repo_memory_context)
-                        };
-                        match suggest::llm::ask_question(
-                            &index_clone,
-                            &context_clone,
-                            &question,
-                            mem,
-                        )
-                        .await
-                        {
-                            Ok((answer, usage)) => {
-                                let _ = tx_question.send(BackgroundMessage::QuestionResponse {
-                                    answer,
-                                    usage,
-                                });
+                    background::spawn_background(
+                        ctx.tx.clone(),
+                        "ask_question_preview",
+                        async move {
+                            let mem = if repo_memory_context.trim().is_empty() {
+                                None
+                            } else {
+                                Some(repo_memory_context)
+                            };
+                            match suggest::llm::ask_question(
+                                &index_clone,
+                                &context_clone,
+                                &question,
+                                mem,
+                            )
+                            .await
+                            {
+                                Ok((answer, usage)) => {
+                                    let _ = tx_question.send(BackgroundMessage::QuestionResponse {
+                                        answer,
+                                        usage,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        tx_question.send(BackgroundMessage::Error(e.to_string()));
+                                }
                             }
-                            Err(e) => {
-                                let _ = tx_question.send(BackgroundMessage::Error(e.to_string()));
-                            }
-                        }
-                    });
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -93,8 +98,8 @@ pub(super) fn handle_overlay_input(
                     background::spawn_background(ctx.tx.clone(), "reset_cosmos", async move {
                         match crate::cache::reset_cosmos(&repo_path, &selected).await {
                             Ok(_) => {
-                                let _ =
-                                    tx_reset.send(BackgroundMessage::ResetComplete { options: selected });
+                                let _ = tx_reset
+                                    .send(BackgroundMessage::ResetComplete { options: selected });
                             }
                             Err(e) => {
                                 let _ = tx_reset.send(BackgroundMessage::Error(e.to_string()));

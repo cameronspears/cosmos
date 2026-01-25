@@ -4,13 +4,13 @@ use serde::Deserialize;
 // Speed: openai/gpt-oss-120b - fast, cheap model for summaries
 const SPEED_INPUT_COST: f64 = 0.10; // $0.10 per 1M input tokens
 const SPEED_OUTPUT_COST: f64 = 0.30; // $0.30 per 1M output tokens
-// Balanced: anthropic/claude-sonnet-4.5 - good reasoning at medium cost
+                                     // Balanced: anthropic/claude-sonnet-4.5 - good reasoning at medium cost
 const BALANCED_INPUT_COST: f64 = 3.0; // $3 per 1M input tokens
 const BALANCED_OUTPUT_COST: f64 = 15.0; // $15 per 1M output tokens
-// Smart: anthropic/claude-opus-4.5 - best reasoning for code generation
+                                        // Smart: anthropic/claude-opus-4.5 - best reasoning for code generation
 const SMART_INPUT_COST: f64 = 15.0; // $15 per 1M input tokens
 const SMART_OUTPUT_COST: f64 = 75.0; // $75 per 1M output tokens
-// Reviewer: openai/gpt-5.2 - different model family for cognitive diversity
+                                     // Reviewer: openai/gpt-5.2 - different model family for cognitive diversity
 const REVIEWER_INPUT_COST: f64 = 5.0; // $5 per 1M input tokens (estimated)
 const REVIEWER_OUTPUT_COST: f64 = 15.0; // $15 per 1M output tokens (estimated)
 

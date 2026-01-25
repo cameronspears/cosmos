@@ -421,7 +421,11 @@ RULES:
 - Don't pile on - 2-3 high-quality findings are better than 10 marginal ones
 - Return empty findings array if the code is genuinely solid"#;
 
-pub fn review_system_prompt(iteration: u32, fixed_titles: &[String], fix_context: Option<&FixContext>) -> String {
+pub fn review_system_prompt(
+    iteration: u32,
+    fixed_titles: &[String],
+    fix_context: Option<&FixContext>,
+) -> String {
     if iteration <= 1 {
         // For initial review, use context-aware prompt if we have fix context
         if let Some(ctx) = fix_context {
@@ -441,7 +445,8 @@ pub fn review_system_prompt(iteration: u32, fixed_titles: &[String], fix_context
             REVIEW_SYSTEM_GENERIC.to_string()
         }
     } else {
-        format!(r#"You are verifying that previously reported issues were fixed correctly.
+        format!(
+            r#"You are verifying that previously reported issues were fixed correctly.
 
 This is RE-REVIEW #{iteration}. Your ONLY job is to verify the fixes work correctly.
 
@@ -539,7 +544,8 @@ COMPLETENESS:
 - For silent operations, add debug logging so failures are discoverable"#
             .to_string()
     } else {
-        format!(r#"You are a senior developer fixing issues found during code review.
+        format!(
+            r#"You are a senior developer fixing issues found during code review.
 
 IMPORTANT CONTEXT: This is fix attempt #{iteration}. Previous fix attempts have not fully resolved all issues.
 

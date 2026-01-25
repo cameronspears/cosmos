@@ -40,7 +40,10 @@ pub(super) fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     ));
 
     if app.git_refresh_error.is_some() {
-        spans.push(Span::styled("  status stale", Style::default().fg(Theme::YELLOW)));
+        spans.push(Span::styled(
+            "  status stale",
+            Style::default().fg(Theme::YELLOW),
+        ));
     }
 
     // Cost + budget indicators

@@ -212,8 +212,16 @@ pub(crate) fn truncate_content(content: &str, max_chars: usize) -> String {
         content.to_string()
     } else {
         let head: String = content.chars().take(max_chars / 2).collect();
-        let tail: String = content.chars().rev().take(max_chars / 2).collect::<String>();
-        format!("{}\n\n... [truncated] ...\n\n{}", head, tail.chars().rev().collect::<String>())
+        let tail: String = content
+            .chars()
+            .rev()
+            .take(max_chars / 2)
+            .collect::<String>();
+        format!(
+            "{}\n\n... [truncated] ...\n\n{}",
+            head,
+            tail.chars().rev().collect::<String>()
+        )
     }
 }
 
@@ -317,9 +325,10 @@ where
                 request_json_correction(response, &initial_error, context_hint).await?;
 
             // Extract and parse the corrected JSON
-            let corrected_json = extract_json_object(&correction_response.content).ok_or_else(
-                || anyhow::anyhow!("No JSON found in correction response for {}", context_hint),
-            )?;
+            let corrected_json =
+                extract_json_object(&correction_response.content).ok_or_else(|| {
+                    anyhow::anyhow!("No JSON found in correction response for {}", context_hint)
+                })?;
 
             let corrected_json = fix_json_issues(corrected_json);
             let parsed = serde_json::from_str::<T>(&corrected_json).map_err(|e| {
@@ -343,8 +352,7 @@ pub(crate) async fn request_json_correction(
     parse_error: &serde_json::Error,
     context_hint: &str,
 ) -> anyhow::Result<LlmResponse> {
-    request_json_correction_generic(original_response, &parse_error.to_string(), context_hint)
-        .await
+    request_json_correction_generic(original_response, &parse_error.to_string(), context_hint).await
 }
 
 /// Ask the LLM to fix malformed JSON (generic version taking error as string).
@@ -423,8 +431,7 @@ pub(crate) fn parse_summaries_response(
         // Look for common wrapper keys that might contain summaries
         for key in ["summaries", "files", "results", "data"] {
             if let Some(inner) = wrapper.get(key) {
-                if let Ok(parsed) =
-                    serde_json::from_value::<HashMap<String, String>>(inner.clone())
+                if let Ok(parsed) = serde_json::from_value::<HashMap<String, String>>(inner.clone())
                 {
                     let summaries = parsed
                         .into_iter()
@@ -501,8 +508,7 @@ pub(crate) fn parse_summaries_and_terms_response(
 
         // Extract terms
         if let Some(terms_obj) = wrapper.get("terms") {
-            if let Ok(parsed) =
-                serde_json::from_value::<HashMap<String, String>>(terms_obj.clone())
+            if let Ok(parsed) = serde_json::from_value::<HashMap<String, String>>(terms_obj.clone())
             {
                 terms = parsed;
             }

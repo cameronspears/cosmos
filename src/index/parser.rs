@@ -11,7 +11,7 @@ pub fn parse_file(
     language: Language,
 ) -> anyhow::Result<(Vec<Symbol>, Vec<Dependency>)> {
     let mut parser = Parser::new();
-    
+
     // Set the language
     let ts_language = match language {
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
@@ -21,14 +21,15 @@ pub fn parse_file(
         Language::Go => tree_sitter_go::LANGUAGE.into(),
         Language::Unknown => return Ok((Vec::new(), Vec::new())),
     };
-    
+
     parser.set_language(&ts_language)?;
-    
-    let tree = parser.parse(content, None)
+
+    let tree = parser
+        .parse(content, None)
         .ok_or_else(|| anyhow::anyhow!("Failed to parse file"))?;
-    
+
     let root = tree.root_node();
-    
+
     // Extract symbols and dependencies based on language
     let symbols = match language {
         Language::Rust => extract_rust_symbols(&root, content, path),
@@ -37,7 +38,7 @@ pub fn parse_file(
         Language::Go => extract_go_symbols(&root, content, path),
         Language::Unknown => Vec::new(),
     };
-    
+
     let dependencies = match language {
         Language::Rust => extract_rust_deps(&root, content, path),
         Language::JavaScript | Language::TypeScript => extract_js_deps(&root, content, path),
@@ -45,7 +46,7 @@ pub fn parse_file(
         Language::Go => extract_go_deps(&root, content, path),
         Language::Unknown => Vec::new(),
     };
-    
+
     Ok((symbols, dependencies))
 }
 
@@ -53,7 +54,7 @@ pub fn parse_file(
 fn extract_rust_symbols(root: &tree_sitter::Node, content: &str, path: &Path) -> Vec<Symbol> {
     let mut symbols = Vec::new();
     let mut cursor = root.walk();
-    
+
     extract_rust_symbols_recursive(&mut cursor, content, path, &mut symbols);
     symbols
 }
@@ -67,7 +68,7 @@ fn extract_rust_symbols_recursive(
     loop {
         let node = cursor.node();
         let kind = node.kind();
-        
+
         match kind {
             "function_item" | "function_signature_item" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
@@ -77,7 +78,7 @@ fn extract_rust_symbols_recursive(
                     } else {
                         Visibility::Private
                     };
-                    
+
                     symbols.push(Symbol {
                         name,
                         kind: SymbolKind::Function,
@@ -188,13 +189,13 @@ fn extract_rust_symbols_recursive(
             }
             _ => {}
         }
-        
+
         // Recurse into children
         if cursor.goto_first_child() {
             extract_rust_symbols_recursive(cursor, content, path, symbols);
             cursor.goto_parent();
         }
-        
+
         if !cursor.goto_next_sibling() {
             break;
         }
@@ -205,28 +206,32 @@ fn extract_rust_symbols_recursive(
 fn extract_rust_deps(root: &tree_sitter::Node, content: &str, path: &Path) -> Vec<Dependency> {
     let mut deps = Vec::new();
     let mut cursor = root.walk();
-    
+
     loop {
         let node = cursor.node();
-        
+
         if node.kind() == "use_declaration" {
             let import_text = get_node_text(&node, content);
-            let is_external = !import_text.contains("crate::") && 
-                              !import_text.contains("super::") &&
-                              !import_text.contains("self::");
-            
+            let is_external = !import_text.contains("crate::")
+                && !import_text.contains("super::")
+                && !import_text.contains("self::");
+
             deps.push(Dependency {
                 from_file: path.to_path_buf(),
-                import_path: import_text.replace("use ", "").replace(";", "").trim().to_string(),
+                import_path: import_text
+                    .replace("use ", "")
+                    .replace(";", "")
+                    .trim()
+                    .to_string(),
                 line: node.start_position().row + 1,
                 is_external,
             });
         }
-        
+
         if cursor.goto_first_child() {
             continue;
         }
-        
+
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
                 return deps;
@@ -239,11 +244,11 @@ fn extract_rust_deps(root: &tree_sitter::Node, content: &str, path: &Path) -> Ve
 fn extract_js_symbols(root: &tree_sitter::Node, content: &str, path: &Path) -> Vec<Symbol> {
     let mut symbols = Vec::new();
     let mut cursor = root.walk();
-    
+
     loop {
         let node = cursor.node();
         let kind = node.kind();
-        
+
         match kind {
             "function_declaration" | "function" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
@@ -322,11 +327,11 @@ fn extract_js_symbols(root: &tree_sitter::Node, content: &str, path: &Path) -> V
             }
             _ => {}
         }
-        
+
         if cursor.goto_first_child() {
             continue;
         }
-        
+
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
                 return symbols;
@@ -339,17 +344,17 @@ fn extract_js_symbols(root: &tree_sitter::Node, content: &str, path: &Path) -> V
 fn extract_js_deps(root: &tree_sitter::Node, content: &str, path: &Path) -> Vec<Dependency> {
     let mut deps = Vec::new();
     let mut cursor = root.walk();
-    
+
     loop {
         let node = cursor.node();
-        
+
         if node.kind() == "import_statement" {
             if let Some(source) = node.child_by_field_name("source") {
                 let import_path = get_node_text(&source, content)
                     .trim_matches(|c| c == '"' || c == '\'' || c == '`')
                     .to_string();
                 let is_external = !import_path.starts_with('.') && !import_path.starts_with('/');
-                
+
                 deps.push(Dependency {
                     from_file: path.to_path_buf(),
                     import_path,
@@ -358,11 +363,11 @@ fn extract_js_deps(root: &tree_sitter::Node, content: &str, path: &Path) -> Vec<
                 });
             }
         }
-        
+
         if cursor.goto_first_child() {
             continue;
         }
-        
+
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
                 return deps;
@@ -375,11 +380,11 @@ fn extract_js_deps(root: &tree_sitter::Node, content: &str, path: &Path) -> Vec<
 fn extract_python_symbols(root: &tree_sitter::Node, content: &str, path: &Path) -> Vec<Symbol> {
     let mut symbols = Vec::new();
     let mut cursor = root.walk();
-    
+
     loop {
         let node = cursor.node();
         let kind = node.kind();
-        
+
         match kind {
             "function_definition" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
@@ -393,7 +398,7 @@ fn extract_python_symbols(root: &tree_sitter::Node, content: &str, path: &Path) 
                     } else {
                         Visibility::Public
                     };
-                    
+
                     symbols.push(Symbol {
                         name,
                         kind: SymbolKind::Function,
@@ -421,11 +426,11 @@ fn extract_python_symbols(root: &tree_sitter::Node, content: &str, path: &Path) 
             }
             _ => {}
         }
-        
+
         if cursor.goto_first_child() {
             continue;
         }
-        
+
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
                 return symbols;
@@ -438,14 +443,14 @@ fn extract_python_symbols(root: &tree_sitter::Node, content: &str, path: &Path) 
 fn extract_python_deps(root: &tree_sitter::Node, content: &str, path: &Path) -> Vec<Dependency> {
     let mut deps = Vec::new();
     let mut cursor = root.walk();
-    
+
     loop {
         let node = cursor.node();
-        
+
         if node.kind() == "import_statement" || node.kind() == "import_from_statement" {
             let import_text = get_node_text(&node, content);
-            let is_external = !import_text.contains(" .");  // Relative imports use dots
-            
+            let is_external = !import_text.contains(" ."); // Relative imports use dots
+
             deps.push(Dependency {
                 from_file: path.to_path_buf(),
                 import_path: import_text.trim().to_string(),
@@ -453,11 +458,11 @@ fn extract_python_deps(root: &tree_sitter::Node, content: &str, path: &Path) -> 
                 is_external,
             });
         }
-        
+
         if cursor.goto_first_child() {
             continue;
         }
-        
+
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
                 return deps;
@@ -470,21 +475,26 @@ fn extract_python_deps(root: &tree_sitter::Node, content: &str, path: &Path) -> 
 fn extract_go_symbols(root: &tree_sitter::Node, content: &str, path: &Path) -> Vec<Symbol> {
     let mut symbols = Vec::new();
     let mut cursor = root.walk();
-    
+
     loop {
         let node = cursor.node();
         let kind = node.kind();
-        
+
         match kind {
             "function_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = get_node_text(&name_node, content);
-                    let visibility = if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    let visibility = if name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false)
+                    {
                         Visibility::Public
                     } else {
                         Visibility::Private
                     };
-                    
+
                     symbols.push(Symbol {
                         name,
                         kind: SymbolKind::Function,
@@ -499,12 +509,17 @@ fn extract_go_symbols(root: &tree_sitter::Node, content: &str, path: &Path) -> V
             "method_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = get_node_text(&name_node, content);
-                    let visibility = if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    let visibility = if name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false)
+                    {
                         Visibility::Public
                     } else {
                         Visibility::Private
                     };
-                    
+
                     symbols.push(Symbol {
                         name,
                         kind: SymbolKind::Method,
@@ -528,7 +543,7 @@ fn extract_go_symbols(root: &tree_sitter::Node, content: &str, path: &Path) -> V
                         } else {
                             SymbolKind::Struct
                         };
-                        
+
                         symbols.push(Symbol {
                             name,
                             kind: sym_kind,
@@ -543,11 +558,11 @@ fn extract_go_symbols(root: &tree_sitter::Node, content: &str, path: &Path) -> V
             }
             _ => {}
         }
-        
+
         if cursor.goto_first_child() {
             continue;
         }
-        
+
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
                 return symbols;
@@ -560,21 +575,21 @@ fn extract_go_symbols(root: &tree_sitter::Node, content: &str, path: &Path) -> V
 fn extract_go_deps(root: &tree_sitter::Node, content: &str, path: &Path) -> Vec<Dependency> {
     let mut deps = Vec::new();
     let mut cursor = root.walk();
-    
+
     loop {
         let node = cursor.node();
-        
+
         if node.kind() == "import_declaration" {
             // Handle both single imports and import groups
             for i in 0..node.named_child_count() {
                 if let Some(child) = node.named_child(i) {
-                    if child.kind() == "import_spec" || child.kind() == "interpreted_string_literal" {
-                        let import_path = get_node_text(&child, content)
-                            .trim_matches('"')
-                            .to_string();
-                        let is_external = !import_path.starts_with('.') && 
-                                         import_path.contains('/');
-                        
+                    if child.kind() == "import_spec" || child.kind() == "interpreted_string_literal"
+                    {
+                        let import_path =
+                            get_node_text(&child, content).trim_matches('"').to_string();
+                        let is_external =
+                            !import_path.starts_with('.') && import_path.contains('/');
+
                         deps.push(Dependency {
                             from_file: path.to_path_buf(),
                             import_path,
@@ -585,11 +600,11 @@ fn extract_go_deps(root: &tree_sitter::Node, content: &str, path: &Path) -> Vec<
                 }
             }
         }
-        
+
         if cursor.goto_first_child() {
             continue;
         }
-        
+
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
                 return deps;
@@ -621,13 +636,15 @@ fn has_pub_modifier(node: &tree_sitter::Node, content: &str) -> bool {
 fn estimate_complexity(node: &tree_sitter::Node, content: &str) -> f64 {
     let text = get_node_text(node, content);
     let mut complexity = 1.0;
-    
+
     // Count decision points
-    let keywords = ["if", "else", "for", "while", "match", "case", "&&", "||", "?"];
+    let keywords = [
+        "if", "else", "for", "while", "match", "case", "&&", "||", "?",
+    ];
     for kw in &keywords {
         complexity += text.matches(kw).count() as f64 * 0.5;
     }
-    
+
     complexity
 }
 
@@ -646,13 +663,9 @@ mod tests {
                 bar: i32,
             }
         "#;
-        
-        let (symbols, _) = parse_file(
-            Path::new("test.rs"),
-            content,
-            Language::Rust
-        ).unwrap();
-        
+
+        let (symbols, _) = parse_file(Path::new("test.rs"), content, Language::Rust).unwrap();
+
         assert!(!symbols.is_empty());
     }
 
@@ -667,14 +680,9 @@ mod tests {
                 bar() {}
             }
         "#;
-        
-        let (symbols, _) = parse_file(
-            Path::new("test.js"),
-            content,
-            Language::JavaScript
-        ).unwrap();
-        
+
+        let (symbols, _) = parse_file(Path::new("test.js"), content, Language::JavaScript).unwrap();
+
         assert!(!symbols.is_empty());
     }
 }
-

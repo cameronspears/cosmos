@@ -11,11 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Handle key events in normal mode (no special input active)
-pub(super) fn handle_normal_mode(
-    app: &mut App,
-    key: KeyEvent,
-    ctx: &RuntimeContext,
-) -> Result<()> {
+pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> Result<()> {
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Tab => app.toggle_panel(),
@@ -205,12 +201,12 @@ pub(super) fn handle_normal_mode(
 
                                                 let mut all_files = Vec::new();
                                                 all_files.push(file_path.clone());
-                                                all_files.extend(additional_files_for_preview.clone());
+                                                all_files
+                                                    .extend(additional_files_for_preview.clone());
 
                                                 for target in &all_files {
                                                     let resolved = match resolve_repo_path_allow_new(
-                                                        &repo_root,
-                                                        target,
+                                                        &repo_root, target,
                                                     ) {
                                                         Ok(resolved) => resolved,
                                                         Err(e) => {
@@ -227,8 +223,9 @@ pub(super) fn handle_normal_mode(
                                                         }
                                                     };
 
-                                                    let bytes = match std::fs::read(&resolved.absolute)
-                                                    {
+                                                    let bytes = match std::fs::read(
+                                                        &resolved.absolute,
+                                                    ) {
                                                         Ok(content) => content,
                                                         Err(e)
                                                             if e.kind()
@@ -277,8 +274,8 @@ pub(super) fn handle_normal_mode(
                                                     }
                                                 }
 
-                                                let resolved_rel =
-                                                    primary_rel.unwrap_or_else(|| file_path.clone());
+                                                let resolved_rel = primary_rel
+                                                    .unwrap_or_else(|| file_path.clone());
                                                 match suggest::llm::generate_fix_preview(
                                                     &resolved_rel,
                                                     &primary_content,
@@ -320,7 +317,8 @@ pub(super) fn handle_normal_mode(
                                     let repo_memory_context =
                                         app.repo_memory.to_prompt_context(12, 900);
 
-                                    if let (Some(sid), Some(fp)) = (suggestion_id, file_path.clone())
+                                    if let (Some(sid), Some(fp)) =
+                                        (suggestion_id, file_path.clone())
                                     {
                                         if let Some(suggestion) = app
                                             .suggestions
@@ -350,9 +348,8 @@ pub(super) fn handle_normal_mode(
                                             let mut changed_files = Vec::new();
                                             let mut all_files = Vec::new();
                                             all_files.push(fp.clone());
-                                            all_files.extend(
-                                                app.verify_state.additional_files.clone(),
-                                            );
+                                            all_files
+                                                .extend(app.verify_state.additional_files.clone());
                                             for target in &all_files {
                                                 let resolved = match resolve_repo_path_allow_new(
                                                     &app.repo_path,
@@ -392,11 +389,10 @@ pub(super) fn handle_normal_mode(
                                                     .preview_hashes
                                                     .get(&resolved.relative)
                                                 {
-                                                    Some(expected)
-                                                        if expected == &current_hash => {}
-                                                    _ => changed_files.push(
-                                                        resolved.relative.clone(),
-                                                    ),
+                                                    Some(expected) if expected == &current_hash => {
+                                                    }
+                                                    _ => changed_files
+                                                        .push(resolved.relative.clone()),
                                                 }
                                             }
                                             if !changed_files.is_empty() {
@@ -451,11 +447,12 @@ pub(super) fn handle_normal_mode(
                                                             }
                                                         };
 
-                                                    let mem = if repo_memory_context.trim().is_empty() {
-                                                        None
-                                                    } else {
-                                                        Some(repo_memory_context)
-                                                    };
+                                                    let mem =
+                                                        if repo_memory_context.trim().is_empty() {
+                                                            None
+                                                        } else {
+                                                            Some(repo_memory_context)
+                                                        };
 
                                                     // Check if this is a multi-file suggestion
                                                     if suggestion.is_multi_file() {
@@ -463,13 +460,13 @@ pub(super) fn handle_normal_mode(
                                                         let all_files = suggestion.affected_files();
 
                                                         // Read all file contents
-                                                        let mut file_inputs: Vec<suggest::llm::FileInput> =
-                                                            Vec::new();
+                                                        let mut file_inputs: Vec<
+                                                            suggest::llm::FileInput,
+                                                        > = Vec::new();
                                                         for file_path in &all_files {
                                                             let resolved =
                                                                 match resolve_repo_path_allow_new(
-                                                                    &repo_path,
-                                                                    file_path,
+                                                                    &repo_path, file_path,
                                                                 ) {
                                                                     Ok(resolved) => resolved,
                                                                     Err(e) => {
@@ -485,7 +482,8 @@ pub(super) fn handle_normal_mode(
                                                                         return;
                                                                     }
                                                                 };
-                                                            let is_new = !resolved.absolute.exists();
+                                                            let is_new =
+                                                                !resolved.absolute.exists();
                                                             let content = match std::fs::read_to_string(
                                                                 &resolved.absolute,
                                                             ) {
@@ -509,11 +507,13 @@ pub(super) fn handle_normal_mode(
                                                                     return;
                                                                 }
                                                             };
-                                                            file_inputs.push(suggest::llm::FileInput {
-                                                                path: resolved.relative,
-                                                                content,
-                                                                is_new,
-                                                            });
+                                                            file_inputs.push(
+                                                                suggest::llm::FileInput {
+                                                                    path: resolved.relative,
+                                                                    content,
+                                                                    is_new,
+                                                                },
+                                                            );
                                                         }
 
                                                         // Generate multi-file fix
@@ -528,9 +528,12 @@ pub(super) fn handle_normal_mode(
                                                             Ok(multi_fix) => {
                                                                 // Apply all edits
                                                                 let mut file_changes: Vec<(
-                                                                    PathBuf, String,
+                                                                    PathBuf,
+                                                                    String,
                                                                 )> = Vec::new();
-                                                                for file_edit in &multi_fix.file_edits {
+                                                                for file_edit in
+                                                                    &multi_fix.file_edits
+                                                                {
                                                                     let resolved = match resolve_repo_path_allow_new(
                                                                         &repo_path,
                                                                         &file_edit.path,
@@ -551,10 +554,16 @@ pub(super) fn handle_normal_mode(
                                                                             return;
                                                                         }
                                                                     };
-                                                                    let full_path = resolved.absolute;
+                                                                    let full_path =
+                                                                        resolved.absolute;
 
-                                                                    if let Some(parent) = full_path.parent() {
-                                                                        let _ = std::fs::create_dir_all(parent);
+                                                                    if let Some(parent) =
+                                                                        full_path.parent()
+                                                                    {
+                                                                        let _ =
+                                                                            std::fs::create_dir_all(
+                                                                                parent,
+                                                                            );
                                                                     }
                                                                     match std::fs::write(
                                                                         &full_path,
@@ -562,15 +571,15 @@ pub(super) fn handle_normal_mode(
                                                                     ) {
                                                                         Ok(_) => {
                                                                             // Stage the file
-                                                                            let rel_path =
-                                                                                resolved
-                                                                                    .relative
-                                                                                    .to_string_lossy()
-                                                                                    .to_string();
-                                                                            let _ = git_ops::stage_file(
-                                                                                &repo_path,
-                                                                                &rel_path,
-                                                                            );
+                                                                            let rel_path = resolved
+                                                                                .relative
+                                                                                .to_string_lossy()
+                                                                                .to_string();
+                                                                            let _ =
+                                                                                git_ops::stage_file(
+                                                                                    &repo_path,
+                                                                                    &rel_path,
+                                                                                );
 
                                                                             let diff = format!(
                                                                                 "Modified: {}",
@@ -578,12 +587,16 @@ pub(super) fn handle_normal_mode(
                                                                                     .modified_areas
                                                                                     .join(", ")
                                                                             );
-                                                                            file_changes
-                                                                                .push((resolved.relative, diff));
+                                                                            file_changes.push((
+                                                                                resolved.relative,
+                                                                                diff,
+                                                                            ));
                                                                         }
                                                                         Err(e) => {
                                                                             // Rollback via git restore
-                                                                            for (path, _) in &file_changes {
+                                                                            for (path, _) in
+                                                                                &file_changes
+                                                                            {
                                                                                 let _ = git_ops::restore_file(&repo_path, path);
                                                                             }
                                                                             let _ = tx_apply.send(
@@ -629,7 +642,9 @@ pub(super) fn handle_normal_mode(
                                                     } else {
                                                         // Single-file fix (original logic)
                                                         let resolved =
-                                                            match resolve_repo_path_allow_new(&repo_path, &fp) {
+                                                            match resolve_repo_path_allow_new(
+                                                                &repo_path, &fp,
+                                                            ) {
                                                                 Ok(resolved) => resolved,
                                                                 Err(e) => {
                                                                     let _ = tx_apply.send(
@@ -680,8 +695,12 @@ pub(super) fn handle_normal_mode(
                                                         .await
                                                         {
                                                             Ok(applied_fix) => {
-                                                                if let Some(parent) = full_path.parent() {
-                                                                    let _ = std::fs::create_dir_all(parent);
+                                                                if let Some(parent) =
+                                                                    full_path.parent()
+                                                                {
+                                                                    let _ = std::fs::create_dir_all(
+                                                                        parent,
+                                                                    );
                                                                 }
                                                                 match std::fs::write(
                                                                     &full_path,
@@ -724,7 +743,11 @@ pub(super) fn handle_normal_mode(
                                                                     }
                                                                     Err(e) => {
                                                                         // Rollback via git restore
-                                                                        let _ = git_ops::restore_file(&repo_path, &rel_path);
+                                                                        let _ =
+                                                                            git_ops::restore_file(
+                                                                                &repo_path,
+                                                                                &rel_path,
+                                                                            );
                                                                         let _ = tx_apply.send(
                                                                             BackgroundMessage::DirectFixError(
                                                                                 format!(
@@ -808,7 +831,9 @@ pub(super) fn handle_normal_mode(
                                                         }
                                                         Err(e) => {
                                                             let _ = tx_fix.send(
-                                                                BackgroundMessage::Error(e.to_string()),
+                                                                BackgroundMessage::Error(
+                                                                    e.to_string(),
+                                                                ),
                                                             );
                                                         }
                                                     }
@@ -836,8 +861,7 @@ pub(super) fn handle_normal_mode(
                                         // Start the ship process
                                         let repo_path = app.repo_path.clone();
                                         let branch_name = app.ship_state.branch_name.clone();
-                                        let commit_message =
-                                            app.ship_state.commit_message.clone();
+                                        let commit_message = app.ship_state.commit_message.clone();
                                         let (pr_title, pr_body) = app.generate_pr_content();
                                         let tx_ship = ctx.tx.clone();
 
@@ -848,9 +872,10 @@ pub(super) fn handle_normal_mode(
                                             "ship_confirm",
                                             async move {
                                                 // Execute ship workflow
-                                                let _ = tx_ship.send(BackgroundMessage::ShipProgress(
-                                                    ShipStep::Committing,
-                                                ));
+                                                let _ =
+                                                    tx_ship.send(BackgroundMessage::ShipProgress(
+                                                        ShipStep::Committing,
+                                                    ));
 
                                                 // Commit (files are already staged)
                                                 if let Err(e) =
@@ -862,9 +887,10 @@ pub(super) fn handle_normal_mode(
                                                     return;
                                                 }
 
-                                                let _ = tx_ship.send(BackgroundMessage::ShipProgress(
-                                                    ShipStep::Pushing,
-                                                ));
+                                                let _ =
+                                                    tx_ship.send(BackgroundMessage::ShipProgress(
+                                                        ShipStep::Pushing,
+                                                    ));
 
                                                 // Push
                                                 if let Err(e) =
@@ -876,15 +902,14 @@ pub(super) fn handle_normal_mode(
                                                     return;
                                                 }
 
-                                                let _ = tx_ship.send(BackgroundMessage::ShipProgress(
-                                                    ShipStep::CreatingPR,
-                                                ));
+                                                let _ =
+                                                    tx_ship.send(BackgroundMessage::ShipProgress(
+                                                        ShipStep::CreatingPR,
+                                                    ));
 
                                                 // Create PR with human-friendly content
                                                 match git_ops::create_pr(
-                                                    &repo_path,
-                                                    &pr_title,
-                                                    &pr_body,
+                                                    &repo_path, &pr_title, &pr_body,
                                                 ) {
                                                     Ok(url) => {
                                                         let _ = tx_ship.send(
@@ -893,7 +918,9 @@ pub(super) fn handle_normal_mode(
                                                     }
                                                     Err(e) => {
                                                         let _ = tx_ship.send(
-                                                            BackgroundMessage::ShipError(e.to_string()),
+                                                            BackgroundMessage::ShipError(
+                                                                e.to_string(),
+                                                            ),
                                                         );
                                                     }
                                                 }

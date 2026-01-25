@@ -12,18 +12,12 @@ pub mod summaries;
 pub use analysis::{analyze_codebase, ask_question};
 pub use client::is_available;
 pub use fix::{
-    generate_fix_content,
-    generate_fix_preview,
-    generate_multi_file_fix,
-    FileInput,
-    FixPreview,
+    generate_fix_content, generate_fix_preview, generate_multi_file_fix, FileInput, FixPreview,
     FixScope,
 };
 pub use models::{Model, Usage};
 pub use review::{fix_review_findings, verify_changes, FixContext, ReviewFinding};
 pub use summaries::{
-    discover_project_context,
-    generate_summaries_for_files,
-    prioritize_files_for_summary,
+    discover_project_context, generate_summaries_for_files, prioritize_files_for_summary,
     SUMMARY_BATCH_SIZE,
 };

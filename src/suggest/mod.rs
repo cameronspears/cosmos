@@ -27,7 +27,6 @@ pub enum SuggestionSource {
     LlmDeep,
 }
 
-
 /// Kind of suggestion
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SuggestionKind {
@@ -75,9 +74,9 @@ pub enum Priority {
 impl Priority {
     pub fn icon(&self) -> char {
         match self {
-            Priority::High => '\u{25CF}',   // 
-            Priority::Medium => '\u{25D0}', // 
-            Priority::Low => '\u{25CB}',    // 
+            Priority::High => '\u{25CF}',   //
+            Priority::Medium => '\u{25D0}', //
+            Priority::Low => '\u{25CB}',    //
         }
     }
 }
@@ -169,7 +168,7 @@ pub struct SuggestionEngine {
 
 impl SuggestionEngine {
     /// Create a new suggestion engine from a codebase index
-    /// 
+    ///
     /// Starts empty - LLM suggestions are generated separately.
     pub fn new(index: CodebaseIndex) -> Self {
         Self {
@@ -217,11 +216,8 @@ impl SuggestionEngine {
 
     /// Sort suggestions with git context: changed files first, then blast radius, then priority.
     pub fn sort_with_context(&mut self, context: &crate::context::WorkContext) {
-        let changed: std::collections::HashSet<PathBuf> = context
-            .all_changed_files()
-            .into_iter()
-            .cloned()
-            .collect();
+        let changed: std::collections::HashSet<PathBuf> =
+            context.all_changed_files().into_iter().cloned().collect();
 
         // “Blast radius” = files that import changed files (and direct deps of changed files).
         let mut blast: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -286,9 +282,18 @@ impl SuggestionEngine {
     pub fn counts(&self) -> SuggestionCounts {
         let active = self.active_suggestions();
         SuggestionCounts {
-            high: active.iter().filter(|s| s.priority == Priority::High).count(),
-            medium: active.iter().filter(|s| s.priority == Priority::Medium).count(),
-            low: active.iter().filter(|s| s.priority == Priority::Low).count(),
+            high: active
+                .iter()
+                .filter(|s| s.priority == Priority::High)
+                .count(),
+            medium: active
+                .iter()
+                .filter(|s| s.priority == Priority::Medium)
+                .count(),
+            low: active
+                .iter()
+                .filter(|s| s.priority == Priority::Low)
+                .count(),
         }
     }
 }
@@ -319,7 +324,7 @@ mod tests {
             "Test suggestion".to_string(),
             SuggestionSource::Static,
         );
-        
+
         assert!(!suggestion.dismissed);
         assert!(!suggestion.applied);
     }

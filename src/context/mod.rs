@@ -105,8 +105,10 @@ fn get_file_statuses(
             }
 
             // Staged changes (in index)
-            if status.is_index_new() || status.is_index_modified() 
-                || status.is_index_deleted() || status.is_index_renamed() 
+            if status.is_index_new()
+                || status.is_index_modified()
+                || status.is_index_deleted()
+                || status.is_index_renamed()
             {
                 staged.push(path.clone());
             }
@@ -141,12 +143,29 @@ fn infer_focus(
 
     // Find common patterns/directories
     let mut dir_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    let mut keyword_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut keyword_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
 
     let focus_keywords = [
-        "auth", "api", "db", "database", "ui", "test", "config", "util",
-        "model", "view", "controller", "service", "handler", "route",
-        "component", "hook", "store", "action", "reducer",
+        "auth",
+        "api",
+        "db",
+        "database",
+        "ui",
+        "test",
+        "config",
+        "util",
+        "model",
+        "view",
+        "controller",
+        "service",
+        "handler",
+        "route",
+        "component",
+        "hook",
+        "store",
+        "action",
+        "reducer",
     ];
 
     for file in &all_files {

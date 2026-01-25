@@ -71,19 +71,19 @@ impl Theme {
 
     /// Refactor badge color
     pub const BADGE_REFACTOR: Color = Self::GREY_200;
-    
+
     /// Quality badge color
     pub const BADGE_QUALITY: Color = Self::GREY_300;
-    
+
     /// Security badge color
     pub const BADGE_SECURITY: Color = Self::GREY_100;
-    
+
     /// Performance badge color
     pub const BADGE_PERF: Color = Self::GREY_300;
-    
+
     /// Documentation badge color
     pub const BADGE_DOCS: Color = Self::GREY_400;
-    
+
     /// Bug badge color
     pub const BADGE_BUG: Color = Self::GREY_100;
 
@@ -92,7 +92,7 @@ impl Theme {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Priority indicators (cosmic)
-    pub const PRIORITY_HIGH: char = '●';   // Full moon - attention
+    pub const PRIORITY_HIGH: char = '●'; // Full moon - attention
 
     // ═══════════════════════════════════════════════════════════════════════
     //  COSMOS UI STRINGS
@@ -100,18 +100,17 @@ impl Theme {
 
     /// The Cosmos header/branding - elegant italic
     pub const COSMOS_LOGO: &'static str = "𝘤 𝘰 𝘴 𝘮 𝘰 𝘴";
-    
+
     /// Section headers - elegant serif style
     pub const SECTION_PROJECT: &'static str = "𝘱𝘳𝘰𝘫𝘦𝘤𝘵";
-    
+
     /// Workflow step labels - italic style
     pub const WORKFLOW_SUGGESTIONS: &'static str = "𝘴𝘶𝘨𝘨𝘦𝘴𝘵𝘪𝘰𝘯𝘴";
     pub const WORKFLOW_VERIFY: &'static str = "𝘷𝘦𝘳𝘪𝘧𝘺";
     pub const WORKFLOW_REVIEW: &'static str = "𝘳𝘦𝘷𝘪𝘦𝘸";
     pub const WORKFLOW_SHIP: &'static str = "𝘴𝘩𝘪𝘱";
-    
+
     /// View mode labels - italic style
     pub const VIEW_FLAT: &'static str = "𝘧𝘭𝘢𝘵";
     pub const VIEW_GROUPED: &'static str = "𝘨𝘳𝘰𝘶𝘱𝘦𝘥";
-
 }

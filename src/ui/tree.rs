@@ -156,11 +156,7 @@ pub(super) fn build_grouped_tree(
                         // Use contextual display name for generic files
                         let name = crate::grouping::display_name_with_context(file_path);
 
-                        entries.push(GroupedTreeEntry::file(
-                            &name,
-                            file_path.clone(),
-                            priority,
-                        ));
+                        entries.push(GroupedTreeEntry::file(&name, file_path.clone(), priority));
                     }
                 }
 
@@ -194,11 +190,7 @@ pub(super) fn build_grouped_tree(
                     // Use contextual display name
                     let name = crate::grouping::display_name_with_context(file_path);
 
-                    entries.push(GroupedTreeEntry::file(
-                        &name,
-                        file_path.clone(),
-                        priority,
-                    ));
+                    entries.push(GroupedTreeEntry::file(&name, file_path.clone(), priority));
                 }
             }
         }

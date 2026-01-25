@@ -42,7 +42,7 @@ fn prompt_budget_per_file(file_count: usize) -> usize {
         return 0;
     }
     let per_file = MAX_MULTI_FILE_EXCERPT_CHARS / file_count;
-    per_file.min(MAX_FIX_EXCERPT_CHARS).max(1)
+    per_file.clamp(1, MAX_FIX_EXCERPT_CHARS)
 }
 
 fn choose_fix_anchor_line(
@@ -191,7 +191,8 @@ fn is_context_limit_error(message: &str) -> bool {
     if msg.contains("context length") || msg.contains("context window") {
         return true;
     }
-    if msg.contains("request too large") || msg.contains("payload too large") || msg.contains("413") {
+    if msg.contains("request too large") || msg.contains("payload too large") || msg.contains("413")
+    {
         return true;
     }
     let has_context = msg.contains("context")
@@ -261,7 +262,11 @@ pub async fn generate_fix_content(
 ) -> anyhow::Result<AppliedFix> {
     let plan_text = format!(
         "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
-        if plan.verified { "CONFIRMED" } else { "UNCONFIRMED" },
+        if plan.verified {
+            "CONFIRMED"
+        } else {
+            "UNCONFIRMED"
+        },
         plan.verification_note,
         plan.description,
         plan.scope.label(),
@@ -281,14 +286,8 @@ pub async fn generate_fix_content(
         ""
     };
 
-    let prompt_content = build_fix_prompt_content(
-        content,
-        path,
-        suggestion,
-        plan,
-        MAX_FIX_EXCERPT_CHARS,
-        true,
-    );
+    let prompt_content =
+        build_fix_prompt_content(content, path, suggestion, plan, MAX_FIX_EXCERPT_CHARS, true);
     let excerpt_guidance = format_excerpt_guidance(prompt_content.note.as_deref());
     let user_full = build_fix_user_prompt(
         path,
@@ -512,7 +511,11 @@ pub async fn generate_multi_file_fix(
 
     let plan_text = format!(
         "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
-        if plan.verified { "CONFIRMED" } else { "UNCONFIRMED" },
+        if plan.verified {
+            "CONFIRMED"
+        } else {
+            "UNCONFIRMED"
+        },
         plan.verification_note,
         plan.description,
         plan.scope.label(),
@@ -630,8 +633,7 @@ pub async fn generate_multi_file_fix(
         }
 
         let context = format!("file {}", file_path.display());
-        let new_content =
-            apply_edits_with_context(&new_content, &file_edit_json.edits, &context)?;
+        let new_content = apply_edits_with_context(&new_content, &file_edit_json.edits, &context)?;
 
         // Preserve whitespace and match trailing newline to original
         let new_content =
@@ -772,8 +774,11 @@ fn select_preview_content(content: &str, suggestion: &Suggestion) -> String {
         return truncate_content(content, MAX_PREVIEW_CHARS);
     }
 
-    let hint_tokens =
-        extract_hint_tokens(&suggestion.summary, suggestion.detail.as_deref(), &suggestion.file);
+    let hint_tokens = extract_hint_tokens(
+        &suggestion.summary,
+        suggestion.detail.as_deref(),
+        &suggestion.file,
+    );
     let anchor_line = choose_preview_anchor_line(&lines, suggestion.line, &hint_tokens);
 
     truncate_content_around_line(content, anchor_line, MAX_PREVIEW_CHARS)
@@ -785,8 +790,7 @@ fn choose_preview_anchor_line(
     suggestion_line: Option<usize>,
     hint_tokens: &[String],
 ) -> usize {
-    let valid_suggestion_line =
-        suggestion_line.filter(|line| *line > 0 && *line <= lines.len());
+    let valid_suggestion_line = suggestion_line.filter(|line| *line > 0 && *line <= lines.len());
 
     if let Some((best_line, best_score)) = find_best_anchor_line(lines, hint_tokens) {
         if let Some(suggested) = valid_suggestion_line {
@@ -933,8 +937,8 @@ fn normalize_hint_tokens(tokens: Vec<String>) -> Vec<String> {
 
 fn extract_backtick_tokens(text: &str) -> Vec<String> {
     let re = regex::Regex::new(r"`([^`]+)`").unwrap_or_else(|_| regex::Regex::new("$^").unwrap());
-    let id_re =
-        regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").unwrap_or_else(|_| regex::Regex::new("$^").unwrap());
+    let id_re = regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*")
+        .unwrap_or_else(|_| regex::Regex::new("$^").unwrap());
     let mut tokens = Vec::new();
     for caps in re.captures_iter(text) {
         let raw = caps.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -946,11 +950,9 @@ fn extract_backtick_tokens(text: &str) -> Vec<String> {
 }
 
 fn extract_identifier_tokens(text: &str) -> Vec<String> {
-    let re =
-        regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").unwrap_or_else(|_| regex::Regex::new("$^").unwrap());
-    re.find_iter(text)
-        .map(|m| m.as_str().to_string())
-        .collect()
+    let re = regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*")
+        .unwrap_or_else(|_| regex::Regex::new("$^").unwrap());
+    re.find_iter(text).map(|m| m.as_str().to_string()).collect()
 }
 
 fn extract_path_tokens(path: &Path) -> Vec<String> {
@@ -958,7 +960,11 @@ fn extract_path_tokens(path: &Path) -> Vec<String> {
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
         tokens.extend(extract_identifier_tokens(stem));
     }
-    if let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
+    if let Some(parent) = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+    {
         tokens.extend(extract_identifier_tokens(parent));
     }
     tokens
@@ -967,14 +973,72 @@ fn extract_path_tokens(path: &Path) -> Vec<String> {
 fn is_stopword(token: &str) -> bool {
     matches!(
         token,
-        "a" | "an" | "the" | "and" | "or" | "but" | "if" | "when" | "while" | "with"
-            | "without" | "for" | "from" | "to" | "of" | "in" | "on" | "at" | "by" | "as"
-            | "is" | "are" | "was" | "were" | "be" | "been" | "being" | "this" | "that"
-            | "these" | "those" | "it" | "its" | "they" | "them" | "their" | "we" | "our"
-            | "you" | "your" | "should" | "could" | "would" | "can" | "may" | "might"
-            | "will" | "do" | "does" | "did" | "done" | "use" | "uses" | "used" | "using"
-            | "file" | "files" | "code" | "system" | "method" | "function" | "module"
-            | "line" | "lines" | "path" | "paths" | "mod"
+        "a" | "an"
+            | "the"
+            | "and"
+            | "or"
+            | "but"
+            | "if"
+            | "when"
+            | "while"
+            | "with"
+            | "without"
+            | "for"
+            | "from"
+            | "to"
+            | "of"
+            | "in"
+            | "on"
+            | "at"
+            | "by"
+            | "as"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "been"
+            | "being"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+            | "it"
+            | "its"
+            | "they"
+            | "them"
+            | "their"
+            | "we"
+            | "our"
+            | "you"
+            | "your"
+            | "should"
+            | "could"
+            | "would"
+            | "can"
+            | "may"
+            | "might"
+            | "will"
+            | "do"
+            | "does"
+            | "did"
+            | "done"
+            | "use"
+            | "uses"
+            | "used"
+            | "using"
+            | "file"
+            | "files"
+            | "code"
+            | "system"
+            | "method"
+            | "function"
+            | "module"
+            | "line"
+            | "lines"
+            | "path"
+            | "paths"
+            | "mod"
     )
 }
 
@@ -1176,8 +1240,13 @@ mod tests {
 
     #[test]
     fn test_choose_preview_anchor_falls_back_to_suggestion_line() {
-        let content = ["line1", "pub struct FileSummary {", "}", "impl CodebaseIndex {"]
-            .join("\n");
+        let content = [
+            "line1",
+            "pub struct FileSummary {",
+            "}",
+            "impl CodebaseIndex {",
+        ]
+        .join("\n");
         let lines: Vec<&str> = content.lines().collect();
         let hint_tokens = vec!["missingtoken".to_string()];
 
@@ -1187,8 +1256,13 @@ mod tests {
 
     #[test]
     fn test_choose_preview_anchor_uses_first_impl_when_missing_suggestion() {
-        let content = ["line1", "pub struct FileSummary {", "}", "impl CodebaseIndex {"]
-            .join("\n");
+        let content = [
+            "line1",
+            "pub struct FileSummary {",
+            "}",
+            "impl CodebaseIndex {",
+        ]
+        .join("\n");
         let lines: Vec<&str> = content.lines().collect();
 
         let line = choose_preview_anchor_line(&lines, None, &[]);
@@ -1202,8 +1276,7 @@ mod tests {
         let suggestion = sample_suggestion(path.to_path_buf());
         let plan = sample_preview(None);
 
-        let prompt =
-            build_fix_prompt_content(content, path, &suggestion, &plan, 200, true);
+        let prompt = build_fix_prompt_content(content, path, &suggestion, &plan, 200, true);
 
         assert_eq!(prompt.content, content);
         assert!(prompt.note.is_none());
@@ -1218,8 +1291,7 @@ mod tests {
         let suggestion = sample_suggestion(path.to_path_buf());
         let plan = sample_preview(Some(150));
 
-        let prompt =
-            build_fix_prompt_content(&content, path, &suggestion, &plan, 200, true);
+        let prompt = build_fix_prompt_content(&content, path, &suggestion, &plan, 200, true);
 
         assert!(prompt.content.chars().count() <= 200);
         let note = prompt.note.expect("expected truncation note");

@@ -19,20 +19,16 @@ use crate::app::messages::BackgroundMessage;
 use crate::app::RuntimeContext;
 use crate::cache;
 use crate::suggest;
-use crate::ui::{App, LoadingState, WorkflowStep};
 use crate::ui;
+use crate::ui::{App, LoadingState, WorkflowStep};
 use crate::util::truncate;
 use futures::FutureExt;
-use std::path::PathBuf;
-use std::sync::mpsc;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
+use std::sync::mpsc;
 
-pub fn drain_messages(
-    app: &mut App,
-    rx: &mpsc::Receiver<BackgroundMessage>,
-    ctx: &RuntimeContext,
-) {
+pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx: &RuntimeContext) {
     while let Ok(msg) = rx.try_recv() {
         match msg {
             BackgroundMessage::SuggestionsReady {
@@ -146,8 +142,7 @@ pub fn drain_messages(
                         spawn_background(ctx.tx.clone(), "suggestions_generation", async move {
                             let mut config = crate::config::Config::load();
                             if let Err(e) = budget_guard.allow_ai(&mut config) {
-                                let _ = tx_suggestions
-                                    .send(BackgroundMessage::SuggestionsError(e));
+                                let _ = tx_suggestions.send(BackgroundMessage::SuggestionsError(e));
                                 return;
                             }
                             let mem = if repo_memory_context.trim().is_empty() {
@@ -175,16 +170,16 @@ pub fn drain_messages(
                                         cache::SuggestionsCache::from_suggestions(&suggestions);
                                     let _ = cache.save_suggestions_cache(&cache_data);
 
-                                    let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
-                                        suggestions,
-                                        usage,
-                                        model: "smart".to_string(),
-                                    });
+                                    let _ =
+                                        tx_suggestions.send(BackgroundMessage::SuggestionsReady {
+                                            suggestions,
+                                            usage,
+                                            model: "smart".to_string(),
+                                        });
                                 }
                                 Err(e) => {
-                                    let _ = tx_suggestions.send(
-                                        BackgroundMessage::SuggestionsError(e.to_string()),
-                                    );
+                                    let _ = tx_suggestions
+                                        .send(BackgroundMessage::SuggestionsError(e.to_string()));
                                 }
                             }
                         });
@@ -352,8 +347,7 @@ pub fn drain_messages(
                             .unwrap_or(None)
                             .unwrap_or_default();
                         let full_path = app.repo_path.join(path);
-                        let new_content =
-                            std::fs::read_to_string(&full_path).unwrap_or_default();
+                        let new_content = std::fs::read_to_string(&full_path).unwrap_or_default();
                         (path.clone(), original, new_content)
                     })
                     .collect();
@@ -378,7 +372,7 @@ pub fn drain_messages(
                     app.show_toast(&e);
                 } else {
                     let tx_verify = ctx.tx.clone();
-                    
+
                     // Build fix context so the reviewer knows what the fix was supposed to do
                     let fix_context = suggest::llm::FixContext {
                         problem_summary: problem_summary.clone(),
@@ -386,9 +380,16 @@ pub fn drain_messages(
                         description: description.clone(),
                         modified_areas: Vec::new(), // Could be extracted from fix response if needed
                     };
-                    
+
                     spawn_background(ctx.tx.clone(), "verification", async move {
-                        match suggest::llm::verify_changes(&files_with_content, 1, &[], Some(&fix_context)).await {
+                        match suggest::llm::verify_changes(
+                            &files_with_content,
+                            1,
+                            &[],
+                            Some(&fix_context),
+                        )
+                        .await
+                        {
                             Ok(review) => {
                                 let _ = tx_verify.send(BackgroundMessage::VerificationComplete {
                                     findings: review.findings,
@@ -452,11 +453,7 @@ pub fn drain_messages(
                 app.loading = LoadingState::None;
                 app.show_toast(&truncate(&e, 100));
             }
-            BackgroundMessage::QuestionResponse {
-                answer,
-                usage,
-                ..
-            } => {
+            BackgroundMessage::QuestionResponse { answer, usage, .. } => {
                 // Track cost (Balanced model for questions)
                 if let Some(u) = usage {
                     let cost = u.calculate_cost(suggest::llm::Model::Balanced);
@@ -560,11 +557,8 @@ pub fn drain_messages(
     }
 }
 
-pub fn spawn_background<F>(
-    tx: mpsc::Sender<BackgroundMessage>,
-    task_name: &'static str,
-    fut: F,
-) where
+pub fn spawn_background<F>(tx: mpsc::Sender<BackgroundMessage>, task_name: &'static str, fut: F)
+where
     F: Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {

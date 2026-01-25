@@ -163,19 +163,36 @@ fn analyze_project_structure(index: &CodebaseIndex) -> String {
     let mut technologies = Vec::new();
     let files: Vec<_> = index.files.keys().collect();
 
-    if files.iter().any(|p| p.extension().map(|e| e == "rs").unwrap_or(false)) {
+    if files
+        .iter()
+        .any(|p| p.extension().map(|e| e == "rs").unwrap_or(false))
+    {
         technologies.push("Rust");
     }
-    if files.iter().any(|p| p.extension().map(|e| e == "ts" || e == "tsx").unwrap_or(false)) {
+    if files.iter().any(|p| {
+        p.extension()
+            .map(|e| e == "ts" || e == "tsx")
+            .unwrap_or(false)
+    }) {
         technologies.push("TypeScript");
     }
-    if files.iter().any(|p| p.extension().map(|e| e == "js" || e == "jsx").unwrap_or(false)) {
+    if files.iter().any(|p| {
+        p.extension()
+            .map(|e| e == "js" || e == "jsx")
+            .unwrap_or(false)
+    }) {
         technologies.push("JavaScript");
     }
-    if files.iter().any(|p| p.extension().map(|e| e == "py").unwrap_or(false)) {
+    if files
+        .iter()
+        .any(|p| p.extension().map(|e| e == "py").unwrap_or(false))
+    {
         technologies.push("Python");
     }
-    if files.iter().any(|p| p.extension().map(|e| e == "go").unwrap_or(false)) {
+    if files
+        .iter()
+        .any(|p| p.extension().map(|e| e == "go").unwrap_or(false))
+    {
         technologies.push("Go");
     }
 
@@ -315,7 +332,8 @@ pub fn prioritize_files_for_summary(
     let mut medium_priority = Vec::new();
     let mut low_priority = Vec::new();
 
-    let changed_files: std::collections::HashSet<_> = context.all_changed_files().into_iter().collect();
+    let changed_files: std::collections::HashSet<_> =
+        context.all_changed_files().into_iter().collect();
 
     for path in files_needing_summary {
         // Check if file is in the index

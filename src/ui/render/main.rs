@@ -985,7 +985,10 @@ fn render_review_content<'a>(
         lines.push(Line::from(vec![
             Span::styled("    ", Style::default()),
             Span::styled(format!("{} ", spinner), Style::default().fg(Theme::WHITE)),
-            Span::styled("Reviewing your changes...", Style::default().fg(Theme::GREY_300)),
+            Span::styled(
+                "Reviewing your changes...",
+                Style::default().fg(Theme::GREY_300),
+            ),
         ]));
         return;
     }
@@ -1078,7 +1081,11 @@ fn render_review_content<'a>(
         // Summary line
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {} issue{} found", total_findings, if total_findings == 1 { "" } else { "s" }),
+                format!(
+                    "  {} issue{} found",
+                    total_findings,
+                    if total_findings == 1 { "" } else { "s" }
+                ),
                 Style::default().fg(Theme::WHITE),
             ),
             if selected_count > 0 {
@@ -1189,10 +1196,10 @@ fn render_review_content<'a>(
             for (i, finding) in state.findings.iter().enumerate().take(remaining_height) {
                 let is_cursor = i == state.cursor;
                 let is_selected = state.selected.contains(&i);
-                
+
                 let indicator = if is_cursor { "›" } else { " " };
                 let checkbox = if is_selected { "×" } else { " " };
-                
+
                 // Truncate title to fit on one line
                 let max_title_len = text_width.saturating_sub(8);
                 let title = if finding.title.len() > max_title_len {
@@ -1208,16 +1215,33 @@ fn render_review_content<'a>(
                 };
 
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {}", indicator), Style::default().fg(if is_cursor { Theme::WHITE } else { Theme::GREY_700 })),
-                    Span::styled(format!("[{}] ", checkbox), Style::default().fg(if is_selected { Theme::GREEN } else { Theme::GREY_600 })),
+                    Span::styled(
+                        format!("  {}", indicator),
+                        Style::default().fg(if is_cursor {
+                            Theme::WHITE
+                        } else {
+                            Theme::GREY_700
+                        }),
+                    ),
+                    Span::styled(
+                        format!("[{}] ", checkbox),
+                        Style::default().fg(if is_selected {
+                            Theme::GREEN
+                        } else {
+                            Theme::GREY_600
+                        }),
+                    ),
                     Span::styled(title, title_style),
                 ]));
             }
-            
+
             // Scroll hint if needed
             if total_findings > remaining_height {
                 lines.push(Line::from(vec![Span::styled(
-                    format!("  ↕ Use ↑↓ to see more ({} hidden)", total_findings - remaining_height),
+                    format!(
+                        "  ↕ Use ↑↓ to see more ({} hidden)",
+                        total_findings - remaining_height
+                    ),
                     Style::default().fg(Theme::GREY_500),
                 )]));
             }

@@ -17,8 +17,8 @@ use crate::index::CodebaseIndex;
 use crate::suggest;
 use crate::suggest::llm::grouping as grouping_llm;
 use crate::suggest::SuggestionEngine;
-use crate::ui::{App, LoadingState};
 use crate::ui;
+use crate::ui::{App, LoadingState};
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
@@ -86,18 +86,12 @@ pub async fn run_tui(
 
     // Optional AI-assisted grouping (safe fallback, low-confidence only)
     let grouping_ai_enabled = true;
-    let mut grouping_ai_cache = cache_manager
-        .load_grouping_ai_cache()
-        .unwrap_or_default();
+    let mut grouping_ai_cache = cache_manager.load_grouping_ai_cache().unwrap_or_default();
     if grouping_ai_cache.normalize_paths(&index.root) {
         let _ = cache_manager.save_grouping_ai_cache(&grouping_ai_cache);
     }
     if grouping_ai_enabled {
-        let overrides = cached_grouping_overrides(
-            &app.grouping,
-            &grouping_ai_cache,
-            &file_hashes,
-        );
+        let overrides = cached_grouping_overrides(&app.grouping, &grouping_ai_cache, &file_hashes);
         if !overrides.is_empty() {
             let grouping = crate::grouping::generate_grouping_with_overrides(&index, &overrides);
             app.apply_grouping_update(grouping);
@@ -105,9 +99,7 @@ pub async fn run_tui(
     }
 
     // Load cached LLM summaries and apply immediately
-    let mut llm_cache = cache_manager
-        .load_llm_summaries_cache()
-        .unwrap_or_default();
+    let mut llm_cache = cache_manager.load_llm_summaries_cache().unwrap_or_default();
     if llm_cache.normalize_paths(&index.root) {
         let _ = cache_manager.save_llm_summaries_cache(&llm_cache);
     }
@@ -187,9 +179,7 @@ pub async fn run_tui(
             // Process chunks sequentially in a single task to avoid cache races
             background::spawn_background(tx.clone(), "grouping_ai", async move {
                 let cache = cache::Cache::new(&cache_path);
-                let mut grouping_cache = cache
-                    .load_grouping_ai_cache()
-                    .unwrap_or_default();
+                let mut grouping_cache = cache.load_grouping_ai_cache().unwrap_or_default();
                 let _ = grouping_cache.normalize_paths(&index_clone.root);
 
                 let mut total_usage = suggest::llm::Usage::default();
@@ -201,8 +191,7 @@ pub async fn run_tui(
                 {
                     let mut config = crate::config::Config::load();
                     if let Err(e) = budget_guard.allow_ai(&mut config) {
-                        let _ = tx_grouping
-                            .send(BackgroundMessage::GroupingEnhanceError(e));
+                        let _ = tx_grouping.send(BackgroundMessage::GroupingEnhanceError(e));
                         return;
                     }
                     match grouping_llm::classify_grouping_candidates(&index_clone, chunk).await {
@@ -306,14 +295,10 @@ pub async fn run_tui(
                 let cache = cache::Cache::new(&cache_path);
 
                 // Load existing cache to update incrementally
-                let mut llm_cache = cache
-                    .load_llm_summaries_cache()
-                    .unwrap_or_default();
+                let mut llm_cache = cache.load_llm_summaries_cache().unwrap_or_default();
 
                 // Load existing glossary to merge new terms into
-                let mut glossary = cache
-                    .load_glossary()
-                    .unwrap_or_default();
+                let mut glossary = cache.load_glossary().unwrap_or_default();
 
                 let mut all_summaries = HashMap::new();
                 let mut total_usage = suggest::llm::Usage::default();
@@ -340,8 +325,7 @@ pub async fn run_tui(
                         let batch_files: Vec<PathBuf> = batch.to_vec();
                         let mut config = crate::config::Config::load();
                         if let Err(e) = budget_guard.allow_ai(&mut config) {
-                            let _ = tx_summaries
-                                .send(BackgroundMessage::SummariesError(e));
+                            let _ = tx_summaries.send(BackgroundMessage::SummariesError(e));
                             return;
                         }
                         match suggest::llm::generate_summaries_for_files(

@@ -140,9 +140,9 @@ impl Config {
 
     /// Save config to disk
     pub fn save(&self) -> Result<(), String> {
-        let dir = Self::config_dir()
-            .ok_or_else(|| "Could not determine config directory".to_string())?;
-        
+        let dir =
+            Self::config_dir().ok_or_else(|| "Could not determine config directory".to_string())?;
+
         fs::create_dir_all(&dir)
             .map_err(|e| format!("Failed to create config directory: {}", e))?;
 
@@ -150,10 +150,13 @@ impl Config {
         {
             use std::os::unix::fs::PermissionsExt;
             if let Err(e) = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)) {
-                eprintln!("  Warning: Failed to set config directory permissions: {}", e);
+                eprintln!(
+                    "  Warning: Failed to set config directory permissions: {}",
+                    e
+                );
             }
         }
-        
+
         let path = dir.join("config.json");
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
@@ -166,10 +169,9 @@ impl Config {
 
         #[cfg(not(unix))]
         {
-            fs::write(&path, content)
-                .map_err(|e| format!("Failed to write config: {}", e))?;
+            fs::write(&path, content).map_err(|e| format!("Failed to write config: {}", e))?;
         }
-        
+
         Ok(())
     }
 
@@ -234,27 +236,19 @@ impl Config {
                 self.openrouter_api_key = None;
                 self.save()
             }
-            Ok(Some(_)) => {
-                Err(
-                    "API key verification failed: stored key doesn't match. \
+            Ok(Some(_)) => Err("API key verification failed: stored key doesn't match. \
                      You can set the OPENROUTER_API_KEY environment variable instead."
-                        .to_string(),
-                )
-            }
-            Ok(None) => {
-                Err(
-                    "API key verification failed: key was not persisted to keychain. \
+                .to_string()),
+            Ok(None) => Err(
+                "API key verification failed: key was not persisted to keychain. \
                      You can set the OPENROUTER_API_KEY environment variable instead."
-                        .to_string(),
-                )
-            }
-            Err(read_err) => {
-                Err(format!(
-                    "API key verification failed: couldn't read back from keychain ({}). \
+                    .to_string(),
+            ),
+            Err(read_err) => Err(format!(
+                "API key verification failed: couldn't read back from keychain ({}). \
                      You can set the OPENROUTER_API_KEY environment variable instead.",
-                    read_err
-                ))
-            }
+                read_err
+            )),
         }
     }
 
@@ -303,7 +297,10 @@ impl Config {
         // Session cost budget
         if let Some(max) = self.max_session_cost_usd {
             if max >= 0.0 && session_cost >= max {
-                return Err(format!("Session budget reached (${:.4}/${:.4})", session_cost, max));
+                return Err(format!(
+                    "Session budget reached (${:.4}/${:.4})",
+                    session_cost, max
+                ));
             }
         }
 
@@ -311,7 +308,10 @@ impl Config {
         self.ensure_daily_rollover();
         if let Some(max_tokens) = self.max_tokens_per_day {
             if self.tokens_used_today >= max_tokens {
-                return Err(format!("Daily token budget reached ({} / {})", self.tokens_used_today, max_tokens));
+                return Err(format!(
+                    "Daily token budget reached ({} / {})",
+                    self.tokens_used_today, max_tokens
+                ));
             }
         }
 
@@ -397,7 +397,10 @@ fn write_config_atomic(path: &std::path::Path, content: &str) -> Result<(), Stri
         .map_err(|e| e.to_string())?;
 
     if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-        eprintln!("  Warning: Failed to set temp config file permissions: {}", e);
+        eprintln!(
+            "  Warning: Failed to set temp config file permissions: {}",
+            e
+        );
     }
 
     file.write_all(content.as_bytes())
@@ -461,6 +464,3 @@ mod tests {
         assert_eq!(third, Ok(Some("updated-key".to_string())));
     }
 }
-
-
-

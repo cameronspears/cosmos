@@ -112,7 +112,6 @@ pub struct IndexCache {
     pub file_hashes: HashMap<PathBuf, String>,
 }
 
-
 /// Cached suggestions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuggestionsCache {
@@ -125,7 +124,8 @@ pub struct SuggestionsCache {
 impl SuggestionsCache {
     /// Create from a list of suggestions
     pub fn from_suggestions(suggestions: &[Suggestion]) -> Self {
-        let files: Vec<PathBuf> = suggestions.iter()
+        let files: Vec<PathBuf> = suggestions
+            .iter()
             .map(|s| s.file.clone())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
@@ -137,7 +137,6 @@ impl SuggestionsCache {
             files,
         }
     }
-
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -216,11 +215,14 @@ impl LlmSummaryCache {
     /// Get summary for a file if valid
     /// Update or insert a summary
     pub fn set_summary(&mut self, path: PathBuf, summary: String, file_hash: String) {
-        self.summaries.insert(path, LlmSummaryEntry {
-            summary,
-            file_hash,
-            generated_at: Utc::now(),
-        });
+        self.summaries.insert(
+            path,
+            LlmSummaryEntry {
+                summary,
+                file_hash,
+                generated_at: Utc::now(),
+            },
+        );
         self.cached_at = Utc::now();
     }
 
@@ -230,8 +232,12 @@ impl LlmSummaryCache {
     }
 
     /// Get all valid summaries as a HashMap for the UI
-    pub fn get_all_valid_summaries(&self, file_hashes: &HashMap<PathBuf, String>) -> HashMap<PathBuf, String> {
-        self.summaries.iter()
+    pub fn get_all_valid_summaries(
+        &self,
+        file_hashes: &HashMap<PathBuf, String>,
+    ) -> HashMap<PathBuf, String> {
+        self.summaries
+            .iter()
             .filter(|(path, _)| {
                 if let Some(current_hash) = file_hashes.get(*path) {
                     self.is_file_valid(path, current_hash)
@@ -244,8 +250,12 @@ impl LlmSummaryCache {
     }
 
     /// Get files that need regeneration (changed or missing)
-    pub fn get_files_needing_summary(&self, file_hashes: &HashMap<PathBuf, String>) -> Vec<PathBuf> {
-        file_hashes.iter()
+    pub fn get_files_needing_summary(
+        &self,
+        file_hashes: &HashMap<PathBuf, String>,
+    ) -> Vec<PathBuf> {
+        file_hashes
+            .iter()
             .filter(|(path, hash)| !self.is_file_valid(path, hash))
             .map(|(path, _)| path.clone())
             .collect()
@@ -373,7 +383,9 @@ impl Default for GroupingAiCache {
 
 /// Compute file hashes for change detection
 pub fn compute_file_hashes(index: &CodebaseIndex) -> HashMap<PathBuf, String> {
-    index.files.iter()
+    index
+        .files
+        .iter()
         .map(|(path, file_index)| {
             // Use a stable content hash when available; fall back for older data.
             let hash = if !file_index.content_hash.is_empty() {
@@ -457,10 +469,13 @@ impl DomainGlossary {
             }
         } else {
             // New term
-            self.terms.insert(name, GlossaryEntry {
-                definition,
-                files: vec![file],
-            });
+            self.terms.insert(
+                name,
+                GlossaryEntry {
+                    definition,
+                    files: vec![file],
+                },
+            );
         }
         self.generated_at = Utc::now();
     }
@@ -489,7 +504,7 @@ impl DomainGlossary {
         }
 
         let mut lines = Vec::new();
-        
+
         // Sort by number of files (most used terms first)
         let mut sorted: Vec<_> = self.terms.iter().collect();
         sorted.sort_by(|a, b| b.1.files.len().cmp(&a.1.files.len()));
@@ -501,7 +516,10 @@ impl DomainGlossary {
         if lines.is_empty() {
             String::new()
         } else {
-            format!("DOMAIN TERMINOLOGY (use these terms, not generic descriptions):\n{}", lines.join("\n"))
+            format!(
+                "DOMAIN TERMINOLOGY (use these terms, not generic descriptions):\n{}",
+                lines.join("\n")
+            )
         }
     }
 
@@ -548,18 +566,18 @@ impl Cache {
     fn ensure_dir(&self) -> anyhow::Result<()> {
         if !self.cache_dir.exists() {
             fs::create_dir_all(&self.cache_dir)?;
-            
+
             // Add to .gitignore if it exists
-            let gitignore = self.cache_dir.parent()
+            let gitignore = self
+                .cache_dir
+                .parent()
                 .map(|p| p.join(".gitignore"))
                 .filter(|p| p.exists());
-            
+
             if let Some(gitignore_path) = gitignore {
                 let content = fs::read_to_string(&gitignore_path)?;
                 if !content.contains(".cosmos") {
-                    let mut file = fs::OpenOptions::new()
-                        .append(true)
-                        .open(&gitignore_path)?;
+                    let mut file = fs::OpenOptions::new().append(true).open(&gitignore_path)?;
                     use std::io::Write;
                     writeln!(file, "\n# Cosmos cache\n.cosmos/")?;
                 }
@@ -758,7 +776,6 @@ impl Cache {
 
         Ok(cleared)
     }
-
 }
 
 /// Reset selected Cosmos cache files for the given repository.
@@ -825,14 +842,21 @@ fn compute_current_hashes(root: &Path) -> anyhow::Result<HashMap<PathBuf, String
 }
 
 fn is_ignored_path(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let ignored = [
-        "target", "node_modules", ".git", ".svn", ".hg",
-        "dist", "build", "__pycache__", ".pytest_cache",
-        "vendor", ".idea", ".vscode", ".cosmos",
+        "target",
+        "node_modules",
+        ".git",
+        ".svn",
+        ".hg",
+        "dist",
+        "build",
+        "__pycache__",
+        ".pytest_cache",
+        "vendor",
+        ".idea",
+        ".vscode",
+        ".cosmos",
     ];
 
     ignored.contains(&name) || name.starts_with('.')
@@ -922,5 +946,3 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 }
-
-

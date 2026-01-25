@@ -25,7 +25,7 @@ pub enum ActivePanel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
     #[default]
-    Flat,    // Traditional flat file list
+    Flat, // Traditional flat file list
     Grouped, // Grouped by layer and feature
 }
 
@@ -134,7 +134,7 @@ pub enum Overlay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShipStep {
     #[default]
-    Confirm,    // Show what will happen
+    Confirm, // Show what will happen
     Committing, // Committing changes
     Pushing,    // Pushing to remote
     CreatingPR, // Creating pull request
@@ -146,9 +146,9 @@ pub enum ShipStep {
 pub enum WorkflowStep {
     #[default]
     Suggestions, // Browse and select suggestions
-    Verify,      // Verify the fix, apply it
-    Review,      // Review applied changes, fix issues
-    Ship,        // Commit, push, create PR
+    Verify, // Verify the fix, apply it
+    Review, // Review applied changes, fix issues
+    Ship,   // Commit, push, create PR
 }
 
 impl WorkflowStep {

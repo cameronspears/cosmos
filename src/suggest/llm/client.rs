@@ -100,10 +100,7 @@ fn parse_retry_after(text: &str) -> Option<u64> {
         // Try to extract a number after "retry"
         let after_retry = &text_lower[pos..];
         for word in after_retry.split_whitespace().skip(1).take(5) {
-            if let Ok(secs) = word
-                .trim_matches(|c: char| !c.is_numeric())
-                .parse::<u64>()
-            {
+            if let Ok(secs) = word.trim_matches(|c: char| !c.is_numeric()).parse::<u64>() {
                 if secs > 0 && secs < 300 {
                     return Some(secs);
                 }
@@ -117,7 +114,11 @@ fn backoff_secs(retry_count: u32) -> u64 {
     let factor = BACKOFF_MULTIPLIER.pow(retry_count.saturating_sub(1));
     let ms = INITIAL_BACKOFF_MS.saturating_mul(factor);
     let secs = ms / 1000;
-    if secs == 0 { 1 } else { secs }
+    if secs == 0 {
+        1
+    } else {
+        secs
+    }
 }
 
 fn is_retryable_network_error(err: &reqwest::Error) -> bool {

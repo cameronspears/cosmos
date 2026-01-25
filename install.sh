@@ -1,79 +1,117 @@
 #!/bin/bash
 set -e
 
-# Cosmos installer - detects your system and installs the right binary
+# Cosmos installer
+# Installs Rust (if needed) and builds cosmos from source
 
 REPO="cameronspears/cosmos"
-INSTALL_DIR="/usr/local/bin"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+print_step() {
+    echo -e "${BLUE}==>${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}!${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}✗${NC} $1"
+}
 
 echo ""
-echo "  Installing cosmos..."
+echo "  ╭─────────────────────────────────────╮"
+echo "  │      Installing cosmos              │"
+echo "  ╰─────────────────────────────────────╯"
 echo ""
 
-# Detect OS and architecture
+# Detect OS
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-ARCH=$(uname -m)
 
 case "$OS" in
-  darwin)
-    # macOS: use the .pkg installer
-    echo "  Detected: macOS"
-    echo ""
-    
-    TMP_DIR=$(mktemp -d)
-    PKG_PATH="$TMP_DIR/cosmos-macos-installer.pkg"
-    
-    echo "  Downloading installer..."
-    curl -fsSL "https://github.com/$REPO/releases/latest/download/cosmos-macos-installer.pkg" -o "$PKG_PATH"
-    
-    echo "  Running installer (you may be prompted for your password)..."
-    sudo installer -pkg "$PKG_PATH" -target /
-    
-    rm -rf "$TMP_DIR"
-    
-    echo ""
-    echo "  Done! Run 'cosmos' in any project folder to get started."
-    echo ""
-    exit 0
-    ;;
-  linux)
-    case "$ARCH" in
-      x86_64) ARTIFACT="cosmos-linux-x64.tar.gz" ;;
-      aarch64) ARTIFACT="cosmos-linux-arm64.tar.gz" ;;
-      *) echo "  Unsupported architecture: $ARCH"; exit 1 ;;
-    esac
-    ;;
-  *)
-    echo "  Unsupported OS: $OS"
-    echo "  Please download manually from: https://github.com/$REPO/releases"
-    exit 1
-    ;;
+    darwin)
+        print_step "Detected macOS"
+        ;;
+    linux)
+        print_step "Detected Linux"
+        ;;
+    *)
+        print_error "Unsupported OS: $OS"
+        echo ""
+        echo "  For Windows, use PowerShell:"
+        echo "  irm https://raw.githubusercontent.com/$REPO/main/install.ps1 | iex"
+        echo ""
+        exit 1
+        ;;
 esac
 
-URL="https://github.com/$REPO/releases/latest/download/$ARTIFACT"
-
-echo "  Detected: $OS ($ARCH)"
-echo ""
-
-# Download and extract
-TMP_DIR=$(mktemp -d)
-cd "$TMP_DIR"
-
-echo "  Downloading..."
-curl -fsSL "$URL" | tar xz
-
-# Install
-echo "  Installing to $INSTALL_DIR..."
-if [ -w "$INSTALL_DIR" ]; then
-  mv cosmos "$INSTALL_DIR/"
+# Check for Rust
+if command -v cargo &> /dev/null; then
+    print_success "Rust is already installed"
+    RUST_VERSION=$(rustc --version)
+    echo "     $RUST_VERSION"
 else
-  sudo mv cosmos "$INSTALL_DIR/"
+    print_step "Rust is not installed. Installing now..."
+    echo ""
+    echo "  Rust is the programming language cosmos is built with."
+    echo "  This installation is safe and can be removed later with 'rustup self uninstall'."
+    echo ""
+    
+    # Install rustup
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    
+    # Source the cargo environment
+    source "$HOME/.cargo/env"
+    
+    if command -v cargo &> /dev/null; then
+        print_success "Rust installed successfully"
+    else
+        print_error "Failed to install Rust"
+        echo ""
+        echo "  Please install Rust manually: https://rustup.rs"
+        echo "  Then run this script again."
+        echo ""
+        exit 1
+    fi
 fi
 
-# Cleanup
-cd - > /dev/null
-rm -rf "$TMP_DIR"
+echo ""
+print_step "Installing cosmos from crates.io..."
+echo ""
+echo "  This compiles cosmos for your system. It may take a few minutes."
+echo ""
+
+# Install cosmos via cargo
+# Using --locked to ensure reproducible builds when Cargo.lock is present
+if cargo install cosmos-tui 2>&1; then
+    print_success "cosmos installed successfully!"
+else
+    # If crates.io install fails, try from git
+    print_warning "crates.io install failed, trying from GitHub..."
+    cargo install --git "https://github.com/$REPO" --locked
+    print_success "cosmos installed successfully!"
+fi
 
 echo ""
-echo "  Done! Run 'cosmos' in any project folder to get started."
+echo "  ╭─────────────────────────────────────╮"
+echo "  │      Installation complete!         │"
+echo "  ╰─────────────────────────────────────╯"
+echo ""
+echo "  To get started:"
+echo ""
+echo "    1. Open a terminal in your project folder"
+echo "    2. Run: cosmos"
+echo ""
+echo "  If 'cosmos' is not found, restart your terminal or run:"
+echo "    source ~/.cargo/env"
 echo ""

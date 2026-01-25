@@ -713,7 +713,10 @@ impl App {
 
     /// Show inquiry response in the right panel (Ask Cosmos mode)
     pub fn show_inquiry(&mut self, response: String) {
-        self.ask_cosmos_state = Some(AskCosmosState { response, scroll: 0 });
+        self.ask_cosmos_state = Some(AskCosmosState {
+            response,
+            scroll: 0,
+        });
     }
 
     /// Exit ask cosmos mode and return to suggestions
@@ -767,7 +770,7 @@ impl App {
         if !mem.trim().is_empty() {
             preview.push_str("\nRepo memory (sample):\n");
             preview.push_str(&mem);
-            preview.push_str("\n");
+            preview.push('\n');
         }
 
         self.overlay = Overlay::InquiryPreview {

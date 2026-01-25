@@ -10,7 +10,7 @@ use super::{CodebaseGrouping, Layer};
 use crate::index::{CodebaseIndex, Dependency, FileIndex, SymbolKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::{Path, Component};
+use std::path::{Component, Path};
 
 /// Confidence level for layer detection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -32,15 +32,24 @@ pub struct LayerDetection {
 
 impl LayerDetection {
     pub fn high(layer: Layer) -> Self {
-        Self { layer, confidence: Confidence::High }
+        Self {
+            layer,
+            confidence: Confidence::High,
+        }
     }
-    
+
     pub fn medium(layer: Layer) -> Self {
-        Self { layer, confidence: Confidence::Medium }
+        Self {
+            layer,
+            confidence: Confidence::Medium,
+        }
     }
-    
+
     pub fn low(layer: Layer) -> Self {
-        Self { layer, confidence: Confidence::Low }
+        Self {
+            layer,
+            confidence: Confidence::Low,
+        }
     }
 }
 
@@ -121,7 +130,9 @@ pub fn detect_layer_with_confidence(path: &Path, file_index: &FileIndex) -> Laye
 fn has_path_segment(path: &Path, segment: &str) -> bool {
     path.components().any(|c| {
         if let Component::Normal(s) = c {
-            s.to_str().map(|s| s.eq_ignore_ascii_case(segment)).unwrap_or(false)
+            s.to_str()
+                .map(|s| s.eq_ignore_ascii_case(segment))
+                .unwrap_or(false)
         } else {
             false
         }
@@ -148,21 +159,24 @@ fn path_segments(path: &Path) -> Vec<String> {
 
 /// Check if file is a test file
 fn is_test_file(path: &Path) -> bool {
-    let filename = path.file_name()
+    let filename = path
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_lowercase();
 
     // Test directory patterns (using segment matching)
-    if has_any_path_segment(path, &["test", "tests", "__tests__", "spec", "specs", "__test__"]) {
+    if has_any_path_segment(
+        path,
+        &["test", "tests", "__tests__", "spec", "specs", "__test__"],
+    ) {
         return true;
     }
 
     // Test file patterns
     let test_patterns = [
-        ".test.", ".spec.", "_test.", "_spec.",
-        ".test", ".spec",  // End patterns
-        "test_", "spec_",  // Start patterns
+        ".test.", ".spec.", "_test.", "_spec.", ".test", ".spec", // End patterns
+        "test_", "spec_", // Start patterns
     ];
     if test_patterns.iter().any(|p| filename.contains(p)) {
         return true;
@@ -175,20 +189,41 @@ fn is_test_file(path: &Path) -> bool {
 
 /// Check if file is a config file
 fn is_config_file(path: &Path) -> bool {
-    let filename = path.file_name()
+    let filename = path
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_lowercase();
 
     let config_patterns = [
-        "config.", "configuration.", ".config.", ".conf",
-        "settings.", ".env", "environment.",
-        "tsconfig", "jsconfig", "webpack.config", "vite.config",
-        "next.config", "nuxt.config", "svelte.config",
-        "tailwind.config", "postcss.config", "babel.config",
-        "eslint", "prettier", ".eslintrc", ".prettierrc",
-        "cargo.toml", "package.json", "pyproject.toml", "go.mod",
-        "makefile", "rakefile", "gemfile",
+        "config.",
+        "configuration.",
+        ".config.",
+        ".conf",
+        "settings.",
+        ".env",
+        "environment.",
+        "tsconfig",
+        "jsconfig",
+        "webpack.config",
+        "vite.config",
+        "next.config",
+        "nuxt.config",
+        "svelte.config",
+        "tailwind.config",
+        "postcss.config",
+        "babel.config",
+        "eslint",
+        "prettier",
+        ".eslintrc",
+        ".prettierrc",
+        "cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "makefile",
+        "rakefile",
+        "gemfile",
     ];
 
     config_patterns.iter().any(|p| filename.contains(p))
@@ -196,16 +231,28 @@ fn is_config_file(path: &Path) -> bool {
 
 /// Check if file is infrastructure-related
 fn is_infra_file(path: &Path) -> bool {
-    let filename = path.file_name()
+    let filename = path
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_lowercase();
 
     // Infra directories (using segment matching)
     let infra_dirs = [
-        ".github", ".gitlab", ".circleci", "ci", "cd",
-        "docker", "k8s", "kubernetes", "terraform",
-        "ansible", "scripts", "bin", "deploy", "infra",
+        ".github",
+        ".gitlab",
+        ".circleci",
+        "ci",
+        "cd",
+        "docker",
+        "k8s",
+        "kubernetes",
+        "terraform",
+        "ansible",
+        "scripts",
+        "bin",
+        "deploy",
+        "infra",
     ];
     if has_any_path_segment(path, &infra_dirs) {
         return true;
@@ -213,8 +260,12 @@ fn is_infra_file(path: &Path) -> bool {
 
     // Infra file patterns
     let infra_patterns = [
-        "dockerfile", "docker-compose", ".dockerignore",
-        "jenkinsfile", ".travis", "cloudbuild",
+        "dockerfile",
+        "docker-compose",
+        ".dockerignore",
+        "jenkinsfile",
+        ".travis",
+        "cloudbuild",
     ];
     if infra_patterns.iter().any(|p| filename.contains(p)) {
         return true;
@@ -231,21 +282,25 @@ fn is_infra_file(path: &Path) -> bool {
 
 /// Detect layer based on file naming patterns (most specific)
 fn detect_by_file_pattern(path: &Path) -> Option<Layer> {
-    let original_filename = path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let original_filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let filename = original_filename.to_lowercase();
 
     // === API patterns (check first - most specific) ===
     // Framework-specific route files
     let api_file_patterns = [
-        "route.ts", "route.js", "route.tsx", "route.jsx",
-        "+server.ts", "+server.js", "+page.server.ts", "+page.server.js",
+        "route.ts",
+        "route.js",
+        "route.tsx",
+        "route.jsx",
+        "+server.ts",
+        "+server.js",
+        "+page.server.ts",
+        "+page.server.js",
     ];
     if api_file_patterns.iter().any(|p| filename == *p) {
         return Some(Layer::Api);
     }
-    
+
     // API naming patterns
     let api_patterns = [".api.", "api.", "endpoint.", "handler."];
     if api_patterns.iter().any(|p| filename.contains(p)) {
@@ -254,9 +309,20 @@ fn detect_by_file_pattern(path: &Path) -> Option<Layer> {
 
     // === Backend patterns ===
     let backend_patterns = [
-        "service.", ".service.", "controller.", ".controller.",
-        "middleware.", ".middleware.", "resolver.", ".resolver.",
-        "worker.", ".worker.", "job.", ".job.", "queue.", ".queue.",
+        "service.",
+        ".service.",
+        "controller.",
+        ".controller.",
+        "middleware.",
+        ".middleware.",
+        "resolver.",
+        ".resolver.",
+        "worker.",
+        ".worker.",
+        "job.",
+        ".job.",
+        "queue.",
+        ".queue.",
     ];
     if backend_patterns.iter().any(|p| filename.contains(p)) {
         return Some(Layer::Backend);
@@ -264,10 +330,22 @@ fn detect_by_file_pattern(path: &Path) -> Option<Layer> {
 
     // === Database patterns ===
     let db_patterns = [
-        "model.", ".model.", "entity.", ".entity.",
-        "schema.", ".schema.", "migration.", ".migration.",
-        "repository.", ".repository.", "dao.", ".dao.",
-        "seed.", ".seed.", "query.", ".query.",
+        "model.",
+        ".model.",
+        "entity.",
+        ".entity.",
+        "schema.",
+        ".schema.",
+        "migration.",
+        ".migration.",
+        "repository.",
+        ".repository.",
+        "dao.",
+        ".dao.",
+        "seed.",
+        ".seed.",
+        "query.",
+        ".query.",
     ];
     if db_patterns.iter().any(|p| filename.contains(p)) {
         return Some(Layer::Database);
@@ -275,18 +353,33 @@ fn detect_by_file_pattern(path: &Path) -> Option<Layer> {
 
     // === Shared patterns ===
     let shared_patterns = [
-        "types.", ".types.", "type.", ".type.",
-        "util.", ".util.", "utils.", ".utils.",
-        "helper.", ".helper.", "helpers.", ".helpers.",
-        "constant.", ".constant.", "constants.", ".constants.",
-        "interface.", ".interface.", "interfaces.", ".interfaces.",
+        "types.",
+        ".types.",
+        "type.",
+        ".type.",
+        "util.",
+        ".util.",
+        "utils.",
+        ".utils.",
+        "helper.",
+        ".helper.",
+        "helpers.",
+        ".helpers.",
+        "constant.",
+        ".constant.",
+        "constants.",
+        ".constants.",
+        "interface.",
+        ".interface.",
+        "interfaces.",
+        ".interfaces.",
     ];
     if shared_patterns.iter().any(|p| filename.contains(p)) {
         return Some(Layer::Shared);
     }
 
     // === Frontend patterns ===
-    
+
     // React hooks pattern - "use" followed by uppercase letter
     if original_filename.len() > 3 {
         let chars: Vec<char> = original_filename.chars().collect();
@@ -305,13 +398,20 @@ fn detect_by_file_pattern(path: &Path) -> Option<Layer> {
 
     // Component/page/layout patterns
     let frontend_file_patterns = [
-        "component.", ".component.",
-        "page.", ".page.",
-        "layout.", ".layout.",
-        "hook.", ".hook.",
-        "context.", ".context.",
-        "provider.", ".provider.",
-        "store.", ".store.",
+        "component.",
+        ".component.",
+        "page.",
+        ".page.",
+        "layout.",
+        ".layout.",
+        "hook.",
+        ".hook.",
+        "context.",
+        ".context.",
+        "provider.",
+        ".provider.",
+        "store.",
+        ".store.",
     ];
     if frontend_file_patterns.iter().any(|p| filename.contains(p)) {
         return Some(Layer::Frontend);
@@ -319,7 +419,10 @@ fn detect_by_file_pattern(path: &Path) -> Option<Layer> {
 
     // Style files
     let style_extensions = [".css", ".scss", ".sass", ".less", ".styled."];
-    if style_extensions.iter().any(|e| filename.ends_with(e) || filename.contains(e)) {
+    if style_extensions
+        .iter()
+        .any(|e| filename.ends_with(e) || filename.contains(e))
+    {
         return Some(Layer::Frontend);
     }
 
@@ -343,7 +446,7 @@ fn detect_by_file_pattern(path: &Path) -> Option<Layer> {
 /// Detect layer based on symbol analysis
 fn detect_by_symbols(file_index: &FileIndex) -> Option<Layer> {
     let symbols = &file_index.symbols;
-    
+
     if symbols.is_empty() {
         return None;
     }
@@ -356,7 +459,7 @@ fn detect_by_symbols(file_index: &FileIndex) -> Option<Layer> {
 
     for symbol in symbols {
         let name_lower = symbol.name.to_lowercase();
-        
+
         // React components (PascalCase functions/classes returning JSX)
         if matches!(symbol.kind, SymbolKind::Function | SymbolKind::Class) {
             let first_char = symbol.name.chars().next().unwrap_or('a');
@@ -364,7 +467,7 @@ fn detect_by_symbols(file_index: &FileIndex) -> Option<Layer> {
                 has_component = true;
             }
         }
-        
+
         // Hooks
         if name_lower.starts_with("use") && name_lower.len() > 3 {
             let fourth_char = symbol.name.chars().nth(3).unwrap_or('a');
@@ -372,13 +475,16 @@ fn detect_by_symbols(file_index: &FileIndex) -> Option<Layer> {
                 has_hook = true;
             }
         }
-        
+
         // Handler patterns
-        if name_lower.contains("handler") || name_lower.contains("controller")
-            || name_lower.starts_with("handle") || name_lower.starts_with("on_") {
+        if name_lower.contains("handler")
+            || name_lower.contains("controller")
+            || name_lower.starts_with("handle")
+            || name_lower.starts_with("on_")
+        {
             has_handler = true;
         }
-        
+
         // Model/Entity patterns
         if matches!(symbol.kind, SymbolKind::Struct | SymbolKind::Class)
             && (name_lower.contains("model")
@@ -410,18 +516,37 @@ fn detect_by_symbols(file_index: &FileIndex) -> Option<Layer> {
 /// Detect layer based on directory structure using path segment matching
 fn detect_by_directory_segments(path: &Path) -> Option<Layer> {
     let segments = path_segments(path);
-    
+
     // Check for API first (before frontend, since app/api should be API not Frontend)
-    let api_segments = ["api", "routes", "endpoints", "rest", "graphql", "trpc", "rpc"];
+    let api_segments = [
+        "api",
+        "routes",
+        "endpoints",
+        "rest",
+        "graphql",
+        "trpc",
+        "rpc",
+    ];
     if segments.iter().any(|s| api_segments.contains(&s.as_str())) {
         return Some(Layer::Api);
     }
 
     // Database directories
     let db_segments = [
-        "models", "model", "entities", "entity",
-        "schemas", "schema", "migrations", "db", "database",
-        "repositories", "repository", "dao", "prisma", "drizzle",
+        "models",
+        "model",
+        "entities",
+        "entity",
+        "schemas",
+        "schema",
+        "migrations",
+        "db",
+        "database",
+        "repositories",
+        "repository",
+        "dao",
+        "prisma",
+        "drizzle",
     ];
     if segments.iter().any(|s| db_segments.contains(&s.as_str())) {
         return Some(Layer::Database);
@@ -429,26 +554,55 @@ fn detect_by_directory_segments(path: &Path) -> Option<Layer> {
 
     // Backend directories
     let backend_segments = [
-        "server", "backend", "services", "service",
-        "handlers", "controllers", "middleware",
-        "core", "domain", "business", "logic",
-        "jobs", "workers", "queues",
+        "server",
+        "backend",
+        "services",
+        "service",
+        "handlers",
+        "controllers",
+        "middleware",
+        "core",
+        "domain",
+        "business",
+        "logic",
+        "jobs",
+        "workers",
+        "queues",
     ];
-    if segments.iter().any(|s| backend_segments.contains(&s.as_str())) {
+    if segments
+        .iter()
+        .any(|s| backend_segments.contains(&s.as_str()))
+    {
         return Some(Layer::Backend);
     }
 
     // Frontend directories (check after API/Backend to avoid app/api conflicts)
     let frontend_segments = [
-        "components", "pages", "views", "layouts", "templates",
-        "client", "frontend", "web",
-        "ui", "styles", "css", "assets", "public",
-        "hooks", "contexts", "providers", "stores",
+        "components",
+        "pages",
+        "views",
+        "layouts",
+        "templates",
+        "client",
+        "frontend",
+        "web",
+        "ui",
+        "styles",
+        "css",
+        "assets",
+        "public",
+        "hooks",
+        "contexts",
+        "providers",
+        "stores",
     ];
-    if segments.iter().any(|s| frontend_segments.contains(&s.as_str())) {
+    if segments
+        .iter()
+        .any(|s| frontend_segments.contains(&s.as_str()))
+    {
         return Some(Layer::Frontend);
     }
-    
+
     // Special handling for "app" directory (Next.js, etc.)
     // Only treat as frontend if no API/backend signals
     if segments.contains(&"app".to_string()) {
@@ -457,10 +611,21 @@ fn detect_by_directory_segments(path: &Path) -> Option<Layer> {
 
     // Shared directories
     let shared_segments = [
-        "shared", "common", "lib", "libs", "utils", "util",
-        "helpers", "types", "interfaces", "constants",
+        "shared",
+        "common",
+        "lib",
+        "libs",
+        "utils",
+        "util",
+        "helpers",
+        "types",
+        "interfaces",
+        "constants",
     ];
-    if segments.iter().any(|s| shared_segments.contains(&s.as_str())) {
+    if segments
+        .iter()
+        .any(|s| shared_segments.contains(&s.as_str()))
+    {
         return Some(Layer::Shared);
     }
 
@@ -469,7 +634,8 @@ fn detect_by_directory_segments(path: &Path) -> Option<Layer> {
 
 /// Detect layer based on import analysis
 fn detect_by_imports(dependencies: &[Dependency]) -> Option<Layer> {
-    let imports: HashSet<&str> = dependencies.iter()
+    let imports: HashSet<&str> = dependencies
+        .iter()
         .filter(|d| d.is_external)
         .map(|d| d.import_path.as_str())
         .collect();
@@ -480,43 +646,104 @@ fn detect_by_imports(dependencies: &[Dependency]) -> Option<Layer> {
 
     // Frontend framework imports
     let frontend_imports = [
-        "react", "react-dom", "vue", "svelte", "solid-js", "preact",
-        "@angular", "next", "nuxt", "astro", "@remix-run",
-        "styled-components", "@emotion", "tailwindcss",
-        "@tanstack/react-query", "swr", "zustand", "jotai", "recoil",
-        "@radix-ui", "@headlessui", "framer-motion",
+        "react",
+        "react-dom",
+        "vue",
+        "svelte",
+        "solid-js",
+        "preact",
+        "@angular",
+        "next",
+        "nuxt",
+        "astro",
+        "@remix-run",
+        "styled-components",
+        "@emotion",
+        "tailwindcss",
+        "@tanstack/react-query",
+        "swr",
+        "zustand",
+        "jotai",
+        "recoil",
+        "@radix-ui",
+        "@headlessui",
+        "framer-motion",
     ];
-    
-    let frontend_score: usize = imports.iter()
+
+    let frontend_score: usize = imports
+        .iter()
         .filter(|i| frontend_imports.iter().any(|f| i.starts_with(f)))
         .count();
 
     // Backend framework imports
     let backend_imports = [
-        "express", "fastify", "koa", "hono", "elysia",
-        "nestjs", "@nestjs", "trpc", "@trpc",
-        "actix", "actix-web", "axum", "rocket", "warp", "tower",
-        "flask", "django", "fastapi", "starlette", "aiohttp",
-        "gin", "echo", "fiber", "chi",
-        "bull", "agenda", "bee-queue", // Job queues
+        "express",
+        "fastify",
+        "koa",
+        "hono",
+        "elysia",
+        "nestjs",
+        "@nestjs",
+        "trpc",
+        "@trpc",
+        "actix",
+        "actix-web",
+        "axum",
+        "rocket",
+        "warp",
+        "tower",
+        "flask",
+        "django",
+        "fastapi",
+        "starlette",
+        "aiohttp",
+        "gin",
+        "echo",
+        "fiber",
+        "chi",
+        "bull",
+        "agenda",
+        "bee-queue", // Job queues
     ];
-    
-    let backend_score: usize = imports.iter()
+
+    let backend_score: usize = imports
+        .iter()
         .filter(|i| backend_imports.iter().any(|b| i.starts_with(b)))
         .count();
 
     // Database imports
     let db_imports = [
-        "prisma", "@prisma", "drizzle", "drizzle-orm",
-        "typeorm", "sequelize", "knex",
-        "mongoose", "mongodb", "pg", "mysql", "mysql2", "sqlite", "sqlite3",
-        "sqlx", "diesel", "sea-orm", "tokio-postgres",
-        "sqlalchemy", "peewee", "tortoise", "databases",
-        "gorm", "ent", "bun",
-        "redis", "ioredis", // Cache/data stores
+        "prisma",
+        "@prisma",
+        "drizzle",
+        "drizzle-orm",
+        "typeorm",
+        "sequelize",
+        "knex",
+        "mongoose",
+        "mongodb",
+        "pg",
+        "mysql",
+        "mysql2",
+        "sqlite",
+        "sqlite3",
+        "sqlx",
+        "diesel",
+        "sea-orm",
+        "tokio-postgres",
+        "sqlalchemy",
+        "peewee",
+        "tortoise",
+        "databases",
+        "gorm",
+        "ent",
+        "bun",
+        "redis",
+        "ioredis", // Cache/data stores
     ];
-    
-    let db_score: usize = imports.iter()
+
+    let db_score: usize = imports
+        .iter()
         .filter(|i| db_imports.iter().any(|d| i.starts_with(d)))
         .count();
 
@@ -540,9 +767,7 @@ fn detect_by_imports(dependencies: &[Dependency]) -> Option<Layer> {
 fn detect_by_language_conventions(path: &Path, file_index: &FileIndex) -> Layer {
     use crate::index::Language;
 
-    let filename = path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
     match file_index.language {
         Language::Rust => {
@@ -551,12 +776,13 @@ fn detect_by_language_conventions(path: &Path, file_index: &FileIndex) -> Layer 
                 Layer::Backend
             } else if filename == "mod.rs" {
                 // Look at parent directory
-                let parent = path.parent()
+                let parent = path
+                    .parent()
                     .and_then(|p| p.file_name())
                     .and_then(|n| n.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-                
+
                 if ["api", "routes", "handlers"].contains(&parent.as_str()) {
                     Layer::Api
                 } else if ["models", "db", "schema", "entities"].contains(&parent.as_str()) {

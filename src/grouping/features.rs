@@ -20,10 +20,10 @@ pub fn detect_features(grouping: &mut CodebaseGrouping, index: &CodebaseIndex) {
 
             // Detect features using multiple strategies
             let features = detect_layer_features(&files, index, *layer);
-            
+
             // Clear ungrouped and reassign to features
             group.ungrouped_files.clear();
-            
+
             for feature in features {
                 for file in &feature.files {
                     // Update the file assignment
@@ -45,18 +45,18 @@ const MIN_GROUP_SIZE_GENERIC: usize = 2;
 
 /// Generic filenames that shouldn't form single-file features
 const GENERIC_FILES: &[&str] = &[
-    "index", "mod", "lib", "main", "app", "page", "layout",
-    "route", "server", "+page", "+layout", "+server",
-    "__init__", "views", "models", "urls",
+    "index", "mod", "lib", "main", "app", "page", "layout", "route", "server", "+page", "+layout",
+    "+server", "__init__", "views", "models", "urls",
 ];
 
 /// Check if a file has a meaningful name (not generic)
 fn is_named_file(path: &Path) -> bool {
-    let stem = path.file_stem()
+    let stem = path
+        .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
-    
+
     // Remove common suffixes
     let clean_stem = stem
         .trim_end_matches(".test")
@@ -65,7 +65,7 @@ fn is_named_file(path: &Path) -> bool {
         .trim_end_matches(".controller")
         .trim_end_matches(".model")
         .trim_end_matches(".component");
-    
+
     !GENERIC_FILES.contains(&clean_stem)
 }
 
@@ -76,7 +76,7 @@ fn extract_feature_name(path: &Path, index: &CodebaseIndex) -> Option<String> {
         let purpose = &file_index.summary.purpose;
         // Extract key words from purpose
         let purpose_lower = purpose.to_lowercase();
-        
+
         // Skip generic purposes
         let generic_purposes = ["module", "file", "code", "script", "utility"];
         if !generic_purposes.iter().any(|g| purpose_lower.contains(g)) {
@@ -86,7 +86,7 @@ fn extract_feature_name(path: &Path, index: &CodebaseIndex) -> Option<String> {
             }
         }
     }
-    
+
     // Second try: use filename stem if meaningful
     let stem = path.file_stem()?.to_str()?;
     let clean_name = stem
@@ -97,17 +97,17 @@ fn extract_feature_name(path: &Path, index: &CodebaseIndex) -> Option<String> {
         .trim_end_matches(".model")
         .trim_end_matches(".component")
         .trim_end_matches(".hook");
-    
+
     // Split by separators and get first meaningful part
     let parts: Vec<&str> = clean_name
         .split(['-', '_', '.'])
         .filter(|p| !p.is_empty())
         .collect();
-    
+
     if parts.is_empty() {
         return None;
     }
-    
+
     // Use first meaningful part
     let first = parts[0].to_lowercase();
     if GENERIC_FILES.iter().any(|g| first == *g) || first.len() < 3 {
@@ -116,7 +116,7 @@ fn extract_feature_name(path: &Path, index: &CodebaseIndex) -> Option<String> {
         }
         return None;
     }
-    
+
     Some(first)
 }
 
@@ -124,25 +124,43 @@ fn extract_feature_name(path: &Path, index: &CodebaseIndex) -> Option<String> {
 fn extract_purpose_keyword(purpose: &str) -> Option<String> {
     // Look for common patterns like "handles X", "manages Y", "X service"
     let words: Vec<&str> = purpose.split_whitespace().collect();
-    
+
     for word in words.iter() {
         let w = word.trim_matches(|c: char| !c.is_alphanumeric());
-        
+
         // Skip common verbs and articles
         let skip_words = [
-            "the", "a", "an", "is", "are", "was", "were", "be", "been",
-            "handles", "manages", "provides", "contains", "defines",
-            "implements", "exports", "imports", "for", "with", "and", "or",
+            "the",
+            "a",
+            "an",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "handles",
+            "manages",
+            "provides",
+            "contains",
+            "defines",
+            "implements",
+            "exports",
+            "imports",
+            "for",
+            "with",
+            "and",
+            "or",
         ];
-        
+
         if skip_words.contains(&w) || w.len() < 3 {
             continue;
         }
-        
+
         // Found a good word
         return Some(w.to_string());
     }
-    
+
     None
 }
 
@@ -161,11 +179,12 @@ fn detect_layer_features(files: &[PathBuf], index: &CodebaseIndex, layer: Layer)
     }
 
     // Strategy 2: Group by file purpose (semantic grouping)
-    let remaining: Vec<_> = files.iter()
+    let remaining: Vec<_> = files
+        .iter()
         .filter(|f| !assigned.contains(*f))
         .cloned()
         .collect();
-    
+
     let purpose_features = group_by_purpose(&remaining, index);
     for feature in purpose_features {
         for file in &feature.files {
@@ -175,11 +194,12 @@ fn detect_layer_features(files: &[PathBuf], index: &CodebaseIndex, layer: Layer)
     }
 
     // Strategy 3: Cluster by dependency relationships
-    let remaining: Vec<_> = files.iter()
+    let remaining: Vec<_> = files
+        .iter()
         .filter(|f| !assigned.contains(*f))
         .cloned()
         .collect();
-    
+
     let dep_features = detect_dependency_clusters(&remaining, index);
     for feature in dep_features {
         for file in &feature.files {
@@ -189,11 +209,12 @@ fn detect_layer_features(files: &[PathBuf], index: &CodebaseIndex, layer: Layer)
     }
 
     // Strategy 4: Group by immediate parent directory
-    let remaining: Vec<_> = files.iter()
+    let remaining: Vec<_> = files
+        .iter()
         .filter(|f| !assigned.contains(*f))
         .cloned()
         .collect();
-    
+
     let parent_features = group_by_parent_directory(&remaining);
     for feature in parent_features {
         for file in &feature.files {
@@ -203,11 +224,12 @@ fn detect_layer_features(files: &[PathBuf], index: &CodebaseIndex, layer: Layer)
     }
 
     // Strategy 5: Cluster by naming patterns
-    let remaining: Vec<_> = files.iter()
+    let remaining: Vec<_> = files
+        .iter()
         .filter(|f| !assigned.contains(*f))
         .cloned()
         .collect();
-    
+
     let name_features = detect_naming_clusters(&remaining, index);
     for feature in name_features {
         for file in &feature.files {
@@ -217,11 +239,12 @@ fn detect_layer_features(files: &[PathBuf], index: &CodebaseIndex, layer: Layer)
     }
 
     // Strategy 6: Create single-file features for named files
-    let remaining: Vec<_> = files.iter()
+    let remaining: Vec<_> = files
+        .iter()
         .filter(|f| !assigned.contains(*f))
         .cloned()
         .collect();
-    
+
     let single_features = create_single_file_features(&remaining, index);
     for feature in single_features {
         for file in &feature.files {
@@ -231,11 +254,12 @@ fn detect_layer_features(files: &[PathBuf], index: &CodebaseIndex, layer: Layer)
     }
 
     // Handle remaining files - only create misc if small enough
-    let still_remaining: Vec<_> = files.iter()
+    let still_remaining: Vec<_> = files
+        .iter()
         .filter(|f| !assigned.contains(*f))
         .cloned()
         .collect();
-    
+
     if !still_remaining.is_empty() {
         if still_remaining.len() <= MAX_MISC_FILES {
             let other_name = get_misc_name(layer);
@@ -256,14 +280,14 @@ fn detect_layer_features(files: &[PathBuf], index: &CodebaseIndex, layer: Layer)
             _ => b.files.len().cmp(&a.files.len()),
         }
     });
-    
+
     features
 }
 
 /// Group files by their semantic purpose
 fn group_by_purpose(files: &[PathBuf], index: &CodebaseIndex) -> Vec<Feature> {
     let mut purpose_groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    
+
     for file in files {
         if let Some(feature_name) = extract_feature_name(file, index) {
             purpose_groups
@@ -272,9 +296,10 @@ fn group_by_purpose(files: &[PathBuf], index: &CodebaseIndex) -> Vec<Feature> {
                 .push(file.clone());
         }
     }
-    
+
     // Create features for groups with enough files
-    purpose_groups.into_iter()
+    purpose_groups
+        .into_iter()
         .filter(|(_, files)| files.len() >= MIN_GROUP_SIZE_GENERIC)
         .map(|(name, files)| Feature::new(name).with_files(files))
         .collect()
@@ -283,7 +308,7 @@ fn group_by_purpose(files: &[PathBuf], index: &CodebaseIndex) -> Vec<Feature> {
 /// Create single-file features for meaningfully named files
 fn create_single_file_features(files: &[PathBuf], index: &CodebaseIndex) -> Vec<Feature> {
     let mut features = Vec::new();
-    
+
     for file in files {
         // Only create single-file features for named (non-generic) files
         if is_named_file(file) {
@@ -292,7 +317,7 @@ fn create_single_file_features(files: &[PathBuf], index: &CodebaseIndex) -> Vec<
             }
         }
     }
-    
+
     features
 }
 
@@ -312,13 +337,24 @@ fn get_misc_name(layer: Layer) -> &'static str {
 /// Group files by their immediate parent directory
 fn group_by_parent_directory(files: &[PathBuf]) -> Vec<Feature> {
     let mut parent_groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    
+
     // Skip these generic parent names
     let skip_parents = [
-        "src", "lib", "app", "pages", "components", "api", "routes",
-        "utils", "helpers", "types", "models", "services", "hooks",
+        "src",
+        "lib",
+        "app",
+        "pages",
+        "components",
+        "api",
+        "routes",
+        "utils",
+        "helpers",
+        "types",
+        "models",
+        "services",
+        "hooks",
     ];
-    
+
     for file in files {
         if let Some(parent) = file.parent() {
             if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
@@ -326,7 +362,7 @@ fn group_by_parent_directory(files: &[PathBuf]) -> Vec<Feature> {
                 if skip_parents.contains(&parent_name.to_lowercase().as_str()) {
                     continue;
                 }
-                
+
                 parent_groups
                     .entry(parent_name.to_string())
                     .or_default()
@@ -334,9 +370,10 @@ fn group_by_parent_directory(files: &[PathBuf]) -> Vec<Feature> {
             }
         }
     }
-    
+
     // Create features for directories with enough files
-    parent_groups.into_iter()
+    parent_groups
+        .into_iter()
         .filter(|(_, files)| files.len() >= MIN_GROUP_SIZE_GENERIC)
         .map(|(name, files)| Feature::new(name).with_files(files))
         .collect()
@@ -347,7 +384,7 @@ fn split_large_misc(files: &[PathBuf], layer: Layer) -> Vec<Feature> {
     let mut features = Vec::new();
     let mut parent_groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut ungrouped = Vec::new();
-    
+
     for file in files {
         if let Some(parent) = file.parent() {
             if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
@@ -362,7 +399,7 @@ fn split_large_misc(files: &[PathBuf], layer: Layer) -> Vec<Feature> {
             ungrouped.push(file.clone());
         }
     }
-    
+
     // Create features for each parent group
     for (name, group_files) in parent_groups {
         if group_files.len() >= MIN_GROUP_SIZE_GENERIC {
@@ -371,12 +408,12 @@ fn split_large_misc(files: &[PathBuf], layer: Layer) -> Vec<Feature> {
             ungrouped.extend(group_files);
         }
     }
-    
+
     // If we still have ungrouped files, add them as misc
     if !ungrouped.is_empty() {
         features.push(Feature::new(get_misc_name(layer)).with_files(ungrouped));
     }
-    
+
     features
 }
 
@@ -394,7 +431,8 @@ fn detect_directory_features(files: &[PathBuf], _layer: Layer) -> Vec<Feature> {
     }
 
     // Create features for directories with files (allow single files for explicit feature dirs)
-    dir_groups.into_iter()
+    dir_groups
+        .into_iter()
         .filter(|(_, files)| !files.is_empty())
         .map(|(name, files)| Feature::new(name).with_files(files))
         .collect()
@@ -402,14 +440,13 @@ fn detect_directory_features(files: &[PathBuf], _layer: Layer) -> Vec<Feature> {
 
 /// Extract a feature directory name from a path
 fn extract_feature_directory(path: &Path) -> Option<String> {
-    let components: Vec<_> = path.components()
+    let components: Vec<_> = path
+        .components()
         .filter_map(|c| c.as_os_str().to_str())
         .collect();
 
     // Look for feature-indicating directories
-    let feature_dirs = [
-        "features", "modules", "domains", "packages", "apps",
-    ];
+    let feature_dirs = ["features", "modules", "domains", "packages", "apps"];
 
     // Check for explicit feature directories (features/auth/...)
     for (i, comp) in components.iter().enumerate() {
@@ -423,8 +460,9 @@ fn extract_feature_directory(path: &Path) -> Option<String> {
         if *comp == "app" && i + 1 < components.len() {
             let next = components[i + 1];
             // Skip common non-feature directories
-            if !["api", "components", "lib", "utils", "(", "_"].iter()
-                .any(|s| next.starts_with(s)) 
+            if !["api", "components", "lib", "utils", "(", "_"]
+                .iter()
+                .any(|s| next.starts_with(s))
             {
                 if next.starts_with('(') || next.starts_with('[') {
                     continue;
@@ -459,28 +497,23 @@ fn detect_naming_clusters(files: &[PathBuf], index: &CodebaseIndex) -> Vec<Featu
                 let export_lower = export.to_lowercase();
                 // Extract prefix from export names
                 if let Some(prefix) = extract_export_prefix(&export_lower) {
-                    prefix_groups
-                        .entry(prefix)
-                        .or_default()
-                        .push(file.clone());
+                    prefix_groups.entry(prefix).or_default().push(file.clone());
                     break; // Use first meaningful export
                 }
             }
         }
-        
+
         // Fall back to filename prefix
         if !prefix_groups.values().any(|v| v.contains(file)) {
             if let Some(prefix) = extract_naming_prefix(file) {
-                prefix_groups
-                    .entry(prefix)
-                    .or_default()
-                    .push(file.clone());
+                prefix_groups.entry(prefix).or_default().push(file.clone());
             }
         }
     }
 
     // Only create features for prefixes with multiple files
-    prefix_groups.into_iter()
+    prefix_groups
+        .into_iter()
         .filter(|(_, files)| files.len() >= MIN_GROUP_SIZE_GENERIC)
         .map(|(name, files)| Feature::new(name).with_files(files))
         .collect()
@@ -489,11 +522,11 @@ fn detect_naming_clusters(files: &[PathBuf], index: &CodebaseIndex) -> Vec<Featu
 /// Extract a prefix from an export name
 fn extract_export_prefix(export: &str) -> Option<String> {
     // Common patterns: UserService -> user, handleAuth -> auth, useSettings -> settings
-    
+
     // Only strip prefix if followed by uppercase (indicating camelCase boundary)
     let prefixes_to_strip = ["use", "get", "set", "handle", "create", "fetch", "with"];
     let mut work = export;
-    
+
     for prefix in prefixes_to_strip {
         if work.len() > prefix.len() && work.starts_with(prefix) {
             let next_char = work.chars().nth(prefix.len());
@@ -506,11 +539,11 @@ fn extract_export_prefix(export: &str) -> Option<String> {
             }
         }
     }
-    
+
     if work.is_empty() || work.len() < 3 {
         return None;
     }
-    
+
     // Convert from camelCase/PascalCase to prefix (take first word)
     let mut prefix = String::new();
     for (i, c) in work.chars().enumerate() {
@@ -519,7 +552,7 @@ fn extract_export_prefix(export: &str) -> Option<String> {
         }
         prefix.push(c.to_ascii_lowercase());
     }
-    
+
     if prefix.len() >= 3 {
         Some(prefix)
     } else {
@@ -530,7 +563,7 @@ fn extract_export_prefix(export: &str) -> Option<String> {
 /// Extract a meaningful prefix from a filename for clustering
 fn extract_naming_prefix(path: &Path) -> Option<String> {
     let filename = path.file_stem()?.to_str()?;
-    
+
     // Remove common suffixes first
     let clean_name = filename
         .trim_end_matches(".test")
@@ -544,22 +577,20 @@ fn extract_naming_prefix(path: &Path) -> Option<String> {
         .trim_end_matches(".helper");
 
     // Split by common separators
-    let parts: Vec<&str> = clean_name
-        .split(['-', '_', '.'])
-        .collect();
+    let parts: Vec<&str> = clean_name.split(['-', '_', '.']).collect();
 
     if parts.is_empty() {
         return None;
     }
 
     let prefix = parts[0].to_lowercase();
-    
+
     // Filter out common non-descriptive prefixes
     let ignored_prefixes = [
-        "index", "main", "app", "page", "layout", "use", "get", "set",
-        "create", "update", "delete", "fetch", "handle", "on", "is", "has",
+        "index", "main", "app", "page", "layout", "use", "get", "set", "create", "update",
+        "delete", "fetch", "handle", "on", "is", "has",
     ];
-    
+
     if ignored_prefixes.contains(&prefix.as_str()) || prefix.len() < 3 {
         if parts.len() > 1 {
             return Some(parts[1].to_lowercase());
@@ -585,15 +616,27 @@ fn detect_dependency_clusters(files: &[PathBuf], index: &CodebaseIndex) -> Vec<F
             // Check depends_on
             for dep in &file_index.summary.depends_on {
                 if file_set.contains(dep) {
-                    adjacency.entry(file.clone()).or_default().insert(dep.clone());
-                    adjacency.entry(dep.clone()).or_default().insert(file.clone());
+                    adjacency
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(dep.clone());
+                    adjacency
+                        .entry(dep.clone())
+                        .or_default()
+                        .insert(file.clone());
                 }
             }
             // Check used_by
             for user in &file_index.summary.used_by {
                 if file_set.contains(user) {
-                    adjacency.entry(file.clone()).or_default().insert(user.clone());
-                    adjacency.entry(user.clone()).or_default().insert(file.clone());
+                    adjacency
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(user.clone());
+                    adjacency
+                        .entry(user.clone())
+                        .or_default()
+                        .insert(file.clone());
                 }
             }
         }
@@ -634,7 +677,8 @@ fn detect_dependency_clusters(files: &[PathBuf], index: &CodebaseIndex) -> Vec<F
     }
 
     // Convert clusters to features with generated names
-    clusters.into_iter()
+    clusters
+        .into_iter()
         .enumerate()
         .map(|(i, files)| {
             let name = generate_cluster_name(&files, index, i);
@@ -644,7 +688,11 @@ fn detect_dependency_clusters(files: &[PathBuf], index: &CodebaseIndex) -> Vec<F
 }
 
 /// Generate a name for a dependency cluster
-fn generate_cluster_name(files: &[PathBuf], index: &CodebaseIndex, fallback_index: usize) -> String {
+fn generate_cluster_name(
+    files: &[PathBuf],
+    index: &CodebaseIndex,
+    fallback_index: usize,
+) -> String {
     // First try: use common purpose words
     let mut purpose_words: HashMap<String, usize> = HashMap::new();
     for file in files {
@@ -658,13 +706,15 @@ fn generate_cluster_name(files: &[PathBuf], index: &CodebaseIndex, fallback_inde
             }
         }
     }
-    
+
     // Remove common words
-    let skip_words = ["file", "module", "code", "the", "and", "for", "with", "this", "that"];
+    let skip_words = [
+        "file", "module", "code", "the", "and", "for", "with", "this", "that",
+    ];
     for word in skip_words {
         purpose_words.remove(word);
     }
-    
+
     if let Some((word, count)) = purpose_words.into_iter().max_by_key(|(_, count)| *count) {
         if count >= files.len() / 2 {
             return word;
@@ -672,7 +722,8 @@ fn generate_cluster_name(files: &[PathBuf], index: &CodebaseIndex, fallback_inde
     }
 
     // Second try: common prefix among filenames
-    let names: Vec<String> = files.iter()
+    let names: Vec<String> = files
+        .iter()
         .filter_map(|f| f.file_stem())
         .filter_map(|n| n.to_str())
         .map(|s| s.to_lowercase())
@@ -761,30 +812,36 @@ mod tests {
             extract_naming_prefix(Path::new("auth.service.ts")),
             Some("auth".to_string())
         );
-        assert_eq!(
-            extract_naming_prefix(Path::new("index.ts")),
-            None
-        );
+        assert_eq!(extract_naming_prefix(Path::new("index.ts")), None);
     }
 
     #[test]
     fn test_extract_export_prefix() {
-        assert_eq!(extract_export_prefix("userService"), Some("user".to_string()));
-        assert_eq!(extract_export_prefix("handleAuth"), Some("auth".to_string()));
-        assert_eq!(extract_export_prefix("useSettings"), Some("settings".to_string()));
+        assert_eq!(
+            extract_export_prefix("userService"),
+            Some("user".to_string())
+        );
+        assert_eq!(
+            extract_export_prefix("handleAuth"),
+            Some("auth".to_string())
+        );
+        assert_eq!(
+            extract_export_prefix("useSettings"),
+            Some("settings".to_string())
+        );
     }
 
     #[test]
     fn test_generate_cluster_name_fallback() {
-        use std::collections::HashMap;
         use chrono::Utc;
-        
+        use std::collections::HashMap;
+
         let files = vec![
             PathBuf::from("user-list.tsx"),
             PathBuf::from("user-profile.tsx"),
             PathBuf::from("user-settings.tsx"),
         ];
-        
+
         // Create minimal empty index for test
         let index = CodebaseIndex {
             root: PathBuf::new(),
@@ -795,7 +852,7 @@ mod tests {
             cached_at: Utc::now(),
             index_errors: Vec::new(),
         };
-        
+
         assert_eq!(generate_cluster_name(&files, &index, 0), "user");
     }
 }

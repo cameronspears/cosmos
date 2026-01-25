@@ -2,8 +2,8 @@
 //!
 //! Provides branch, stage, commit, and push operations.
 
-use anyhow::{Context, Result};
 use crate::util::{run_command_with_timeout, CommandRunResult};
+use anyhow::{Context, Result};
 use git2::{Repository, Signature, StatusOptions};
 use std::path::Path;
 use std::process::Command;
@@ -23,16 +23,16 @@ pub struct GitStatus {
 /// Get the current git status
 pub fn current_status(repo_path: &Path) -> Result<GitStatus> {
     let repo = Repository::open(repo_path)?;
-    
+
     let head = repo.head().context("Failed to get HEAD")?;
     let is_detached = !head.is_branch();
     let branch = head.shorthand().unwrap_or("detached").to_string();
-    
+
     let mut status = GitStatus {
         branch,
         ..Default::default()
     };
-    
+
     let mut opts = StatusOptions::new();
     opts.include_untracked(true);
     opts.recurse_untracked_dirs(true);
@@ -41,11 +41,11 @@ pub fn current_status(repo_path: &Path) -> Result<GitStatus> {
     opts.exclude_submodules(true);
 
     let statuses = repo.statuses(Some(&mut opts))?;
-    
+
     for entry in statuses.iter() {
         let path = entry.path().unwrap_or("").to_string();
         let s = entry.status();
-        
+
         if s.is_index_new() || s.is_index_modified() || s.is_index_deleted() {
             status.staged.push(path.clone());
         }
@@ -56,15 +56,17 @@ pub fn current_status(repo_path: &Path) -> Result<GitStatus> {
             status.untracked.push(path);
         }
     }
-    
+
     // Count ahead/behind (simplified - just counts local commits)
     if is_detached {
         return Ok(status);
     }
 
     if let Some(local_oid) = head.target() {
-        if let Ok(upstream) = repo.find_branch(&status.branch, git2::BranchType::Local)
-            .and_then(|b| b.upstream()) {
+        if let Ok(upstream) = repo
+            .find_branch(&status.branch, git2::BranchType::Local)
+            .and_then(|b| b.upstream())
+        {
             if let Some(upstream_oid) = upstream.get().target() {
                 let (ahead, behind) = repo.graph_ahead_behind(local_oid, upstream_oid)?;
                 status.ahead = ahead;
@@ -72,24 +74,25 @@ pub fn current_status(repo_path: &Path) -> Result<GitStatus> {
             }
         }
     }
-    
+
     Ok(status)
 }
 
 /// Checkout an existing branch
 pub fn checkout_branch(repo_path: &Path, name: &str) -> Result<()> {
     let repo = Repository::open(repo_path)?;
-    
-    let (object, reference) = repo.revparse_ext(name)
+
+    let (object, reference) = repo
+        .revparse_ext(name)
         .context(format!("Branch '{}' not found", name))?;
-    
+
     repo.checkout_tree(&object, None)?;
-    
+
     match reference {
         Some(r) => repo.set_head(r.name().unwrap_or("HEAD"))?,
         None => repo.set_head_detached(object.id())?,
     }
-    
+
     Ok(())
 }
 
@@ -97,7 +100,7 @@ pub fn checkout_branch(repo_path: &Path, name: &str) -> Result<()> {
 /// Used for creating fix branches before applying changes
 pub fn create_fix_branch_from_main(repo_path: &Path, branch_name: &str) -> Result<String> {
     let repo = Repository::open(repo_path)?;
-    
+
     // Find the default branch (main/master/trunk/etc)
     let main_branch_name = get_main_branch_name(repo_path)?;
     let main_branch = repo
@@ -107,14 +110,18 @@ pub fn create_fix_branch_from_main(repo_path: &Path, branch_name: &str) -> Resul
             "Could not find '{}' branch locally or on remote",
             main_branch_name
         ))?;
-    
-    let main_commit = main_branch.get().peel_to_commit()
+
+    let main_commit = main_branch
+        .get()
+        .peel_to_commit()
         .context("Failed to get commit from main branch")?;
-    
+
     // Check if branch already exists (avoid deleting user work)
     let mut final_name = branch_name.to_string();
     if let Ok(existing) = repo.find_branch(branch_name, git2::BranchType::Local) {
-        let existing_commit = existing.get().peel_to_commit()
+        let existing_commit = existing
+            .get()
+            .peel_to_commit()
             .context("Failed to get commit from existing branch")?;
         if existing_commit.id() == main_commit.id() {
             // Branch already points at main; just reuse it.
@@ -124,21 +131,27 @@ pub fn create_fix_branch_from_main(repo_path: &Path, branch_name: &str) -> Resul
 
         final_name = unique_branch_name(&repo, branch_name)?;
     }
-    
+
     // Create the new branch from main
     repo.branch(&final_name, &main_commit, false)
-        .context(format!("Failed to create branch '{}' from main", final_name))?;
-    
+        .context(format!(
+            "Failed to create branch '{}' from main",
+            final_name
+        ))?;
+
     // Checkout the new branch
     checkout_branch(repo_path, &final_name)?;
-    
+
     Ok(final_name)
 }
 
 fn unique_branch_name(repo: &Repository, base: &str) -> Result<String> {
     for suffix in 2..100 {
         let candidate = format!("{}-{}", base, suffix);
-        if repo.find_branch(&candidate, git2::BranchType::Local).is_err() {
+        if repo
+            .find_branch(&candidate, git2::BranchType::Local)
+            .is_err()
+        {
             return Ok(candidate);
         }
     }
@@ -228,10 +241,10 @@ fn is_valid_git_ref(name: &str) -> bool {
 pub fn stage_file(repo_path: &Path, file_path: &str) -> Result<()> {
     let repo = Repository::open(repo_path)?;
     let mut index = repo.index()?;
-    
+
     index.add_path(Path::new(file_path))?;
     index.write()?;
-    
+
     Ok(())
 }
 
@@ -239,10 +252,10 @@ pub fn stage_file(repo_path: &Path, file_path: &str) -> Result<()> {
 pub fn commit(repo_path: &Path, message: &str) -> Result<String> {
     let repo = Repository::open(repo_path)?;
     let mut index = repo.index()?;
-    
+
     let tree_id = index.write_tree()?;
     let tree = repo.find_tree(tree_id)?;
-    
+
     let parent = match repo.head() {
         Ok(head) => match head.peel_to_commit() {
             Ok(commit) => Some(commit),
@@ -266,19 +279,23 @@ pub fn commit(repo_path: &Path, message: &str) -> Result<String> {
         }
         Err(err) => return Err(err.into()),
     };
-    
+
     // Get author info from git config
     let config = repo.config()?;
-    let name = config.get_string("user.name").unwrap_or_else(|_| "cosmos".to_string());
-    let email = config.get_string("user.email").unwrap_or_else(|_| "cosmos@local".to_string());
-    
+    let name = config
+        .get_string("user.name")
+        .unwrap_or_else(|_| "cosmos".to_string());
+    let email = config
+        .get_string("user.email")
+        .unwrap_or_else(|_| "cosmos@local".to_string());
+
     let sig = Signature::now(&name, &email)?;
-    
+
     let oid = match parent {
         Some(ref parent) => repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[parent])?,
         None => repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[])?,
     };
-    
+
     Ok(oid.to_string())
 }
 
@@ -374,10 +391,7 @@ fn has_upstream(repo: &Repository, branch: &str) -> bool {
 }
 
 fn ensure_local_branch(repo: &Repository, branch: &str) -> Result<()> {
-    if repo
-        .find_branch(branch, git2::BranchType::Local)
-        .is_ok()
-    {
+    if repo.find_branch(branch, git2::BranchType::Local).is_ok() {
         return Ok(());
     }
 
@@ -433,11 +447,7 @@ pub fn get_main_branch_name(repo_path: &Path) -> Result<String> {
     if let Ok(config) = repo.config() {
         if let Ok(name) = config.get_string("init.defaultBranch") {
             let name = name.trim();
-            if !name.is_empty()
-                && repo
-                    .find_branch(name, git2::BranchType::Local)
-                    .is_ok()
-            {
+            if !name.is_empty() && repo.find_branch(name, git2::BranchType::Local).is_ok() {
                 return Ok(name.to_string());
             }
         }
@@ -491,8 +501,9 @@ fn run_gh_command(repo_path: Option<&Path>, args: &[&str]) -> Result<CommandRunR
 
 /// Check if gh CLI is available
 pub fn gh_available() -> Result<()> {
-    let output = run_gh_command(None, &["--version"])
-        .map_err(|_| anyhow::anyhow!("gh CLI not installed. Install from https://cli.github.com"))?;
+    let output = run_gh_command(None, &["--version"]).map_err(|_| {
+        anyhow::anyhow!("gh CLI not installed. Install from https://cli.github.com")
+    })?;
     if output.timed_out {
         return Err(anyhow::anyhow!(
             "GitHub CLI timed out after {}s while checking version. Check your network and try again.",
@@ -502,7 +513,9 @@ pub fn gh_available() -> Result<()> {
     if output.status.map(|s| s.success()).unwrap_or(false) {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("gh CLI not installed. Install from https://cli.github.com"))
+        Err(anyhow::anyhow!(
+            "gh CLI not installed. Install from https://cli.github.com"
+        ))
     }
 }
 
@@ -519,7 +532,9 @@ pub fn gh_authenticated() -> Result<()> {
     if output.status.map(|s| s.success()).unwrap_or(false) {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("gh CLI not authenticated. Run 'gh auth login' first"))
+        Err(anyhow::anyhow!(
+            "gh CLI not authenticated. Run 'gh auth login' first"
+        ))
     }
 }
 
@@ -539,7 +554,7 @@ pub fn create_pr(repo_path: &Path, title: &str, body: &str) -> Result<String> {
             GH_TIMEOUT_SECS
         ));
     }
-    
+
     if output.status.map(|s| s.success()).unwrap_or(false) {
         // gh pr create outputs the PR URL
         let url = output.stdout.trim().to_string();
@@ -607,8 +622,9 @@ pub fn restore_file(repo_path: &Path, file_path: &Path) -> Result<()> {
             // File doesn't exist in HEAD - it's a new file, remove it
             let full_path = repo_path.join(file_path);
             if full_path.exists() {
-                std::fs::remove_file(&full_path)
-                    .with_context(|| format!("Failed to remove new file {}", file_path.display()))?;
+                std::fs::remove_file(&full_path).with_context(|| {
+                    format!("Failed to remove new file {}", file_path.display())
+                })?;
             }
             // Remove from index if staged
             let mut index = repo.index()?;
@@ -629,7 +645,7 @@ pub fn open_url(url: &str) -> Result<()> {
             .spawn()
             .context("Failed to open URL")?;
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         Command::new("xdg-open")
@@ -637,7 +653,7 @@ pub fn open_url(url: &str) -> Result<()> {
             .spawn()
             .context("Failed to open URL")?;
     }
-    
+
     #[cfg(target_os = "windows")]
     {
         Command::new("cmd")
@@ -645,7 +661,7 @@ pub fn open_url(url: &str) -> Result<()> {
             .spawn()
             .context("Failed to open URL")?;
     }
-    
+
     Ok(())
 }
 
@@ -685,4 +701,3 @@ mod tests {
         assert!(!is_valid_git_ref("bad.lock"));
     }
 }
-

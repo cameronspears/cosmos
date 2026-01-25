@@ -5,12 +5,12 @@
 
 pub mod parser;
 
+use crate::util::hash_str;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-use crate::util::hash_str;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  PATTERN DETECTION THRESHOLDS
@@ -92,7 +92,6 @@ pub enum SymbolKind {
     Variable,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Visibility {
     Public,
@@ -158,7 +157,6 @@ impl PatternKind {
             PatternKind::TodoMarker => PatternSeverity::Info,
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -189,26 +187,28 @@ impl FileSummary {
     pub fn from_file_index(file_index: &FileIndex, rel_path: &Path, root: &Path) -> Self {
         // Infer purpose from filename and exports
         let purpose = infer_purpose(rel_path, &file_index.symbols, file_index.language);
-        
+
         // Get public exports
-        let exports: Vec<String> = file_index.symbols.iter()
+        let exports: Vec<String> = file_index
+            .symbols
+            .iter()
             .filter(|s| s.visibility == Visibility::Public)
             .map(|s| s.name.clone())
             .take(10)
             .collect();
-        
+
         // Build metrics string
-        let func_count = file_index.symbols.iter()
+        let func_count = file_index
+            .symbols
+            .iter()
             .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
             .count();
-        
+
         let metrics = format!(
             "{} LOC | {} funcs | complexity: {:.0}",
-            file_index.loc,
-            func_count,
-            file_index.complexity
+            file_index.loc, func_count, file_index.complexity
         );
-        
+
         // depends_on will be populated by the codebase index
         let depends_on: Vec<PathBuf> = file_index
             .dependencies
@@ -216,7 +216,7 @@ impl FileSummary {
             .filter(|d| !d.is_external)
             .filter_map(|d| resolve_import_path(&d.import_path, rel_path, root))
             .collect();
-        
+
         Self {
             purpose,
             exports,
@@ -225,20 +225,21 @@ impl FileSummary {
             metrics,
         }
     }
-    
 }
 
 /// Infer the purpose of a file from its name and exports
 fn infer_purpose(path: &Path, symbols: &[Symbol], _language: Language) -> String {
-    let filename = path.file_stem()
+    let filename = path
+        .file_stem()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
-    
-    let parent = path.parent()
+
+    let parent = path
+        .parent()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    
+
     // Common filename patterns -> descriptions
     let known_purpose = match filename.to_lowercase().as_str() {
         "mod" => Some(format!("{} module definitions", parent)),
@@ -251,30 +252,39 @@ fn infer_purpose(path: &Path, symbols: &[Symbol], _language: Language) -> String
         "tests" | "test" => Some("Test suite".to_string()),
         _ => None,
     };
-    
+
     // Get public symbols grouped by kind
-    let public_symbols: Vec<_> = symbols.iter()
+    let public_symbols: Vec<_> = symbols
+        .iter()
         .filter(|s| s.visibility == Visibility::Public)
         .collect();
-    
-    let functions: Vec<&str> = public_symbols.iter()
+
+    let functions: Vec<&str> = public_symbols
+        .iter()
         .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
         .map(|s| s.name.as_str())
         .collect();
-    
-    let types: Vec<&str> = public_symbols.iter()
-        .filter(|s| matches!(s.kind, SymbolKind::Struct | SymbolKind::Class | SymbolKind::Enum))
+
+    let types: Vec<&str> = public_symbols
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SymbolKind::Struct | SymbolKind::Class | SymbolKind::Enum
+            )
+        })
         .map(|s| s.name.as_str())
         .collect();
-    
-    let traits: Vec<&str> = public_symbols.iter()
+
+    let traits: Vec<&str> = public_symbols
+        .iter()
         .filter(|s| matches!(s.kind, SymbolKind::Trait | SymbolKind::Interface))
         .map(|s| s.name.as_str())
         .collect();
-    
+
     // Build a descriptive summary
     let mut parts = Vec::new();
-    
+
     // Start with known purpose if we have one, otherwise infer from filename
     if let Some(purpose) = known_purpose {
         parts.push(purpose);
@@ -285,7 +295,7 @@ fn infer_purpose(path: &Path, symbols: &[Symbol], _language: Language) -> String
             parts.push(inferred);
         }
     }
-    
+
     // Add type information
     if !types.is_empty() {
         let type_desc = if types.len() == 1 {
@@ -293,11 +303,15 @@ fn infer_purpose(path: &Path, symbols: &[Symbol], _language: Language) -> String
         } else if types.len() <= 3 {
             format!("Defines {} types", types.join(", "))
         } else {
-            format!("Defines {} and {} other types", types[..2].join(", "), types.len() - 2)
+            format!(
+                "Defines {} and {} other types",
+                types[..2].join(", "),
+                types.len() - 2
+            )
         };
         parts.push(type_desc);
     }
-    
+
     // Add trait/interface information
     if !traits.is_empty() {
         let trait_desc = if traits.len() == 1 {
@@ -307,7 +321,7 @@ fn infer_purpose(path: &Path, symbols: &[Symbol], _language: Language) -> String
         };
         parts.push(trait_desc);
     }
-    
+
     // Add function information
     if !functions.is_empty() {
         let func_desc = if functions.len() == 1 {
@@ -317,20 +331,28 @@ fn infer_purpose(path: &Path, symbols: &[Symbol], _language: Language) -> String
             format!("Provides {} functions", names.join(", "))
         } else {
             let names: Vec<_> = functions.iter().take(3).map(|n| humanize_name(n)).collect();
-            format!("Provides {} and {} other functions", names.join(", "), functions.len() - 3)
+            format!(
+                "Provides {} and {} other functions",
+                names.join(", "),
+                functions.len() - 3
+            )
         };
         parts.push(func_desc);
     }
-    
+
     // If we still have nothing useful, provide a basic description
     if parts.is_empty() {
         if symbols.is_empty() {
             return format!("{} module (no exports)", capitalize(filename));
         } else {
-            return format!("{} module with {} symbols", capitalize(filename), symbols.len());
+            return format!(
+                "{} module with {} symbols",
+                capitalize(filename),
+                symbols.len()
+            );
         }
     }
-    
+
     // Join parts intelligently
     if parts.len() == 1 {
         parts[0].clone()
@@ -343,82 +365,125 @@ fn infer_purpose(path: &Path, symbols: &[Symbol], _language: Language) -> String
 /// Infer purpose from filename patterns (camelCase, snake_case, etc.)
 fn infer_from_filename(filename: &str, parent: &str) -> String {
     let lower = filename.to_lowercase();
-    
+
     // Check for common suffixes/patterns
-    if lower.ends_with("utils") || lower.ends_with("util") || lower.ends_with("helpers") || lower.ends_with("helper") {
-        let name = lower.replace("utils", "").replace("util", "").replace("helpers", "").replace("helper", "").trim_end_matches('_').trim_end_matches('-').to_string();
+    if lower.ends_with("utils")
+        || lower.ends_with("util")
+        || lower.ends_with("helpers")
+        || lower.ends_with("helper")
+    {
+        let name = lower
+            .replace("utils", "")
+            .replace("util", "")
+            .replace("helpers", "")
+            .replace("helper", "")
+            .trim_end_matches('_')
+            .trim_end_matches('-')
+            .to_string();
         if name.is_empty() {
             return "General utility functions".to_string();
         }
         return format!("{} utility functions", capitalize(&name));
     }
-    
+
     if lower.ends_with("service") || lower.ends_with("services") {
-        let name = lower.replace("service", "").replace("services", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        let name = lower
+            .replace("service", "")
+            .replace("services", "")
+            .trim_end_matches('_')
+            .trim_end_matches('-')
+            .to_string();
         if name.is_empty() {
             return "Service layer logic".to_string();
         }
         return format!("{} service operations", capitalize(&name));
     }
-    
+
     if lower.ends_with("controller") || lower.ends_with("controllers") {
-        let name = lower.replace("controller", "").replace("controllers", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        let name = lower
+            .replace("controller", "")
+            .replace("controllers", "")
+            .trim_end_matches('_')
+            .trim_end_matches('-')
+            .to_string();
         if name.is_empty() {
             return "Request controller handlers".to_string();
         }
         return format!("{} request handlers", capitalize(&name));
     }
-    
+
     if lower.ends_with("handler") || lower.ends_with("handlers") {
-        let name = lower.replace("handler", "").replace("handlers", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        let name = lower
+            .replace("handler", "")
+            .replace("handlers", "")
+            .trim_end_matches('_')
+            .trim_end_matches('-')
+            .to_string();
         if name.is_empty() {
             return "Event/request handlers".to_string();
         }
         return format!("{} event handlers", capitalize(&name));
     }
-    
+
     if lower.ends_with("model") || lower.ends_with("models") {
-        let name = lower.replace("model", "").replace("models", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        let name = lower
+            .replace("model", "")
+            .replace("models", "")
+            .trim_end_matches('_')
+            .trim_end_matches('-')
+            .to_string();
         if name.is_empty() {
             return "Data model definitions".to_string();
         }
         return format!("{} data model", capitalize(&name));
     }
-    
+
     if lower.ends_with("api") {
-        let name = lower.replace("api", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        let name = lower
+            .replace("api", "")
+            .trim_end_matches('_')
+            .trim_end_matches('-')
+            .to_string();
         if name.is_empty() {
             return "API endpoint definitions".to_string();
         }
         return format!("{} API operations", capitalize(&name));
     }
-    
+
     if lower.ends_with("client") {
-        let name = lower.replace("client", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        let name = lower
+            .replace("client", "")
+            .trim_end_matches('_')
+            .trim_end_matches('-')
+            .to_string();
         if name.is_empty() {
             return "Client implementation".to_string();
         }
         return format!("{} client", capitalize(&name));
     }
-    
+
     if lower.ends_with("store") {
-        let name = lower.replace("store", "").trim_end_matches('_').trim_end_matches('-').to_string();
+        let name = lower
+            .replace("store", "")
+            .trim_end_matches('_')
+            .trim_end_matches('-')
+            .to_string();
         if name.is_empty() {
             return "State store management".to_string();
         }
         return format!("{} state management", capitalize(&name));
     }
-    
+
     if lower.ends_with("hook") || lower.ends_with("hooks") {
         return "React hooks".to_string();
     }
-    
+
     if lower.starts_with("use") && filename.len() > 3 {
         // React hook pattern: useAuth, useQuery, etc.
         let hook_name = humanize_camel_case(&filename[3..]);
         return format!("{} React hook", hook_name);
     }
-    
+
     // Check parent directory for context
     if !parent.is_empty() {
         let parent_lower = parent.to_lowercase();
@@ -438,7 +503,7 @@ fn infer_from_filename(filename: &str, parent: &str) -> String {
             return format!("{} API endpoints", capitalize(filename));
         }
     }
-    
+
     // Default: humanize the filename
     let humanized = humanize_camel_case(filename);
     if humanized != filename {
@@ -452,7 +517,7 @@ fn infer_from_filename(filename: &str, parent: &str) -> String {
 fn humanize_camel_case(s: &str) -> String {
     let mut result = String::new();
     let mut prev_was_upper = false;
-    
+
     for (i, c) in s.chars().enumerate() {
         if c.is_uppercase() {
             if i > 0 && !prev_was_upper {
@@ -468,7 +533,7 @@ fn humanize_camel_case(s: &str) -> String {
             prev_was_upper = false;
         }
     }
-    
+
     // Capitalize first letter
     let mut chars = result.chars();
     match chars.next() {
@@ -529,17 +594,18 @@ fn resolve_import_path(import: &str, from_file: &Path, root: &Path) -> Option<Pa
             }
         }
     }
-    
+
     // Handle crate/module imports (simplified)
     if import.starts_with("crate::") || import.starts_with("super::") {
         let parts: Vec<&str> = import.split("::").collect();
         if parts.len() >= 2 {
             // Build path from parts
-            let path_parts: Vec<&str> = parts[1..].iter()
+            let path_parts: Vec<&str> = parts[1..]
+                .iter()
                 .take_while(|p| !p.chars().next().map(|c| c.is_uppercase()).unwrap_or(false))
                 .copied()
                 .collect();
-            
+
             if !path_parts.is_empty() {
                 let path_str = path_parts.join("/");
                 let candidate = PathBuf::from(format!("src/{}.rs", path_str));
@@ -554,7 +620,7 @@ fn resolve_import_path(import: &str, from_file: &Path, root: &Path) -> Option<Pa
             }
         }
     }
-    
+
     None
 }
 
@@ -586,7 +652,9 @@ pub struct FileIndex {
 
 impl FileIndex {
     pub fn suggestion_density(&self) -> f64 {
-        let pattern_weight: f64 = self.patterns.iter()
+        let pattern_weight: f64 = self
+            .patterns
+            .iter()
             .map(|p| match p.kind.severity() {
                 PatternSeverity::High => 3.0,
                 PatternSeverity::Medium => 2.0,
@@ -594,7 +662,7 @@ impl FileIndex {
                 PatternSeverity::Info => 0.5,
             })
             .sum();
-        
+
         // Normalize by file size
         if self.loc > 0 {
             pattern_weight / (self.loc as f64 / 100.0)
@@ -644,10 +712,10 @@ impl CodebaseIndex {
         };
 
         index.scan(root)?;
-        
+
         // Build the dependency graph after all files are indexed
         index.build_dependency_graph();
-        
+
         Ok(index)
     }
 
@@ -663,10 +731,8 @@ impl CodebaseIndex {
                 continue;
             }
 
-            let ext = path.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
             let language = Language::from_extension(ext);
             if language == Language::Unknown {
                 continue;
@@ -678,7 +744,7 @@ impl CodebaseIndex {
                     self.symbols.extend(file_index.symbols.clone());
                     self.dependencies.extend(file_index.dependencies.clone());
                     self.patterns.extend(file_index.patterns.clone());
-                    
+
                     let rel_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
                     self.files.insert(rel_path, file_index);
                 }
@@ -715,26 +781,24 @@ impl CodebaseIndex {
             ));
         }
 
-        let content = String::from_utf8(bytes).map_err(|_| {
-            anyhow::anyhow!("File is not valid UTF-8, skipping")
-        })?;
+        let content = String::from_utf8(bytes)
+            .map_err(|_| anyhow::anyhow!("File is not valid UTF-8, skipping"))?;
 
-        let modified = metadata.modified()
+        let modified = metadata
+            .modified()
             .map(DateTime::<Utc>::from)
             .unwrap_or_else(|_| Utc::now());
 
         let loc = content.lines().count();
-        let sloc = content.lines()
-            .filter(|l| !l.trim().is_empty())
-            .count();
+        let sloc = content.lines().filter(|l| !l.trim().is_empty()).count();
         let content_hash = hash_str(&content);
 
         // Parse with tree-sitter
         let (symbols, deps) = parser::parse_file(path, &content, language)?;
-        
+
         // Detect patterns
         let mut patterns = Vec::new();
-        
+
         // Check for long functions
         for sym in &symbols {
             if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
@@ -790,14 +854,14 @@ impl CodebaseIndex {
             layer: None,
             feature: None,
         };
-        
+
         // Generate summary (rel_path will be set properly after insertion)
         let rel_path = path.strip_prefix(&self.root).unwrap_or(path);
         file_index.summary = FileSummary::from_file_index(&file_index, rel_path, &self.root);
-        
+
         Ok(file_index)
     }
-    
+
     /// Build the dependency graph (populate used_by for all files)
     pub fn build_dependency_graph(&mut self) {
         // Precompute lookup tables to avoid quadratic scans
@@ -840,12 +904,13 @@ impl CodebaseIndex {
 
         // Collect all dependencies first
         let mut used_by_map: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-        
+
         for (file_path, file_index) in &self.files {
             for dep in &file_index.summary.depends_on {
                 // Normalize the dependency path
                 let dep_normalized = normalize_path(dep);
-                let mut matches: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+                let mut matches: std::collections::HashSet<PathBuf> =
+                    std::collections::HashSet::new();
 
                 if let Some(paths) = path_lookup.get(&dep_normalized) {
                     matches.extend(paths.iter().cloned());
@@ -883,7 +948,7 @@ impl CodebaseIndex {
                 }
             }
         }
-        
+
         // Now update each file's used_by
         for (path, used_by) in used_by_map {
             if let Some(file_index) = self.files.get_mut(&path) {
@@ -945,34 +1010,40 @@ pub struct FlatTreeEntry {
 fn calculate_complexity(content: &str, _language: Language) -> f64 {
     // Count decision points
     let decision_keywords = [
-        "if ", "else ", "elif ", "for ", "while ", "match ", 
-        "case ", "catch ", "&&", "||", "?", "try ", "switch "
+        "if ", "else ", "elif ", "for ", "while ", "match ", "case ", "catch ", "&&", "||", "?",
+        "try ", "switch ",
     ];
-    
+
     let mut complexity = 1.0; // Base complexity
-    
+
     for keyword in &decision_keywords {
         complexity += content.matches(keyword).count() as f64;
     }
-    
+
     complexity
 }
 
-/// Compute a stable hash of file contents (FNV-1a 64-bit).
-
 /// Check if a path should be ignored
 fn is_ignored(path: &Path) -> bool {
-    let name = path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
     // Common ignore patterns
     let ignored = [
-        "target", "node_modules", ".git", ".svn", ".hg",
-        "dist", "build", "__pycache__", ".pytest_cache",
-        "vendor", ".idea", ".vscode", ".cosmos",
+        "target",
+        "node_modules",
+        ".git",
+        ".svn",
+        ".hg",
+        "dist",
+        "build",
+        "__pycache__",
+        ".pytest_cache",
+        "vendor",
+        ".idea",
+        ".vscode",
+        ".cosmos",
     ];
-    
+
     ignored.contains(&name) || name.starts_with('.')
 }
 

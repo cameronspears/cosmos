@@ -3,8 +3,8 @@
 //! Organizes codebase files into architectural layers (Frontend, Backend, API, etc.)
 //! and feature clusters for a more intuitive project explorer.
 
-pub mod heuristics;
 pub mod features;
+pub mod heuristics;
 
 use crate::index::CodebaseIndex;
 use serde::{Deserialize, Serialize};
@@ -16,38 +16,61 @@ pub use heuristics::Confidence;
 
 /// Generic filenames that need parent directory context
 const GENERIC_FILENAMES: &[&str] = &[
-    "route.ts", "route.js", "route.tsx", "route.jsx",
-    "page.ts", "page.tsx", "page.js", "page.jsx",
-    "index.ts", "index.tsx", "index.js", "index.jsx",
-    "layout.ts", "layout.tsx", "layout.js", "layout.jsx",
-    "+page.svelte", "+layout.svelte", "+server.ts", "+server.js",
-    "mod.rs", "lib.rs", "main.rs",
-    "__init__.py", "views.py", "models.py", "urls.py",
+    "route.ts",
+    "route.js",
+    "route.tsx",
+    "route.jsx",
+    "page.ts",
+    "page.tsx",
+    "page.js",
+    "page.jsx",
+    "index.ts",
+    "index.tsx",
+    "index.js",
+    "index.jsx",
+    "layout.ts",
+    "layout.tsx",
+    "layout.js",
+    "layout.jsx",
+    "+page.svelte",
+    "+layout.svelte",
+    "+server.ts",
+    "+server.js",
+    "mod.rs",
+    "lib.rs",
+    "main.rs",
+    "__init__.py",
+    "views.py",
+    "models.py",
+    "urls.py",
 ];
 
 /// Get a display name with context for generic filenames
-/// 
+///
 /// For files like "route.ts", shows "users/route.ts" using the parent directory
 pub fn display_name_with_context(path: &Path) -> String {
-    let filename = path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("?");
-    
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+
     // Check if this is a generic filename that needs context
     if GENERIC_FILENAMES.contains(&filename) {
         // Get parent directory name
-        if let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+        if let Some(parent) = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
             // Skip unhelpful parent names
             let skip_parents = ["src", "app", "lib", "pages", "routes", "api"];
             if !skip_parents.contains(&parent) {
                 return format!("{}/{}", parent, filename);
             }
-            
+
             // Try grandparent if parent is generic
-            if let Some(grandparent) = path.parent()
+            if let Some(grandparent) = path
+                .parent()
                 .and_then(|p| p.parent())
                 .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str()) 
+                .and_then(|n| n.to_str())
             {
                 if !skip_parents.contains(&grandparent) {
                     return format!("{}/{}", grandparent, filename);
@@ -55,12 +78,14 @@ pub fn display_name_with_context(path: &Path) -> String {
             }
         }
     }
-    
+
     filename.to_string()
 }
 
 /// Architectural layer classification
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord, Default,
+)]
 pub enum Layer {
     /// UI components, pages, layouts, styles
     Frontend,
@@ -131,7 +156,6 @@ impl Layer {
     }
 }
 
-
 /// A feature grouping within a layer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Feature {
@@ -198,7 +222,6 @@ impl FileGroup {
     pub fn add_file(&mut self, path: PathBuf) {
         self.ungrouped_files.push(path);
     }
-
 }
 
 /// File assignment with confidence tracking
@@ -246,12 +269,20 @@ impl CodebaseGrouping {
     }
 
     /// Assign a file to a layer with explicit confidence
-    pub fn assign_file_with_confidence(&mut self, path: PathBuf, layer: Layer, confidence: Confidence) {
-        self.file_assignments.insert(path.clone(), FileAssignment {
-            layer,
-            feature: None,
-            confidence,
-        });
+    pub fn assign_file_with_confidence(
+        &mut self,
+        path: PathBuf,
+        layer: Layer,
+        confidence: Confidence,
+    ) {
+        self.file_assignments.insert(
+            path.clone(),
+            FileAssignment {
+                layer,
+                feature: None,
+                confidence,
+            },
+        );
         self.groups
             .entry(layer)
             .or_insert_with(|| FileGroup::new(layer))
@@ -277,17 +308,19 @@ impl CodebaseGrouping {
             }
         }
 
-        self.file_assignments.insert(path.clone(), FileAssignment {
-            layer,
-            feature: None,
-            confidence,
-        });
+        self.file_assignments.insert(
+            path.clone(),
+            FileAssignment {
+                layer,
+                feature: None,
+                confidence,
+            },
+        );
         self.groups
             .entry(layer)
             .or_insert_with(|| FileGroup::new(layer))
             .add_file(path.clone());
     }
-
 }
 
 pub fn generate_grouping_with_overrides(
@@ -365,4 +398,3 @@ impl GroupedTreeEntry {
         }
     }
 }
-

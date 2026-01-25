@@ -31,9 +31,9 @@ pub struct FixContext {
 pub struct ReviewFinding {
     pub file: String,
     pub line: Option<u32>,
-    pub severity: String, // "critical", "warning", "suggestion", "nitpick"
-    pub category: String, // "bug", "security", "performance", "logic", "error-handling", "style"
-    pub title: String,    // Short title
+    pub severity: String,    // "critical", "warning", "suggestion", "nitpick"
+    pub category: String,    // "bug", "security", "performance", "logic", "error-handling", "style"
+    pub title: String,       // Short title
     pub description: String, // Detailed explanation in plain language
     pub recommended: bool, // Reviewer recommends fixing this (true = should fix, false = optional)
 }
@@ -110,7 +110,10 @@ pub async fn verify_changes(
         changes_text.push('\n');
     }
 
-    let user = format!("Review these code changes for bugs and issues:\n{}", changes_text);
+    let user = format!(
+        "Review these code changes for bugs and issues:\n{}",
+        changes_text
+    );
 
     let response = call_llm_with_usage(&system, &user, Model::Reviewer, true).await?;
 

@@ -50,5 +50,3 @@ mod tests {
         let _ = is_first_run();
     }
 }
-
-

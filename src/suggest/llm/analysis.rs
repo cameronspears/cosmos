@@ -41,7 +41,12 @@ pub async fn ask_question(
         .files
         .values()
         .flat_map(|f| f.symbols.iter())
-        .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Struct | SymbolKind::Enum))
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SymbolKind::Function | SymbolKind::Struct | SymbolKind::Enum
+            )
+        })
         .take(100)
         .map(|s| format!("{:?}: {}", s.kind, s.name))
         .collect();
@@ -71,8 +76,7 @@ QUESTION:
         question
     );
 
-    let response =
-        call_llm_with_usage(ASK_QUESTION_SYSTEM, &user, Model::Balanced, false).await?;
+    let response = call_llm_with_usage(ASK_QUESTION_SYSTEM, &user, Model::Balanced, false).await?;
     Ok((response.content, response.usage))
 }
 
@@ -172,8 +176,7 @@ fn build_codebase_context(
 
     // Blast radius: files affected by the current changes (direct importers + direct deps)
     if !context.all_changed_files().is_empty() {
-        let changed: HashSet<PathBuf> =
-            context.all_changed_files().into_iter().cloned().collect();
+        let changed: HashSet<PathBuf> = context.all_changed_files().into_iter().cloned().collect();
         let mut related: HashSet<PathBuf> = HashSet::new();
 
         for c in &changed {
@@ -215,7 +218,10 @@ fn build_codebase_context(
         if !glossary.is_empty() {
             let terms = glossary.to_prompt_context(20);
             if !terms.trim().is_empty() {
-                sections.push(format!("\n\nDOMAIN TERMINOLOGY (use these terms):\n{}", terms));
+                sections.push(format!(
+                    "\n\nDOMAIN TERMINOLOGY (use these terms):\n{}",
+                    terms
+                ));
             }
         }
     }
@@ -266,7 +272,10 @@ fn build_codebase_context(
         for todo in &todos {
             todos_section.push_str(&format!(
                 "\n- {}:{} - {}",
-                todo.file.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                todo.file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?"),
                 todo.line,
                 truncate_str(&todo.description, 70)
             ));

@@ -65,13 +65,8 @@ pub async fn classify_grouping_candidates(
         serde_json::to_string_pretty(&file_contexts)?
     );
 
-    let response = call_llm_with_usage(
-        GROUPING_CLASSIFY_SYSTEM,
-        &user,
-        Model::Balanced,
-        true,
-    )
-    .await?;
+    let response =
+        call_llm_with_usage(GROUPING_CLASSIFY_SYSTEM, &user, Model::Balanced, true).await?;
 
     let (parsed, correction_usage): (GroupingAiResponse, _) =
         parse_json_with_retry(&response.content, "grouping classification").await?;
