@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/cameronspears/cosmos/compare/v0.1.1...v0.1.2) (2026-01-25)
+
+
+### Bug Fixes
+
+* **build:** disable git2 ssh/https to remove OpenSSL dependency ([4efaa93](https://github.com/cameronspears/cosmos/commit/4efaa936895ab1821c826e418d0062b5896e1a76))
+
 ## [0.1.1](https://github.com/cameronspears/cosmos/compare/v0.1.0...v0.1.1) (2026-01-25)
 
 
