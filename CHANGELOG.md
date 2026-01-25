@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/cameronspears/cosmos/compare/v0.1.2...v0.1.3) (2026-01-25)
+
+
+### Bug Fixes
+
+* **install:** improve Rust installation detection and error handling ([d56386e](https://github.com/cameronspears/cosmos/commit/d56386e20826bc2e283f26a8670ef4de981d8d5c))
+
 ## [0.1.2](https://github.com/cameronspears/cosmos/compare/v0.1.1...v0.1.2) (2026-01-25)
 
 
