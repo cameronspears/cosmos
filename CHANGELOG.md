@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/cameronspears/cosmos/compare/v0.2.0...v0.3.0) (2026-01-26)
+
+
+### Features
+
+* **git:** implement stash and discard functionality ([ac8edfa](https://github.com/cameronspears/cosmos/commit/ac8edfad9f898757f4be678a0b22908e91797f23))
+
 ## [0.2.0](https://github.com/cameronspears/cosmos/compare/v0.1.4...v0.2.0) (2026-01-26)
 
 
