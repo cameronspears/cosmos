@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/cameronspears/cosmos/compare/v0.4.0...v0.4.1) (2026-01-26)
+
+
+### Bug Fixes
+
+* remove outdated tagline and ASCII documentation ([8da0ad7](https://github.com/cameronspears/cosmos/commit/8da0ad7f781bb22673afbbf73942e644112b0d62))
+
 ## [0.4.0](https://github.com/cameronspears/cosmos/compare/v0.3.0...v0.4.0) (2026-01-26)
 
 
