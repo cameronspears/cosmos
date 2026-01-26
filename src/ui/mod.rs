@@ -869,8 +869,12 @@ impl App {
 
     /// Set update error
     pub fn set_update_error(&mut self, message: String) {
-        if let Overlay::Update { error, .. } = &mut self.overlay {
+        if let Overlay::Update {
+            error, progress, ..
+        } = &mut self.overlay
+        {
             *error = Some(message);
+            *progress = None; // Clear progress to ensure clean error state
         }
     }
 

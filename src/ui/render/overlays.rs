@@ -740,7 +740,7 @@ pub(super) fn render_update_overlay(
 
         if pct < 100 {
             lines.push(Line::from(Span::styled(
-                "  Downloading update...",
+                "  Installing update (this may take a minute)...",
                 Style::default().fg(Theme::GREY_400),
             )));
         } else {

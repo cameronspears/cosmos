@@ -57,6 +57,19 @@ pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
     }
 }
 
+/// Extract the most useful error message from cargo stderr output
+///
+/// Looks for lines starting with "error:" or "error[" first (actual error messages),
+/// then falls back to the last non-empty line.
+fn extract_cargo_error(stderr: &str) -> &str {
+    stderr
+        .lines()
+        .find(|line| line.trim().starts_with("error:") || line.trim().starts_with("error["))
+        .or_else(|| stderr.lines().filter(|l| !l.trim().is_empty()).last())
+        .map(|s| s.trim())
+        .unwrap_or("unknown error")
+}
+
 /// Compare two semver version strings
 /// Returns true if `latest` is newer than `current`
 fn is_newer_version(latest: &str, current: &str) -> bool {
@@ -93,24 +106,32 @@ where
 {
     use std::process::Command;
 
-    // Initial progress
-    on_progress(5);
+    // Check if cargo is available first
+    let cargo_check = Command::new("cargo").arg("--version").output();
+    if cargo_check.is_err() || !cargo_check.as_ref().unwrap().status.success() {
+        return Err(anyhow::anyhow!(
+            "Cargo is not installed. Please install Rust from https://rustup.rs"
+        ));
+    }
+
+    // Starting download/compile
+    on_progress(10);
 
     // Run cargo install to update
+    // Note: We don't use --locked because it requires exact Cargo.lock match,
+    // which can fail if dependencies have been updated since publishing.
     let output = Command::new("cargo")
-        .args(["install", "cosmos-tui", "--force", "--locked"])
+        .args(["install", "cosmos-tui", "--force"])
         .output()
-        .context("Failed to run cargo install. Is Rust installed?")?;
+        .context("Failed to run cargo install")?;
 
     // Update complete
     on_progress(100);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!(
-            "cargo install failed: {}",
-            stderr.lines().last().unwrap_or("unknown error")
-        ));
+        let error_msg = extract_cargo_error(&stderr);
+        return Err(anyhow::anyhow!("Update failed: {}", error_msg));
     }
 
     // Binary was replaced, now exec into the new version
@@ -269,5 +290,90 @@ mod tests {
         // Patch version bumps within same minor
         assert!(is_newer_version("0.3.5", "0.3.4"));
         assert!(is_newer_version("0.3.100", "0.3.99"));
+    }
+
+    #[test]
+    fn test_extract_cargo_error_finds_error_line() {
+        // Should find the "error:" line
+        let stderr = r#"
+    Updating crates.io index
+    Compiling some-crate v1.0.0
+error: failed to download `some-crate v1.0.0`
+    Caused by: network error
+"#;
+        assert_eq!(
+            extract_cargo_error(stderr),
+            "error: failed to download `some-crate v1.0.0`"
+        );
+    }
+
+    #[test]
+    fn test_extract_cargo_error_finds_error_code() {
+        // Should find "error[E0123]:" style lines
+        let stderr = r#"
+   Compiling cosmos-tui v0.5.0
+error[E0433]: failed to resolve: use of undeclared crate or module
+   --> src/main.rs:1:5
+"#;
+        assert!(extract_cargo_error(stderr).starts_with("error[E0433]"));
+    }
+
+    #[test]
+    fn test_extract_cargo_error_falls_back_to_last_line() {
+        // When no "error:" line, use last non-empty line
+        let stderr = r#"
+warning: some warning
+note: some note
+The operation failed
+"#;
+        assert_eq!(extract_cargo_error(stderr), "The operation failed");
+    }
+
+    #[test]
+    fn test_extract_cargo_error_empty_stderr() {
+        // Empty stderr returns unknown error
+        assert_eq!(extract_cargo_error(""), "unknown error");
+        assert_eq!(extract_cargo_error("   \n  \n  "), "unknown error");
+    }
+
+    #[test]
+    fn test_extract_cargo_error_trims_whitespace() {
+        // Should trim leading/trailing whitespace from the error
+        let stderr = "   error: some problem   \n";
+        assert_eq!(extract_cargo_error(stderr), "error: some problem");
+    }
+
+    #[test]
+    fn test_extract_cargo_error_prefers_first_error() {
+        // When multiple error lines exist, find the first one
+        let stderr = r#"
+error: first error
+error: second error
+"#;
+        assert_eq!(extract_cargo_error(stderr), "error: first error");
+    }
+
+    #[test]
+    fn test_extract_cargo_error_real_cargo_output() {
+        // Test with realistic cargo install failure output
+        let stderr = r#"
+    Updating crates.io index
+error: could not find `nonexistent-crate` in registry `crates-io`
+"#;
+        assert_eq!(
+            extract_cargo_error(stderr),
+            "error: could not find `nonexistent-crate` in registry `crates-io`"
+        );
+    }
+
+    #[test]
+    fn test_extract_cargo_error_network_failure() {
+        // Test network-related error
+        let stderr = r#"
+    Updating crates.io index
+warning: spurious network error
+error: failed to fetch `https://github.com/rust-lang/crates.io-index`
+"#;
+        assert!(extract_cargo_error(stderr).contains("failed to fetch"));
     }
 }
