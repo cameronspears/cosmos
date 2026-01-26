@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/cameronspears/cosmos/compare/v0.1.3...v0.1.4) (2026-01-26)
+
+
+### Bug Fixes
+
+* reduce keywords to comply with crates.io limit ([4321647](https://github.com/cameronspears/cosmos/commit/43216473fcb07d82d206a09e5c2aae48ff951450))
+
 ## [0.1.3](https://github.com/cameronspears/cosmos/compare/v0.1.2...v0.1.3) (2026-01-25)
 
 
