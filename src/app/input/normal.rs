@@ -894,7 +894,9 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                                 // Create PR with human-friendly content
                                                 match git_ops::create_pr(
                                                     &repo_path, &pr_title, &pr_body,
-                                                ) {
+                                                )
+                                                .await
+                                                {
                                                     Ok(url) => {
                                                         let _ = tx_ship.send(
                                                             BackgroundMessage::ShipComplete(url),

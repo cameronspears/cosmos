@@ -9,6 +9,7 @@ mod app;
 mod cache;
 mod config;
 mod context;
+mod github;
 mod grouping;
 mod index;
 mod onboarding;
@@ -44,6 +45,10 @@ struct Args {
     /// Set up OpenRouter API key for AI features (BYOK mode)
     #[arg(long)]
     setup: bool,
+
+    /// Authenticate with GitHub for PR creation
+    #[arg(long)]
+    github_login: bool,
 }
 
 #[tokio::main]
@@ -55,9 +60,16 @@ async fn main() -> Result<()> {
         return setup_api_key();
     }
 
-    // Check for first run and run setup
-    if onboarding::is_first_run() {
-        onboarding::run_onboarding().map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Handle --github-login flag
+    if args.github_login {
+        return github_login().await;
+    }
+
+    // Check if onboarding is needed (missing API key or GitHub auth)
+    if onboarding::needs_onboarding() {
+        onboarding::run_onboarding()
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         // Setup completed, verify API key is accessible
         let mut config = config::Config::load();
@@ -179,6 +191,73 @@ fn setup_api_key() -> Result<()> {
             return Err(anyhow::anyhow!("API key verification failed"));
         }
     }
+
+    Ok(())
+}
+
+/// Authenticate with GitHub using OAuth device flow
+async fn github_login() -> Result<()> {
+    use std::io::{self, Write};
+
+    // Check if already authenticated
+    if github::is_authenticated() {
+        println!();
+        println!("  Already authenticated with GitHub.");
+        println!("  To re-authenticate, unset GITHUB_TOKEN or clear the keychain entry.");
+        println!();
+        return Ok(());
+    }
+
+    println!();
+    println!("  GitHub Authentication");
+    println!("  ─────────────────────");
+    println!();
+    println!("  Cosmos uses GitHub to create pull requests.");
+    println!("  We'll open your browser to authenticate with GitHub.");
+    println!();
+
+    struct CliCallbacks {
+        cancelled: bool,
+    }
+
+    impl github::DeviceFlowCallbacks for CliCallbacks {
+        fn show_instructions(&mut self, instructions: &github::AuthInstructions) {
+            println!("  To authenticate:");
+            println!();
+            println!("    1. Visit: {}", instructions.verification_uri);
+            println!("    2. Enter code: {}", instructions.user_code);
+            println!();
+            print!("  Waiting for authorization...");
+            let _ = io::stdout().flush();
+
+            // Try to open the URL in the default browser
+            let _ = git_ops::open_url(&instructions.verification_uri);
+        }
+
+        fn poll_status(&mut self) -> bool {
+            print!(".");
+            let _ = io::stdout().flush();
+            !self.cancelled
+        }
+
+        fn on_success(&mut self, username: &str) {
+            println!();
+            println!();
+            println!("  + Authenticated as @{}", username);
+            println!("  + Token saved to system keychain");
+            println!();
+        }
+
+        fn on_error(&mut self, error: &str) {
+            println!();
+            println!();
+            eprintln!("  ! {}", error);
+            println!();
+        }
+    }
+
+    let mut callbacks = CliCallbacks { cancelled: false };
+    github::run_device_flow(&mut callbacks).await?;
 
     Ok(())
 }

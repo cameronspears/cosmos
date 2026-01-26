@@ -481,90 +481,28 @@ fn resolve_remote_head_branch(repo: &Repository) -> Option<String> {
 }
 
 // ============================================================================
-// GitHub CLI (gh) Integration
+// GitHub Integration (via native API)
 // ============================================================================
 
-const GH_TIMEOUT_SECS: u64 = 60;
+/// Create a pull request using the GitHub API.
+///
+/// Returns the URL of the created PR.
+pub async fn create_pr(repo_path: &Path, title: &str, body: &str) -> Result<String> {
+    let (owner, repo) = crate::github::get_remote_info(repo_path)?;
+    let base = get_main_branch_name(repo_path)?;
+    let head = get_current_branch(repo_path)?;
 
-fn run_gh_command(repo_path: Option<&Path>, args: &[&str]) -> Result<CommandRunResult> {
-    let mut cmd = Command::new("gh");
-    if let Some(path) = repo_path {
-        cmd.current_dir(path);
-    }
-    cmd.args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GH_PROMPT_DISABLED", "1");
-
-    run_command_with_timeout(&mut cmd, Duration::from_secs(GH_TIMEOUT_SECS))
-        .map_err(|e| anyhow::anyhow!("Failed to run gh command: {}", e))
+    crate::github::create_pull_request(&owner, &repo, &base, &head, title, body).await
 }
 
-/// Check if gh CLI is available
-pub fn gh_available() -> Result<()> {
-    let output = run_gh_command(None, &["--version"]).map_err(|_| {
-        anyhow::anyhow!("gh CLI not installed. Install from https://cli.github.com")
-    })?;
-    if output.timed_out {
-        return Err(anyhow::anyhow!(
-            "GitHub CLI timed out after {}s while checking version. Check your network and try again.",
-            GH_TIMEOUT_SECS
-        ));
-    }
-    if output.status.map(|s| s.success()).unwrap_or(false) {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "gh CLI not installed. Install from https://cli.github.com"
-        ))
-    }
-}
-
-/// Check if gh is authenticated
-pub fn gh_authenticated() -> Result<()> {
-    let output = run_gh_command(None, &["auth", "status"])
-        .map_err(|_| anyhow::anyhow!("gh CLI not authenticated. Run 'gh auth login' first"))?;
-    if output.timed_out {
-        return Err(anyhow::anyhow!(
-            "GitHub CLI timed out after {}s while checking login. Check your network and try again.",
-            GH_TIMEOUT_SECS
-        ));
-    }
-    if output.status.map(|s| s.success()).unwrap_or(false) {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "gh CLI not authenticated. Run 'gh auth login' first"
-        ))
-    }
-}
-
-/// Create a pull request using gh CLI
-pub fn create_pr(repo_path: &Path, title: &str, body: &str) -> Result<String> {
-    gh_available()?;
-    gh_authenticated()?;
-
-    let output = run_gh_command(
-        Some(repo_path),
-        &["pr", "create", "--title", title, "--body", body],
-    )
-    .context("Failed to create PR")?;
-    if output.timed_out {
-        return Err(anyhow::anyhow!(
-            "GitHub CLI timed out after {}s while creating the PR. Check your network and try again.",
-            GH_TIMEOUT_SECS
-        ));
-    }
-
-    if output.status.map(|s| s.success()).unwrap_or(false) {
-        // gh pr create outputs the PR URL
-        let url = output.stdout.trim().to_string();
-        Ok(url)
-    } else {
-        Err(anyhow::anyhow!(
-            "Failed to create PR: {}",
-            output.stderr.trim()
-        ))
-    }
+/// Get the current branch name.
+fn get_current_branch(repo_path: &Path) -> Result<String> {
+    let repo = Repository::open(repo_path)?;
+    let head = repo.head().context("Failed to get HEAD")?;
+    let branch = head
+        .shorthand()
+        .ok_or_else(|| anyhow::anyhow!("HEAD is not a branch"))?;
+    Ok(branch.to_string())
 }
 
 /// Read file content from HEAD (without modifying the working directory).
@@ -670,6 +608,10 @@ mod tests {
     use super::*;
     use std::env;
 
+    // ========================================================================
+    // Git Status Tests
+    // ========================================================================
+
     #[test]
     fn test_current_status() {
         // Test on the cosmos repo itself
@@ -678,6 +620,24 @@ mod tests {
         assert!(status.is_ok());
         assert!(!status.unwrap().branch.is_empty());
     }
+
+    #[test]
+    fn test_current_status_returns_git_status_struct() {
+        let repo_path = env::current_dir().unwrap();
+        let status = current_status(&repo_path).unwrap();
+
+        // Verify struct fields are accessible
+        let _branch: &str = &status.branch;
+        let _staged: &Vec<String> = &status.staged;
+        let _modified: &Vec<String> = &status.modified;
+        let _untracked: &Vec<String> = &status.untracked;
+        let _ahead: usize = status.ahead;
+        let _behind: usize = status.behind;
+    }
+
+    // ========================================================================
+    // Branch Name Generation Tests
+    // ========================================================================
 
     #[test]
     fn test_branch_name_sanitization() {
@@ -693,11 +653,178 @@ mod tests {
     }
 
     #[test]
+    fn test_branch_name_with_long_summary() {
+        let long_summary = "This is a very long summary that should be truncated to a reasonable length for the branch name";
+        let name = generate_fix_branch_name("abcd1234", long_summary);
+        assert!(name.starts_with("fix/abcd1234-"));
+        assert!(is_valid_git_ref(&name));
+        // Should be truncated
+        assert!(name.len() < 60);
+    }
+
+    #[test]
+    fn test_branch_name_unicode_handling() {
+        // Unicode should be converted to dashes
+        let name = generate_fix_branch_name("12345678", "Fix émoji 🚀 issue");
+        assert!(is_valid_git_ref(&name));
+        // Should not contain emoji or accented chars
+        assert!(!name.contains("é"));
+        assert!(!name.contains("🚀"));
+    }
+
+    #[test]
+    fn test_branch_name_consecutive_special_chars() {
+        let name = generate_fix_branch_name("12345678", "Fix---multiple///slashes");
+        assert!(is_valid_git_ref(&name));
+        // Should not have consecutive dashes (they get collapsed)
+        assert!(!name.contains("--"));
+    }
+
+    // ========================================================================
+    // Git Ref Validation Tests
+    // ========================================================================
+
+    #[test]
     fn test_invalid_git_ref_rejected() {
         assert!(!is_valid_git_ref("bad..name"));
         assert!(!is_valid_git_ref("bad@{name"));
         assert!(!is_valid_git_ref("bad name"));
         assert!(!is_valid_git_ref("bad:ref"));
         assert!(!is_valid_git_ref("bad.lock"));
+    }
+
+    #[test]
+    fn test_valid_git_refs_accepted() {
+        assert!(is_valid_git_ref("main"));
+        assert!(is_valid_git_ref("feature/new-thing"));
+        assert!(is_valid_git_ref("fix/issue-123"));
+        assert!(is_valid_git_ref("release-v1.2.3"));
+    }
+
+    #[test]
+    fn test_git_ref_edge_cases() {
+        // Empty string
+        assert!(!is_valid_git_ref(""));
+
+        // Starting/ending with dot
+        assert!(!is_valid_git_ref(".hidden"));
+        assert!(!is_valid_git_ref("name."));
+
+        // Ending with slash
+        assert!(!is_valid_git_ref("path/"));
+
+        // Control characters (tab)
+        assert!(!is_valid_git_ref("name\twith\ttabs"));
+    }
+
+    // ========================================================================
+    // Main Branch Detection Tests
+    // ========================================================================
+
+    #[test]
+    fn test_get_main_branch_name() {
+        let repo_path = env::current_dir().unwrap();
+        let result = get_main_branch_name(&repo_path);
+        assert!(result.is_ok());
+
+        let branch = result.unwrap();
+        // Should be one of the common default branch names
+        assert!(
+            branch == "main" || branch == "master" || branch == "trunk" || branch == "develop",
+            "Unexpected default branch: {}",
+            branch
+        );
+    }
+
+    // ========================================================================
+    // Current Branch Tests
+    // ========================================================================
+
+    #[test]
+    fn test_get_current_branch() {
+        let repo_path = env::current_dir().unwrap();
+        let result = get_current_branch(&repo_path);
+        assert!(result.is_ok());
+        assert!(!result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_get_current_branch_is_valid_ref() {
+        let repo_path = env::current_dir().unwrap();
+        let branch = get_current_branch(&repo_path).unwrap();
+        assert!(is_valid_git_ref(&branch));
+    }
+
+    // ========================================================================
+    // PR Creation Tests (signature validation)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_create_pr_requires_github_auth() {
+        // Save original env state
+        let orig = std::env::var("GITHUB_TOKEN").ok();
+
+        // Remove GitHub token to ensure not authenticated
+        std::env::remove_var("GITHUB_TOKEN");
+
+        let repo_path = env::current_dir().unwrap();
+        let result = create_pr(&repo_path, "Test PR", "Test body").await;
+
+        // Should fail because not authenticated
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("authenticated") || err.contains("token") || err.contains("GitHub"),
+            "Error should mention authentication: {}",
+            err
+        );
+
+        // Restore original state
+        match orig {
+            Some(val) => std::env::set_var("GITHUB_TOKEN", val),
+            None => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_pr_is_async() {
+        // This test just verifies create_pr is an async function
+        // by using it in an async context
+        let repo_path = env::current_dir().unwrap();
+
+        // We don't actually want to create a PR, just verify it compiles as async
+        let future = create_pr(&repo_path, "title", "body");
+
+        // Verify it's a future (can be awaited)
+        // We'll cancel it immediately by dropping
+        drop(future);
+    }
+
+    // ========================================================================
+    // File Operations Tests
+    // ========================================================================
+
+    #[test]
+    fn test_read_file_from_head_returns_option() {
+        let repo_path = env::current_dir().unwrap();
+
+        // Try reading a file that exists
+        let result = read_file_from_head(&repo_path, Path::new("Cargo.toml"));
+        assert!(result.is_ok());
+
+        if let Ok(Some(content)) = result {
+            // Cargo.toml should contain the package name
+            assert!(content.contains("cosmos"));
+        }
+    }
+
+    #[test]
+    fn test_read_file_from_head_returns_none_for_new_file() {
+        let repo_path = env::current_dir().unwrap();
+
+        // Try reading a file that definitely doesn't exist
+        let result = read_file_from_head(&repo_path, Path::new("definitely-not-a-real-file.xyz"));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }
