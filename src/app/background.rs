@@ -11,9 +11,6 @@
 //! - **Cache saves** (`cache.save_*()`): These are best-effort operations. Failure
 //!   means we'll regenerate the data next time. Not ideal but not catastrophic.
 //!
-//! - **Config updates** (`config.record_tokens()`): Budget tracking is best-effort.
-//!   If it fails, the user might slightly exceed their budget, but the core
-//!   functionality continues to work.
 
 use crate::app::messages::BackgroundMessage;
 use crate::app::RuntimeContext;
@@ -44,17 +41,11 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 // Diff-first ordering: changed files and their blast radius float to the top.
                 app.suggestions.sort_with_context(&app.context);
 
-                // Track cost (Smart model for suggestions)
+                // Track session cost for display
                 if let Some(u) = usage {
                     let cost = u.calculate_cost(suggest::llm::Model::Smart);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
-                    ctx.budget_guard.record_usage(cost, u.total_tokens);
-                    let _ = app.config.record_tokens(u.total_tokens);
-                    let _ = app
-                        .config
-                        .allow_ai(app.session_cost)
-                        .map_err(|e| app.show_toast(&e));
                 }
 
                 // If summaries are still generating, switch to that loading state
@@ -87,17 +78,11 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 app.update_summaries(summaries);
                 let failed_count = failed_files.len();
                 app.summary_failed_files = failed_files;
-                // Track cost (using Speed preset for summaries)
+                // Track session cost for display
                 if let Some(u) = usage {
                     let cost = u.calculate_cost(suggest::llm::Model::Speed);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
-                    ctx.budget_guard.record_usage(cost, u.total_tokens);
-                    let _ = app.config.record_tokens(u.total_tokens);
-                    let _ = app
-                        .config
-                        .allow_ai(app.session_cost)
-                        .map_err(|e| app.show_toast(&e));
                 }
 
                 // Reload glossary from cache (it was built during summary generation)
@@ -114,13 +99,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     app.pending_suggestions_on_init = false;
 
                     // Check if AI is still available
-                    let mut ai_enabled = suggest::llm::is_available();
-                    if ai_enabled {
-                        if let Err(e) = app.config.allow_ai(app.session_cost) {
-                            app.show_toast(&e);
-                            ai_enabled = false;
-                        }
-                    }
+                    let ai_enabled = suggest::llm::is_available();
 
                     if ai_enabled {
                         let index_clone = app.index.clone();
@@ -129,7 +108,6 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                         let cache_clone_path = ctx.repo_path.clone();
                         let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
                         let glossary_clone = app.glossary.clone();
-                        let budget_guard = ctx.budget_guard.clone();
 
                         app.loading = LoadingState::GeneratingSuggestions;
                         if failed_count == 0 {
@@ -140,11 +118,6 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                         }
 
                         spawn_background(ctx.tx.clone(), "suggestions_generation", async move {
-                            let mut config = crate::config::Config::load();
-                            if let Err(e) = budget_guard.allow_ai(&mut config) {
-                                let _ = tx_suggestions.send(BackgroundMessage::SuggestionsError(e));
-                                return;
-                            }
                             let mem = if repo_memory_context.trim().is_empty() {
                                 None
                             } else {
@@ -234,14 +207,6 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 // Track progress for display
                 app.summary_progress = Some((completed, total));
             }
-            BackgroundMessage::SummariesError(e) => {
-                // Only clear loading if we're not still waiting for suggestions
-                if !matches!(app.loading, LoadingState::GeneratingSuggestions) {
-                    app.loading = LoadingState::None;
-                }
-                app.summary_progress = None;
-                app.show_toast(&format!("Summary error: {}", truncate(&e, 80)));
-            }
             BackgroundMessage::GroupingEnhanced {
                 grouping,
                 updated_files,
@@ -256,12 +221,6 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     let cost = u.calculate_cost(suggest::llm::Model::Balanced);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
-                    ctx.budget_guard.record_usage(cost, u.total_tokens);
-                    let _ = app.config.record_tokens(u.total_tokens);
-                    let _ = app
-                        .config
-                        .allow_ai(app.session_cost)
-                        .map_err(|e| app.show_toast(&e));
                 }
 
                 if updated_files > 0 {
@@ -302,17 +261,11 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 problem_summary,
                 outcome,
             } => {
-                // Track cost
+                // Track session cost for display
                 if let Some(u) = usage {
                     let cost = u.calculate_cost(suggest::llm::Model::Smart);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
-                    ctx.budget_guard.record_usage(cost, u.total_tokens);
-                    let _ = app.config.record_tokens(u.total_tokens);
-                    let _ = app
-                        .config
-                        .allow_ai(app.session_cost)
-                        .map_err(|e| app.show_toast(&e));
                 }
 
                 app.loading = LoadingState::None;
@@ -368,9 +321,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 app.start_review(first_file, first_original.clone(), first_new.clone());
 
                 // Trigger verification in background (all files)
-                if let Err(e) = app.config.allow_ai(app.session_cost) {
-                    app.show_toast(&e);
-                } else {
+                {
                     let tx_verify = ctx.tx.clone();
 
                     // Build fix context so the reviewer knows what the fix was supposed to do
@@ -454,17 +405,11 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 app.show_toast(&truncate(&e, 100));
             }
             BackgroundMessage::QuestionResponse { answer, usage, .. } => {
-                // Track cost (Balanced model for questions)
+                // Track session cost for display
                 if let Some(u) = usage {
                     let cost = u.calculate_cost(suggest::llm::Model::Balanced);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
-                    ctx.budget_guard.record_usage(cost, u.total_tokens);
-                    let _ = app.config.record_tokens(u.total_tokens);
-                    let _ = app
-                        .config
-                        .allow_ai(app.session_cost)
-                        .map_err(|e| app.show_toast(&e));
                 }
 
                 app.loading = LoadingState::None;
@@ -476,13 +421,11 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 summary,
                 usage,
             } => {
-                // Track cost
+                // Track session cost for display
                 if let Some(u) = usage {
                     let cost = u.calculate_cost(suggest::llm::Model::Reviewer);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
-                    ctx.budget_guard.record_usage(cost, u.total_tokens);
-                    let _ = app.config.record_tokens(u.total_tokens);
                 }
                 // Update the Review workflow step with findings
                 app.set_review_findings(findings, summary);
@@ -492,13 +435,11 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 description,
                 usage,
             } => {
-                // Track cost
+                // Track session cost for display
                 if let Some(u) = usage {
                     let cost = u.calculate_cost(suggest::llm::Model::Smart);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
-                    ctx.budget_guard.record_usage(cost, u.total_tokens);
-                    let _ = app.config.record_tokens(u.total_tokens);
                 }
 
                 app.show_toast(&format!("Fixed: {}", truncate(&description, 40)));
@@ -515,42 +456,37 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 // Note: On re-reviews, we don't pass suggestion context because we're
                 // verifying fixes to the reviewer's findings, not the original suggestion
                 if let Some(fp) = file_path {
-                    if let Err(e) = app.config.allow_ai(app.session_cost) {
-                        app.show_toast(&e);
-                    } else {
-                        app.review_state.reviewing = true;
-                        app.loading = LoadingState::ReviewingChanges;
+                    app.review_state.reviewing = true;
+                    app.loading = LoadingState::ReviewingChanges;
 
-                        let tx_verify = ctx.tx.clone();
-                        spawn_background(ctx.tx.clone(), "re_verification", async move {
-                            let files_with_content = vec![(fp, original_content, new_content)];
-                            // For re-reviews, we pass None for fix_context since we're now
-                            // verifying the fix to the reviewer's findings, not the original fix
-                            match suggest::llm::verify_changes(
-                                &files_with_content,
-                                iteration,
-                                &fixed_titles,
-                                None,
-                            )
-                            .await
-                            {
-                                Ok(review) => {
-                                    let _ =
-                                        tx_verify.send(BackgroundMessage::VerificationComplete {
-                                            findings: review.findings,
-                                            summary: review.summary,
-                                            usage: review.usage,
-                                        });
-                                }
-                                Err(e) => {
-                                    let _ = tx_verify.send(BackgroundMessage::Error(format!(
-                                        "Re-verification failed: {}",
-                                        e
-                                    )));
-                                }
+                    let tx_verify = ctx.tx.clone();
+                    spawn_background(ctx.tx.clone(), "re_verification", async move {
+                        let files_with_content = vec![(fp, original_content, new_content)];
+                        // For re-reviews, we pass None for fix_context since we're now
+                        // verifying the fix to the reviewer's findings, not the original fix
+                        match suggest::llm::verify_changes(
+                            &files_with_content,
+                            iteration,
+                            &fixed_titles,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(review) => {
+                                let _ = tx_verify.send(BackgroundMessage::VerificationComplete {
+                                    findings: review.findings,
+                                    summary: review.summary,
+                                    usage: review.usage,
+                                });
                             }
-                        });
-                    }
+                            Err(e) => {
+                                let _ = tx_verify.send(BackgroundMessage::Error(format!(
+                                    "Re-verification failed: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    });
                 }
             }
         }

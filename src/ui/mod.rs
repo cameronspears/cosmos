@@ -50,7 +50,6 @@ pub struct App {
     pub index: CodebaseIndex,
     pub suggestions: SuggestionEngine,
     pub context: WorkContext,
-    pub config: crate::config::Config,
 
     // UI state
     pub active_panel: ActivePanel,
@@ -150,7 +149,6 @@ impl App {
             index,
             suggestions,
             context,
-            config: crate::config::Config::load(),
             active_panel: ActivePanel::default(),
             project_scroll: 0,
             project_selected: 0,
@@ -744,42 +742,6 @@ impl App {
         }
     }
 
-    /// Show a privacy preview for an inquiry (what will be sent).
-    pub fn show_inquiry_preview(&mut self, question: String) {
-        let mut preview = String::new();
-        preview.push_str("Cosmos will send:\n");
-        preview.push_str("- Repo stats (file count, LOC, symbol count)\n");
-        preview.push_str("- Up to 50 file paths (top-level key files)\n");
-        preview.push_str("- Up to 100 symbol names (functions/structs/enums)\n");
-
-        let changed: Vec<String> = self
-            .context
-            .all_changed_files()
-            .into_iter()
-            .take(10)
-            .map(|p| p.display().to_string())
-            .collect();
-        if !changed.is_empty() {
-            preview.push_str("\nChanged files (sample):\n");
-            for f in changed {
-                preview.push_str(&format!("- `{}`\n", f));
-            }
-        }
-
-        let mem = self.repo_memory.to_prompt_context(6, 500);
-        if !mem.trim().is_empty() {
-            preview.push_str("\nRepo memory (sample):\n");
-            preview.push_str(&mem);
-            preview.push('\n');
-        }
-
-        self.overlay = Overlay::InquiryPreview {
-            question,
-            preview,
-            scroll: 0,
-        };
-    }
-
     /// Clear expired toast
     pub fn clear_expired_toast(&mut self) {
         if let Some(ref toast) = self.toast {
@@ -892,7 +854,6 @@ impl App {
     pub fn overlay_scroll_down(&mut self) {
         match &mut self.overlay {
             Overlay::Help { scroll }
-            | Overlay::InquiryPreview { scroll, .. }
             | Overlay::FileDetail { scroll, .. }
             | Overlay::StartupCheck { scroll, .. } => {
                 *scroll += 1;
@@ -905,7 +866,6 @@ impl App {
     pub fn overlay_scroll_up(&mut self) {
         match &mut self.overlay {
             Overlay::Help { scroll }
-            | Overlay::InquiryPreview { scroll, .. }
             | Overlay::FileDetail { scroll, .. }
             | Overlay::StartupCheck { scroll, .. } => {
                 *scroll = scroll.saturating_sub(1);

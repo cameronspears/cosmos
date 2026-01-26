@@ -17,7 +17,7 @@ use footer::render_footer;
 use header::render_header;
 use main::render_main;
 use overlays::{
-    render_file_detail, render_help, render_inquiry_preview, render_reset_overlay,
+    render_file_detail, render_help, render_reset_overlay,
     render_startup_check,
 };
 use toast::render_toast;
@@ -48,13 +48,6 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Overlays
     match &app.overlay {
         Overlay::Help { scroll } => render_help(frame, *scroll),
-        Overlay::InquiryPreview {
-            question,
-            preview,
-            scroll,
-        } => {
-            render_inquiry_preview(frame, question, preview, *scroll);
-        }
         Overlay::FileDetail { path, scroll } => {
             if let Some(file_index) = app.index.files.get(path) {
                 render_file_detail(frame, path, file_index, app.get_llm_summary(path), *scroll);

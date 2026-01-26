@@ -25,7 +25,6 @@ use context::WorkContext;
 use index::CodebaseIndex;
 use std::path::{Path, PathBuf};
 use suggest::SuggestionEngine;
-use util::truncate;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -45,10 +44,6 @@ struct Args {
     /// Set up OpenRouter API key for AI features (BYOK mode)
     #[arg(long)]
     setup: bool,
-
-    /// Show stats and exit (no TUI)
-    #[arg(long)]
-    stats: bool,
 }
 
 #[tokio::main]
@@ -94,12 +89,6 @@ async fn main() -> Result<()> {
 
     // Create suggestion engine (LLM suggestions generated on demand)
     let suggestions = SuggestionEngine::new(index.clone());
-
-    // Stats mode: print and exit
-    if args.stats {
-        print_stats(&index, &suggestions, &context);
-        return Ok(());
-    }
 
     // Run TUI with background LLM tasks
     app::run_tui(index, suggestions, context, cache_manager, path).await
@@ -167,82 +156,6 @@ fn init_context(path: &Path) -> Result<WorkContext> {
     );
 
     Ok(context)
-}
-
-/// Print stats and exit
-fn print_stats(index: &CodebaseIndex, suggestions: &SuggestionEngine, context: &WorkContext) {
-    let stats = index.stats();
-    let counts = suggestions.counts();
-
-    println!();
-    println!("  ╔══════════════════════════════════════════════════╗");
-    println!("  ║             C O S M O S   Stats                  ║");
-    println!("  ╠══════════════════════════════════════════════════╣");
-    println!("  ║                                                  ║");
-    println!(
-        "  ║  Files:     {:>6}                               ║",
-        stats.file_count
-    );
-    println!(
-        "  ║  LOC:       {:>6}                               ║",
-        stats.total_loc
-    );
-    println!(
-        "  ║  Symbols:   {:>6}                               ║",
-        stats.symbol_count
-    );
-    println!(
-        "  ║  Patterns:  {:>6}                               ║",
-        stats.pattern_count
-    );
-    println!(
-        "  ║  Skipped:   {:>6}                               ║",
-        stats.skipped_files
-    );
-    println!("  ║                                                  ║");
-    println!("  ║  Suggestions:                                    ║");
-    println!(
-        "  ║    High:    {:>6} ●                             ║",
-        counts.high
-    );
-    println!(
-        "  ║    Medium:  {:>6} ◐                             ║",
-        counts.medium
-    );
-    println!(
-        "  ║    Low:     {:>6} ○                             ║",
-        counts.low
-    );
-    println!("  ║                                                  ║");
-    println!("  ║  Context:                                        ║");
-    println!(
-        "  ║    Branch:  {:>20}               ║",
-        truncate(&context.branch, 20)
-    );
-    println!(
-        "  ║    Changed: {:>6}                               ║",
-        context.modified_count
-    );
-    println!("  ║                                                  ║");
-    println!("  ╚══════════════════════════════════════════════════╝");
-    println!();
-
-    // Top suggestions
-    let top = suggestions.high_priority_suggestions();
-    if !top.is_empty() {
-        println!("  Top suggestions:");
-        println!();
-        for (i, s) in top.iter().take(5).enumerate() {
-            println!(
-                "    {}. {} {}: {}",
-                i + 1,
-                s.priority.icon(),
-                s.kind.label(),
-                truncate(&s.summary, 50)
-            );
-        }
-        println!();
-    }
 }
 
 /// Set up the API key interactively

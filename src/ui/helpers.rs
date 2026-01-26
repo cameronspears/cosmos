@@ -23,15 +23,6 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-/// Truncate a string to fit within a given character count
-pub fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max - 3])
-    }
-}
-
 /// Wrap text to fit within a given width
 pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     wrap_text_variable_width(text, width, width)
@@ -114,21 +105,6 @@ pub fn lowercase_first(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_truncate_short_string() {
-        assert_eq!(truncate("hello", 10), "hello");
-    }
-
-    #[test]
-    fn test_truncate_long_string() {
-        assert_eq!(truncate("hello world", 8), "hello...");
-    }
-
-    #[test]
-    fn test_truncate_exact_length() {
-        assert_eq!(truncate("hello", 5), "hello");
-    }
 
     #[test]
     fn test_wrap_text_single_line() {

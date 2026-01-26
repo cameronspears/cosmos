@@ -23,7 +23,6 @@ pub enum BackgroundMessage {
         total: usize,
         summaries: HashMap<PathBuf, String>,
     },
-    SummariesError(String),
     /// AI-assisted grouping update ready
     GroupingEnhanced {
         grouping: crate::grouping::CodebaseGrouping,

@@ -36,18 +36,7 @@ fn submit_question(app: &mut App, ctx: &RuntimeContext) -> Result<()> {
         return Ok(());
     }
 
-    // Privacy preview (what will be sent) before the network call
-    if app.config.privacy_preview {
-        app.show_inquiry_preview(question);
-        return Ok(());
-    }
-
-    if let Err(e) = app.config.allow_ai(app.session_cost) {
-        app.show_toast(&e);
-        return Ok(());
-    }
-
-    // Send question to LLM
+    // Send question directly to LLM
     let index_clone = ctx.index.clone();
     let context_clone = app.context.clone();
     let tx_question = ctx.tx.clone();

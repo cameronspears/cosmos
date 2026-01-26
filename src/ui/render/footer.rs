@@ -46,32 +46,13 @@ pub(super) fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
-    // Cost + budget indicators
-    if app.session_cost > 0.0
-        || app.config.max_session_cost_usd.is_some()
-        || app.config.max_tokens_per_day.is_some()
-    {
+    // Session cost indicator
+    if app.session_cost > 0.0 {
         spans.push(Span::styled("  ", Style::default()));
-
-        if let Some(max) = app.config.max_session_cost_usd {
-            spans.push(Span::styled(
-                format!("${:.4}/${:.4}", app.session_cost, max),
-                Style::default().fg(Theme::GREY_400),
-            ));
-        } else if app.session_cost > 0.0 {
-            spans.push(Span::styled(
-                format!("${:.4}", app.session_cost),
-                Style::default().fg(Theme::GREY_400),
-            ));
-        }
-
-        if let Some(max_tokens) = app.config.max_tokens_per_day {
-            spans.push(Span::styled("  ", Style::default()));
-            spans.push(Span::styled(
-                format!("tok {}/{}", app.config.tokens_used_today, max_tokens),
-                Style::default().fg(Theme::GREY_500),
-            ));
-        }
+        spans.push(Span::styled(
+            format!("${:.4}", app.session_cost),
+            Style::default().fg(Theme::GREY_400),
+        ));
     }
 
     // Spacer before buttons

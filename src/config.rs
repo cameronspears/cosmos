@@ -12,20 +12,8 @@ use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
+    /// Legacy field for migration - API key is now stored in system keychain
     pub openrouter_api_key: Option<String>,
-    /// Optional max USD spend per Cosmos session (best-effort; enforced before new AI actions)
-    pub max_session_cost_usd: Option<f64>,
-    /// Optional max tokens per day (local tracking; best-effort)
-    pub max_tokens_per_day: Option<u32>,
-    /// Tokens used today (local tracking)
-    pub tokens_used_today: u32,
-    /// Date string (YYYY-MM-DD) for tokens_used_today
-    pub tokens_used_date: Option<String>,
-    /// If true, only generate LLM summaries for changed files (and not the whole repo)
-    pub summarize_changed_only: bool,
-    /// If true, show a preview of what will be sent before inquiry actions
-    #[serde(default = "default_privacy_preview")]
-    pub privacy_preview: bool,
 }
 
 const KEYRING_SERVICE: &str = "cosmos";
@@ -102,10 +90,6 @@ fn write_keyring_key(key: &str) -> Result<(), keyring::Error> {
     entry.set_password(key)?;
     update_keyring_cache_after_write(key);
     Ok(())
-}
-
-fn default_privacy_preview() -> bool {
-    true
 }
 
 impl Config {
@@ -271,51 +255,6 @@ impl Config {
     /// Validate API key format (should start with sk-)
     pub fn validate_api_key_format(key: &str) -> bool {
         key.starts_with("sk-")
-    }
-
-    /// Refresh daily token counter if the day changed.
-    pub fn ensure_daily_rollover(&mut self) {
-        let today = chrono::Utc::now().date_naive().to_string();
-        match self.tokens_used_date.as_deref() {
-            Some(d) if d == today => {}
-            _ => {
-                self.tokens_used_today = 0;
-                self.tokens_used_date = Some(today);
-            }
-        }
-    }
-
-    /// Record token usage for daily budgeting (best-effort).
-    pub fn record_tokens(&mut self, tokens: u32) -> Result<(), String> {
-        self.ensure_daily_rollover();
-        self.tokens_used_today = self.tokens_used_today.saturating_add(tokens);
-        self.save()
-    }
-
-    /// Check whether AI actions are allowed given current session cost and daily token budget.
-    pub fn allow_ai(&mut self, session_cost: f64) -> Result<(), String> {
-        // Session cost budget
-        if let Some(max) = self.max_session_cost_usd {
-            if max >= 0.0 && session_cost >= max {
-                return Err(format!(
-                    "Session budget reached (${:.4}/${:.4})",
-                    session_cost, max
-                ));
-            }
-        }
-
-        // Daily token budget
-        self.ensure_daily_rollover();
-        if let Some(max_tokens) = self.max_tokens_per_day {
-            if self.tokens_used_today >= max_tokens {
-                return Err(format!(
-                    "Daily token budget reached ({} / {})",
-                    self.tokens_used_today, max_tokens
-                ));
-            }
-        }
-
-        Ok(())
     }
 
     /// Get the config file location for display

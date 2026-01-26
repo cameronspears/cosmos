@@ -83,10 +83,6 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                 && !app.review_state.fixing
                 && !app.review_state.selected.is_empty()
             {
-                if let Err(e) = app.config.allow_ai(app.session_cost) {
-                    app.show_toast(&e);
-                    return Ok(());
-                }
                 let selected_findings = app.get_selected_review_findings();
                 let file = app.review_state.file_path.clone();
                 let content = app.review_state.new_content.clone();
@@ -163,10 +159,6 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                     if !suggest::llm::is_available() {
                                         app.show_toast("Run: cosmos --setup");
                                     } else {
-                                        if let Err(e) = app.config.allow_ai(app.session_cost) {
-                                            app.show_toast(&e);
-                                            return Ok(());
-                                        }
                                         let suggestion_id = suggestion.id;
                                         let file_path = suggestion.file.clone();
                                         let additional_files = suggestion.additional_files.clone();
@@ -327,10 +319,6 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                             .find(|s| s.id == sid)
                                             .cloned()
                                         {
-                                            if let Err(e) = app.config.allow_ai(app.session_cost) {
-                                                app.show_toast(&e);
-                                                return Ok(());
-                                            }
                                             if let Ok(status) =
                                                 git_ops::current_status(&app.repo_path)
                                             {
@@ -778,10 +766,6 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                 if !app.review_state.reviewing && !app.review_state.fixing {
                                     if !app.review_state.selected.is_empty() {
                                         // Fix selected findings (same as 'f' key)
-                                        if let Err(e) = app.config.allow_ai(app.session_cost) {
-                                            app.show_toast(&e);
-                                            return Ok(());
-                                        }
                                         let selected_findings = app.get_selected_review_findings();
                                         let file = app.review_state.file_path.clone();
                                         let content = app.review_state.new_content.clone();

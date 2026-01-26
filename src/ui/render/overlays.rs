@@ -1,5 +1,4 @@
-use crate::ui::helpers::{centered_rect, truncate, wrap_text};
-use crate::ui::markdown;
+use crate::ui::helpers::{centered_rect, wrap_text};
 use crate::ui::theme::Theme;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
@@ -110,107 +109,6 @@ pub(super) fn render_help(frame: &mut Frame, scroll: usize) {
                 .style(Style::default().bg(Theme::GREY_900)),
         )
         .scroll((scroll as u16, 0));
-
-    frame.render_widget(block, area);
-}
-
-pub(super) fn render_inquiry_preview(
-    frame: &mut Frame,
-    question: &str,
-    preview: &str,
-    scroll: usize,
-) {
-    let area = centered_rect(80, 80, frame.area());
-    frame.render_widget(Clear, area);
-
-    let inner_width = area.width.saturating_sub(10) as usize;
-    let visible_height = area.height.saturating_sub(12) as usize;
-
-    let header = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("   ", Style::default()),
-            Span::styled(
-                " › ",
-                Style::default()
-                    .fg(Theme::GREY_900)
-                    .bg(Theme::WHITE)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " inquiry preview ",
-                Style::default()
-                    .fg(Theme::GREY_200)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("   Q: ", Style::default().fg(Theme::GREY_500)),
-            Span::styled(
-                truncate(question, inner_width.saturating_sub(6).max(8)),
-                Style::default().fg(Theme::WHITE),
-            ),
-        ]),
-        Line::from(""),
-    ];
-
-    let parsed = markdown::parse_markdown(preview, inner_width.saturating_sub(4));
-    let total = parsed.len();
-    let mut body: Vec<Line<'static>> = Vec::new();
-    for line in parsed.into_iter().skip(scroll).take(visible_height) {
-        body.push(line);
-    }
-
-    let mut lines = header;
-    lines.extend(body);
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("   ", Style::default()),
-        Span::styled(
-            " ↵ ",
-            Style::default()
-                .fg(Theme::GREY_900)
-                .bg(Theme::GREEN)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" send ", Style::default().fg(Theme::GREEN)),
-        Span::styled("  ", Style::default()),
-        Span::styled(
-            " Esc ",
-            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_500),
-        ),
-        Span::styled(" cancel ", Style::default().fg(Theme::GREY_500)),
-        Span::styled("  ", Style::default()),
-        Span::styled(
-            " ↑↓ ",
-            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
-        ),
-        Span::styled(" scroll ", Style::default().fg(Theme::GREY_400)),
-    ]));
-    if total > visible_height {
-        lines.push(Line::from(vec![
-            Span::styled("   ", Style::default()),
-            Span::styled(
-                format!(
-                    "↕ {}/{}",
-                    scroll + 1,
-                    total.saturating_sub(visible_height) + 1
-                ),
-                Style::default().fg(Theme::GREY_600),
-            ),
-        ]));
-    }
-
-    let block = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .title(" › inquiry preview ")
-            .title_style(Style::default().fg(Theme::GREY_100))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Theme::GREY_400))
-            .style(Style::default().bg(Theme::GREY_900)),
-    );
 
     frame.render_widget(block, area);
 }

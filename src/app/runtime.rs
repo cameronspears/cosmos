@@ -8,7 +8,7 @@
 //! - Cache saves are best-effort - failure means regeneration next time
 
 use crate::app::messages::BackgroundMessage;
-use crate::app::{background, input, BudgetGuard, RuntimeContext};
+use crate::app::{background, input, RuntimeContext};
 use crate::cache;
 use crate::context::WorkContext;
 use crate::git_ops;
@@ -49,7 +49,6 @@ pub async fn run_tui(
 
     // Create app with loading state
     let mut app = App::new(index.clone(), suggestions, context.clone());
-    let budget_guard = BudgetGuard::new(app.session_cost, app.session_tokens);
     // Load repo-local “memory” (decisions/conventions) from .cosmos/
     app.repo_memory = cache_manager.load_repo_memory();
     // Load cached domain glossary (auto-extracted terminology)
@@ -68,14 +67,8 @@ pub async fn run_tui(
         }
     }
 
-    // Check if we have API access (and budgets allow it)
-    let mut ai_enabled = suggest::llm::is_available();
-    if ai_enabled {
-        if let Err(e) = app.config.allow_ai(0.0) {
-            ai_enabled = false;
-            app.show_toast(&e);
-        }
-    }
+    // Check if we have API access
+    let ai_enabled = suggest::llm::is_available();
 
     // ═══════════════════════════════════════════════════════════════════════
     //  SMART SUMMARY CACHING
@@ -122,25 +115,7 @@ pub async fn run_tui(
     llm_cache.set_project_context(project_context.clone());
 
     // Find files that need new/updated summaries
-    let mut files_needing_summary = llm_cache.get_files_needing_summary(&file_hashes);
-
-    // Optional privacy/cost control: only summarize changed files (and their immediate blast radius)
-    if app.config.summarize_changed_only {
-        let changed: std::collections::HashSet<PathBuf> =
-            context.all_changed_files().into_iter().cloned().collect();
-        let mut wanted = changed.clone();
-        for c in &changed {
-            if let Some(file_index) = index.files.get(c) {
-                for u in &file_index.summary.used_by {
-                    wanted.insert(u.clone());
-                }
-                for d in &file_index.summary.depends_on {
-                    wanted.insert(d.clone());
-                }
-            }
-        }
-        files_needing_summary.retain(|p| wanted.contains(p));
-    }
+    let files_needing_summary = llm_cache.get_files_needing_summary(&file_hashes);
     let needs_summary_count = files_needing_summary.len();
 
     // Track if we need to generate summaries (used to control loading state)
@@ -174,7 +149,6 @@ pub async fn run_tui(
             let file_hashes_clone = file_hashes.clone();
             let tx_grouping = tx.clone();
             let cache_path = repo_path.clone();
-            let budget_guard = budget_guard.clone();
 
             // Process chunks sequentially in a single task to avoid cache races
             background::spawn_background(tx.clone(), "grouping_ai", async move {
@@ -189,11 +163,6 @@ pub async fn run_tui(
                     .chunks(grouping_llm::GROUPING_AI_FILES_PER_REQUEST)
                     .take(grouping_llm::GROUPING_AI_MAX_REQUESTS)
                 {
-                    let mut config = crate::config::Config::load();
-                    if let Err(e) = budget_guard.allow_ai(&mut config) {
-                        let _ = tx_grouping.send(BackgroundMessage::GroupingEnhanceError(e));
-                        return;
-                    }
                     match grouping_llm::classify_grouping_candidates(&index_clone, chunk).await {
                         Ok((suggestions, usage)) => {
                             for suggestion in suggestions {
@@ -270,7 +239,6 @@ pub async fn run_tui(
             let tx_summaries = tx.clone();
             let cache_path = repo_path.clone();
             let file_hashes_clone = file_hashes.clone();
-            let budget_guard = budget_guard.clone();
 
             // Prioritize files for generation
             let (high_priority, medium_priority, low_priority) =
@@ -323,11 +291,6 @@ pub async fn run_tui(
                     // Process batches sequentially (llm.rs handles internal parallelism)
                     for batch in batches {
                         let batch_files: Vec<PathBuf> = batch.to_vec();
-                        let mut config = crate::config::Config::load();
-                        if let Err(e) = budget_guard.allow_ai(&mut config) {
-                            let _ = tx_summaries.send(BackgroundMessage::SummariesError(e));
-                            return;
-                        }
                         match suggest::llm::generate_summaries_for_files(
                             &index_clone2,
                             batch,
@@ -407,7 +370,6 @@ pub async fn run_tui(
             let cache_clone_path = repo_path.clone();
             let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
             let glossary_clone = app.glossary.clone();
-            let budget_guard = budget_guard.clone();
 
             if !glossary_clone.is_empty() {
                 app.show_toast(&format!(
@@ -417,11 +379,6 @@ pub async fn run_tui(
             }
 
             background::spawn_background(tx.clone(), "suggestions_generation", async move {
-                let mut config = crate::config::Config::load();
-                if let Err(e) = budget_guard.allow_ai(&mut config) {
-                    let _ = tx_suggestions.send(BackgroundMessage::SuggestionsError(e));
-                    return;
-                }
                 let mem = if repo_memory_context.trim().is_empty() {
                     None
                 } else {
@@ -462,15 +419,7 @@ pub async fn run_tui(
     }
 
     // Main loop with async event handling
-    let result = run_loop(
-        &mut terminal,
-        &mut app,
-        rx,
-        tx,
-        repo_path,
-        index,
-        budget_guard.clone(),
-    );
+    let result = run_loop(&mut terminal, &mut app, rx, tx, repo_path, index);
 
     // Restore terminal
     disable_raw_mode()?;
@@ -492,7 +441,6 @@ fn run_loop<B: Backend>(
     tx: mpsc::Sender<BackgroundMessage>,
     repo_path: PathBuf,
     index: CodebaseIndex,
-    budget_guard: BudgetGuard,
 ) -> Result<()> {
     // Track last git status refresh time
     let mut last_git_refresh = std::time::Instant::now();
@@ -508,7 +456,6 @@ fn run_loop<B: Backend>(
         index: &index,
         repo_path: &repo_path,
         tx: &tx,
-        budget_guard,
     };
 
     loop {

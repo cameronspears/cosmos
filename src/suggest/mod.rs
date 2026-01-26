@@ -71,16 +71,6 @@ pub enum Priority {
     High,
 }
 
-impl Priority {
-    pub fn icon(&self) -> char {
-        match self {
-            Priority::High => '\u{25CF}',   //
-            Priority::Medium => '\u{25D0}', //
-            Priority::Low => '\u{25CB}',    //
-        }
-    }
-}
-
 /// A suggestion for improvement
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Suggestion {
@@ -186,14 +176,6 @@ impl SuggestionEngine {
             .collect()
     }
 
-    /// Get high priority suggestions
-    pub fn high_priority_suggestions(&self) -> Vec<&Suggestion> {
-        self.active_suggestions()
-            .into_iter()
-            .filter(|s| s.priority == Priority::High)
-            .collect()
-    }
-
     /// Mark a suggestion as applied
     pub fn mark_applied(&mut self, id: Uuid) {
         if let Some(s) = self.suggestions.iter_mut().find(|s| s.id == id) {
@@ -277,32 +259,6 @@ impl SuggestionEngine {
             b.created_at.cmp(&a.created_at)
         });
     }
-
-    /// Get suggestion count by priority
-    pub fn counts(&self) -> SuggestionCounts {
-        let active = self.active_suggestions();
-        SuggestionCounts {
-            high: active
-                .iter()
-                .filter(|s| s.priority == Priority::High)
-                .count(),
-            medium: active
-                .iter()
-                .filter(|s| s.priority == Priority::Medium)
-                .count(),
-            low: active
-                .iter()
-                .filter(|s| s.priority == Priority::Low)
-                .count(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SuggestionCounts {
-    pub high: usize,
-    pub medium: usize,
-    pub low: usize,
 }
 
 #[cfg(test)]

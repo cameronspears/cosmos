@@ -94,12 +94,6 @@ pub enum Overlay {
     Help {
         scroll: usize,
     },
-    /// Privacy preview for inquiry (what will be sent)
-    InquiryPreview {
-        question: String,
-        preview: String,
-        scroll: usize,
-    },
     FileDetail {
         path: PathBuf,
         scroll: usize,
