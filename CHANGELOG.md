@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/cameronspears/cosmos/compare/v0.3.0...v0.4.0) (2026-01-26)
+
+
+### Features
+
+* **update:** implement self-update functionality ([7e30e0e](https://github.com/cameronspears/cosmos/commit/7e30e0e0e003ad7969df4ea0ad987d5083a5432b))
+
 ## [0.3.0](https://github.com/cameronspears/cosmos/compare/v0.2.0...v0.3.0) (2026-01-26)
 
 
