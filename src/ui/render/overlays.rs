@@ -714,11 +714,27 @@ pub(super) fn render_update_overlay(
 
     // Progress or error display
     if let Some(err) = error {
+        // Split error message if it contains the manual install hint
+        let (error_part, hint_part) = if let Some(idx) = err.find(". Try manually:") {
+            (&err[..idx], Some(&err[idx + 2..]))
+        } else {
+            (err, None)
+        };
+
         lines.push(Line::from(Span::styled(
-            format!("  Error: {}", err),
+            format!("  {}", error_part),
             Style::default().fg(Theme::RED),
         )));
         lines.push(Line::from(""));
+
+        if let Some(hint) = hint_part {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", hint),
+                Style::default().fg(Theme::GREY_300),
+            )));
+            lines.push(Line::from(""));
+        }
+
         lines.push(Line::from(Span::styled(
             "  Press Enter to retry or Esc to cancel.",
             Style::default().fg(Theme::GREY_400),

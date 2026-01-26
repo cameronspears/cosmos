@@ -131,7 +131,10 @@ where
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let error_msg = extract_cargo_error(&stderr);
-        return Err(anyhow::anyhow!("Update failed: {}", error_msg));
+        return Err(anyhow::anyhow!(
+            "{}. Try manually: cargo install cosmos-tui --force",
+            error_msg
+        ));
     }
 
     // Binary was replaced, now exec into the new version
