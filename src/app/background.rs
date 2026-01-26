@@ -416,6 +416,10 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
             }
             BackgroundMessage::Error(e) => {
                 app.loading = LoadingState::None;
+                // Reset review fixing state if we were applying review fixes
+                if app.review_state.fixing {
+                    app.review_state.fixing = false;
+                }
                 app.show_toast(&truncate(&e, 100));
             }
             BackgroundMessage::QuestionResponse { answer, usage, .. } => {
