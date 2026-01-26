@@ -362,7 +362,10 @@ pub fn parse_remote_url(url: &str) -> Option<(String, String)> {
     // HTTPS format: https://github.com/owner/repo.git
     if url.contains("github.com") {
         if let Ok(parsed) = url::Url::parse(url) {
-            let path = parsed.path().trim_start_matches('/').trim_end_matches(".git");
+            let path = parsed
+                .path()
+                .trim_start_matches('/')
+                .trim_end_matches(".git");
             let parts: Vec<&str> = path.splitn(2, '/').collect();
             if parts.len() == 2 {
                 return Some((parts[0].to_string(), parts[1].to_string()));
@@ -416,7 +419,6 @@ pub fn get_remote_info(repo_path: &Path) -> Result<(String, String)> {
         "No GitHub remote found. Make sure you have a remote pointing to github.com"
     ))
 }
-
 
 #[derive(Serialize)]
 struct CreatePrRequest {
@@ -485,10 +487,7 @@ pub async fn create_pull_request(
 
     let status = resp.status();
     if status.is_success() {
-        let pr: CreatePrResponse = resp
-            .json()
-            .await
-            .context("Failed to parse PR response")?;
+        let pr: CreatePrResponse = resp.json().await.context("Failed to parse PR response")?;
         Ok(pr.html_url)
     } else {
         let error_body = resp.text().await.unwrap_or_default();
@@ -621,8 +620,7 @@ mod tests {
 
     #[test]
     fn test_parse_remote_with_dashes_and_underscores() {
-        let (owner, repo) =
-            parse_remote_url("git@github.com:my-org/my_cool-repo.git").unwrap();
+        let (owner, repo) = parse_remote_url("git@github.com:my-org/my_cool-repo.git").unwrap();
         assert_eq!(owner, "my-org");
         assert_eq!(repo, "my_cool-repo");
     }
@@ -751,7 +749,8 @@ mod tests {
 
     #[test]
     fn test_parse_token_response_expired() {
-        let json = r#"{"error": "expired_token", "error_description": "The device code has expired"}"#;
+        let json =
+            r#"{"error": "expired_token", "error_description": "The device code has expired"}"#;
         let parsed: TokenResponse = serde_json::from_str(json).unwrap();
         assert!(parsed.access_token.is_none());
         assert_eq!(parsed.error, Some("expired_token".to_string()));

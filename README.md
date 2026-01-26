@@ -26,7 +26,7 @@ Cosmos is a terminal-based AI code reviewer. Point it at your project, and it wi
 - **Explains issues in plain English** — no jargon, just clear descriptions of what's wrong and why it matters
 - **Suggests fixes** and lets you preview the plan, scope, and affected files before applying
 - **Reviews its own work** — an adversarial AI reviewer double-checks each applied fix for issues
-- **Creates pull requests** via the GitHub CLI (`gh`) so changes can go through your normal review process
+- **Creates pull requests** directly via the GitHub API so changes can go through your normal review process
 
 **Supported languages:** JavaScript, TypeScript, Python, Rust, Go
 
@@ -55,7 +55,7 @@ Here's where Cosmos gets thorough: after applying the fix, it runs an adversaria
 
 ### 4. Ship
 
-When the review passes, you can commit, push, and create a pull request — all from within Cosmos. Pull request creation uses the GitHub CLI (`gh`) and requires it to be installed and authenticated.
+When the review passes, you can commit, push, and create a pull request — all from within Cosmos. On first run, Cosmos will guide you through GitHub authentication.
 
 ---
 
@@ -287,6 +287,22 @@ Currently, Cosmos works through OpenRouter, which provides access to models from
 
 - **GitHub Issues:** [github.com/cameronspears/cosmos/issues](https://github.com/cameronspears/cosmos/issues)
 - **Discussions:** [github.com/cameronspears/cosmos/discussions](https://github.com/cameronspears/cosmos/discussions)
+
+---
+
+## Contributing
+
+```bash
+# Clone and set up the repo
+git clone https://github.com/cameronspears/cosmos.git
+cd cosmos
+
+# Enable pre-commit hooks (auto-formats code before commits)
+git config core.hooksPath .githooks
+
+# Run tests
+cargo test
+```
 
 ---
 

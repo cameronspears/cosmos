@@ -1,0 +1,26 @@
+#!/bin/sh
+# Pre-commit hook: auto-format Rust code before committing
+
+# Check if cargo fmt is available
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "Warning: cargo not found, skipping format check"
+    exit 0
+fi
+
+# Run cargo fmt and stage any changes
+echo "Running cargo fmt..."
+cargo fmt --all
+
+# Check if there are formatting changes
+if ! git diff --quiet --cached; then
+    # Re-add any formatted files that were already staged
+    git diff --name-only --cached | xargs -I {} git add {}
+fi
+
+# Also add any formatting changes to unstaged files that are partially staged
+STAGED_RS_FILES=$(git diff --name-only --cached --diff-filter=ACM | grep '\.rs$' || true)
+if [ -n "$STAGED_RS_FILES" ]; then
+    echo "$STAGED_RS_FILES" | xargs -I {} git add {}
+fi
+
+exit 0
