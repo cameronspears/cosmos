@@ -144,23 +144,11 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                             .await
                             {
                                 Ok((suggestions, usage)) => {
-                                    // Cache the suggestions with file hashes for validation
-                                    let cache = cache::Cache::new(&repo_root);
-                                    let file_hashes = index_clone.file_hashes();
-                                    let file_count = index_clone.files.len();
-                                    let cache_data =
-                                        cache::SuggestionsCache::from_suggestions_with_hashes(
-                                            &suggestions,
-                                            file_hashes,
-                                            file_count,
-                                        );
-                                    let _ = cache.save_suggestions_cache(&cache_data);
-
                                     let _ =
                                         tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                                             suggestions,
                                             usage,
-                                            model: "smart-agentic".to_string(),
+                                            model: "speed-lean".to_string(),
                                         });
                                 }
                                 Err(e) => {

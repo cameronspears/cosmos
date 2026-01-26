@@ -255,27 +255,14 @@ pub async fn run_tui(
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  SUGGESTION CACHING: Try to use cached suggestions if still valid
+    //  SUGGESTION GENERATION: Always generate fresh suggestions on startup
     // ═══════════════════════════════════════════════════════════════════════
+    //
+    // Unlike summaries (which are expensive and file-content-dependent), suggestions
+    // benefit from fresh analysis each session. The model may find different issues
+    // based on its exploration path, and users expect new insights on restart.
 
-    let mut suggestions_from_cache = false;
-    if ai_enabled && files_needing_summary.is_empty() {
-        // All summaries cached - check if suggestions are also cached and valid
-        if let Some(cached_suggestions) = cache_manager.load_suggestions_cache() {
-            if cached_suggestions.is_valid(&file_hashes, total_files) {
-                // Cached suggestions are valid - use them!
-                let count = cached_suggestions.suggestions.len();
-                for s in cached_suggestions.suggestions {
-                    app.suggestions.add_llm_suggestion(s);
-                }
-                app.suggestions.sort_with_context(&context);
-                eprintln!("  Loaded {} cached suggestions", count);
-                suggestions_from_cache = true;
-            } else {
-                eprintln!("  Cached suggestions invalid - regenerating");
-            }
-        }
-    }
+    let suggestions_from_cache = false;
 
     // ═══════════════════════════════════════════════════════════════════════
     //  SEQUENTIAL INIT: Summaries first (builds glossary), then suggestions
@@ -456,21 +443,10 @@ pub async fn run_tui(
                 .await
                 {
                     Ok((suggestions, usage)) => {
-                        // Cache the suggestions with file hashes for validation
-                        let cache = cache::Cache::new(&repo_root);
-                        let file_hashes = index_clone.file_hashes();
-                        let file_count = index_clone.files.len();
-                        let cache_data = cache::SuggestionsCache::from_suggestions_with_hashes(
-                            &suggestions,
-                            file_hashes,
-                            file_count,
-                        );
-                        let _ = cache.save_suggestions_cache(&cache_data);
-
                         let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                             suggestions,
                             usage,
-                            model: "smart-agentic".to_string(),
+                            model: "speed-lean".to_string(),
                         });
                     }
                     Err(e) => {

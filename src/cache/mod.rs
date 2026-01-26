@@ -14,7 +14,6 @@
 //! For critical data, callers should explicitly handle errors.
 
 use crate::index::CodebaseIndex;
-use crate::suggest::Suggestion;
 use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -121,92 +120,8 @@ pub struct IndexCache {
     pub file_hashes: HashMap<PathBuf, String>,
 }
 
-/// Cached suggestions
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SuggestionsCache {
-    pub suggestions: Vec<Suggestion>,
-    pub cached_at: DateTime<Utc>,
-    /// File paths that these suggestions apply to
-    pub files: Vec<PathBuf>,
-    /// Hash of files at time of generation for invalidation
-    #[serde(default)]
-    pub file_hashes: HashMap<PathBuf, String>,
-    /// Index file count at time of generation (for quick invalidation check)
-    #[serde(default)]
-    pub index_file_count: usize,
-}
-
-/// Cache validity durations for suggestions
-const SUGGESTIONS_CACHE_HOURS: i64 = 24;
-
-impl SuggestionsCache {
-    /// Create from a list of suggestions with file hashes for validation
-    pub fn from_suggestions_with_hashes(
-        suggestions: &[Suggestion],
-        file_hashes: HashMap<PathBuf, String>,
-        index_file_count: usize,
-    ) -> Self {
-        let files: Vec<PathBuf> = suggestions
-            .iter()
-            .map(|s| s.file.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        Self {
-            suggestions: suggestions.to_vec(),
-            cached_at: Utc::now(),
-            files,
-            file_hashes,
-            index_file_count,
-        }
-    }
-
-    /// Check if the cache is valid against current file hashes
-    /// Returns true if cache can be used, false if regeneration needed
-    pub fn is_valid(
-        &self,
-        current_file_hashes: &HashMap<PathBuf, String>,
-        current_file_count: usize,
-    ) -> bool {
-        // Check time-based expiration (24 hours)
-        let age = Utc::now().signed_duration_since(self.cached_at);
-        if age.num_hours() > SUGGESTIONS_CACHE_HOURS {
-            return false;
-        }
-
-        // If no hashes stored (legacy cache), invalid
-        if self.file_hashes.is_empty() {
-            return false;
-        }
-
-        // Quick check: if file count changed significantly, regenerate
-        // Allow some variance since new files might be added
-        if current_file_count > self.index_file_count + 10 {
-            return false;
-        }
-
-        // Check if any suggestion's file has changed
-        for file in &self.files {
-            let current_hash = current_file_hashes.get(file);
-            let cached_hash = self.file_hashes.get(file);
-
-            match (current_hash, cached_hash) {
-                (Some(curr), Some(cached)) if curr != cached => {
-                    // File content changed
-                    return false;
-                }
-                (None, Some(_)) => {
-                    // File was deleted
-                    return false;
-                }
-                _ => {}
-            }
-        }
-
-        true
-    }
-}
+// Note: Suggestions are generated fresh each session (not cached across restarts)
+// to ensure users always see new insights from the AI exploration.
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  QUESTION ANSWER CACHE - Persistent storage for AI-generated answers
@@ -807,27 +722,6 @@ impl Cache {
         None
     }
 
-    /// Save suggestions cache
-    pub fn save_suggestions_cache(&self, cache: &SuggestionsCache) -> anyhow::Result<()> {
-        let _lock = self.lock(true)?;
-        let path = self.cache_dir.join(SUGGESTIONS_CACHE_FILE);
-        let content = serde_json::to_string_pretty(cache)?;
-        write_atomic(&path, &content)?;
-        Ok(())
-    }
-
-    /// Load suggestions cache
-    pub fn load_suggestions_cache(&self) -> Option<SuggestionsCache> {
-        let path = self.cache_dir.join(SUGGESTIONS_CACHE_FILE);
-        if !path.exists() {
-            return None;
-        }
-
-        let _lock = self.lock(false).ok()?;
-        let content = fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&content).ok()
-    }
-
     /// Load LLM-generated summaries cache
     pub fn load_llm_summaries_cache(&self) -> Option<LlmSummaryCache> {
         let path = self.cache_dir.join(LLM_SUMMARIES_CACHE_FILE);
@@ -1135,132 +1029,5 @@ mod tests {
         assert!(invalidated.is_none());
 
         let _ = fs::remove_dir_all(&root);
-    }
-
-    // ========================================================================
-    // SuggestionsCache Validation Tests
-    // ========================================================================
-
-    fn make_test_suggestion(id: uuid::Uuid, file: &str) -> Suggestion {
-        Suggestion {
-            id,
-            kind: crate::suggest::SuggestionKind::Improvement,
-            priority: crate::suggest::Priority::Medium,
-            file: PathBuf::from(file),
-            additional_files: Vec::new(),
-            line: None,
-            summary: "Test suggestion".into(),
-            detail: None,
-            source: crate::suggest::SuggestionSource::LlmDeep,
-            created_at: Utc::now(),
-            dismissed: false,
-            applied: false,
-        }
-    }
-
-    #[test]
-    fn test_suggestions_cache_valid_when_files_unchanged() {
-        let mut file_hashes = HashMap::new();
-        file_hashes.insert(PathBuf::from("src/main.rs"), "hash1".into());
-        file_hashes.insert(PathBuf::from("src/lib.rs"), "hash2".into());
-
-        let suggestion = make_test_suggestion(uuid::Uuid::new_v4(), "src/main.rs");
-        let cache =
-            SuggestionsCache::from_suggestions_with_hashes(&[suggestion], file_hashes.clone(), 2);
-
-        // Same hashes - should be valid
-        assert!(cache.is_valid(&file_hashes, 2));
-    }
-
-    #[test]
-    fn test_suggestions_cache_invalid_when_file_changed() {
-        let mut original_hashes = HashMap::new();
-        original_hashes.insert(PathBuf::from("src/main.rs"), "hash1".into());
-
-        let suggestion = make_test_suggestion(uuid::Uuid::new_v4(), "src/main.rs");
-        let cache =
-            SuggestionsCache::from_suggestions_with_hashes(&[suggestion], original_hashes, 1);
-
-        // Different hash for the suggestion's file
-        let mut current_hashes = HashMap::new();
-        current_hashes.insert(PathBuf::from("src/main.rs"), "hash_changed".into());
-
-        assert!(!cache.is_valid(&current_hashes, 1));
-    }
-
-    #[test]
-    fn test_suggestions_cache_invalid_when_file_deleted() {
-        let mut original_hashes = HashMap::new();
-        original_hashes.insert(PathBuf::from("src/main.rs"), "hash1".into());
-
-        let suggestion = make_test_suggestion(uuid::Uuid::new_v4(), "src/main.rs");
-        let cache =
-            SuggestionsCache::from_suggestions_with_hashes(&[suggestion], original_hashes, 1);
-
-        // File no longer exists
-        let current_hashes = HashMap::new();
-
-        assert!(!cache.is_valid(&current_hashes, 0));
-    }
-
-    #[test]
-    fn test_suggestions_cache_invalid_when_many_files_added() {
-        let mut original_hashes = HashMap::new();
-        original_hashes.insert(PathBuf::from("src/main.rs"), "hash1".into());
-
-        let suggestion = make_test_suggestion(uuid::Uuid::new_v4(), "src/main.rs");
-        let cache = SuggestionsCache::from_suggestions_with_hashes(
-            &[suggestion],
-            original_hashes.clone(),
-            1,
-        );
-
-        // Many more files added (index grew significantly)
-        let mut current_hashes = original_hashes;
-        for i in 0..15 {
-            current_hashes.insert(
-                PathBuf::from(format!("src/new{}.rs", i)),
-                format!("hash{}", i),
-            );
-        }
-
-        assert!(!cache.is_valid(&current_hashes, 16));
-    }
-
-    #[test]
-    fn test_suggestions_cache_invalid_when_empty_hashes() {
-        let suggestion = make_test_suggestion(uuid::Uuid::new_v4(), "src/main.rs");
-        // Legacy cache with no hashes stored
-        let cache = SuggestionsCache {
-            suggestions: vec![suggestion],
-            cached_at: Utc::now(),
-            files: vec![PathBuf::from("src/main.rs")],
-            file_hashes: HashMap::new(), // Empty!
-            index_file_count: 0,
-        };
-
-        let mut current_hashes = HashMap::new();
-        current_hashes.insert(PathBuf::from("src/main.rs"), "hash1".into());
-
-        // Empty hashes = legacy cache = invalid
-        assert!(!cache.is_valid(&current_hashes, 1));
-    }
-
-    #[test]
-    fn test_suggestions_cache_valid_ignores_unrelated_file_changes() {
-        let mut original_hashes = HashMap::new();
-        original_hashes.insert(PathBuf::from("src/main.rs"), "hash1".into());
-        original_hashes.insert(PathBuf::from("src/other.rs"), "hash2".into());
-
-        let suggestion = make_test_suggestion(uuid::Uuid::new_v4(), "src/main.rs");
-        let cache =
-            SuggestionsCache::from_suggestions_with_hashes(&[suggestion], original_hashes, 2);
-
-        // other.rs changed but main.rs (the suggestion's file) is the same
-        let mut current_hashes = HashMap::new();
-        current_hashes.insert(PathBuf::from("src/main.rs"), "hash1".into());
-        current_hashes.insert(PathBuf::from("src/other.rs"), "hash_changed".into());
-
-        assert!(cache.is_valid(&current_hashes, 2));
     }
 }

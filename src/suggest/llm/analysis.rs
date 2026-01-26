@@ -4,6 +4,7 @@ use super::models::{Model, Usage};
 use super::parse::parse_codebase_suggestions;
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{ANALYZE_CODEBASE_AGENTIC_SYSTEM, ASK_QUESTION_SYSTEM};
+use super::summaries::discover_project_context;
 use crate::cache::DomainGlossary;
 use crate::context::WorkContext;
 use crate::index::{CodebaseIndex, PatternKind, SymbolKind};
@@ -82,16 +83,17 @@ QUESTION:
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  AGENTIC CODEBASE ANALYSIS
+//  LEAN HYBRID ANALYSIS (Compact Context + Surgical Tool Use)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Analyze codebase using agentic exploration for highest accuracy
+/// Analyze codebase with compact context and minimal, surgical tool use
 ///
-/// Unlike `analyze_codebase`, this lets the model explore the codebase with shell
-/// commands before generating suggestions. This eliminates hallucinations because
-/// the model only suggests issues for code it has actually read.
+/// Strategy:
+/// 1. Start with synthesized context (summaries, not full files)
+/// 2. Model can make 1-3 targeted tool calls to verify specific issues
+/// 3. Uses gpt-oss-120b for cost efficiency (~$0.02-0.05 total)
 ///
-/// Uses Model::Smart (Opus 4.5) for best reasoning during exploration.
+/// This balances accuracy (model can verify) with speed/cost (minimal calls).
 pub async fn analyze_codebase_agentic(
     repo_root: &Path,
     index: &CodebaseIndex,
@@ -99,32 +101,32 @@ pub async fn analyze_codebase_agentic(
     repo_memory: Option<String>,
     glossary: Option<&DomainGlossary>,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>)> {
-    let user_prompt =
-        build_agentic_exploration_prompt(index, context, repo_memory.as_deref(), glossary);
+    let user_prompt = build_lean_analysis_prompt(index, context, repo_memory.as_deref(), glossary);
 
-    // Use Smart model (Opus 4.5) for best reasoning during exploration
+    // Use Speed model (gpt-oss-120b) with surgical tool access
     let response = call_llm_agentic(
         ANALYZE_CODEBASE_AGENTIC_SYSTEM,
         &user_prompt,
-        Model::Smart,
+        Model::Speed,
         repo_root,
-        false, // Not JSON mode - model explores first, then returns JSON
+        false,
     )
     .await?;
 
-    // Parse the final JSON response
     let suggestions = parse_codebase_suggestions(&response.content)?;
-
-    // Note: Agentic calls don't currently return usage stats
-    // TODO: Track usage across tool calls in agentic loop
     Ok((suggestions, None))
 }
 
-/// Build exploration prompt for agentic analysis
+/// Build a lean prompt using summaries, not full file content
 ///
-/// This prompt guides the model on where to focus its exploration,
-/// but doesn't include actual code - the model reads it via shell.
-fn build_agentic_exploration_prompt(
+/// The model gets:
+/// - Project context and purpose
+/// - Compact file summaries (what each file does)
+/// - List of changed files with their purposes
+/// - Permission to read specific files IF needed for verification
+///
+/// This keeps the initial prompt small (~2-4K tokens) for fast first response.
+fn build_lean_analysis_prompt(
     index: &CodebaseIndex,
     context: &WorkContext,
     repo_memory: Option<&str>,
@@ -137,63 +139,45 @@ fn build_agentic_exploration_prompt(
         .and_then(|n| n.to_str())
         .unwrap_or("project");
 
+    // Get project context from README/package files
+    let project_context = discover_project_context(index);
+
     let mut sections = Vec::new();
 
-    // Header with overview
+    // Header
     sections.push(format!(
-        "CODEBASE: {} ({} files, {} LOC)\nBRANCH: {}",
+        "CODEBASE: {} ({} files, {} LOC) on branch '{}'",
         project_name, stats.file_count, stats.total_loc, context.branch,
     ));
 
-    // Focus areas - changed files are highest priority
-    if !context.uncommitted_files.is_empty()
-        || !context.staged_files.is_empty()
-        || !context.untracked_files.is_empty()
-    {
-        let mut focus = String::from("\n\nFOCUS AREAS [CHANGED] - Read these files first:");
-        for file in context
-            .uncommitted_files
-            .iter()
-            .chain(context.staged_files.iter())
-            .chain(context.untracked_files.iter())
-            .take(10)
-        {
-            focus.push_str(&format!("\n- {}", file.display()));
-        }
-        sections.push(focus);
+    // Project context
+    if !project_context.trim().is_empty() {
+        sections.push(format!(
+            "\n\nWHAT THIS PROJECT DOES:\n{}",
+            truncate_str(&project_context, 600)
+        ));
     }
 
-    // Blast radius - related files to check
-    if !context.all_changed_files().is_empty() {
-        let changed: HashSet<PathBuf> = context.all_changed_files().into_iter().cloned().collect();
-        let mut related: HashSet<PathBuf> = HashSet::new();
-
-        for c in &changed {
-            if let Some(file_index) = index.files.get(c) {
-                for u in file_index.summary.used_by.iter().take(5) {
-                    related.insert(u.clone());
-                }
-                for d in file_index.summary.depends_on.iter().take(5) {
-                    related.insert(d.clone());
-                }
-            }
+    // Changed files with summaries (highest priority)
+    let changed: HashSet<PathBuf> = context.all_changed_files().into_iter().cloned().collect();
+    if !changed.is_empty() {
+        let mut changed_section = String::from("\n\nCHANGED FILES (focus here):");
+        for path in changed.iter().take(10) {
+            let summary = index
+                .files
+                .get(path)
+                .map(|f| f.summary.purpose.as_str())
+                .unwrap_or("(new file)");
+            changed_section.push_str(&format!(
+                "\n• {} - {}",
+                path.display(),
+                truncate_str(summary, 80)
+            ));
         }
-        for c in &changed {
-            related.remove(c);
-        }
-
-        if !related.is_empty() {
-            let mut list: Vec<_> = related.into_iter().collect();
-            list.sort();
-            let mut blast = String::from("\n\nBLAST RADIUS (dependencies of changed files):");
-            for path in list.into_iter().take(10) {
-                blast.push_str(&format!("\n- {}", path.display()));
-            }
-            sections.push(blast);
-        }
+        sections.push(changed_section);
     }
 
-    // Hotspots - complex files worth examining
+    // Hotspots with summaries
     let mut hotspots = index.files.values().collect::<Vec<_>>();
     hotspots.sort_by(|a, b| {
         b.complexity
@@ -203,18 +187,47 @@ fn build_agentic_exploration_prompt(
     let hot: Vec<_> = hotspots
         .iter()
         .filter(|f| f.complexity > HIGH_COMPLEXITY_THRESHOLD || f.loc > GOD_MODULE_LOC_THRESHOLD)
-        .take(8)
+        .filter(|f| !changed.contains(&f.path))
+        .take(5)
         .collect();
 
     if !hot.is_empty() {
-        let mut hot_section = String::from("\n\nHOTSPOTS (complex files worth examining):");
+        let mut hot_section = String::from("\n\nCOMPLEX FILES (potential issues):");
         for file in hot {
-            hot_section.push_str(&format!("\n- {} ({} LOC)", file.path.display(), file.loc));
+            hot_section.push_str(&format!(
+                "\n• {} ({} LOC) - {}",
+                file.path.display(),
+                file.loc,
+                truncate_str(&file.summary.purpose, 60)
+            ));
         }
         sections.push(hot_section);
     }
 
-    // TODOs and FIXMEs
+    // Key file summaries for broader context
+    let other_summaries: Vec<_> = index
+        .files
+        .values()
+        .filter(|f| !changed.contains(&f.path))
+        .filter(|f| !f.summary.purpose.is_empty())
+        .take(15)
+        .map(|f| {
+            format!(
+                "• {}: {}",
+                f.path.display(),
+                truncate_str(&f.summary.purpose, 50)
+            )
+        })
+        .collect();
+
+    if !other_summaries.is_empty() {
+        sections.push(format!(
+            "\n\nOTHER KEY FILES:\n{}",
+            other_summaries.join("\n")
+        ));
+    }
+
+    // TODOs
     let todos: Vec<_> = index
         .patterns
         .iter()
@@ -223,38 +236,42 @@ fn build_agentic_exploration_prompt(
         .collect();
 
     if !todos.is_empty() {
-        let mut todos_section = String::from("\n\nTODO/FIXME MARKERS:");
+        let mut todos_section = String::from("\n\nTODO/FIXME:");
         for todo in &todos {
             todos_section.push_str(&format!(
-                "\n- {}:{} - {}",
+                "\n• {}:{} - {}",
                 todo.file.display(),
                 todo.line,
-                truncate_str(&todo.description, 60)
+                truncate_str(&todo.description, 50)
             ));
         }
         sections.push(todos_section);
     }
 
-    // Repository memory / conventions
-    let memory_section = format_repo_memory_section(repo_memory, "REPO CONVENTIONS");
+    // Repo memory
+    let memory_section = format_repo_memory_section(repo_memory, "CONVENTIONS");
     if !memory_section.is_empty() {
         sections.push(memory_section);
     }
 
-    // Domain glossary
+    // Glossary
     if let Some(glossary) = glossary {
         if !glossary.is_empty() {
-            let terms = glossary.to_prompt_context(15);
+            let terms = glossary.to_prompt_context(10);
             if !terms.trim().is_empty() {
-                sections.push(format!("\n\nDOMAIN TERMINOLOGY:\n{}", terms));
+                sections.push(format!("\n\nTERMINOLOGY:\n{}", terms));
             }
         }
     }
 
-    // Final instruction
+    // Instructions - encourage minimal tool use
     sections.push(String::from(
-        "\n\nExplore the codebase using shell commands. Focus on [CHANGED] files first, \
-         then check BLAST RADIUS and HOTSPOTS. Only suggest issues you've verified by reading the actual code.",
+        "\n\nINSTRUCTIONS:
+Based on the summaries above, identify 10-15 improvement opportunities.
+You may use `head -100 <file>` to verify specific issues, but MINIMIZE tool calls.
+Most suggestions should be derivable from the summaries + your expertise.
+Only read files when you need to confirm a specific detail.
+After gathering evidence, return your suggestions as JSON.",
     ));
 
     sections.join("")

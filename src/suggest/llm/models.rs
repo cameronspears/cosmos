@@ -4,13 +4,19 @@ use serde::Deserialize;
 // Speed: openai/gpt-oss-120b - fast, cheap model for summaries
 const SPEED_INPUT_COST: f64 = 0.10; // $0.10 per 1M input tokens
 const SPEED_OUTPUT_COST: f64 = 0.30; // $0.30 per 1M output tokens
-                                     // Balanced: anthropic/claude-sonnet-4.5 - good reasoning at medium cost
+                                     // Fast: anthropic/claude-haiku-4.5 - fast Anthropic model with good instruction following
+const FAST_INPUT_COST: f64 = 0.80; // $0.80 per 1M input tokens
+const FAST_OUTPUT_COST: f64 = 4.0; // $4.00 per 1M output tokens
+                                   // Balanced: anthropic/claude-sonnet-4.5 - good reasoning at medium cost
 const BALANCED_INPUT_COST: f64 = 3.0; // $3 per 1M input tokens
 const BALANCED_OUTPUT_COST: f64 = 15.0; // $15 per 1M output tokens
                                         // Smart: anthropic/claude-opus-4.5 - best reasoning for code generation
 const SMART_INPUT_COST: f64 = 15.0; // $15 per 1M input tokens
 const SMART_OUTPUT_COST: f64 = 75.0; // $75 per 1M output tokens
-                                     // Reviewer: openai/gpt-5.2 - different model family for cognitive diversity
+                                     // Coder: openai/gpt-5.2-codex - code-focused model with medium reasoning
+const CODER_INPUT_COST: f64 = 2.5; // $2.50 per 1M input tokens (estimated)
+const CODER_OUTPUT_COST: f64 = 10.0; // $10 per 1M output tokens (estimated)
+                                     // Reviewer: openai/gpt-5.2 - different model family for adversarial bug-finding
 const REVIEWER_INPUT_COST: f64 = 5.0; // $5 per 1M input tokens (estimated)
 const REVIEWER_OUTPUT_COST: f64 = 15.0; // $15 per 1M output tokens (estimated)
 
@@ -19,6 +25,10 @@ const REVIEWER_OUTPUT_COST: f64 = 15.0; // $15 per 1M output tokens (estimated)
 pub enum Model {
     /// Speed tier - fast, cheap model for summaries and classification (gpt-oss-120b)
     Speed,
+    /// Fast tier - fast Anthropic model with better instruction following (claude-haiku-4.5)
+    Fast,
+    /// Coder tier - code-focused model with medium reasoning (gpt-5.2-codex)
+    Coder,
     /// Balanced tier - good reasoning at medium cost for questions/previews (claude-sonnet-4.5)
     Balanced,
     /// Smart tier - best reasoning for code generation (claude-opus-4.5)
@@ -34,6 +44,8 @@ impl Model {
     pub fn id(&self) -> &'static str {
         match self {
             Model::Speed => "openai/gpt-oss-120b:nitro",
+            Model::Fast => "anthropic/claude-haiku-4.5:nitro",
+            Model::Coder => "openai/gpt-5.2-codex:nitro",
             Model::Balanced => "anthropic/claude-sonnet-4.5:nitro",
             Model::Smart => "anthropic/claude-opus-4.5:nitro",
             Model::Reviewer => "openai/gpt-5.2:nitro",
@@ -48,6 +60,8 @@ impl Model {
     pub fn calculate_cost(&self, prompt_tokens: u32, completion_tokens: u32) -> f64 {
         let (input_rate, output_rate) = match self {
             Model::Speed => (SPEED_INPUT_COST, SPEED_OUTPUT_COST),
+            Model::Fast => (FAST_INPUT_COST, FAST_OUTPUT_COST),
+            Model::Coder => (CODER_INPUT_COST, CODER_OUTPUT_COST),
             Model::Balanced => (BALANCED_INPUT_COST, BALANCED_OUTPUT_COST),
             Model::Smart => (SMART_INPUT_COST, SMART_OUTPUT_COST),
             Model::Reviewer => (REVIEWER_INPUT_COST, REVIEWER_OUTPUT_COST),
@@ -92,6 +106,8 @@ mod tests {
     #[test]
     fn test_model_ids() {
         assert!(Model::Speed.id().contains("gpt"));
+        assert!(Model::Fast.id().contains("haiku"));
+        assert!(Model::Coder.id().contains("codex"));
         assert!(Model::Balanced.id().contains("claude"));
         assert!(Model::Smart.id().contains("claude"));
         assert!(Model::Reviewer.id().contains("gpt"));

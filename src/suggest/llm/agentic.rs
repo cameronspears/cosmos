@@ -135,7 +135,18 @@ pub async fn call_llm_agentic(
         },
     ];
 
+    // Lean hybrid: allow only 1-3 surgical tool calls, then must respond
+    const MAX_ITERATIONS: usize = 5;
+    let mut iteration = 0;
+
     loop {
+        iteration += 1;
+
+        if iteration > MAX_ITERATIONS {
+            // Don't error - just force the model to respond with what it has
+            // by making one final call without tools
+            break;
+        }
         // Note: json_mode is accepted for API compatibility but not currently used
         // during the agentic loop since tool calls don't use JSON response format
         let response_format: Option<ResponseFormat> = None;
@@ -223,6 +234,49 @@ pub async fn call_llm_agentic(
 
         return Ok(AgenticResponse { content });
     }
+
+    // If we broke out of loop (hit max iterations), make one final call WITHOUT tools
+    // to force the model to respond with whatever it has
+    messages.push(Message {
+        role: "user".to_string(),
+        content: Some("You've gathered enough context. Now respond with your JSON suggestions based on what you've learned. No more tool calls.".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+
+    let final_request = ChatRequest {
+        model: model.id().to_string(),
+        messages: messages.clone(),
+        max_tokens: model.max_tokens(),
+        stream: false,
+        response_format: None,
+        tools: None, // No tools - force text response
+        provider: Some(ProviderConfig {
+            allow_fallbacks: true,
+        }),
+    };
+
+    let response = client
+        .post(OPENROUTER_URL)
+        .header("Content-Type", "application/json")
+        .header("HTTP-Referer", "https://cosmos.dev")
+        .header("X-Title", "Cosmos")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&final_request)
+        .send()
+        .await?;
+
+    let text = response.text().await?;
+    let parsed: ChatResponse = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("Failed to parse final response: {}\n{}", e, text))?;
+
+    let content = parsed
+        .choices
+        .first()
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_default();
+
+    Ok(AgenticResponse { content })
 }
 
 #[cfg(test)]

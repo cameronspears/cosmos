@@ -48,17 +48,15 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         tool_type: "function",
         function: FunctionDefinition {
             name: "shell",
-            description: r#"Execute a shell command in the repository. Use this to explore code, search for patterns, read files, check types, run tests, or make changes.
+            description: r#"Execute a shell command in the repository. Use this to explore code and find issues.
 
-Common patterns:
-- Search: rg "pattern" or grep -r "pattern" .
-- Read files: cat path/to/file or head -100 file
-- List files: ls -la or find . -name "*.rs"
-- Check types: cargo check or tsc --noEmit
-- Run tests: cargo test or npm test
-- Edit files: Use sed, or write new content with shell redirection
+IMPORTANT: Output is truncated at 16KB. Use targeted commands:
+- Search: rg "pattern" (preferred) or grep -r "pattern" .
+- Read files: head -150 file (preferred) or sed -n '100,200p' file for specific lines
+- AVOID: cat on large files - use head/tail/sed instead
+- List files: ls -la or find . -name "*.rs" | head -30
 
-The command runs in the repository root. Git protects against mistakes - be bold."#,
+The command runs in the repository root."#,
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -134,7 +132,7 @@ fn execute_shell(root: &Path, args_json: &str) -> String {
         return format!("Repository root does not exist: {}", root.display());
     }
 
-    // Execute the command with timeout
+    // Execute the command
     let output = Command::new("sh")
         .args(["-c", command])
         .current_dir(root)
@@ -165,12 +163,12 @@ fn execute_shell(root: &Path, args_json: &str) -> String {
                 result.push_str(&format!("\n[exit code: {}]", exit_code));
             }
 
-            // Truncate very long output
-            if result.len() > 100000 {
+            // Aggressively truncate to keep context lean
+            // 4KB ≈ 1k tokens - forces surgical, targeted reads
+            if result.len() > 4000 {
                 format!(
-                    "{}\n\n... (output truncated at 100KB, {} total bytes)",
-                    &result[..100000],
-                    result.len()
+                    "{}\n\n... (truncated - use head -50 or grep for specific sections)",
+                    &result[..4000]
                 )
             } else {
                 result

@@ -979,15 +979,6 @@ impl CodebaseIndex {
         }
     }
 
-    /// Get a map of file paths to their content hashes
-    /// Used for cache invalidation
-    pub fn file_hashes(&self) -> HashMap<PathBuf, String> {
-        self.files
-            .iter()
-            .map(|(path, file_index)| (path.clone(), file_index.content_hash.clone()))
-            .collect()
-    }
-
     /// Generate grouping for this codebase using heuristics
     pub fn generate_grouping(&self) -> crate::grouping::CodebaseGrouping {
         let mut grouping = crate::grouping::heuristics::categorize_codebase(self);
