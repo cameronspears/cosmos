@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/cameronspears/cosmos/compare/v0.6.0...v0.6.1) (2026-01-26)
+
+
+### Bug Fixes
+
+* **update:** refine error extraction logic in `extract_cargo_error` ([f698678](https://github.com/cameronspears/cosmos/commit/f69867891923bcebd30319e24fd0600a69d2ea63))
+
 ## [0.6.0](https://github.com/cameronspears/cosmos/compare/v0.5.1...v0.6.0) (2026-01-26)
 
 
