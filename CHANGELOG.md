@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/cameronspears/cosmos/compare/v0.5.0...v0.5.1) (2026-01-26)
+
+
+### Bug Fixes
+
+* **update:** use cargo install instead of pre-built binaries ([db9a38f](https://github.com/cameronspears/cosmos/commit/db9a38fcc27243be59f6c77ff8bc77962e8dc95f))
+
 ## [0.5.0](https://github.com/cameronspears/cosmos/compare/v0.4.1...v0.5.0) (2026-01-26)
 
 
