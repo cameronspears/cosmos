@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/cameronspears/cosmos/compare/v0.1.4...v0.2.0) (2026-01-26)
+
+
+### Features
+
+* **github:** integrate native GitHub API for PR creation ([48ae592](https://github.com/cameronspears/cosmos/commit/48ae5922f1c0a6812a8f495a7cf31da87b667231))
+
+
+### Bug Fixes
+
+* **docs:** correct README claims for accuracy ([8896049](https://github.com/cameronspears/cosmos/commit/88960494f6d6f02c4233365866eaa3aa32b44ebb))
+
 ## [0.1.4](https://github.com/cameronspears/cosmos/compare/v0.1.3...v0.1.4) (2026-01-26)
 
 
