@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0](https://github.com/cameronspears/cosmos/compare/v0.4.1...v0.5.0) (2026-01-26)
+
+
+### Features
+
+* **tui:** enhance TUI integrity and suppress output during updates ([e1bcb8c](https://github.com/cameronspears/cosmos/commit/e1bcb8ce4e41fa9599cac8a688dac1f99bfe20c6))
+* **ui:** enhance footer rendering with dynamic button management ([6fa04b4](https://github.com/cameronspears/cosmos/commit/6fa04b4cb3684f2b7ec24d5caa8b7bdf49c64c53))
+
 ## [0.4.1](https://github.com/cameronspears/cosmos/compare/v0.4.0...v0.4.1) (2026-01-26)
 
 
