@@ -755,7 +755,7 @@ fn render_verify_content<'a>(
         let (status_icon, status_text, status_color) = if preview.verified {
             ("✓", "Confirmed", Theme::GREEN)
         } else {
-            ("?", "Uncertain", Theme::BADGE_BUG)
+            ("✗", "Not Found", Theme::BADGE_BUG)
         };
         content.push(Line::from(vec![
             Span::styled(

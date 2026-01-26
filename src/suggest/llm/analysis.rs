@@ -1,14 +1,15 @@
+use super::agentic::call_llm_agentic;
 use super::client::{call_llm_with_usage, truncate_str};
 use super::models::{Model, Usage};
 use super::parse::parse_codebase_suggestions;
 use super::prompt_utils::format_repo_memory_section;
-use super::prompts::{ANALYZE_CODEBASE_SYSTEM, ASK_QUESTION_SYSTEM};
+use super::prompts::{ANALYZE_CODEBASE_AGENTIC_SYSTEM, ASK_QUESTION_SYSTEM};
 use crate::cache::DomainGlossary;
 use crate::context::WorkContext;
 use crate::index::{CodebaseIndex, PatternKind, SymbolKind};
 use crate::suggest::Suggestion;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  THRESHOLDS AND CONSTANTS
@@ -81,35 +82,49 @@ QUESTION:
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  UNIFIED CODEBASE ANALYSIS
+//  AGENTIC CODEBASE ANALYSIS
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Analyze entire codebase with @preset/smart for quality suggestions
+/// Analyze codebase using agentic exploration for highest accuracy
 ///
-/// This is the main entry point for generating high-quality suggestions.
-/// Uses smart context building to pack maximum insight into the prompt.
-/// Returns suggestions and usage stats for cost tracking.
+/// Unlike `analyze_codebase`, this lets the model explore the codebase with shell
+/// commands before generating suggestions. This eliminates hallucinations because
+/// the model only suggests issues for code it has actually read.
 ///
-/// The optional `glossary` provides domain-specific terminology to help
-/// the LLM use the correct terms in suggestion summaries.
-pub async fn analyze_codebase(
+/// Uses Model::Smart (Opus 4.5) for best reasoning during exploration.
+pub async fn analyze_codebase_agentic(
+    repo_root: &Path,
     index: &CodebaseIndex,
     context: &WorkContext,
     repo_memory: Option<String>,
     glossary: Option<&DomainGlossary>,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>)> {
-    let user_prompt = build_codebase_context(index, context, repo_memory.as_deref(), glossary);
+    let user_prompt =
+        build_agentic_exploration_prompt(index, context, repo_memory.as_deref(), glossary);
 
-    // Use Smart preset for quality reasoning on suggestions
-    let response =
-        call_llm_with_usage(ANALYZE_CODEBASE_SYSTEM, &user_prompt, Model::Smart, true).await?;
+    // Use Smart model (Opus 4.5) for best reasoning during exploration
+    let response = call_llm_agentic(
+        ANALYZE_CODEBASE_AGENTIC_SYSTEM,
+        &user_prompt,
+        Model::Smart,
+        repo_root,
+        false, // Not JSON mode - model explores first, then returns JSON
+    )
+    .await?;
 
+    // Parse the final JSON response
     let suggestions = parse_codebase_suggestions(&response.content)?;
-    Ok((suggestions, response.usage))
+
+    // Note: Agentic calls don't currently return usage stats
+    // TODO: Track usage across tool calls in agentic loop
+    Ok((suggestions, None))
 }
 
-/// Build rich context from codebase index for the LLM prompt
-fn build_codebase_context(
+/// Build exploration prompt for agentic analysis
+///
+/// This prompt guides the model on where to focus its exploration,
+/// but doesn't include actual code - the model reads it via shell.
+fn build_agentic_exploration_prompt(
     index: &CodebaseIndex,
     context: &WorkContext,
     repo_memory: Option<&str>,
@@ -126,67 +141,39 @@ fn build_codebase_context(
 
     // Header with overview
     sections.push(format!(
-        "CODEBASE: {} ({} files, {} LOC)\nBRANCH: {} | FOCUS: {}",
-        project_name,
-        stats.file_count,
-        stats.total_loc,
-        context.branch,
-        context.inferred_focus.as_deref().unwrap_or("general"),
+        "CODEBASE: {} ({} files, {} LOC)\nBRANCH: {}",
+        project_name, stats.file_count, stats.total_loc, context.branch,
     ));
 
-    // Uncommitted changes FIRST (highest priority)
+    // Focus areas - changed files are highest priority
     if !context.uncommitted_files.is_empty()
         || !context.staged_files.is_empty()
         || !context.untracked_files.is_empty()
     {
-        let mut changes_section = String::from("\n\nACTIVELY WORKING ON [CHANGED]:");
+        let mut focus = String::from("\n\nFOCUS AREAS [CHANGED] - Read these files first:");
         for file in context
             .uncommitted_files
             .iter()
             .chain(context.staged_files.iter())
             .chain(context.untracked_files.iter())
-            .take(15)
+            .take(10)
         {
-            // Include file details if we have them
-            if let Some(file_index) = index.files.get(file) {
-                let exports: Vec<_> = file_index
-                    .symbols
-                    .iter()
-                    .filter(|s| s.visibility == crate::index::Visibility::Public)
-                    .take(5)
-                    .map(|s| s.name.as_str())
-                    .collect();
-                let exports_str = if exports.is_empty() {
-                    String::new()
-                } else {
-                    format!(" exports: {}", exports.join(", "))
-                };
-                changes_section.push_str(&format!(
-                    "\n- {} ({} LOC){}",
-                    file.display(),
-                    file_index.loc,
-                    exports_str
-                ));
-            } else {
-                changes_section.push_str(&format!("\n- {}", file.display()));
-            }
+            focus.push_str(&format!("\n- {}", file.display()));
         }
-        sections.push(changes_section);
+        sections.push(focus);
     }
 
-    // Blast radius: files affected by the current changes (direct importers + direct deps)
+    // Blast radius - related files to check
     if !context.all_changed_files().is_empty() {
         let changed: HashSet<PathBuf> = context.all_changed_files().into_iter().cloned().collect();
         let mut related: HashSet<PathBuf> = HashSet::new();
 
         for c in &changed {
             if let Some(file_index) = index.files.get(c) {
-                // Who imports this file?
-                for u in file_index.summary.used_by.iter().take(10) {
+                for u in file_index.summary.used_by.iter().take(5) {
                     related.insert(u.clone());
                 }
-                // What does this file depend on?
-                for d in file_index.summary.depends_on.iter().take(10) {
+                for d in file_index.summary.depends_on.iter().take(5) {
                     related.insert(d.clone());
                 }
             }
@@ -198,41 +185,15 @@ fn build_codebase_context(
         if !related.is_empty() {
             let mut list: Vec<_> = related.into_iter().collect();
             list.sort();
-            let mut blast = String::from("\n\nBLAST RADIUS (related to [CHANGED]):");
-            for path in list.into_iter().take(15) {
+            let mut blast = String::from("\n\nBLAST RADIUS (dependencies of changed files):");
+            for path in list.into_iter().take(10) {
                 blast.push_str(&format!("\n- {}", path.display()));
             }
             sections.push(blast);
         }
     }
 
-    // Repository memory / conventions
-    let memory_section =
-        format_repo_memory_section(repo_memory, "REPO MEMORY (CONVENTIONS/DECISIONS)");
-    if !memory_section.is_empty() {
-        sections.push(memory_section);
-    }
-
-    // Domain glossary
-    if let Some(glossary) = glossary {
-        if !glossary.is_empty() {
-            let terms = glossary.to_prompt_context(20);
-            if !terms.trim().is_empty() {
-                sections.push(format!(
-                    "\n\nDOMAIN TERMINOLOGY (use these terms):\n{}",
-                    terms
-                ));
-            }
-        }
-    }
-
-    // Codebase summary stats
-    sections.push(format!(
-        "\n\nCODEBASE STRUCTURE:\n- Root: {}\n- Files: {}\n- Symbols: {}\n- Patterns: {}",
-        project_name, stats.file_count, stats.symbol_count, stats.pattern_count
-    ));
-
-    // File hotspots (largest/most complex)
+    // Hotspots - complex files worth examining
     let mut hotspots = index.files.values().collect::<Vec<_>>();
     hotspots.sort_by(|a, b| {
         b.complexity
@@ -242,52 +203,58 @@ fn build_codebase_context(
     let hot: Vec<_> = hotspots
         .iter()
         .filter(|f| f.complexity > HIGH_COMPLEXITY_THRESHOLD || f.loc > GOD_MODULE_LOC_THRESHOLD)
-        .take(10)
+        .take(8)
         .collect();
 
     if !hot.is_empty() {
-        let mut hot_section = String::from("\n\nHOTSPOTS (complex or large files):");
+        let mut hot_section = String::from("\n\nHOTSPOTS (complex files worth examining):");
         for file in hot {
-            let rel = &file.path;
-            hot_section.push_str(&format!(
-                "\n- {} ({} LOC, complexity {:.0})",
-                rel.display(),
-                file.loc,
-                file.complexity
-            ));
+            hot_section.push_str(&format!("\n- {} ({} LOC)", file.path.display(), file.loc));
         }
         sections.push(hot_section);
     }
 
-    // TODOs and FIXMEs found in code (actionable items from the developer)
+    // TODOs and FIXMEs
     let todos: Vec<_> = index
         .patterns
         .iter()
         .filter(|p| matches!(p.kind, PatternKind::TodoMarker))
-        .take(10)
+        .take(5)
         .collect();
 
     if !todos.is_empty() {
-        let mut todos_section = String::from("\n\nTODO/FIXME MARKERS IN CODE:");
+        let mut todos_section = String::from("\n\nTODO/FIXME MARKERS:");
         for todo in &todos {
             todos_section.push_str(&format!(
                 "\n- {}:{} - {}",
-                todo.file
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("?"),
+                todo.file.display(),
                 todo.line,
-                truncate_str(&todo.description, 70)
+                truncate_str(&todo.description, 60)
             ));
         }
         sections.push(todos_section);
     }
 
-    // Final instruction - open-ended
+    // Repository memory / conventions
+    let memory_section = format_repo_memory_section(repo_memory, "REPO CONVENTIONS");
+    if !memory_section.is_empty() {
+        sections.push(memory_section);
+    }
+
+    // Domain glossary
+    if let Some(glossary) = glossary {
+        if !glossary.is_empty() {
+            let terms = glossary.to_prompt_context(15);
+            if !terms.trim().is_empty() {
+                sections.push(format!("\n\nDOMAIN TERMINOLOGY:\n{}", terms));
+            }
+        }
+    }
+
+    // Final instruction
     sections.push(String::from(
-        "\n\nLook for bugs, security issues, performance problems, missing error handling, \
-         UX improvements, and feature opportunities. Prioritize the [CHANGED] files (and BLAST RADIUS). \
-         Give me varied, specific suggestions - not just code organization advice.",
+        "\n\nExplore the codebase using shell commands. Focus on [CHANGED] files first, \
+         then check BLAST RADIUS and HOTSPOTS. Only suggest issues you've verified by reading the actual code.",
     ));
 
     sections.join("")

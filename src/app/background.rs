@@ -121,6 +121,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                             ));
                         }
 
+                        let repo_root = cache_clone_path.clone();
                         spawn_background(ctx.tx.clone(), "suggestions_generation", async move {
                             let mem = if repo_memory_context.trim().is_empty() {
                                 None
@@ -132,7 +133,9 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                             } else {
                                 Some(&glossary_clone)
                             };
-                            match suggest::llm::analyze_codebase(
+                            // Use agentic analysis for highest accuracy - model explores codebase with tools
+                            match suggest::llm::analyze_codebase_agentic(
+                                &repo_root,
                                 &index_clone,
                                 &context_clone,
                                 mem,
@@ -142,7 +145,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                             {
                                 Ok((suggestions, usage)) => {
                                     // Cache the suggestions with file hashes for validation
-                                    let cache = cache::Cache::new(&cache_clone_path);
+                                    let cache = cache::Cache::new(&repo_root);
                                     let file_hashes = index_clone.file_hashes();
                                     let file_count = index_clone.files.len();
                                     let cache_data =
@@ -157,7 +160,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                                         tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                                             suggestions,
                                             usage,
-                                            model: "smart".to_string(),
+                                            model: "smart-agentic".to_string(),
                                         });
                                 }
                                 Err(e) => {
