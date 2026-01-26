@@ -65,7 +65,7 @@ fn extract_cargo_error(stderr: &str) -> &str {
     stderr
         .lines()
         .find(|line| line.trim().starts_with("error:") || line.trim().starts_with("error["))
-        .or_else(|| stderr.lines().filter(|l| !l.trim().is_empty()).last())
+        .or_else(|| stderr.lines().rfind(|l| !l.trim().is_empty()))
         .map(|s| s.trim())
         .unwrap_or("unknown error")
 }
