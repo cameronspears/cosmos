@@ -1,22 +1,13 @@
 //! Self-update functionality for Cosmos
 //!
 //! Provides version checking against crates.io and self-updating via
-//! pre-built binaries from GitHub releases.
+//! cargo install from crates.io.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
 /// Current version of Cosmos (from Cargo.toml)
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// GitHub repository owner
-const REPO_OWNER: &str = "cameronspears";
-
-/// GitHub repository name
-const REPO_NAME: &str = "cosmos";
-
-/// Binary name in releases
-const BIN_NAME: &str = "cosmos";
 
 /// Information about an available update
 #[derive(Debug, Clone)]
@@ -90,55 +81,46 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
     }
 }
 
-/// Download and install the latest version from GitHub releases
+/// Install the latest version from crates.io using cargo
 ///
-/// This function downloads the appropriate binary for the current platform,
-/// replaces the current executable, and then exec()s into the new binary.
+/// This function runs `cargo install cosmos-tui --force` to update to the latest version,
+/// then exec()s into the new binary.
 ///
 /// On success, this function does not return (the process is replaced).
 pub fn run_update<F>(target_version: &str, on_progress: F) -> Result<()>
 where
     F: Fn(u8) + Send + 'static,
 {
-    use self_update::backends::github::Update;
-    use self_update::update::UpdateStatus;
+    use std::process::Command;
 
     // Initial progress
     on_progress(5);
 
-    let status = Update::configure()
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
-        .bin_name(BIN_NAME)
-        .current_version(CURRENT_VERSION)
-        .target_version_tag(&format!("v{}", target_version))
-        .show_download_progress(false)
-        .show_output(false)
-        .no_confirm(true)
-        .build()
-        .context("Failed to configure updater")?
-        .update_extended()
-        .context("Failed to download update")?;
+    // Run cargo install to update
+    let output = Command::new("cargo")
+        .args(["install", "cosmos-tui", "--force", "--locked"])
+        .output()
+        .context("Failed to run cargo install. Is Rust installed?")?;
 
     // Update complete
     on_progress(100);
 
-    match status {
-        UpdateStatus::UpToDate => {
-            // Already up to date - nothing to do
-            Ok(())
-        }
-        UpdateStatus::Updated(release) => {
-            // Binary was replaced, now exec into the new version
-            exec_new_binary().map_err(|e| {
-                anyhow::anyhow!(
-                    "Update downloaded (v{}) but failed to restart: {}",
-                    release.version,
-                    e
-                )
-            })
-        }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "cargo install failed: {}",
+            stderr.lines().last().unwrap_or("unknown error")
+        ));
     }
+
+    // Binary was replaced, now exec into the new version
+    exec_new_binary().map_err(|e| {
+        anyhow::anyhow!(
+            "Update installed (v{}) but failed to restart: {}",
+            target_version,
+            e
+        )
+    })
 }
 
 /// Replace the current process with the new binary
