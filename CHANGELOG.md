@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/cameronspears/cosmos/compare/v0.5.1...v0.6.0) (2026-01-26)
+
+
+### Features
+
+* **update:** improve error handling and user feedback during updates ([c9eeb2a](https://github.com/cameronspears/cosmos/commit/c9eeb2ad86cd41b18523a9698c6cd4d1b089186a))
+
+
+### Bug Fixes
+
+* **update:** improve error messages and user guidance during update failures ([f2b8e2b](https://github.com/cameronspears/cosmos/commit/f2b8e2b23dd1669a463249755481686e8463cbde))
+
 ## [0.5.1](https://github.com/cameronspears/cosmos/compare/v0.5.0...v0.5.1) (2026-01-26)
 
 
