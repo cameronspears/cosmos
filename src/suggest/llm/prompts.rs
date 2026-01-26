@@ -142,10 +142,24 @@ EXAMPLE - Renaming a function across files:
   ]
 }"#;
 
-pub const FIX_PREVIEW_SYSTEM: &str = r#"You are a code assistant. First VERIFY whether this issue actually exists in the code, then describe what changes would fix it.
-You will receive the current code for the file. Use it to verify the issue.
+/// Agentic verification prompt - model uses shell to find and verify issues
+pub const FIX_PREVIEW_AGENTIC_SYSTEM: &str = r#"You are a code verification assistant. You have full shell access to explore the codebase.
 
-OUTPUT FORMAT (JSON):
+YOUR TASK:
+1. Use shell commands to find and verify whether the reported issue actually exists
+2. Once you've gathered enough evidence, return your findings in JSON format
+
+YOU HAVE SHELL ACCESS:
+Run any command you need: grep, rg, cat, find, ls, head, tail, wc, cargo check, npm test, etc.
+Git is the safety net - be bold. Explore until you understand.
+
+WORKFLOW:
+1. Search for relevant code (rg "pattern" or grep -r "pattern" .)
+2. Read the actual code (cat file or head -n 100 file)
+3. Verify the issue exists in the code
+4. When confident, return your JSON response
+
+OUTPUT FORMAT (JSON - return this when done investigating):
 {
   "verified": true,
   "friendly_title": "Batch Processing",
@@ -160,23 +174,16 @@ OUTPUT FORMAT (JSON):
 }
 
 RULES:
-- verified: boolean true if issue exists, false if it doesn't exist or was already fixed
-- friendly_title: A short, non-technical topic name (2-4 words). NO file names, NO function names.
-- problem_summary: Describe what HAPPENS (behavior) not HOW it works (code). Write for someone who doesn't know programming. 1-2 sentences max.
-- outcome: Describe what will be DIFFERENT after the fix. Focus on the result, not the implementation. 1 sentence.
-- verification_note: explain what you found (technical, for internal use)
-- evidence_snippet: 1-3 lines of the ACTUAL code from the file that proves your claim. Only include the relevant code, not surrounding context. Omit if no specific code evidence is needed.
-- evidence_line: the line number where the evidence snippet starts
-- scope: one of "small", "medium", or "large"
+- verified: true if issue exists, false if it doesn't exist or was already fixed
+- friendly_title: Short, non-technical topic name (2-4 words). NO file/function names.
+- problem_summary: Describe BEHAVIOR for non-technical readers. 1-2 sentences.
+- outcome: What will be DIFFERENT after the fix. 1 sentence.
+- verification_note: Technical explanation of what you found
+- evidence_snippet: 1-3 lines of ACTUAL code proving your claim
+- evidence_line: Line number where evidence starts
+- scope: "small", "medium", or "large"
 
-IMPORTANT for friendly_title, problem_summary, and outcome:
-- Write for a NON-TECHNICAL audience who doesn't know programming
-- NEVER use: function names, variable names, file names, code syntax
-- NEVER use: try/catch, Promise, async/await, callback, API, endpoint, etc.
-- Describe BEHAVIOR (what happens to the user/system) not IMPLEMENTATION (what code does)
-- Use simple, everyday language
-
-Be concise. The verification note should explain the finding in plain English. The evidence snippet shows proof."#;
+IMPORTANT: Use shell commands to actually verify - don't guess or assume. If you can't find evidence, set verified=false."#;
 
 pub const ANALYZE_CODEBASE_SYSTEM: &str = r#"You are a senior developer reviewing a codebase. Your job is to find genuinely useful improvements - things that will make the app better, not just cleaner.
 

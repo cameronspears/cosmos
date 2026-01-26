@@ -156,6 +156,13 @@ pub async fn run_tui(
         });
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FETCH INITIAL WALLET BALANCE
+    // ═══════════════════════════════════════════════════════════════════════
+    if ai_enabled {
+        background::spawn_balance_refresh(tx.clone());
+    }
+
     // AI grouping enhancement: low-confidence files only, capped for safety
     if grouping_ai_enabled && ai_enabled {
         let max_files =

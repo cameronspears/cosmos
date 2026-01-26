@@ -335,47 +335,62 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                         let suggestion_id = suggestion.id;
                                         let file_path = suggestion.file.clone();
                                         let additional_files = suggestion.additional_files.clone();
-                                        let additional_files_for_preview = additional_files.clone();
-                                        let summary = suggestion.summary.clone();
-                                        let suggestion_clone = suggestion.clone();
-                                        let tx_preview = ctx.tx.clone();
-                                        let repo_root = app.repo_path.clone();
-                                        let repo_memory_context =
-                                            app.repo_memory.to_prompt_context(12, 900);
 
-                                        // Move to Verify step (with multi-file support)
-                                        app.start_verify_multi(
+                                        // Check if we have a valid cached preview for this suggestion
+                                        if app.has_valid_cached_preview(
                                             suggestion_id,
-                                            file_path.clone(),
-                                            additional_files,
-                                            summary.clone(),
-                                        );
+                                            &file_path,
+                                            &additional_files,
+                                            &app.repo_path,
+                                        ) {
+                                            // Use cached result - instant transition
+                                            app.use_cached_verify();
+                                        } else {
+                                            // Generate new preview
+                                            let additional_files_for_preview =
+                                                additional_files.clone();
+                                            let summary = suggestion.summary.clone();
+                                            let suggestion_clone = suggestion.clone();
+                                            let tx_preview = ctx.tx.clone();
+                                            let repo_root = app.repo_path.clone();
+                                            let repo_memory_context =
+                                                app.repo_memory.to_prompt_context(12, 900);
 
-                                        background::spawn_background(
-                                            ctx.tx.clone(),
-                                            "preview_generation",
-                                            async move {
-                                                let mem = if repo_memory_context.trim().is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(repo_memory_context)
-                                                };
-                                                let mut file_hashes = HashMap::new();
-                                                let mut primary_content = String::new();
-                                                let mut primary_rel = None;
+                                            // Move to Verify step (with multi-file support)
+                                            app.start_verify_multi(
+                                                suggestion_id,
+                                                file_path.clone(),
+                                                additional_files,
+                                                summary.clone(),
+                                            );
 
-                                                let mut all_files = Vec::new();
-                                                all_files.push(file_path.clone());
-                                                all_files
-                                                    .extend(additional_files_for_preview.clone());
+                                            background::spawn_background(
+                                                ctx.tx.clone(),
+                                                "preview_generation",
+                                                async move {
+                                                    let mem =
+                                                        if repo_memory_context.trim().is_empty() {
+                                                            None
+                                                        } else {
+                                                            Some(repo_memory_context)
+                                                        };
 
-                                                for target in &all_files {
-                                                    let resolved = match resolve_repo_path_allow_new(
-                                                        &repo_root, target,
-                                                    ) {
-                                                        Ok(resolved) => resolved,
-                                                        Err(e) => {
-                                                            let _ = tx_preview.send(
+                                                    // Build file hashes for change detection
+                                                    let mut file_hashes = HashMap::new();
+                                                    let mut all_files = Vec::new();
+                                                    all_files.push(file_path.clone());
+                                                    all_files.extend(
+                                                        additional_files_for_preview.clone(),
+                                                    );
+
+                                                    for target in &all_files {
+                                                        let resolved =
+                                                            match resolve_repo_path_allow_new(
+                                                                &repo_root, target,
+                                                            ) {
+                                                                Ok(resolved) => resolved,
+                                                                Err(e) => {
+                                                                    let _ = tx_preview.send(
                                                                 BackgroundMessage::PreviewError(
                                                                     format!(
                                                                         "Unsafe path {}: {}",
@@ -384,18 +399,13 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                                                     ),
                                                                 ),
                                                             );
-                                                            return;
-                                                        }
-                                                    };
+                                                                    return;
+                                                                }
+                                                            };
 
-                                                    let bytes = match std::fs::read(
-                                                        &resolved.absolute,
-                                                    ) {
+                                                        let bytes = match std::fs::read(&resolved.absolute) {
                                                         Ok(content) => content,
-                                                        Err(e)
-                                                            if e.kind()
-                                                                == std::io::ErrorKind::NotFound =>
-                                                        {
+                                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                                                             Vec::new()
                                                         }
                                                         Err(e) => {
@@ -412,38 +422,14 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                                         }
                                                     };
 
-                                                    file_hashes.insert(
-                                                        resolved.relative.clone(),
-                                                        hash_bytes(&bytes),
-                                                    );
-
-                                                    if target == &file_path {
-                                                        match String::from_utf8(bytes) {
-                                                            Ok(content) => {
-                                                                primary_content = content;
-                                                                primary_rel =
-                                                                    Some(resolved.relative.clone());
-                                                            }
-                                                            Err(_) => {
-                                                                let _ = tx_preview.send(
-                                                                    BackgroundMessage::PreviewError(
-                                                                        format!(
-                                                                            "Failed to read {}: file is not valid UTF-8",
-                                                                            resolved.relative.display(),
-                                                                        ),
-                                                                    ),
-                                                                );
-                                                                return;
-                                                            }
-                                                        }
+                                                        file_hashes.insert(
+                                                            resolved.relative.clone(),
+                                                            hash_bytes(&bytes),
+                                                        );
                                                     }
-                                                }
-
-                                                let resolved_rel = primary_rel
-                                                    .unwrap_or_else(|| file_path.clone());
-                                                match suggest::llm::generate_fix_preview(
-                                                    &resolved_rel,
-                                                    &primary_content,
+                                                    // Use agentic verification - model explores with shell
+                                                    match suggest::llm::generate_fix_preview_agentic(
+                                                    &repo_root,
                                                     &suggestion_clone,
                                                     None,
                                                     mem,
@@ -466,8 +452,9 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                                         );
                                                     }
                                                 }
-                                            },
-                                        );
+                                                },
+                                            );
+                                        }
                                     }
                                 }
                             }

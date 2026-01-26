@@ -74,7 +74,7 @@ pub async fn verify_changes(
 
     // Build the diff context
     let mut changes_text = String::new();
-    const MAX_REVIEW_CHARS_PER_FILE: usize = 12000;
+    const MAX_REVIEW_CHARS_PER_FILE: usize = 40000;
 
     for (path, old_content, new_content) in files_with_content {
         let file_name = path.display().to_string();

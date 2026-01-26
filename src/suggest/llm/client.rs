@@ -324,3 +324,45 @@ pub(crate) fn truncate_str(s: &str, max_chars: usize) -> &str {
         &s[..byte_idx]
     }
 }
+
+/// OpenRouter credits API URL
+const OPENROUTER_CREDITS_URL: &str = "https://openrouter.ai/api/v1/credits";
+
+/// Response from OpenRouter credits endpoint
+#[derive(Deserialize)]
+struct CreditsResponse {
+    data: CreditsData,
+}
+
+#[derive(Deserialize)]
+struct CreditsData {
+    total_credits: f64,
+    total_usage: f64,
+}
+
+/// Fetch the current account balance from OpenRouter.
+/// Returns the remaining credits (total_credits - total_usage).
+pub async fn fetch_account_balance() -> anyhow::Result<f64> {
+    let api_key = api_key().ok_or_else(|| anyhow::anyhow!("No API key configured"))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let response = client
+        .get(OPENROUTER_CREDITS_URL)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to fetch balance: {}",
+            response.status()
+        ));
+    }
+
+    let credits: CreditsResponse = response.json().await?;
+    let remaining = credits.data.total_credits - credits.data.total_usage;
+    Ok(remaining)
+}

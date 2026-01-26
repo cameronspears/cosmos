@@ -46,6 +46,8 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     let cost = u.calculate_cost(suggest::llm::Model::Smart);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    // Refresh wallet balance after spending
+                    spawn_balance_refresh(ctx.tx.clone());
                 }
 
                 // If summaries are still generating, switch to that loading state
@@ -83,6 +85,8 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     let cost = u.calculate_cost(suggest::llm::Model::Speed);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    // Refresh wallet balance after spending
+                    spawn_balance_refresh(ctx.tx.clone());
                 }
 
                 // Reload glossary from cache (it was built during summary generation)
@@ -227,6 +231,8 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     let cost = u.calculate_cost(suggest::llm::Model::Balanced);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    // Refresh wallet balance after spending
+                    spawn_balance_refresh(ctx.tx.clone());
                 }
 
                 if updated_files > 0 {
@@ -272,6 +278,8 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     let cost = u.calculate_cost(suggest::llm::Model::Smart);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    // Refresh wallet balance after spending
+                    spawn_balance_refresh(ctx.tx.clone());
                 }
 
                 app.loading = LoadingState::None;
@@ -428,6 +436,8 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     let cost = u.calculate_cost(suggest::llm::Model::Balanced);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    // Refresh wallet balance after spending
+                    spawn_balance_refresh(ctx.tx.clone());
                 }
 
                 app.loading = LoadingState::None;
@@ -445,6 +455,8 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     let cost = u.calculate_cost(suggest::llm::Model::Balanced);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    // Refresh wallet balance after spending
+                    spawn_balance_refresh(ctx.tx.clone());
                 }
 
                 // Store answer in cache
@@ -468,6 +480,8 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     let cost = u.calculate_cost(suggest::llm::Model::Reviewer);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    // Refresh wallet balance after spending
+                    spawn_balance_refresh(ctx.tx.clone());
                 }
                 // Update the Review workflow step with findings
                 app.set_review_findings(findings, summary);
@@ -482,6 +496,8 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     let cost = u.calculate_cost(suggest::llm::Model::Smart);
                     app.session_cost += cost;
                     app.session_tokens += u.total_tokens;
+                    // Refresh wallet balance after spending
+                    spawn_balance_refresh(ctx.tx.clone());
                 }
 
                 app.show_toast(&format!("Fixed: {}", truncate(&description, 40)));
@@ -544,8 +560,21 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 app.update_progress = None;
                 app.set_update_error(e);
             }
+            BackgroundMessage::WalletBalanceUpdated { balance } => {
+                app.wallet_balance = Some(balance);
+            }
         }
     }
+}
+
+/// Spawn a background task to fetch the wallet balance
+pub fn spawn_balance_refresh(tx: mpsc::Sender<BackgroundMessage>) {
+    spawn_background(tx.clone(), "balance_fetch", async move {
+        if let Ok(balance) = suggest::llm::fetch_account_balance().await {
+            let _ = tx.send(BackgroundMessage::WalletBalanceUpdated { balance });
+        }
+        // Silently ignore errors - balance display is optional
+    });
 }
 
 pub fn spawn_background<F>(tx: mpsc::Sender<BackgroundMessage>, task_name: &'static str, fut: F)

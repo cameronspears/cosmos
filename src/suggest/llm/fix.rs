@@ -1,10 +1,11 @@
+use super::agentic::call_llm_agentic;
 use super::client::{call_llm_with_usage, LlmResponse};
 use super::models::{Model, Usage};
 use super::parse::{
     merge_usage, parse_json_with_retry, truncate_content, truncate_content_around_line,
 };
 use super::prompt_utils::format_repo_memory_section;
-use super::prompts::{FIX_CONTENT_SYSTEM, FIX_PREVIEW_SYSTEM, MULTI_FILE_FIX_SYSTEM};
+use super::prompts::{FIX_CONTENT_SYSTEM, FIX_PREVIEW_AGENTIC_SYSTEM, MULTI_FILE_FIX_SYSTEM};
 use crate::suggest::Suggestion;
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -27,10 +28,10 @@ pub struct AppliedFix {
     pub usage: Option<Usage>,
 }
 
-const MAX_PREVIEW_CHARS: usize = 6000;
-// Excerpt caps used only when the full prompt exceeds model limits.
-const MAX_FIX_EXCERPT_CHARS: usize = 20000;
-const MAX_MULTI_FILE_EXCERPT_CHARS: usize = 60000;
+// Context limits - generous to let models work with full context.
+// Modern models handle 100k+ tokens easily; these limits only kick in for unusually large files.
+const MAX_FIX_EXCERPT_CHARS: usize = 60000;
+const MAX_MULTI_FILE_EXCERPT_CHARS: usize = 120000;
 
 struct PromptContent {
     content: String,
@@ -729,61 +730,62 @@ impl FixScope {
     }
 }
 
-/// Generate a preview of what the fix will do with smart verification
-/// This is Phase 1 of the two-phase fix flow - uses Smart model to thoroughly verify the issue exists before users approve
-pub async fn generate_fix_preview(
-    path: &Path,
-    content: &str,
+/// Generate a preview using agentic verification.
+///
+/// Instead of spoon-feeding truncated code, this lets the model use tools
+/// (grep, read, ls) to explore the codebase and find the evidence it needs.
+/// This produces more accurate verification because the model finds context itself.
+pub async fn generate_fix_preview_agentic(
+    repo_root: &Path,
     suggestion: &Suggestion,
     modifier: Option<&str>,
     repo_memory: Option<String>,
 ) -> anyhow::Result<FixPreview> {
     let modifier_text = modifier
-        .map(|m| format!("\n\nUser wants: {}", m))
+        .map(|m| format!("\n\nUser modification request: {}", m))
         .unwrap_or_default();
 
     let memory_section =
         format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
 
-    let preview_content = select_preview_content(content, suggestion);
+    // Build a focused prompt - the model will use tools to find the code
     let user = format!(
-        "File: {}\nIssue: {}\n{}{}{}\n\nCurrent Code:\n```\n{}\n```",
-        path.display(),
+        r#"ISSUE TO VERIFY:
+File: {}
+Summary: {}
+{}
+{}{}
+
+Use the available tools to:
+1. Find and examine the relevant code in this file
+2. Verify whether this issue actually exists
+3. Return your findings as JSON"#,
+        suggestion.file.display(),
         suggestion.summary,
         suggestion.detail.as_deref().unwrap_or(""),
         memory_section,
         modifier_text,
-        preview_content
     );
 
-    let response = call_llm_with_usage(FIX_PREVIEW_SYSTEM, &user, Model::Balanced, true).await?;
+    let response = call_llm_agentic(
+        FIX_PREVIEW_AGENTIC_SYSTEM,
+        &user,
+        Model::Balanced,
+        repo_root,
+        false,
+    )
+    .await?;
 
-    // Try parsing, with self-correction retry on failure
+    // Parse the final response as JSON
     let (parsed, _correction_usage): (serde_json::Value, _) =
         parse_json_with_retry(&response.content, "fix preview").await?;
+
     build_fix_preview(parsed, modifier.map(String::from))
 }
 
-fn select_preview_content(content: &str, suggestion: &Suggestion) -> String {
-    if content.trim().is_empty() {
-        return String::new();
-    }
-
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.is_empty() {
-        return truncate_content(content, MAX_PREVIEW_CHARS);
-    }
-
-    let hint_tokens = extract_hint_tokens(
-        &suggestion.summary,
-        suggestion.detail.as_deref(),
-        &suggestion.file,
-    );
-    let anchor_line = choose_preview_anchor_line(&lines, suggestion.line, &hint_tokens);
-
-    truncate_content_around_line(content, anchor_line, MAX_PREVIEW_CHARS)
-        .unwrap_or_else(|| truncate_content(content, MAX_PREVIEW_CHARS))
-}
+// ═══════════════════════════════════════════════════════════════════════════
+//  ANCHOR LINE SELECTION (used by fix generation for context selection)
+// ═══════════════════════════════════════════════════════════════════════════
 
 fn choose_preview_anchor_line(
     lines: &[&str],
@@ -901,9 +903,9 @@ fn find_first_impl_or_fn_line(lines: &[&str]) -> Option<usize> {
         .map(|idx| idx + 1)
 }
 
-fn extract_hint_tokens(summary: &str, detail: Option<&str>, path: &Path) -> Vec<String> {
-    extract_hint_tokens_with_extras(summary, detail, path, &[])
-}
+// ═══════════════════════════════════════════════════════════════════════════
+//  TOKEN EXTRACTION (used by fix generation for context selection)
+// ═══════════════════════════════════════════════════════════════════════════
 
 fn extract_hint_tokens_with_extras(
     summary: &str,

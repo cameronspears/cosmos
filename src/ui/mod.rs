@@ -79,6 +79,7 @@ pub struct App {
     pub session_cost: f64,            // Total USD spent this session
     pub session_tokens: u32,          // Total tokens used this session
     pub active_model: Option<String>, // Current/last model used
+    pub wallet_balance: Option<f64>,  // Remaining credits in OpenRouter account
 
     // Track if summaries need generation (to avoid showing loading state when all cached)
     pub needs_summary_generation: bool,
@@ -169,6 +170,7 @@ impl App {
             session_cost: 0.0,
             session_tokens: 0,
             active_model: None,
+            wallet_balance: None,
             needs_summary_generation: false,
             summary_progress: None,
             summary_failed_files: Vec::new(),
@@ -1125,6 +1127,66 @@ impl App {
         self.verify_state.loading = false;
         self.verify_state.preview_hashes = file_hashes;
         self.loading = LoadingState::None;
+    }
+
+    /// Use cached verification result (transitions to Verify step without regenerating preview)
+    pub fn use_cached_verify(&mut self) {
+        self.verify_state.loading = false;
+        self.verify_state.scroll = 0;
+        self.workflow_step = WorkflowStep::Verify;
+        self.loading = LoadingState::None;
+    }
+
+    /// Check if we have a valid cached preview for the given suggestion and files.
+    /// Returns true if cache is valid and can be reused.
+    pub fn has_valid_cached_preview(
+        &self,
+        suggestion_id: uuid::Uuid,
+        file_path: &std::path::Path,
+        additional_files: &[PathBuf],
+        repo_path: &std::path::Path,
+    ) -> bool {
+        // Must match the same suggestion
+        if self.verify_state.suggestion_id != Some(suggestion_id) {
+            return false;
+        }
+
+        // Must have an existing preview
+        if self.verify_state.preview.is_none() {
+            return false;
+        }
+
+        // Must have cached hashes to compare
+        if self.verify_state.preview_hashes.is_empty() {
+            return false;
+        }
+
+        // Collect all files that need hash validation
+        let mut all_files = vec![file_path.to_path_buf()];
+        all_files.extend(additional_files.iter().cloned());
+
+        // Check that all file hashes match
+        for target in &all_files {
+            let resolved = match crate::util::resolve_repo_path_allow_new(repo_path, target) {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+
+            let bytes = match std::fs::read(&resolved.absolute) {
+                Ok(content) => content,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(_) => return false,
+            };
+
+            let current_hash = crate::util::hash_bytes(&bytes);
+
+            match self.verify_state.preview_hashes.get(&resolved.relative) {
+                Some(cached_hash) if cached_hash == &current_hash => continue,
+                _ => return false,
+            }
+        }
+
+        true
     }
 
     /// Scroll verify panel down

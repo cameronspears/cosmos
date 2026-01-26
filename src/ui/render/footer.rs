@@ -111,11 +111,19 @@ pub(super) fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ""
     };
 
-    let cost_text = if app.session_cost > 0.0 {
-        format!("  ${:.4}", app.session_cost)
-    } else {
-        String::new()
+    // Build balance/cost display: "$12.48 (-$0.02)" format
+    // Shows current wallet balance, then session cost in parentheses
+    // Note: wallet_balance from API already reflects spending, so we don't subtract session_cost
+    let (balance_text, cost_suffix) = match (app.session_cost > 0.0, app.wallet_balance) {
+        (true, Some(balance)) => (
+            format!("  ${:.2}", balance),
+            format!(" (-${:.2})", app.session_cost),
+        ),
+        (true, None) => (format!("  -${:.2}", app.session_cost), String::new()),
+        (false, Some(balance)) => (format!("  ${:.2}", balance), String::new()),
+        (false, None) => (String::new(), String::new()),
     };
+    let cost_text_len = balance_text.chars().count() + cost_suffix.chars().count();
 
     // Base status: "  project ⎇ branch"
     let base_status_width = 2 + project_name.chars().count() + 3 + branch_display.chars().count();
@@ -238,15 +246,21 @@ pub(super) fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             ));
         }
 
-        // Add cost if it fits
+        // Add balance/cost if it fits
         let current_status_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        if !cost_text.is_empty()
-            && current_status_len + cost_text.chars().count() <= space_for_status
-        {
+        if !balance_text.is_empty() && current_status_len + cost_text_len <= space_for_status {
+            // Remaining balance in standard color
             spans.push(Span::styled(
-                cost_text.clone(),
+                balance_text.clone(),
                 Style::default().fg(Theme::GREY_400),
             ));
+            // Session cost in dimmer color (if present)
+            if !cost_suffix.is_empty() {
+                spans.push(Span::styled(
+                    cost_suffix.clone(),
+                    Style::default().fg(Theme::GREY_500),
+                ));
+            }
         }
     }
 

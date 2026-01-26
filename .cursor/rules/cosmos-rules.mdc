@@ -23,8 +23,18 @@ constraints unless they clearly improve safety or user outcomes.
 - Avoid panics in user-facing flows. Do not use unwrap/expect in
   production paths unless the condition is truly impossible. Prefer
   Result with actionable errors.
-- Keep warnings and lints clean. Do not add #[allow(dead_code)] in
-  production code; remove dead code or wire it up.
+- Keep warnings and lints clean. The codebase MUST compile with zero
+  warnings.
+
+## Dead code policy (STRICTLY ENFORCED)
+- NEVER add #[allow(dead_code)] or #[allow(unused)] attributes.
+- NEVER add fields, functions, or variables "for future use."
+- If code is not used RIGHT NOW, delete it. Git preserves history.
+- If a struct field is not read, remove it.
+- If a function is not called, remove it.
+- If a variable is assigned but never read, remove the assignment.
+- This applies to ALL code including tests, internal modules, and "useful
+  metadata." If it's not wired up, it doesn't belong in the codebase.
 
 ## Error handling and self-healing
 - Never leave users with an error they cannot act on.

@@ -106,4 +106,8 @@ pub enum BackgroundMessage {
     },
     /// Update failed
     UpdateError(String),
+    /// Wallet balance updated
+    WalletBalanceUpdated {
+        balance: f64,
+    },
 }
