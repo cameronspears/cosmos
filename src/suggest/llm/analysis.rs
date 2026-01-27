@@ -124,6 +124,9 @@ pub async fn analyze_codebase_agentic(
 
     let mut suggestions = parse_codebase_suggestions(&response.content)?;
 
+    // Deduplicate initial suggestions (LLM sometimes returns near-duplicates)
+    suggestions = deduplicate_suggestions(suggestions);
+
     // If we got fewer than MIN_SUGGESTIONS, make continuation calls to get more
     let mut attempts = 0;
     while suggestions.len() < MIN_SUGGESTIONS && attempts < MAX_CONTINUATION_ATTEMPTS {
@@ -143,14 +146,33 @@ pub async fn analyze_codebase_agentic(
 
         match parse_codebase_suggestions(&continuation_response.content) {
             Ok(additional) => {
-                // Deduplicate by file+summary to avoid repeats
-                let existing_keys: std::collections::HashSet<_> = suggestions
+                // Deduplicate using multiple criteria to catch near-duplicates:
+                // 1. Exact file+summary match
+                // 2. Same file+line (same location = likely same issue)
+                // 3. Same file+kind (same category in same file = often duplicate)
+                let existing_summaries: std::collections::HashSet<_> = suggestions
                     .iter()
                     .map(|s| (s.file.clone(), s.summary.clone()))
                     .collect();
+                let existing_locations: std::collections::HashSet<_> = suggestions
+                    .iter()
+                    .filter_map(|s| s.line.map(|l| (s.file.clone(), l)))
+                    .collect();
+                let existing_file_kinds: std::collections::HashSet<_> = suggestions
+                    .iter()
+                    .map(|s| (s.file.clone(), s.kind))
+                    .collect();
 
                 for s in additional {
-                    if !existing_keys.contains(&(s.file.clone(), s.summary.clone())) {
+                    let dominated_by_summary =
+                        existing_summaries.contains(&(s.file.clone(), s.summary.clone()));
+                    let dominated_by_location = s
+                        .line
+                        .map(|l| existing_locations.contains(&(s.file.clone(), l)))
+                        .unwrap_or(false);
+                    let dominated_by_kind = existing_file_kinds.contains(&(s.file.clone(), s.kind));
+
+                    if !dominated_by_summary && !dominated_by_location && !dominated_by_kind {
                         suggestions.push(s);
                     }
                 }
@@ -163,6 +185,43 @@ pub async fn analyze_codebase_agentic(
     }
 
     Ok((suggestions, None))
+}
+
+/// Remove near-duplicate suggestions from a list
+///
+/// Considers suggestions duplicates if they match on any of:
+/// - Same file + same summary (exact duplicate)
+/// - Same file + same line (same location = likely same issue)
+/// - Same file + same kind (same category in same file = often duplicate)
+fn deduplicate_suggestions(suggestions: Vec<Suggestion>) -> Vec<Suggestion> {
+    let mut seen_summaries: HashSet<(PathBuf, String)> = HashSet::new();
+    let mut seen_locations: HashSet<(PathBuf, usize)> = HashSet::new();
+    let mut seen_file_kinds: HashSet<(PathBuf, crate::suggest::SuggestionKind)> = HashSet::new();
+    let mut result = Vec::new();
+
+    for s in suggestions {
+        let summary_key = (s.file.clone(), s.summary.clone());
+        let location_key = s.line.map(|l| (s.file.clone(), l));
+        let kind_key = (s.file.clone(), s.kind);
+
+        let is_dup_summary = seen_summaries.contains(&summary_key);
+        let is_dup_location = location_key
+            .as_ref()
+            .map(|k| seen_locations.contains(k))
+            .unwrap_or(false);
+        let is_dup_kind = seen_file_kinds.contains(&kind_key);
+
+        if !is_dup_summary && !is_dup_location && !is_dup_kind {
+            seen_summaries.insert(summary_key);
+            if let Some(loc) = location_key {
+                seen_locations.insert(loc);
+            }
+            seen_file_kinds.insert(kind_key);
+            result.push(s);
+        }
+    }
+
+    result
 }
 
 /// Build a prompt asking for additional suggestions to reach the minimum

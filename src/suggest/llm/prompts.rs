@@ -112,6 +112,7 @@ Respond with JSON now."#;
 pub const ANALYZE_CODEBASE_AGENTIC_SYSTEM: &str = r#"Senior code reviewer with shell access. Find genuine improvements that help users, not just cleaner code.
 
 CRITICAL: You MUST return EXACTLY 10 suggestions. No more, no less.
+CRITICAL: Each suggestion must be UNIQUE - different files OR different issues. Never repeat the same problem.
 
 SHELL: rg, grep, cat, head, find, ls, cargo check. Be bold - git is your safety net.
 
@@ -154,7 +155,8 @@ RULES:
 - Evidence required: include actual code snippet
 - No guessing from file names
 - Return JSON array only, no extra text
-- EXACTLY 10 SUGGESTIONS REQUIRED: Count your array before responding. If you have fewer than 10, keep exploring until you find more."#;
+- EXACTLY 10 SUGGESTIONS REQUIRED: Count your array before responding. If you have fewer than 10, keep exploring until you find more.
+- NO DUPLICATES: Each suggestion must address a different issue. Same file is OK if it's a genuinely different problem at a different location."#;
 
 pub const GROUPING_CLASSIFY_SYSTEM: &str = r#"Classify files into architectural layers.
 

@@ -151,7 +151,12 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct MessageContent {
-    content: String,
+    /// Content can be null in some API responses (e.g., when refusal or error occurs)
+    #[serde(default)]
+    content: Option<String>,
+    /// Refusal reason - set when content is blocked by content moderation
+    #[serde(default)]
+    refusal: Option<String>,
 }
 
 /// Check if LLM is available (either BYOK or managed)
@@ -388,11 +393,28 @@ pub(crate) async fn call_llm_with_usage(
     let parsed: ChatResponse = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("Failed to parse OpenRouter response: {}\n{}", e, text))?;
 
-    let content = parsed
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
+    let choice = parsed.choices.first();
+
+    // Check for refusal (content moderation)
+    if let Some(c) = choice {
+        if let Some(refusal) = &c.message.refusal {
+            return Err(anyhow::anyhow!(
+                "Request was refused: {}",
+                truncate_str(refusal, 200)
+            ));
+        }
+    }
+
+    // Extract content, handling null/empty cases
+    let content = choice
+        .and_then(|c| c.message.content.clone())
         .unwrap_or_default();
+
+    if content.is_empty() {
+        return Err(anyhow::anyhow!(
+            "API returned empty response. The model may have been rate limited or failed to generate content. Please try again."
+        ));
+    }
 
     Ok(LlmResponse {
         content,
@@ -467,11 +489,28 @@ where
     let parsed: ChatResponse = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("Failed to parse OpenRouter response: {}\n{}", e, text))?;
 
-    let content = parsed
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
+    let choice = parsed.choices.first();
+
+    // Check for refusal (content moderation)
+    if let Some(c) = choice {
+        if let Some(refusal) = &c.message.refusal {
+            return Err(anyhow::anyhow!(
+                "Request was refused: {}",
+                truncate_str(refusal, 200)
+            ));
+        }
+    }
+
+    // Extract content, handling null/empty cases
+    let content = choice
+        .and_then(|c| c.message.content.clone())
         .unwrap_or_default();
+
+    if content.is_empty() {
+        return Err(anyhow::anyhow!(
+            "API returned empty response. The model may have been rate limited or failed to generate content. Please try again."
+        ));
+    }
 
     let data: T = serde_json::from_str(&content).map_err(|e| {
         anyhow::anyhow!(

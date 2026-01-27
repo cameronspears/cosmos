@@ -28,7 +28,7 @@ pub enum SuggestionSource {
 }
 
 /// Kind of suggestion
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SuggestionKind {
     /// Code improvement/refactoring
     Improvement,
