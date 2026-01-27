@@ -5,7 +5,7 @@ use super::parse::{
     merge_usage, parse_json_with_retry, truncate_content, truncate_content_around_line,
 };
 use super::prompt_utils::format_repo_memory_section;
-use super::prompts::{FIX_CONTENT_SYSTEM, FIX_PREVIEW_AGENTIC_SYSTEM, MULTI_FILE_FIX_SYSTEM};
+use super::prompts::{fix_content_system, multi_file_fix_system, FIX_PREVIEW_AGENTIC_SYSTEM};
 use crate::suggest::Suggestion;
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -310,7 +310,7 @@ pub async fn generate_fix_content(
     );
 
     let response = call_llm_with_fallback(
-        FIX_CONTENT_SYSTEM,
+        &fix_content_system(),
         &user_full,
         &user_excerpt,
         Model::Smart,
@@ -589,7 +589,7 @@ pub async fn generate_multi_file_fix(
     );
 
     let response = call_llm_with_fallback(
-        MULTI_FILE_FIX_SYSTEM,
+        &multi_file_fix_system(),
         &user_full,
         &user_excerpt,
         Model::Smart,
