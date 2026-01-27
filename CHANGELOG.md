@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.7.0](https://github.com/cameronspears/cosmos/compare/v0.6.1...v0.7.0) (2026-01-27)
+
+
+### Features
+
+* **agentic:** implement agentic codebase analysis for improved suggestions ([32c96e6](https://github.com/cameronspears/cosmos/commit/32c96e638f14d16a641488e670b06fa6bb646e6a))
+* **cache:** implement question answer caching and improve suggestion caching validation ([315a9a2](https://github.com/cameronspears/cosmos/commit/315a9a27d554d66601bdbfa8053fa08fe61fae49))
+* **llm:** add support for Anthropic prompt caching in LLM calls ([8d58c9a](https://github.com/cameronspears/cosmos/commit/8d58c9acbed260789c415230ad7bf1a8694cc5e2))
+* **llm:** enhance suggestion generation with continuation logic ([581c444](https://github.com/cameronspears/cosmos/commit/581c444d2571a746587563427be77bb1c3fd195c))
+* **wallet:** implement wallet balance tracking and refresh mechanism ([731e98e](https://github.com/cameronspears/cosmos/commit/731e98ebdb80dc7dd4d10d50e5d0e3a5f9278f15))
+
+
+### Bug Fixes
+
+* **cache:** wire up question cache cleanup on load ([63cf7ac](https://github.com/cameronspears/cosmos/commit/63cf7aca6893b88e5656d0b4aab06b776aa4f4ff))
+* **ui:** reset review fixing state on error to prevent stuck UI ([2a1b150](https://github.com/cameronspears/cosmos/commit/2a1b150574ddc4d1bafe996766f42bd122c49c0f))
+
 ## [0.6.1](https://github.com/cameronspears/cosmos/compare/v0.6.0...v0.6.1) (2026-01-26)
 
 
