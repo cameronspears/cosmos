@@ -1,5 +1,5 @@
 use super::agentic::call_llm_agentic;
-use super::client::{call_llm_structured, StructuredResponse};
+use super::client::{call_llm_structured_cached, StructuredResponse};
 use super::fix::{
     apply_edits_with_context, fix_response_schema, normalize_generated_content, AppliedFix,
     FixResponse,
@@ -303,8 +303,8 @@ pub async fn fix_review_findings(
         content
     );
 
-    // Use structured output - guarantees valid JSON matching FixResponse schema
-    let response: StructuredResponse<FixResponse> = call_llm_structured(
+    // Use structured output with caching - guarantees valid JSON and reduces costs
+    let response: StructuredResponse<FixResponse> = call_llm_structured_cached(
         &system,
         &user,
         Model::Smart,

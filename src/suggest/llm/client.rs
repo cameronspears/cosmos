@@ -67,6 +67,77 @@ struct Message {
     content: String,
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  ANTHROPIC PROMPT CACHING SUPPORT
+// ═══════════════════════════════════════════════════════════════════════════
+// Anthropic models support prompt caching via multipart message format with
+// cache_control breakpoints. Cached reads are 0.1x input pricing.
+
+/// Cache control for Anthropic prompt caching
+#[derive(Serialize, Clone)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    cache_type: String, // "ephemeral"
+}
+
+/// A content part in a multipart message (for caching)
+#[derive(Serialize, Clone)]
+struct ContentPart {
+    #[serde(rename = "type")]
+    part_type: String, // "text"
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+/// Content can be either a simple string or multipart array
+#[derive(Serialize, Clone)]
+#[serde(untagged)]
+enum MessageContent2 {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+/// Message with multipart content support (for caching)
+#[derive(Serialize, Clone)]
+struct CachedMessage {
+    role: String,
+    content: MessageContent2,
+}
+
+/// Chat request with cached message support
+#[derive(Serialize)]
+struct CachedChatRequest {
+    model: String,
+    messages: Vec<CachedMessage>,
+    max_tokens: u32,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<ProviderConfig>,
+}
+
+/// Build messages with caching enabled on the system prompt
+fn build_cached_messages(system: &str, user: &str) -> Vec<CachedMessage> {
+    vec![
+        CachedMessage {
+            role: "system".to_string(),
+            content: MessageContent2::Parts(vec![ContentPart {
+                part_type: "text".to_string(),
+                text: system.to_string(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                }),
+            }]),
+        },
+        CachedMessage {
+            role: "user".to_string(),
+            content: MessageContent2::Text(user.to_string()),
+        },
+    ]
+}
+
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
@@ -336,21 +407,25 @@ pub struct StructuredResponse<T> {
     pub usage: Option<Usage>,
 }
 
-/// Call LLM API with structured output - guarantees valid JSON matching the schema.
+/// Call LLM API with structured output AND Anthropic prompt caching.
 ///
-/// Uses OpenRouter's structured output feature to eliminate JSON parsing failures.
-/// The response is guaranteed to be valid JSON that matches the provided schema.
+/// This variant enables prompt caching for Anthropic models (Claude), which:
+/// - Reduces costs by ~90% on cached prompt reads (0.1x pricing)
+/// - Potentially improves reliability (OpenRouter routes to same provider)
+/// - Has 5-minute cache TTL by default
+///
+/// Use this for repeated calls with the same system prompt (like fix generation).
 ///
 /// # Arguments
-/// * `system` - System prompt
-/// * `user` - User message
-/// * `model` - Model to use
+/// * `system` - System prompt (will be cached)
+/// * `user` - User message (not cached - changes each call)
+/// * `model` - Model to use (caching only works with Anthropic models)
 /// * `schema_name` - Name for the schema (e.g., "fix_content")
-/// * `schema` - JSON Schema definition (must be a valid JSON Schema object)
+/// * `schema` - JSON Schema definition
 ///
 /// # Returns
 /// Parsed response matching type T and usage stats
-pub(crate) async fn call_llm_structured<T>(
+pub(crate) async fn call_llm_structured_cached<T>(
     system: &str,
     user: &str,
     model: Model,
@@ -375,18 +450,10 @@ where
         }),
     };
 
-    let request = ChatRequest {
+    // Use cached messages with cache_control on system prompt
+    let request = CachedChatRequest {
         model: model.id().to_string(),
-        messages: vec![
-            Message {
-                role: "system".to_string(),
-                content: system.to_string(),
-            },
-            Message {
-                role: "user".to_string(),
-                content: user.to_string(),
-            },
-        ],
+        messages: build_cached_messages(system, user),
         max_tokens: model.max_tokens(),
         stream: false,
         response_format: Some(response_format),
@@ -406,10 +473,9 @@ where
         .map(|c| c.message.content.clone())
         .unwrap_or_default();
 
-    // The structured output guarantees valid JSON - parse directly
     let data: T = serde_json::from_str(&content).map_err(|e| {
         anyhow::anyhow!(
-            "Failed to parse structured response (this should not happen): {}\nContent: {}",
+            "Failed to parse structured response: {}\nContent: {}",
             e,
             truncate_str(&content, 200)
         )

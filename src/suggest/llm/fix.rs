@@ -1,5 +1,5 @@
 use super::agentic::call_llm_agentic;
-use super::client::{call_llm_structured, StructuredResponse};
+use super::client::{call_llm_structured_cached, StructuredResponse};
 use super::models::{Model, Usage};
 use super::parse::{parse_json_with_retry, truncate_content, truncate_content_around_line};
 use super::prompt_utils::format_repo_memory_section;
@@ -267,7 +267,10 @@ pub(crate) fn fix_response_schema() -> serde_json::Value {
     })
 }
 
-/// Call LLM with structured output and fallback for context limits
+/// Call LLM with structured output, caching, and fallback for context limits
+///
+/// Uses Anthropic prompt caching to reduce costs (~90% savings on cached prompts)
+/// and potentially improve reliability.
 async fn call_llm_structured_with_fallback<T>(
     system: &str,
     user_full: &str,
@@ -279,13 +282,17 @@ async fn call_llm_structured_with_fallback<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    match call_llm_structured::<T>(system, user_full, model, schema_name, schema.clone()).await {
+    // Use cached version - caches the system prompt for Anthropic models
+    match call_llm_structured_cached::<T>(system, user_full, model, schema_name, schema.clone())
+        .await
+    {
         Ok(response) => Ok(response),
         Err(err) => {
             let message = err.to_string();
             // Handle context limit by trying with smaller excerpt
             if is_context_limit_error(&message) && user_full != user_excerpt {
-                call_llm_structured::<T>(system, user_excerpt, model, schema_name, schema).await
+                call_llm_structured_cached::<T>(system, user_excerpt, model, schema_name, schema)
+                    .await
             } else {
                 Err(err)
             }
