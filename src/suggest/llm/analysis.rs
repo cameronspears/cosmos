@@ -86,12 +86,19 @@ QUESTION:
 //  LEAN HYBRID ANALYSIS (Compact Context + Surgical Tool Use)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Minimum number of suggestions we require from analysis
+const MIN_SUGGESTIONS: usize = 10;
+
+/// Maximum continuation attempts to reach MIN_SUGGESTIONS
+const MAX_CONTINUATION_ATTEMPTS: usize = 2;
+
 /// Analyze codebase with compact context and minimal, surgical tool use
 ///
 /// Strategy:
 /// 1. Start with synthesized context (summaries, not full files)
 /// 2. Model can make 1-3 targeted tool calls to verify specific issues
 /// 3. Uses gpt-oss-120b for cost efficiency
+/// 4. If fewer than MIN_SUGGESTIONS returned, makes continuation calls to get more
 ///
 /// This balances accuracy (model can verify) with speed/cost (minimal calls).
 pub async fn analyze_codebase_agentic(
@@ -115,8 +122,78 @@ pub async fn analyze_codebase_agentic(
     )
     .await?;
 
-    let suggestions = parse_codebase_suggestions(&response.content)?;
+    let mut suggestions = parse_codebase_suggestions(&response.content)?;
+
+    // If we got fewer than MIN_SUGGESTIONS, make continuation calls to get more
+    let mut attempts = 0;
+    while suggestions.len() < MIN_SUGGESTIONS && attempts < MAX_CONTINUATION_ATTEMPTS {
+        attempts += 1;
+        let needed = MIN_SUGGESTIONS - suggestions.len();
+
+        let continuation_prompt = build_continuation_prompt(&suggestions, needed);
+        let continuation_response = call_llm_agentic(
+            ANALYZE_CODEBASE_AGENTIC_SYSTEM,
+            &continuation_prompt,
+            Model::Speed,
+            repo_root,
+            false,
+            4, // fewer iterations for continuation - context already gathered
+        )
+        .await?;
+
+        match parse_codebase_suggestions(&continuation_response.content) {
+            Ok(additional) => {
+                // Deduplicate by file+summary to avoid repeats
+                let existing_keys: std::collections::HashSet<_> = suggestions
+                    .iter()
+                    .map(|s| (s.file.clone(), s.summary.clone()))
+                    .collect();
+
+                for s in additional {
+                    if !existing_keys.contains(&(s.file.clone(), s.summary.clone())) {
+                        suggestions.push(s);
+                    }
+                }
+            }
+            Err(_) => {
+                // If continuation parsing fails, keep what we have
+                break;
+            }
+        }
+    }
+
     Ok((suggestions, None))
+}
+
+/// Build a prompt asking for additional suggestions to reach the minimum
+fn build_continuation_prompt(existing: &[Suggestion], needed: usize) -> String {
+    let existing_summaries: Vec<String> = existing
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}. {} - {}", i + 1, s.file.display(), s.summary))
+        .collect();
+
+    format!(
+        r#"You provided {} suggestions, but I need at least {} total (so {} more).
+
+EXISTING SUGGESTIONS (do NOT repeat these):
+{}
+
+Find {} MORE unique suggestions. Look in different files or find different issues in the same files.
+Focus on areas you haven't explored yet:
+- Error handling gaps
+- Missing input validation  
+- Performance issues
+- Security concerns
+- Code that could fail silently
+
+Use shell tools to explore and verify. Return ONLY the new suggestions as a JSON array."#,
+        existing.len(),
+        MIN_SUGGESTIONS,
+        needed,
+        existing_summaries.join("\n"),
+        needed
+    )
 }
 
 /// Build a lean prompt using summaries, not full file content
