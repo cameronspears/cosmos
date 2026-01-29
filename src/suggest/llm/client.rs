@@ -28,6 +28,8 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     plugins: Option<Vec<PluginConfig>>,
     /// OpenRouter provider configuration for automatic fallback
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,6 +50,13 @@ struct ProviderConfig {
 #[derive(Serialize)]
 struct PluginConfig {
     id: String,
+}
+
+/// Reasoning configuration for models that support it.
+#[derive(Serialize)]
+struct ReasoningConfig {
+    effort: String,
+    exclude: bool,
 }
 
 /// Response format configuration for OpenRouter
@@ -125,6 +134,8 @@ struct CachedChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plugins: Option<Vec<PluginConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -237,6 +248,13 @@ fn response_healing_plugins(
     } else {
         None
     }
+}
+
+fn reasoning_config(model: Model) -> Option<ReasoningConfig> {
+    model.reasoning_effort().map(|effort| ReasoningConfig {
+        effort: effort.to_string(),
+        exclude: true,
+    })
 }
 
 /// OpenRouter error response (can come with 200 status for upstream errors)
@@ -413,6 +431,7 @@ pub(crate) async fn call_llm_with_usage(
     let stream = false;
     let plugins = response_healing_plugins(&response_format, stream);
     let provider = provider_config(&response_format);
+    let reasoning = reasoning_config(model);
 
     let request = ChatRequest {
         model: model.id().to_string(),
@@ -429,6 +448,7 @@ pub(crate) async fn call_llm_with_usage(
         max_tokens: model.max_tokens(),
         stream,
         response_format,
+        reasoning,
         plugins,
         provider: Some(provider),
     };
@@ -506,6 +526,13 @@ where
         anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
     })?;
 
+    if !model.supports_structured_outputs() {
+        return Err(anyhow::anyhow!(
+            "Structured outputs aren't supported for {}. Try a different model.",
+            model.id()
+        ));
+    }
+
     let client = create_http_client(REQUEST_TIMEOUT_SECS)?;
 
     let response_format = Some(ResponseFormat {
@@ -520,6 +547,7 @@ where
     let stream = false;
     let plugins = response_healing_plugins(&response_format, stream);
     let provider = provider_config(&response_format);
+    let reasoning = reasoning_config(model);
 
     // Use cached messages with cache_control on system prompt
     let request = CachedChatRequest {
@@ -528,6 +556,7 @@ where
         max_tokens: model.max_tokens(),
         stream,
         response_format,
+        reasoning,
         plugins,
         provider: Some(provider),
     };
@@ -676,5 +705,12 @@ mod tests {
 
         assert!(response_healing_plugins(&response_format, true).is_none());
         assert!(response_healing_plugins(&None, false).is_none());
+    }
+
+    #[test]
+    fn test_reasoning_config_excludes_output() {
+        let reasoning = reasoning_config(Model::Speed).expect("expected reasoning config");
+        let value = serde_json::to_value(reasoning).unwrap();
+        assert_eq!(value.get("exclude").and_then(|v| v.as_bool()), Some(true));
     }
 }
