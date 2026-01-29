@@ -26,6 +26,11 @@ impl Model {
     pub fn max_tokens(&self) -> u32 {
         MODEL_MAX_TOKENS
     }
+
+    /// Whether this model supports JSON response formatting.
+    pub fn supports_json_mode(&self) -> bool {
+        matches!(self, Model::Speed | Model::Balanced | Model::Smart)
+    }
 }
 
 /// API usage information from OpenRouter
@@ -67,6 +72,13 @@ mod tests {
     fn test_model_max_tokens() {
         assert_eq!(Model::Speed.max_tokens(), MODEL_MAX_TOKENS);
         assert_eq!(Model::Smart.max_tokens(), MODEL_MAX_TOKENS);
+    }
+
+    #[test]
+    fn test_model_supports_json_mode() {
+        assert!(Model::Speed.supports_json_mode());
+        assert!(Model::Balanced.supports_json_mode());
+        assert!(Model::Smart.supports_json_mode());
     }
 
     #[test]

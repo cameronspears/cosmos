@@ -27,6 +27,8 @@ struct ChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugins: Option<Vec<PluginConfig>>,
     /// OpenRouter provider configuration for automatic fallback
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<ProviderConfig>,
@@ -37,6 +39,15 @@ struct ChatRequest {
 struct ProviderConfig {
     /// Allow OpenRouter to try other providers if the primary fails
     allow_fallbacks: bool,
+    /// Only use providers that support all parameters in the request
+    #[serde(skip_serializing_if = "Option::is_none")]
+    require_parameters: Option<bool>,
+}
+
+/// OpenRouter plugin configuration
+#[derive(Serialize)]
+struct PluginConfig {
+    id: String,
 }
 
 /// Response format configuration for OpenRouter
@@ -114,6 +125,8 @@ struct CachedChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugins: Option<Vec<PluginConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<ProviderConfig>,
 }
@@ -202,6 +215,28 @@ pub(crate) fn backoff_secs(retry_count: u32) -> u64 {
 
 pub(crate) fn is_retryable_network_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect()
+}
+
+const RESPONSE_HEALING_PLUGIN_ID: &str = "response-healing";
+
+fn provider_config(response_format: &Option<ResponseFormat>) -> ProviderConfig {
+    ProviderConfig {
+        allow_fallbacks: true,
+        require_parameters: response_format.as_ref().map(|_| true),
+    }
+}
+
+fn response_healing_plugins(
+    response_format: &Option<ResponseFormat>,
+    stream: bool,
+) -> Option<Vec<PluginConfig>> {
+    if response_format.is_some() && !stream {
+        Some(vec![PluginConfig {
+            id: RESPONSE_HEALING_PLUGIN_ID.to_string(),
+        }])
+    } else {
+        None
+    }
 }
 
 /// OpenRouter error response (can come with 200 status for upstream errors)
@@ -357,6 +392,13 @@ pub(crate) async fn call_llm_with_usage(
         anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
     })?;
 
+    if json_mode && !model.supports_json_mode() {
+        return Err(anyhow::anyhow!(
+            "JSON mode isn't supported for {}. Try a different model.",
+            model.id()
+        ));
+    }
+
     let client = create_http_client(REQUEST_TIMEOUT_SECS)?;
 
     let response_format = if json_mode {
@@ -367,6 +409,10 @@ pub(crate) async fn call_llm_with_usage(
     } else {
         None
     };
+
+    let stream = false;
+    let plugins = response_healing_plugins(&response_format, stream);
+    let provider = provider_config(&response_format);
 
     let request = ChatRequest {
         model: model.id().to_string(),
@@ -381,11 +427,10 @@ pub(crate) async fn call_llm_with_usage(
             },
         ],
         max_tokens: model.max_tokens(),
-        stream: false,
+        stream,
         response_format,
-        provider: Some(ProviderConfig {
-            allow_fallbacks: true,
-        }),
+        plugins,
+        provider: Some(provider),
     };
 
     let text = send_with_retry(&client, &api_key, &request).await?;
@@ -463,25 +508,28 @@ where
 
     let client = create_http_client(REQUEST_TIMEOUT_SECS)?;
 
-    let response_format = ResponseFormat {
+    let response_format = Some(ResponseFormat {
         format_type: "json_schema".to_string(),
         json_schema: Some(JsonSchemaWrapper {
             name: schema_name.to_string(),
             strict: true,
             schema,
         }),
-    };
+    });
+
+    let stream = false;
+    let plugins = response_healing_plugins(&response_format, stream);
+    let provider = provider_config(&response_format);
 
     // Use cached messages with cache_control on system prompt
     let request = CachedChatRequest {
         model: model.id().to_string(),
         messages: build_cached_messages(system, user),
         max_tokens: model.max_tokens(),
-        stream: false,
-        response_format: Some(response_format),
-        provider: Some(ProviderConfig {
-            allow_fallbacks: true,
-        }),
+        stream,
+        response_format,
+        plugins,
+        provider: Some(provider),
     };
 
     let text = send_with_retry(&client, &api_key, &request).await?;
@@ -591,4 +639,42 @@ pub async fn fetch_account_balance() -> anyhow::Result<f64> {
     let credits: CreditsResponse = response.json().await?;
     let remaining = credits.data.total_credits - credits.data.total_usage;
     Ok(remaining)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_provider_requires_parameters_only_with_response_format() {
+        let provider = provider_config(&None);
+        let value = serde_json::to_value(provider).unwrap();
+        assert!(value.get("require_parameters").is_none());
+
+        let response_format = Some(ResponseFormat {
+            format_type: "json_object".to_string(),
+            json_schema: None,
+        });
+        let provider = provider_config(&response_format);
+        let value = serde_json::to_value(provider).unwrap();
+        assert_eq!(
+            value.get("require_parameters").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_response_healing_plugins_only_for_non_streaming_json() {
+        let response_format = Some(ResponseFormat {
+            format_type: "json_object".to_string(),
+            json_schema: None,
+        });
+
+        let plugins = response_healing_plugins(&response_format, false).expect("expected plugin");
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].id, RESPONSE_HEALING_PLUGIN_ID);
+
+        assert!(response_healing_plugins(&response_format, true).is_none());
+        assert!(response_healing_plugins(&None, false).is_none());
+    }
 }
