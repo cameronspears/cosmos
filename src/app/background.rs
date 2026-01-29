@@ -32,6 +32,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 suggestions,
                 usage,
                 model,
+                diagnostics,
             } => {
                 let count = suggestions.len();
                 for s in suggestions {
@@ -61,6 +62,8 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 // More prominent toast for suggestions
                 app.show_toast(&format!("{} suggestions ready ({})", count, &model));
                 app.active_model = Some(model);
+                app.last_suggestion_diagnostics = Some(diagnostics);
+                app.last_suggestion_error = None;
             }
             BackgroundMessage::SuggestionsError(e) => {
                 // If summaries are still generating, switch to that loading state
@@ -69,7 +72,8 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 } else {
                     app.loading = LoadingState::None;
                 }
-                app.show_toast(&format!("Error: {}", truncate(&e, 80)));
+                app.show_toast(&format!("Suggestions error: {}", truncate(&e, 80)));
+                app.last_suggestion_error = Some(e);
             }
             BackgroundMessage::SummariesReady {
                 summaries,
@@ -143,12 +147,13 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                             )
                             .await
                             {
-                                Ok((suggestions, usage)) => {
+                                Ok((suggestions, usage, diagnostics)) => {
                                     let _ =
                                         tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                                             suggestions,
                                             usage,
                                             model: "speed-lean".to_string(),
+                                            diagnostics,
                                         });
                                 }
                                 Err(e) => {

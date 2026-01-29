@@ -902,6 +902,7 @@ VERIFY:
         repo_root,
         false,
         3, // max iterations - verification has code upfront
+        None,
     )
     .await?;
 

@@ -3,10 +3,15 @@
 //! Philosophy: Support top-down exploration that's naturally token-efficient.
 //! Specialized tools enforce efficient patterns; shell is fallback for edge cases.
 
+use crate::util::run_command_with_timeout;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
+
+/// Timeout for shell and search commands (prevents hangs)
+const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  TOOL DEFINITIONS
@@ -400,13 +405,16 @@ fn execute_search(root: &Path, args_json: &str) -> String {
         .arg(&target)
         .current_dir(root);
 
-    match cmd.output() {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.is_empty() {
+    match run_command_with_timeout(&mut cmd, TOOL_TIMEOUT) {
+        Ok(result) => {
+            if result.timed_out {
+                return "Search timed out after 10 seconds. Try a more specific pattern or path."
+                    .to_string();
+            }
+            if result.stdout.is_empty() {
                 format!("No matches found for pattern: {}", args.pattern)
             } else {
-                truncate_output(stdout.to_string())
+                truncate_output(result.stdout)
             }
         }
         Err(_) => {
@@ -419,13 +427,15 @@ fn execute_search(root: &Path, args_json: &str) -> String {
                 .arg(&target)
                 .current_dir(root);
 
-            match cmd.output() {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    if stdout.is_empty() {
+            match run_command_with_timeout(&mut cmd, TOOL_TIMEOUT) {
+                Ok(result) => {
+                    if result.timed_out {
+                        return "Search timed out after 10 seconds. Try a more specific pattern or path.".to_string();
+                    }
+                    if result.stdout.is_empty() {
                         format!("No matches found for pattern: {}", args.pattern)
                     } else {
-                        truncate_output(stdout.to_string())
+                        truncate_output(result.stdout)
                     }
                 }
                 Err(e) => format!("Search failed: {}", e),
@@ -547,29 +557,32 @@ fn execute_shell(root: &Path, args_json: &str) -> String {
         return format!("Repository root does not exist: {}", root.display());
     }
 
-    // Execute the command
-    let output = Command::new("sh")
-        .args(["-c", command])
-        .current_dir(root)
-        .output();
+    // Execute the command with timeout
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", command]).current_dir(root);
 
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let exit_code = out.status.code().unwrap_or(-1);
+    match run_command_with_timeout(&mut cmd, TOOL_TIMEOUT) {
+        Ok(run_result) => {
+            if run_result.timed_out {
+                return "Command timed out after 10 seconds".to_string();
+            }
+
+            let exit_code = run_result
+                .status
+                .map(|s| s.code().unwrap_or(-1))
+                .unwrap_or(-1);
 
             let mut result = String::new();
 
-            if !stdout.is_empty() {
-                result.push_str(&stdout);
+            if !run_result.stdout.is_empty() {
+                result.push_str(&run_result.stdout);
             }
 
-            if !stderr.is_empty() {
+            if !run_result.stderr.is_empty() {
                 if !result.is_empty() {
                     result.push_str("\n--- stderr ---\n");
                 }
-                result.push_str(&stderr);
+                result.push_str(&run_result.stderr);
             }
 
             if result.is_empty() {

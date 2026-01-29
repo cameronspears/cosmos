@@ -442,11 +442,12 @@ pub async fn run_tui(
                 )
                 .await
                 {
-                    Ok((suggestions, usage)) => {
+                    Ok((suggestions, usage, diagnostics)) => {
                         let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                             suggestions,
                             usage,
                             model: "speed-lean".to_string(),
+                            diagnostics,
                         });
                     }
                     Err(e) => {

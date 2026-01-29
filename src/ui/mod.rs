@@ -120,6 +120,10 @@ pub struct App {
     pub git_refresh_error: Option<String>,
     /// Last time we surfaced a git refresh error
     pub git_refresh_error_at: Option<Instant>,
+    /// Diagnostics from the most recent suggestion run
+    pub last_suggestion_diagnostics: Option<crate::suggest::llm::SuggestionDiagnostics>,
+    /// Last suggestion error message (full, untruncated)
+    pub last_suggestion_error: Option<String>,
 
     // Flag: generate suggestions once summaries complete (used at init and after reset)
     pub pending_suggestions_on_init: bool,
@@ -192,6 +196,8 @@ impl App {
             pending_suggestions_on_init: false,
             git_refresh_error: None,
             git_refresh_error_at: None,
+            last_suggestion_diagnostics: None,
+            last_suggestion_error: None,
             update_available: None,
             update_progress: None,
         }

@@ -618,6 +618,8 @@ fn render_suggestions_content<'a>(
             ),
             Span::styled("╯", Style::default().fg(Theme::GREY_700)),
         ]));
+
+        render_suggestion_diagnostics(lines, app, inner_width);
         return;
     }
 
@@ -728,6 +730,146 @@ fn render_suggestions_content<'a>(
             format!("  ↕ {}/{}", app.suggestion_selected + 1, suggestions.len()),
             Style::default().fg(Theme::GREY_500),
         )]));
+    }
+}
+
+fn render_suggestion_diagnostics<'a>(lines: &mut Vec<Line<'a>>, app: &App, inner_width: usize) {
+    let diagnostics = app.last_suggestion_diagnostics.as_ref();
+    let last_error = app.last_suggestion_error.as_ref();
+    let has_any =
+        diagnostics.is_some() || last_error.is_some() || !app.suggestions.suggestions.is_empty();
+    if !has_any {
+        return;
+    }
+
+    let indent = "    ";
+    let text_width = inner_width.saturating_sub(6);
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        format!("{indent}Diagnostics"),
+        Style::default().fg(Theme::GREY_500),
+    )]));
+
+    if let Some(error) = last_error {
+        for line in wrap_text(&format!("Last error: {}", error), text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::BADGE_BUG),
+            )]));
+        }
+    }
+
+    let total = app.suggestions.suggestions.len();
+    if total > 0 {
+        let dismissed = app
+            .suggestions
+            .suggestions
+            .iter()
+            .filter(|s| s.dismissed)
+            .count();
+        let applied = app
+            .suggestions
+            .suggestions
+            .iter()
+            .filter(|s| s.applied)
+            .count();
+        let active = total.saturating_sub(dismissed + applied);
+        let line = format!(
+            "Stored suggestions: total {} · active {} · dismissed {} · applied {}",
+            total, active, dismissed, applied
+        );
+        for line in wrap_text(&line, text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::GREY_400),
+            )]));
+        }
+    }
+
+    if let Some(diag) = diagnostics {
+        let tool_names = if diag.tool_names.is_empty() {
+            "none".to_string()
+        } else {
+            diag.tool_names.join(", ")
+        };
+
+        let meta = format!(
+            "Model: {} · iterations {} · tool calls {} ({})",
+            diag.model, diag.iterations, diag.tool_calls, tool_names
+        );
+        for line in wrap_text(&meta, text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::GREY_400),
+            )]));
+        }
+
+        let path = format!(
+            "Forced final: {} · formatting pass: {} · structured output: {} · response healing: {}",
+            if diag.forced_final { "yes" } else { "no" },
+            if diag.formatting_pass { "yes" } else { "no" },
+            if diag.response_format { "yes" } else { "no" },
+            if diag.response_healing { "yes" } else { "no" }
+        );
+        for line in wrap_text(&path, text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::GREY_400),
+            )]));
+        }
+
+        let counts = format!(
+            "Parsed: {} · deduped: {} · low confidence removed: {} · truncated: {} · final: {}",
+            diag.raw_count,
+            diag.deduped_count,
+            diag.low_confidence_filtered,
+            diag.truncated_count,
+            diag.final_count
+        );
+        for line in wrap_text(&counts, text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::GREY_400),
+            )]));
+        }
+
+        let parse = format!(
+            "Parse: {} · markdown stripped: {} · sanitized: {} · json fix: {} · individual parse: {}",
+            if diag.parse_strategy.is_empty() {
+                "unknown"
+            } else {
+                diag.parse_strategy.as_str()
+            },
+            if diag.parse_stripped_markdown { "yes" } else { "no" },
+            if diag.parse_used_sanitized_fix { "yes" } else { "no" },
+            if diag.parse_used_json_fix { "yes" } else { "no" },
+            if diag.parse_used_individual_parse { "yes" } else { "no" }
+        );
+        for line in wrap_text(&parse, text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::GREY_500),
+            )]));
+        }
+
+        let response_info = format!("Response chars: {}", diag.response_chars);
+        for line in wrap_text(&response_info, text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::GREY_500),
+            )]));
+        }
+
+        if diag.final_count == 0 && !diag.response_preview.is_empty() {
+            let preview = format!("Response preview: {}", diag.response_preview);
+            for line in wrap_text(&preview, text_width) {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{indent}{line}"),
+                    Style::default().fg(Theme::GREY_600),
+                )]));
+            }
+        }
     }
 }
 

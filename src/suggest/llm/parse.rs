@@ -1,6 +1,6 @@
 use super::client::{call_llm_with_usage, truncate_str, LlmResponse};
 use super::models::{Model, Usage};
-use crate::suggest::{Priority, Suggestion, SuggestionKind, SuggestionSource};
+use crate::suggest::{Confidence, Priority, Suggestion, SuggestionKind, SuggestionSource};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,19 +23,67 @@ fn strip_markdown_fences(text: &str) -> &str {
     clean.trim()
 }
 
-/// Extract a JSON fragment between matching delimiters
+/// Extract a balanced JSON fragment between matching delimiters
+/// Properly handles nested structures and ignores delimiters inside strings
 fn extract_json_fragment(text: &str, open: char, close: char) -> Option<&str> {
-    let start = text.find(open)?;
-    let end = text.rfind(close)?;
-    if start <= end {
-        Some(&text[start..=end])
-    } else {
-        None
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut start_idx = None;
+
+    for (i, c) in text.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+
+        if c == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+
+        if in_string {
+            continue;
+        }
+
+        if c == open {
+            if depth == 0 {
+                start_idx = Some(i);
+            }
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                if let Some(start) = start_idx {
+                    return Some(&text[start..=i]);
+                }
+            }
+        }
     }
+
+    None
 }
 
-/// Parse suggestions from codebase-wide analysis
-pub(crate) fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<Suggestion>> {
+#[derive(Debug, Clone, Default)]
+pub struct ParseDiagnostics {
+    pub strategy: String,
+    pub used_markdown_fences: bool,
+    pub used_sanitized_fix: bool,
+    pub used_json_fix: bool,
+    pub used_individual_parse: bool,
+    pub parsed_count: usize,
+}
+
+/// Parse suggestions from codebase-wide analysis with diagnostics
+pub(crate) fn parse_codebase_suggestions_with_diagnostics(
+    response: &str,
+) -> anyhow::Result<(Vec<Suggestion>, ParseDiagnostics)> {
+    let mut diagnostics = ParseDiagnostics::default();
     // Handle empty responses gracefully
     let trimmed = response.trim();
     if trimmed.is_empty() {
@@ -45,29 +93,52 @@ pub(crate) fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<S
     }
 
     let clean = strip_markdown_fences(trimmed);
+    diagnostics.used_markdown_fences = clean != trimmed;
     let sanitized = fix_json_issues(clean);
+    diagnostics.used_sanitized_fix = sanitized != clean;
 
     // Handle multiple LLM response formats:
-    // 1. Array: [...] (expected format)
+    // 1. Array: [...] (expected format) - try this FIRST
     // 2. Object with suggestions key: {"suggestions": [...]}
     // 3. Single suggestion as object: {file: ..., summary: ...}
-    let json_str = if let Some(obj_str) = extract_json_fragment(&sanitized, '{', '}') {
+    // 4. Object containing any array value
+    let json_str = if let Some(array_str) = extract_json_fragment(&sanitized, '[', ']') {
+        diagnostics.strategy = "array".to_string();
+        // Preferred: direct array format
+        array_str.to_string()
+    } else if let Some(obj_str) = extract_json_fragment(&sanitized, '{', '}') {
         // Try to parse as JSON object
         if let Ok(obj) = serde_json::from_str::<serde_json::Value>(obj_str) {
             if let Some(suggestions) = obj.get("suggestions") {
+                diagnostics.strategy = "object:suggestions".to_string();
                 // Format: {"suggestions": [...]}
                 serde_json::to_string(suggestions).unwrap_or_else(|_| obj_str.to_string())
             } else if obj.get("file").is_some() || obj.get("summary").is_some() {
+                diagnostics.strategy = "object:single".to_string();
                 // Format: Single suggestion as object - wrap in array
                 format!("[{}]", obj_str)
             } else {
-                obj_str.to_string()
+                // Look for any array value in the object (handles {"data": [...]} etc.)
+                let mut found_array = None;
+                if let Some(map) = obj.as_object() {
+                    for value in map.values() {
+                        if value.is_array() {
+                            found_array = Some(serde_json::to_string(value).unwrap_or_default());
+                            break;
+                        }
+                    }
+                }
+                if found_array.is_some() {
+                    diagnostics.strategy = "object:array-value".to_string();
+                } else {
+                    diagnostics.strategy = "object".to_string();
+                }
+                found_array.unwrap_or_else(|| obj_str.to_string())
             }
         } else {
+            diagnostics.strategy = "object".to_string();
             obj_str.to_string()
         }
-    } else if let Some(array_str) = extract_json_fragment(&sanitized, '[', ']') {
-        array_str.to_string()
     } else {
         // No JSON structure found - return a clear error
         let preview = truncate_str(&sanitized, 100);
@@ -82,11 +153,13 @@ pub(crate) fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<S
         Ok(v) => v,
         Err(e) => {
             // Try to fix common JSON issues and retry
+            diagnostics.used_json_fix = true;
             let fixed = fix_json_issues(&json_str);
             match serde_json::from_str(&fixed) {
                 Ok(v) => v,
                 Err(_) => {
                     // If still failing, try to extract individual objects and parse them
+                    diagnostics.used_individual_parse = true;
                     match try_parse_individual_suggestions(&json_str) {
                         Ok(v) if !v.is_empty() => v,
                         _ => {
@@ -102,6 +175,7 @@ pub(crate) fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<S
             }
         }
     };
+    diagnostics.parsed_count = parsed.len();
 
     let suggestions = parsed
         .into_iter()
@@ -111,40 +185,56 @@ pub(crate) fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<S
                 "feature" => SuggestionKind::Feature,
                 "optimization" => SuggestionKind::Optimization,
                 "quality" => SuggestionKind::Quality,
-                "documentation" => SuggestionKind::Documentation,
-                "testing" => SuggestionKind::Testing,
+                "security" => SuggestionKind::BugFix, // Best available category
+                "reliability" => SuggestionKind::Quality,
                 "refactoring" => SuggestionKind::Refactoring,
                 _ => SuggestionKind::Improvement,
             };
-
             let priority = match s.priority.as_str() {
                 "high" => Priority::High,
                 "low" => Priority::Low,
                 _ => Priority::Medium,
             };
-
-            let file_path = PathBuf::from(&s.file);
-            let additional_files: Vec<PathBuf> =
-                s.additional_files.into_iter().map(PathBuf::from).collect();
+            let confidence = match s.confidence.as_str() {
+                "high" => Confidence::High,
+                "low" => Confidence::Low,
+                _ => Confidence::Medium,
+            };
 
             let mut suggestion = Suggestion::new(
                 kind,
                 priority,
-                file_path,
-                s.summary,
+                PathBuf::from(&s.file),
+                s.summary.clone(),
                 SuggestionSource::LlmDeep,
             )
-            .with_detail(s.detail)
-            .with_additional_files(additional_files);
+            .with_confidence(confidence);
 
             if let Some(line) = s.line {
                 suggestion = suggestion.with_line(line);
+            }
+            if !s.detail.trim().is_empty() {
+                suggestion = suggestion.with_detail(s.detail);
+            }
+            if !s.additional_files.is_empty() {
+                suggestion = suggestion.with_additional_files(
+                    s.additional_files
+                        .iter()
+                        .map(|p| PathBuf::from(p))
+                        .collect(),
+                );
             }
 
             suggestion
         })
         .collect();
 
+    Ok((suggestions, diagnostics))
+}
+
+/// Parse suggestions from codebase-wide analysis
+pub(crate) fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<Suggestion>> {
+    let (suggestions, _) = parse_codebase_suggestions_with_diagnostics(response)?;
     Ok(suggestions)
 }
 
@@ -157,6 +247,8 @@ struct CodebaseSuggestionJson {
     kind: String,
     #[serde(default)]
     priority: String,
+    #[serde(default)]
+    confidence: String,
     summary: String,
     #[serde(default)]
     detail: String,

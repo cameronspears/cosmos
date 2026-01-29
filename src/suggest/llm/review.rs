@@ -100,7 +100,8 @@ pub async fn verify_changes(
 
     // Use Speed model with high reasoning effort for cost-effective review
     // 4 iterations - diff already provided, occasional context needed
-    let response = call_llm_agentic(&system, &user, Model::Speed, &repo_root, false, 4).await?;
+    let response =
+        call_llm_agentic(&system, &user, Model::Speed, &repo_root, false, 4, None).await?;
 
     // Parse the response with self-correction on failure
     let (parsed, correction_usage): (ReviewResponseJson, _) =

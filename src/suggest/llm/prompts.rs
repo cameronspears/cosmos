@@ -111,17 +111,16 @@ Respond with JSON now."#;
 /// Agentic codebase analysis prompt - model explores with shell before suggesting
 pub const ANALYZE_CODEBASE_AGENTIC_SYSTEM: &str = r#"Senior code reviewer with shell access. Find genuine improvements that help users, not just cleaner code.
 
-CRITICAL: You MUST return EXACTLY 10 suggestions. No more, no less.
-CRITICAL: Each suggestion must be UNIQUE - different files OR different issues. Never repeat the same problem.
+Generate UP TO 15 high-quality suggestions. Quality over quantity — 8 excellent suggestions beats 15 mediocre ones.
 
-SHELL: rg, grep, cat, head, find, ls, cargo check. Be bold - git is your safety net.
+TOOLS: Prefer built-in tools (tree, head, search, read_range) over shell. Use shell only for edge cases.
 
 WORKFLOW:
 1. Read PROJECT CONTEXT to understand app purpose
-2. Explore structure: ls, find . -name "*.rs" | head -20
+2. Use tree to see structure
 3. Read [CHANGED] files and dependencies first
-4. ONLY suggest issues verified by reading actual code
-5. Return EXACTLY 10 findings as JSON (count before submitting)
+4. Verify issues by reading actual code before suggesting
+5. Return findings as JSON
 
 OUTPUT (JSON array):
 [{
@@ -129,18 +128,29 @@ OUTPUT (JSON array):
   "additional_files": ["other.rs"],
   "kind": "bugfix|improvement|optimization|refactoring|security|reliability",
   "priority": "high|medium|low",
+  "confidence": "high|medium|low",
   "summary": "Plain English user impact - NO code terms",
   "detail": "Technical: function names, code refs, fix guidance",
   "line": 42,
   "evidence": "actual code snippet proving issue"
 }]
 
+CONFIDENCE:
+- high: Verified by reading actual code, clear evidence included
+- medium: Likely issue based on patterns, should verify before fixing
+- low: Possible issue, uncertain — OMIT these, only include high/medium
+
 SUMMARY vs DETAIL:
 - summary: NON-TECHNICAL. What user experiences. No function names, no jargon.
 - detail: TECHNICAL. Function names, file refs, fix guidance.
 
-GOOD summary: "When generating suggestions, if one file fails, remaining files are skipped"
+GOOD summary: "When generating suggestions, if one file fails the user will see fewer results than expected, which can make it seem like the analysis missed issues"
 BAD summary: "processQueue() throws on empty batch" (code terms belong in detail)
+
+COVERAGE (aim for diversity, don't force):
+- Bugs and security issues
+- Reliability and error handling
+- Performance and refactoring
 
 LOOK FOR:
 - Bugs: race conditions, off-by-one, null handling, swallowed errors
@@ -155,8 +165,7 @@ RULES:
 - Evidence required: include actual code snippet
 - No guessing from file names
 - Return JSON array only, no extra text
-- EXACTLY 10 SUGGESTIONS REQUIRED: Count your array before responding. If you have fewer than 10, keep exploring until you find more.
-- NO DUPLICATES: Each suggestion must address a different issue. Same file is OK if it's a genuinely different problem at a different location."#;
+- NO DUPLICATES: Each suggestion must address a different issue"#;
 
 pub const GROUPING_CLASSIFY_SYSTEM: &str = r#"Classify files into architectural layers.
 

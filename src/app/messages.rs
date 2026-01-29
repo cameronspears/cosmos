@@ -10,6 +10,7 @@ pub enum BackgroundMessage {
         suggestions: Vec<suggest::Suggestion>,
         usage: Option<suggest::llm::Usage>,
         model: String,
+        diagnostics: suggest::llm::SuggestionDiagnostics,
     },
     SuggestionsError(String),
     SummariesReady {

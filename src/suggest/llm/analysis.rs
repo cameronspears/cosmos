@@ -1,7 +1,7 @@
-use super::agentic::call_llm_agentic;
+use super::agentic::{call_llm_agentic, suggestion_schema};
 use super::client::{call_llm_with_usage, truncate_str};
 use super::models::{Model, Usage};
-use super::parse::parse_codebase_suggestions;
+use super::parse::{parse_codebase_suggestions_with_diagnostics, ParseDiagnostics};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{ANALYZE_CODEBASE_AGENTIC_SYSTEM, ASK_QUESTION_SYSTEM};
 use super::summaries::discover_project_context;
@@ -86,11 +86,34 @@ QUESTION:
 //  LEAN HYBRID ANALYSIS (Compact Context + Surgical Tool Use)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Minimum number of suggestions we require from analysis
-const MIN_SUGGESTIONS: usize = 10;
+use crate::suggest::Confidence;
 
-/// Maximum continuation attempts to reach MIN_SUGGESTIONS
-const MAX_CONTINUATION_ATTEMPTS: usize = 2;
+/// Maximum suggestions to return after quality filtering
+const MAX_SUGGESTIONS: usize = 15;
+
+#[derive(Debug, Clone)]
+pub struct SuggestionDiagnostics {
+    pub model: String,
+    pub iterations: usize,
+    pub tool_calls: usize,
+    pub tool_names: Vec<String>,
+    pub forced_final: bool,
+    pub formatting_pass: bool,
+    pub response_format: bool,
+    pub response_healing: bool,
+    pub parse_strategy: String,
+    pub parse_stripped_markdown: bool,
+    pub parse_used_sanitized_fix: bool,
+    pub parse_used_json_fix: bool,
+    pub parse_used_individual_parse: bool,
+    pub raw_count: usize,
+    pub deduped_count: usize,
+    pub low_confidence_filtered: usize,
+    pub truncated_count: usize,
+    pub final_count: usize,
+    pub response_chars: usize,
+    pub response_preview: String,
+}
 
 /// Analyze codebase with compact context and minimal, surgical tool use
 ///
@@ -98,7 +121,7 @@ const MAX_CONTINUATION_ATTEMPTS: usize = 2;
 /// 1. Start with synthesized context (summaries, not full files)
 /// 2. Model can make 1-3 targeted tool calls to verify specific issues
 /// 3. Uses gpt-oss-120b for cost efficiency
-/// 4. If fewer than MIN_SUGGESTIONS returned, makes continuation calls to get more
+/// 4. Quality-gated: filters out low-confidence suggestions, caps at MAX_SUGGESTIONS
 ///
 /// This balances accuracy (model can verify) with speed/cost (minimal calls).
 pub async fn analyze_codebase_agentic(
@@ -107,84 +130,98 @@ pub async fn analyze_codebase_agentic(
     context: &WorkContext,
     repo_memory: Option<String>,
     glossary: Option<&DomainGlossary>,
-) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>)> {
+) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
     let user_prompt = build_lean_analysis_prompt(index, context, repo_memory.as_deref(), glossary);
 
     // Use Speed model with high reasoning effort and tools for cost-effective analysis
-    // 8 iterations allows for good exploration
+    // 4 iterations is sufficient for: tree -> search -> read_range -> finalize
+    // Structured output is only applied on the final call (no tools) to ensure valid JSON
     let response = call_llm_agentic(
         ANALYZE_CODEBASE_AGENTIC_SYSTEM,
         &user_prompt,
         Model::Speed,
         repo_root,
         false,
-        8, // max iterations - suggestions need exploration
+        4, // max iterations - focused exploration
+        Some(suggestion_schema()),
     )
     .await?;
 
-    let mut suggestions = parse_codebase_suggestions(&response.content)?;
+    let (mut suggestions, parse_diagnostics) =
+        parse_codebase_suggestions_with_diagnostics(&response.content)?;
+    let raw_count = suggestions.len();
 
-    // Deduplicate initial suggestions (LLM sometimes returns near-duplicates)
+    // Deduplicate suggestions (LLM sometimes returns near-duplicates)
     suggestions = deduplicate_suggestions(suggestions);
+    let deduped_count = suggestions.len();
 
-    // If we got fewer than MIN_SUGGESTIONS, make continuation calls to get more
-    let mut attempts = 0;
-    while suggestions.len() < MIN_SUGGESTIONS && attempts < MAX_CONTINUATION_ATTEMPTS {
-        attempts += 1;
-        let needed = MIN_SUGGESTIONS - suggestions.len();
+    // Filter out low confidence suggestions
+    let low_confidence_filtered = suggestions
+        .iter()
+        .filter(|s| s.confidence == Confidence::Low)
+        .count();
+    suggestions.retain(|s| s.confidence != Confidence::Low);
 
-        let continuation_prompt = build_continuation_prompt(&suggestions, needed);
-        let continuation_response = call_llm_agentic(
-            ANALYZE_CODEBASE_AGENTIC_SYSTEM,
-            &continuation_prompt,
-            Model::Speed,
-            repo_root,
-            false,
-            4, // fewer iterations for continuation - context already gathered
-        )
-        .await?;
+    // Sort by confidence (high first), then priority
+    suggestions.sort_by(|a, b| {
+        b.confidence
+            .cmp(&a.confidence)
+            .then_with(|| b.priority.cmp(&a.priority))
+    });
 
-        match parse_codebase_suggestions(&continuation_response.content) {
-            Ok(additional) => {
-                // Deduplicate using multiple criteria to catch near-duplicates:
-                // 1. Exact file+summary match
-                // 2. Same file+line (same location = likely same issue)
-                // 3. Same file+kind (same category in same file = often duplicate)
-                let existing_summaries: std::collections::HashSet<_> = suggestions
-                    .iter()
-                    .map(|s| (s.file.clone(), s.summary.clone()))
-                    .collect();
-                let existing_locations: std::collections::HashSet<_> = suggestions
-                    .iter()
-                    .filter_map(|s| s.line.map(|l| (s.file.clone(), l)))
-                    .collect();
-                let existing_file_kinds: std::collections::HashSet<_> = suggestions
-                    .iter()
-                    .map(|s| (s.file.clone(), s.kind))
-                    .collect();
+    // Cap at MAX_SUGGESTIONS
+    let truncated_count = suggestions.len().saturating_sub(MAX_SUGGESTIONS);
+    suggestions.truncate(MAX_SUGGESTIONS);
+    let final_count = suggestions.len();
 
-                for s in additional {
-                    let dominated_by_summary =
-                        existing_summaries.contains(&(s.file.clone(), s.summary.clone()));
-                    let dominated_by_location = s
-                        .line
-                        .map(|l| existing_locations.contains(&(s.file.clone(), l)))
-                        .unwrap_or(false);
-                    let dominated_by_kind = existing_file_kinds.contains(&(s.file.clone(), s.kind));
+    let diagnostics = build_suggestion_diagnostics(
+        Model::Speed,
+        &response.content,
+        &response.trace,
+        &parse_diagnostics,
+        raw_count,
+        deduped_count,
+        low_confidence_filtered,
+        truncated_count,
+        final_count,
+    );
 
-                    if !dominated_by_summary && !dominated_by_location && !dominated_by_kind {
-                        suggestions.push(s);
-                    }
-                }
-            }
-            Err(_) => {
-                // If continuation parsing fails, keep what we have
-                break;
-            }
-        }
+    Ok((suggestions, None, diagnostics))
+}
+
+fn build_suggestion_diagnostics(
+    model: Model,
+    response_content: &str,
+    trace: &super::agentic::AgenticTrace,
+    parse: &ParseDiagnostics,
+    raw_count: usize,
+    deduped_count: usize,
+    low_confidence_filtered: usize,
+    truncated_count: usize,
+    final_count: usize,
+) -> SuggestionDiagnostics {
+    SuggestionDiagnostics {
+        model: model.id().to_string(),
+        iterations: trace.iterations,
+        tool_calls: trace.tool_calls,
+        tool_names: trace.tool_names.clone(),
+        forced_final: trace.forced_final,
+        formatting_pass: trace.formatting_pass,
+        response_format: true,
+        response_healing: trace.response_healing_used,
+        parse_strategy: parse.strategy.clone(),
+        parse_stripped_markdown: parse.used_markdown_fences,
+        parse_used_sanitized_fix: parse.used_sanitized_fix,
+        parse_used_json_fix: parse.used_json_fix,
+        parse_used_individual_parse: parse.used_individual_parse,
+        raw_count,
+        deduped_count,
+        low_confidence_filtered,
+        truncated_count,
+        final_count,
+        response_chars: response_content.len(),
+        response_preview: truncate_str(response_content, 240).to_string(),
     }
-
-    Ok((suggestions, None))
 }
 
 /// Remove near-duplicate suggestions from a list
@@ -222,37 +259,6 @@ fn deduplicate_suggestions(suggestions: Vec<Suggestion>) -> Vec<Suggestion> {
     }
 
     result
-}
-
-/// Build a prompt asking for additional suggestions to reach the minimum
-fn build_continuation_prompt(existing: &[Suggestion], needed: usize) -> String {
-    let existing_summaries: Vec<String> = existing
-        .iter()
-        .enumerate()
-        .map(|(i, s)| format!("{}. {} - {}", i + 1, s.file.display(), s.summary))
-        .collect();
-
-    format!(
-        r#"You provided {} suggestions, but I need at least {} total (so {} more).
-
-EXISTING SUGGESTIONS (do NOT repeat these):
-{}
-
-Find {} MORE unique suggestions. Look in different files or find different issues in the same files.
-Focus on areas you haven't explored yet:
-- Error handling gaps
-- Missing input validation  
-- Performance issues
-- Security concerns
-- Code that could fail silently
-
-Use shell tools to explore and verify. Return ONLY the new suggestions as a JSON array."#,
-        existing.len(),
-        MIN_SUGGESTIONS,
-        needed,
-        existing_summaries.join("\n"),
-        needed
-    )
 }
 
 /// Build a lean prompt using summaries, not full file content
@@ -443,30 +449,30 @@ fn build_lean_analysis_prompt(
     // ═══ INSTRUCTIONS ═══
     sections.push(String::from(
         "\n\n═══ YOUR TASK ═══
-You MUST return EXACTLY 10 suggestions. Not 5, not 8, not 12. Exactly 10.
+Generate up to 15 high-quality suggestions. Quality over quantity.
 
 TIERED DISCOVERY:
 1. THE GIST → understand project purpose
 2. KEY AREAS → identify interesting modules
 3. PRIORITY FILES → pick files to investigate
-4. Use grep/head to find and read code
+4. Use tree/search/read_range to find and read code
 
-SURGICAL COMMANDS (save tokens!):
-• grep -n 'fn foo' <file> → find line number
-• sed -n '45,75p' <file> → read 30 lines around match
-• head -50 <file> → read file start
-• rg 'pattern' → search entire codebase
+PREFERRED TOOLS (built-in, fast):
+• tree → see directory structure
+• search → find patterns with context
+• read_range → read specific line ranges
+• head → read file starts
 
 EXAMPLE WORKFLOW:
 1. See 'handles API calls' in summary
-2. grep -n 'async fn' src/api.rs → find functions
-3. sed -n '120,160p' src/api.rs → read around interesting function
-4. Find issue → record with evidence
+2. search 'async fn' in src/api.rs → find functions
+3. read_range to examine specific sections
+4. Find issue → record with evidence and confidence
 
 RULES:
 - Only suggest issues you've verified by reading actual code
-- Return as JSON array
-- COUNT YOUR SUGGESTIONS BEFORE RESPONDING: You must have exactly 10 items in the array",
+- Include confidence: high (verified), medium (likely), low (uncertain)
+- Return as JSON array",
     ));
 
     sections.join("")

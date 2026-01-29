@@ -71,12 +71,29 @@ pub enum Priority {
     High,
 }
 
+/// Confidence level for suggestions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Confidence {
+    Low,
+    Medium,
+    High,
+}
+
+impl Default for Confidence {
+    fn default() -> Self {
+        Confidence::Medium
+    }
+}
+
 /// A suggestion for improvement
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Suggestion {
     pub id: Uuid,
     pub kind: SuggestionKind,
     pub priority: Priority,
+    /// Confidence level (high = verified by reading code, medium = likely, low = uncertain)
+    #[serde(default)]
+    pub confidence: Confidence,
     /// Primary file (used for display/grouping)
     pub file: PathBuf,
     /// Additional files affected by this suggestion (for multi-file refactors)
@@ -105,6 +122,7 @@ impl Suggestion {
             id: Uuid::new_v4(),
             kind,
             priority,
+            confidence: Confidence::default(),
             file,
             additional_files: Vec::new(),
             line: None,
@@ -115,6 +133,11 @@ impl Suggestion {
             dismissed: false,
             applied: false,
         }
+    }
+
+    pub fn with_confidence(mut self, confidence: Confidence) -> Self {
+        self.confidence = confidence;
+        self
     }
 
     pub fn with_line(mut self, line: usize) -> Self {
