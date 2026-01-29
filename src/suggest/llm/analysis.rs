@@ -110,7 +110,7 @@ pub async fn analyze_codebase_agentic(
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>)> {
     let user_prompt = build_lean_analysis_prompt(index, context, repo_memory.as_deref(), glossary);
 
-    // Use Speed model (gpt-oss-120b) with surgical tool access
+    // Use Speed model with high reasoning effort and tools for cost-effective analysis
     // 8 iterations allows for good exploration
     let response = call_llm_agentic(
         ANALYZE_CODEBASE_AGENTIC_SYSTEM,

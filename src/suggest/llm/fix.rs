@@ -893,7 +893,7 @@ VERIFY:
         suggestion.file.display(),
     );
 
-    // Use Speed model with surgical tool access
+    // Use Speed model with high reasoning effort for cost-effective fix planning
     // 3 iterations - code already provided, minimal exploration needed
     let response = call_llm_agentic(
         FIX_PREVIEW_AGENTIC_SYSTEM,

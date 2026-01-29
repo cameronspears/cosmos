@@ -12,30 +12,66 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
+use std::cell::RefCell;
+
+/// Cached main layout to avoid recomputing on every frame
+struct CachedMainLayout {
+    area: Rect,
+    project_panel: Rect,
+    suggestions_panel: Rect,
+}
+
+thread_local! {
+    static MAIN_LAYOUT_CACHE: RefCell<Option<CachedMainLayout>> = const { RefCell::new(None) };
+}
 
 pub(super) fn render_main(frame: &mut Frame, area: Rect, app: &App) {
-    // Add horizontal padding for breathing room
-    let padded = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(2), // Left padding
-            Constraint::Min(10),   // Main content
-            Constraint::Length(2), // Right padding
-        ])
-        .split(area);
+    let (project_rect, suggestions_rect) = MAIN_LAYOUT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
 
-    // Split into two panels with gap
-    let panels = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(38), // Project tree
-            Constraint::Length(2),      // Gap between panels
-            Constraint::Percentage(62), // Suggestions (wider for wrapped text)
-        ])
-        .split(padded[1]);
+        // Reuse cached layout if area unchanged
+        if let Some(cached) = cache.as_ref() {
+            if cached.area == area {
+                return (cached.project_panel, cached.suggestions_panel);
+            }
+        }
 
-    render_project_panel(frame, panels[0], app);
-    render_suggestions_panel(frame, panels[2], app);
+        // Recompute layout (only on resize)
+        // Add horizontal padding for breathing room
+        let padded = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(2), // Left padding
+                Constraint::Min(10),   // Main content
+                Constraint::Length(2), // Right padding
+            ])
+            .split(area);
+
+        // Split into two panels with gap
+        let panels = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(38), // Project tree
+                Constraint::Length(2),      // Gap between panels
+                Constraint::Percentage(62), // Suggestions (wider for wrapped text)
+            ])
+            .split(padded[1]);
+
+        let project_panel = panels[0];
+        let suggestions_panel = panels[2];
+
+        // Cache the result
+        *cache = Some(CachedMainLayout {
+            area,
+            project_panel,
+            suggestions_panel,
+        });
+
+        (project_panel, suggestions_panel)
+    });
+
+    render_project_panel(frame, project_rect, app);
+    render_suggestions_panel(frame, suggestions_rect, app);
 }
 
 fn render_project_panel(frame: &mut Frame, area: Rect, app: &App) {

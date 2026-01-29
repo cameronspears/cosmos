@@ -98,7 +98,7 @@ pub async fn verify_changes(
     // Build compact diff summary (not full content)
     let user = build_lean_review_prompt(files_with_content, fix_context);
 
-    // Use Speed model with surgical tool access for fast, accurate review
+    // Use Speed model with high reasoning effort for cost-effective review
     // 4 iterations - diff already provided, occasional context needed
     let response = call_llm_agentic(&system, &user, Model::Speed, &repo_root, false, 4).await?;
 

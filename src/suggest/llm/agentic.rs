@@ -49,6 +49,8 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoice>,
@@ -74,6 +76,21 @@ enum ToolChoice {
 #[derive(Serialize)]
 struct ProviderConfig {
     allow_fallbacks: bool,
+}
+
+/// OpenRouter reasoning configuration for extended thinking
+#[derive(Serialize)]
+struct ReasoningConfig {
+    effort: String,
+    /// Exclude reasoning from the response (we only want the final answer)
+    exclude: bool,
+}
+
+fn reasoning_config(model: Model) -> Option<ReasoningConfig> {
+    model.reasoning_effort().map(|effort| ReasoningConfig {
+        effort: effort.to_string(),
+        exclude: true,
+    })
 }
 
 #[derive(Deserialize)]
@@ -152,6 +169,7 @@ pub async fn call_llm_agentic(
             max_tokens: model.max_tokens(),
             stream: false,
             response_format,
+            reasoning: reasoning_config(model),
             tools: Some(tools.clone()),
             tool_choice: Some(ToolChoice::Auto),
             parallel_tool_calls: Some(true),
@@ -235,6 +253,7 @@ pub async fn call_llm_agentic(
         max_tokens: model.max_tokens(),
         stream: false,
         response_format: None,
+        reasoning: reasoning_config(model),
         tools: Some(tools),
         tool_choice: Some(ToolChoice::None),
         parallel_tool_calls: Some(true),
@@ -322,12 +341,16 @@ mod tests {
     #[test]
     fn test_tool_definition_serialization() {
         let tools = get_tool_definitions();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].function.name, "shell");
+        assert_eq!(tools.len(), 5); // tree, head, search, read_range, shell
+
+        // First tool should be tree (for top-down exploration)
+        assert_eq!(tools[0].function.name, "tree");
+
+        // Last tool should be shell (fallback)
+        assert_eq!(tools[4].function.name, "shell");
 
         let json = serde_json::to_string(&tools[0]).unwrap();
-        assert!(json.contains("shell"));
-        assert!(json.contains("command"));
+        assert!(json.contains("tree"));
     }
 
     #[test]
@@ -344,6 +367,7 @@ mod tests {
             max_tokens: 128,
             stream: false,
             response_format: None,
+            reasoning: None,
             tools: Some(tools),
             tool_choice: Some(ToolChoice::None),
             parallel_tool_calls: Some(true),
@@ -354,5 +378,21 @@ mod tests {
         assert!(json.contains("\"tool_choice\":\"none\""));
         assert!(json.contains("\"parallel_tool_calls\":true"));
         assert!(json.contains("\"tools\""));
+    }
+
+    #[test]
+    fn test_reasoning_config_for_all_models() {
+        use super::Model;
+
+        // All models should get high reasoning effort
+        let speed = reasoning_config(Model::Speed).expect("Speed should have reasoning");
+        assert_eq!(speed.effort, "high");
+        assert!(speed.exclude);
+
+        let balanced = reasoning_config(Model::Balanced).expect("Balanced should have reasoning");
+        assert_eq!(balanced.effort, "high");
+
+        let smart = reasoning_config(Model::Smart).expect("Smart should have reasoning");
+        assert_eq!(smart.effort, "high");
     }
 }
