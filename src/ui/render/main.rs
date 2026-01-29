@@ -527,13 +527,11 @@ fn render_suggestions_content<'a>(
         }
         LoadingState::Resetting => Some("Resetting cache...".to_string()),
         LoadingState::Answering => Some("Thinking...".to_string()),
+        LoadingState::None => None,
         _ => {
-            // Check if suggestions generation is pending (after summaries complete)
+            // For other active loading states, show context if available
             if app.pending_suggestions_on_init {
                 Some("Preparing suggestions...".to_string())
-            } else if app.needs_summary_generation {
-                // Summaries still needed but not actively loading yet
-                Some("Starting analysis...".to_string())
             } else {
                 None
             }
