@@ -51,6 +51,10 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<ProviderConfig>,
 }
 
@@ -58,6 +62,13 @@ struct ChatRequest {
 struct ResponseFormat {
     #[serde(rename = "type")]
     format_type: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "snake_case")]
+enum ToolChoice {
+    Auto,
+    None,
 }
 
 #[derive(Serialize)]
@@ -142,6 +153,8 @@ pub async fn call_llm_agentic(
             stream: false,
             response_format,
             tools: Some(tools.clone()),
+            tool_choice: Some(ToolChoice::Auto),
+            parallel_tool_calls: Some(true),
             provider: Some(ProviderConfig {
                 allow_fallbacks: true,
             }),
@@ -222,7 +235,9 @@ pub async fn call_llm_agentic(
         max_tokens: model.max_tokens(),
         stream: false,
         response_format: None,
-        tools: None, // No tools - force text response
+        tools: Some(tools),
+        tool_choice: Some(ToolChoice::None),
+        parallel_tool_calls: Some(true),
         provider: Some(ProviderConfig {
             allow_fallbacks: true,
         }),
@@ -313,5 +328,31 @@ mod tests {
         let json = serde_json::to_string(&tools[0]).unwrap();
         assert!(json.contains("shell"));
         assert!(json.contains("command"));
+    }
+
+    #[test]
+    fn test_chat_request_tool_controls() {
+        let tools = get_tool_definitions();
+        let request = ChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some("hi".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            max_tokens: 128,
+            stream: false,
+            response_format: None,
+            tools: Some(tools),
+            tool_choice: Some(ToolChoice::None),
+            parallel_tool_calls: Some(true),
+            provider: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"tool_choice\":\"none\""));
+        assert!(json.contains("\"parallel_tool_calls\":true"));
+        assert!(json.contains("\"tools\""));
     }
 }

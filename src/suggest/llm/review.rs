@@ -86,7 +86,12 @@ pub async fn verify_changes(
             }
             None
         })
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not locate repository root (.git directory) from file paths. \
+                 Ensure files are within a git repository."
+            )
+        })?;
 
     let system = review_system_prompt(iteration, fixed_titles, fix_context);
 
