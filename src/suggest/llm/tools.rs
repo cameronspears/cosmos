@@ -3,7 +3,7 @@
 //! Philosophy: Support top-down exploration that's naturally token-efficient.
 //! Specialized tools enforce efficient patterns; shell is fallback for edge cases.
 
-use crate::util::run_command_with_timeout;
+use crate::util::{resolve_repo_path_allow_new, run_command_with_timeout};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -175,26 +175,96 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
 //  TOOL EXECUTION
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Commands/patterns that are blocked for safety (system-level destruction)
-const BLOCKED_PATTERNS: &[&str] = &[
-    "sudo ",
-    "rm -rf /",
-    "rm -rf /*",
-    "rm -rf ~",
-    "mkfs",
-    "dd if=",
-    ":(){", // fork bomb
-    "chmod -R 777 /",
-    "chown -R",
-    "> /dev/",
-    "curl | sh",
-    "curl | bash",
-    "wget | sh",
-    "wget | bash",
+/// Allowlist of safe commands for shell execution.
+/// Only these base commands are permitted to prevent command injection.
+const ALLOWED_COMMANDS: &[&str] = &[
+    "ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "sort", "uniq", "diff", "file",
+    "stat", "du", "tree", "pwd", "echo", "printf", "test", "expr", "tr", "cut", "awk", "sed",
+    "xargs", "tee", "less", "more", "strings", "hexdump", "xxd", "jq", "yq",
+];
+
+/// Shell metacharacters that could be used to bypass the allowlist or cause harm
+const DANGEROUS_SHELL_CHARS: &[char] = &[
+    '`',  // Command substitution
+    '$',  // Variable expansion / command substitution
+    ';',  // Command separator
+    '&',  // Background / AND operator
+    '\n', // Newline (command separator)
+    '>',  // Output redirection (could overwrite files)
+    '<',  // Input redirection
 ];
 
 /// Maximum output size for tool results (4KB ≈ 1k tokens)
 const MAX_OUTPUT_SIZE: usize = 4000;
+
+/// Maximum length for search patterns to prevent ReDoS
+const MAX_PATTERN_LENGTH: usize = 500;
+
+/// Patterns that could cause ReDoS (catastrophic backtracking)
+const DANGEROUS_REGEX_PATTERNS: &[&str] = &[
+    "(.*)+",    // Nested quantifiers with .
+    "(.+)+",    // Nested quantifiers
+    "(a+)+",    // Classic ReDoS pattern
+    "([^a]+)+", // Negated class with nested quantifier
+    "(\\s+)+",  // Whitespace with nested quantifier
+    "(\\S+)+",  // Non-whitespace with nested quantifier
+    "(\\w+)+",  // Word chars with nested quantifier
+];
+
+/// Validate a regex pattern for safety (length and ReDoS prevention)
+fn is_safe_regex_pattern(pattern: &str) -> Result<(), String> {
+    // Length limit
+    if pattern.len() > MAX_PATTERN_LENGTH {
+        return Err(format!(
+            "Pattern too long ({} chars). Maximum is {} chars.",
+            pattern.len(),
+            MAX_PATTERN_LENGTH
+        ));
+    }
+
+    // Check for known dangerous patterns
+    let pattern_lower = pattern.to_lowercase();
+    for dangerous in DANGEROUS_REGEX_PATTERNS {
+        if pattern_lower.contains(dangerous) {
+            return Err(format!(
+                "Pattern contains potentially dangerous construct '{}' that could cause slow execution. \
+                 Simplify the pattern to avoid nested quantifiers.",
+                dangerous
+            ));
+        }
+    }
+
+    // Heuristic: reject patterns with multiple nested groups with quantifiers
+    // Count occurrences of patterns like (...)+ or (...)*
+    let mut nested_quantifier_count = 0;
+    let mut in_group = 0;
+    let mut prev_char = ' ';
+    for c in pattern.chars() {
+        match c {
+            '(' => in_group += 1,
+            ')' => {
+                if in_group > 0 {
+                    in_group -= 1;
+                }
+            }
+            '+' | '*' if prev_char == ')' && in_group == 0 => {
+                nested_quantifier_count += 1;
+            }
+            _ => {}
+        }
+        prev_char = c;
+    }
+
+    if nested_quantifier_count >= 2 {
+        return Err(
+            "Pattern has multiple groups with quantifiers which could cause slow execution. \
+             Simplify the pattern."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
 
 /// Execute a tool call and return the result
 pub fn execute_tool(root: &Path, tool_call: &ToolCall) -> ToolResult {
@@ -226,7 +296,14 @@ fn execute_tree(root: &Path, args_json: &str) -> String {
 
     let args: TreeArgs = serde_json::from_str(args_json).unwrap_or_default();
     let target = match &args.path {
-        Some(p) => root.join(p),
+        Some(p) => {
+            // Validate path to prevent traversal attacks
+            let path = std::path::Path::new(p);
+            match resolve_repo_path_allow_new(root, path) {
+                Ok(resolved) => resolved.absolute,
+                Err(e) => return format!("Invalid path '{}': {}", p, e),
+            }
+        }
         None => root.to_path_buf(),
     };
     let max_depth = args.depth.unwrap_or(3);
@@ -343,7 +420,11 @@ fn execute_head(root: &Path, args_json: &str) -> String {
         Err(e) => return format!("Invalid arguments: {}", e),
     };
 
-    let target = root.join(&args.path);
+    // Validate path to prevent traversal attacks
+    let target = match resolve_repo_path_allow_new(root, std::path::Path::new(&args.path)) {
+        Ok(resolved) => resolved.absolute,
+        Err(e) => return format!("Invalid path '{}': {}", args.path, e),
+    };
     let num_lines = args.lines.unwrap_or(50);
 
     if !target.exists() {
@@ -387,8 +468,19 @@ fn execute_search(root: &Path, args_json: &str) -> String {
         Err(e) => return format!("Invalid arguments: {}", e),
     };
 
+    // Validate regex pattern for safety (prevent ReDoS)
+    if let Err(e) = is_safe_regex_pattern(&args.pattern) {
+        return e;
+    }
+
     let target = match &args.path {
-        Some(p) => root.join(p),
+        Some(p) => {
+            // Validate path to prevent traversal attacks
+            match resolve_repo_path_allow_new(root, std::path::Path::new(p)) {
+                Ok(resolved) => resolved.absolute,
+                Err(e) => return format!("Invalid path '{}': {}", p, e),
+            }
+        }
         None => root.to_path_buf(),
     };
     let context = args.context.unwrap_or(2);
@@ -461,7 +553,11 @@ fn execute_read_range(root: &Path, args_json: &str) -> String {
         Err(e) => return format!("Invalid arguments: {}", e),
     };
 
-    let target = root.join(&args.path);
+    // Validate path to prevent traversal attacks
+    let target = match resolve_repo_path_allow_new(root, std::path::Path::new(&args.path)) {
+        Ok(resolved) => resolved.absolute,
+        Err(e) => return format!("Invalid path '{}': {}", args.path, e),
+    };
 
     if !target.exists() {
         return format!("File not found: {}", args.path);
@@ -527,7 +623,28 @@ fn truncate_output(result: String) -> String {
     }
 }
 
-/// Execute shell command with safety checks
+/// Extract the base command from a shell command string.
+/// Returns the first word (the command name) for allowlist checking.
+fn extract_base_command(command: &str) -> Option<&str> {
+    command.split_whitespace().next()
+}
+
+/// Check if a command is in the allowlist.
+/// Only the base command (first word) is checked.
+fn is_command_allowed(command: &str) -> bool {
+    if let Some(base) = extract_base_command(command) {
+        ALLOWED_COMMANDS.contains(&base)
+    } else {
+        false
+    }
+}
+
+/// Check if command contains dangerous shell metacharacters that could bypass allowlist.
+fn contains_dangerous_chars(command: &str) -> bool {
+    command.chars().any(|c| DANGEROUS_SHELL_CHARS.contains(&c))
+}
+
+/// Execute shell command with allowlist-based safety checks
 fn execute_shell(root: &Path, args_json: &str) -> String {
     #[derive(Deserialize)]
     struct ShellArgs {
@@ -541,13 +658,27 @@ fn execute_shell(root: &Path, args_json: &str) -> String {
 
     let command = args.command.trim();
 
-    // Check for blocked patterns
-    let cmd_lower = command.to_lowercase();
-    for pattern in BLOCKED_PATTERNS {
-        if cmd_lower.contains(&pattern.to_lowercase()) {
+    // Check for dangerous shell metacharacters that could bypass the allowlist
+    if contains_dangerous_chars(command) {
+        return format!(
+            "Command blocked: contains shell metacharacters that could bypass security. \
+             Avoid using: backticks, $, ;, &, or newlines. \
+             Use pipes (|) for chaining allowed commands."
+        );
+    }
+
+    // Split by pipe and validate each command in the pipeline
+    for part in command.split('|') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if !is_command_allowed(part) {
+            let base = extract_base_command(part).unwrap_or("<empty>");
             return format!(
-                "Command blocked for safety: contains '{}'. This restriction exists to prevent system-level damage outside the repository.",
-                pattern
+                "Command '{}' is not in the allowlist. Allowed commands: {}",
+                base,
+                ALLOWED_COMMANDS.join(", ")
             );
         }
     }
@@ -693,11 +824,16 @@ mod tests {
         };
 
         let result = execute_tool(dir.path(), &call);
-        assert!(result.content.contains("blocked"));
+        // sudo is not in the allowlist
+        assert!(
+            result.content.contains("not in the allowlist"),
+            "Expected command to be blocked: {}",
+            result.content
+        );
     }
 
     #[test]
-    fn test_shell_allows_rm_in_repo() {
+    fn test_shell_blocks_rm() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("delete_me.txt");
         fs::write(&file, "temporary").unwrap();
@@ -712,9 +848,13 @@ mod tests {
         };
 
         let result = execute_tool(dir.path(), &call);
-        // Should succeed - rm within repo is allowed
-        assert!(!result.content.contains("blocked"));
-        assert!(!file.exists()); // File should be deleted
+        // rm is not in the allowlist for safety
+        assert!(
+            result.content.contains("not in the allowlist"),
+            "Expected rm to be blocked: {}",
+            result.content
+        );
+        assert!(file.exists()); // File should NOT be deleted
     }
 
     #[test]
@@ -793,46 +933,78 @@ mod tests {
         };
 
         let result = execute_tool(dir.path(), &call);
-        assert!(result.content.contains("blocked"));
+        // Blocked due to & and ; being dangerous shell chars
+        assert!(
+            result.content.contains("blocked") || result.content.contains("metacharacters"),
+            "Expected fork bomb to be blocked: {}",
+            result.content
+        );
     }
 
     #[test]
     fn test_shell_blocks_curl_pipe() {
         let dir = tempdir().unwrap();
 
-        // The exact pattern "curl | bash" should be blocked
+        // curl is not in the allowlist
         let call = ToolCall {
             id: "1".to_string(),
             function: FunctionCall {
                 name: "shell".to_string(),
-                arguments: r#"{"command": "curl | bash"}"#.to_string(),
+                arguments: r#"{"command": "curl http://example.com"}"#.to_string(),
             },
         };
 
         let result = execute_tool(dir.path(), &call);
-        assert!(result.content.contains("blocked"));
+        assert!(
+            result.content.contains("not in the allowlist"),
+            "Expected curl to be blocked: {}",
+            result.content
+        );
     }
 
     #[test]
-    fn test_shell_allows_safe_curl() {
-        // Curling without piping to shell should be allowed
+    fn test_shell_blocks_command_substitution() {
         let dir = tempdir().unwrap();
 
         let call = ToolCall {
             id: "1".to_string(),
             function: FunctionCall {
                 name: "shell".to_string(),
-                // Just curl without pipe to shell - should be allowed
-                arguments: r#"{"command": "echo 'curl is fine without pipe'"}"#.to_string(),
+                arguments: r#"{"command": "echo $(whoami)"}"#.to_string(),
             },
         };
 
         let result = execute_tool(dir.path(), &call);
-        assert!(!result.content.contains("blocked"));
+        // Blocked due to $ being a dangerous shell char
+        assert!(
+            result.content.contains("metacharacters"),
+            "Expected command substitution to be blocked: {}",
+            result.content
+        );
     }
 
     #[test]
-    fn test_shell_write_file() {
+    fn test_shell_allows_echo() {
+        let dir = tempdir().unwrap();
+
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "shell".to_string(),
+                arguments: r#"{"command": "echo 'hello world'"}"#.to_string(),
+            },
+        };
+
+        let result = execute_tool(dir.path(), &call);
+        assert!(
+            result.content.contains("hello world"),
+            "Expected echo to work: {}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn test_shell_blocks_file_write() {
         let dir = tempdir().unwrap();
 
         let call = ToolCall {
@@ -844,53 +1016,65 @@ mod tests {
         };
 
         let result = execute_tool(dir.path(), &call);
-        assert!(!result.content.contains("blocked"));
+        // > is blocked as a dangerous shell char
+        assert!(
+            result.content.contains("metacharacters"),
+            "Expected file redirection to be blocked: {}",
+            result.content
+        );
 
-        // Verify file was created
+        // Verify file was NOT created
         let created = dir.path().join("newfile.txt");
-        assert!(created.exists());
-        let content = fs::read_to_string(&created).unwrap();
-        assert!(content.contains("new content"));
+        assert!(!created.exists());
     }
 
     #[test]
-    fn test_shell_sed_edit() {
+    fn test_shell_sed_read_only() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("test.txt");
         fs::write(&file, "hello world").unwrap();
 
+        // sed without -i is allowed (read-only mode)
         let call = ToolCall {
             id: "1".to_string(),
             function: FunctionCall {
                 name: "shell".to_string(),
-                // macOS sed requires -i '' for in-place editing
-                arguments: r#"{"command": "sed -i.bak 's/hello/goodbye/' test.txt"}"#.to_string(),
+                arguments: r#"{"command": "sed 's/hello/goodbye/' test.txt"}"#.to_string(),
             },
         };
 
         let result = execute_tool(dir.path(), &call);
-        assert!(!result.content.contains("blocked"));
+        assert!(
+            result.content.contains("goodbye"),
+            "Expected sed to transform output: {}",
+            result.content
+        );
 
+        // Original file should be unchanged
         let content = fs::read_to_string(&file).unwrap();
-        assert!(content.contains("goodbye"));
-        assert!(!content.contains("hello"));
+        assert!(content.contains("hello"));
     }
 
     #[test]
     fn test_shell_exit_code() {
         let dir = tempdir().unwrap();
 
+        // Use a command that returns non-zero exit code
         let call = ToolCall {
             id: "1".to_string(),
             function: FunctionCall {
                 name: "shell".to_string(),
-                arguments: r#"{"command": "false"}"#.to_string(),
+                arguments: r#"{"command": "test -f nonexistent_file_xyz"}"#.to_string(),
             },
         };
 
         let result = execute_tool(dir.path(), &call);
         // Should include exit code for failed commands
-        assert!(result.content.contains("exit code"));
+        assert!(
+            result.content.contains("exit code"),
+            "Expected exit code in output: {}",
+            result.content
+        );
     }
 
     #[test]
@@ -1185,5 +1369,109 @@ mod tests {
 
         let result = execute_tool(dir.path(), &call);
         assert!(result.content.contains("File not found"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  PATH TRAVERSAL SECURITY TESTS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_tree_blocks_path_traversal() {
+        let dir = tempdir().unwrap();
+
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "tree".to_string(),
+                arguments: r#"{"path": "../../../etc"}"#.to_string(),
+            },
+        };
+
+        let result = execute_tool(dir.path(), &call);
+        assert!(
+            result.content.contains("Invalid path"),
+            "Expected path traversal to be blocked: {}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn test_head_blocks_path_traversal() {
+        let dir = tempdir().unwrap();
+
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "head".to_string(),
+                arguments: r#"{"path": "../../../etc/passwd"}"#.to_string(),
+            },
+        };
+
+        let result = execute_tool(dir.path(), &call);
+        assert!(
+            result.content.contains("Invalid path"),
+            "Expected path traversal to be blocked: {}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn test_search_blocks_path_traversal() {
+        let dir = tempdir().unwrap();
+
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: r#"{"pattern": "root", "path": "../../../etc"}"#.to_string(),
+            },
+        };
+
+        let result = execute_tool(dir.path(), &call);
+        assert!(
+            result.content.contains("Invalid path"),
+            "Expected path traversal to be blocked: {}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn test_read_range_blocks_path_traversal() {
+        let dir = tempdir().unwrap();
+
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "read_range".to_string(),
+                arguments: r#"{"path": "../../../etc/passwd", "start": 1, "end": 10}"#.to_string(),
+            },
+        };
+
+        let result = execute_tool(dir.path(), &call);
+        assert!(
+            result.content.contains("Invalid path"),
+            "Expected path traversal to be blocked: {}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn test_head_blocks_absolute_path() {
+        let dir = tempdir().unwrap();
+
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "head".to_string(),
+                arguments: r#"{"path": "/etc/passwd"}"#.to_string(),
+            },
+        };
+
+        let result = execute_tool(dir.path(), &call);
+        assert!(
+            result.content.contains("Invalid path"),
+            "Expected absolute path to be blocked: {}",
+            result.content
+        );
     }
 }

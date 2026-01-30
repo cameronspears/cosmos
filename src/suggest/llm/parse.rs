@@ -3,7 +3,29 @@ use super::models::{Model, Usage};
 use crate::suggest::{Confidence, Priority, Suggestion, SuggestionKind, SuggestionSource};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+/// Check if a path is safe (relative, no parent traversal, no absolute)
+fn is_safe_relative_path(path: &Path) -> bool {
+    // Reject empty paths
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+
+    // Reject absolute paths
+    if path.is_absolute() {
+        return false;
+    }
+
+    // Reject paths with parent directory traversal
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            return false;
+        }
+    }
+
+    true
+}
 
 /// Strip markdown code fences from a response
 fn strip_markdown_fences(text: &str) -> &str {
@@ -129,11 +151,32 @@ pub(crate) fn parse_structured_suggestions(
 
     diagnostics.parsed_count = parsed.len();
 
-    // Convert to Suggestion objects
+    // Convert to Suggestion objects, filtering out invalid paths
     let suggestions = parsed
         .into_iter()
         .filter(|s| !s.file.is_empty() && !s.summary.is_empty())
-        .map(|s| {
+        .filter_map(|s| {
+            // Validate file path for security (no traversal, no absolute paths)
+            let file_path = PathBuf::from(&s.file);
+            if !is_safe_relative_path(&file_path) {
+                // Skip suggestions with unsafe paths
+                return None;
+            }
+
+            // Validate additional files too
+            let additional_files: Vec<PathBuf> = s
+                .additional_files
+                .iter()
+                .filter_map(|f| {
+                    let path = PathBuf::from(f);
+                    if is_safe_relative_path(&path) {
+                        Some(path)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
             let kind = match s.kind.to_lowercase().as_str() {
                 "bugfix" => SuggestionKind::BugFix,
                 "optimization" => SuggestionKind::Optimization,
@@ -155,8 +198,7 @@ pub(crate) fn parse_structured_suggestions(
                 _ => Confidence::Medium,
             };
 
-            let file_path = root.join(&s.file);
-
+            // Store relative path (not absolute) for consistent handling downstream
             let mut suggestion = Suggestion::new(
                 kind,
                 priority,
@@ -171,12 +213,11 @@ pub(crate) fn parse_structured_suggestions(
                 suggestion = suggestion.with_line(line);
             }
 
-            if !s.additional_files.is_empty() {
-                suggestion = suggestion
-                    .with_additional_files(s.additional_files.iter().map(PathBuf::from).collect());
+            if !additional_files.is_empty() {
+                suggestion = suggestion.with_additional_files(additional_files);
             }
 
-            suggestion
+            Some(suggestion)
         })
         .collect();
 

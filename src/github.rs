@@ -67,6 +67,43 @@ const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const DEVICE_FLOW_TIMEOUT_SECS: u64 = 30;
 
+/// Maximum length for error body content in error messages
+const MAX_ERROR_BODY_LEN: usize = 200;
+
+/// Sanitize an API error body to prevent credential leakage.
+/// Truncates long responses and redacts potential secrets.
+fn sanitize_error_body(body: &str) -> String {
+    // Patterns that might indicate secrets in error responses
+    const SECRET_PATTERNS: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "auth",
+        "bearer",
+        "ghp_",        // GitHub personal access token prefix
+        "gho_",        // GitHub OAuth token prefix
+        "ghu_",        // GitHub user token prefix
+        "github_pat_", // GitHub PAT prefix
+    ];
+
+    let truncated = if body.len() > MAX_ERROR_BODY_LEN {
+        format!("{}... (truncated)", &body[..MAX_ERROR_BODY_LEN])
+    } else {
+        body.to_string()
+    };
+
+    // Check if the body might contain secrets
+    let lower = truncated.to_lowercase();
+    for pattern in SECRET_PATTERNS {
+        if lower.contains(pattern) {
+            return "(error details redacted - may contain sensitive data)".to_string();
+        }
+    }
+
+    truncated
+}
+
 /// Required scope for creating PRs
 const OAUTH_SCOPE: &str = "repo";
 
@@ -140,7 +177,8 @@ pub async fn run_device_flow<C: DeviceFlowCallbacks>(callbacks: &mut C) -> Resul
     if !device_resp.status().is_success() {
         let status = device_resp.status();
         let body = device_resp.text().await.unwrap_or_default();
-        let err = format!("GitHub returned error {}: {}", status, body);
+        let sanitized = sanitize_error_body(&body);
+        let err = format!("GitHub returned error {}: {}", status, sanitized);
         callbacks.on_error(&err);
         return Err(anyhow::anyhow!("{}", err));
     }
@@ -434,10 +472,12 @@ pub async fn create_pull_request(
             return Err(anyhow::anyhow!("GitHub API error: {}", msg));
         }
 
+        // Sanitize raw error body to prevent credential leakage
+        let sanitized = sanitize_error_body(&error_body);
         Err(anyhow::anyhow!(
             "GitHub API error ({}): {}",
             status,
-            error_body
+            sanitized
         ))
     }
 }

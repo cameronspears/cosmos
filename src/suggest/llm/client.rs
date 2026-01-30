@@ -6,6 +6,34 @@ use std::time::Duration;
 /// OpenRouter direct API URL (BYOK mode)
 pub(crate) const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
+/// Maximum length for error content in error messages
+const MAX_ERROR_CONTENT_LEN: usize = 200;
+
+/// Sanitize API response content for error messages to prevent credential leakage.
+fn sanitize_api_response(content: &str) -> String {
+    const SECRET_PATTERNS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "secret",
+        "password",
+        "credential",
+        "bearer",
+        "sk-", // OpenAI/OpenRouter key prefix
+    ];
+
+    let truncated = truncate_str(content, MAX_ERROR_CONTENT_LEN);
+
+    // Check if the content might contain secrets
+    let lower = truncated.to_lowercase();
+    for pattern in SECRET_PATTERNS {
+        if lower.contains(pattern) {
+            return "(response details redacted - may contain sensitive data)".to_string();
+        }
+    }
+
+    truncated.to_string()
+}
+
 /// Get the configured OpenRouter API key, if any.
 pub(crate) fn api_key() -> Option<String> {
     let mut config = Config::load();
@@ -381,7 +409,7 @@ pub(crate) async fn send_with_retry<T: Serialize>(
                 "OpenRouter server error ({}). The service may be temporarily unavailable.",
                 status
             ),
-            _ => format!("API error {}: {}", status, truncate_str(&text, 200)),
+            _ => format!("API error {}: {}", status, sanitize_api_response(&text)),
         };
         return Err(anyhow::anyhow!("{}", error_msg));
     }
@@ -455,8 +483,13 @@ pub(crate) async fn call_llm_with_usage(
 
     let text = send_with_retry(&client, &api_key, &request).await?;
 
-    let parsed: ChatResponse = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("Failed to parse OpenRouter response: {}\n{}", e, text))?;
+    let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse OpenRouter response: {}\n{}",
+            e,
+            sanitize_api_response(&text)
+        )
+    })?;
 
     let choice = parsed.choices.first();
 
@@ -563,8 +596,13 @@ where
 
     let text = send_with_retry(&client, &api_key, &request).await?;
 
-    let parsed: ChatResponse = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("Failed to parse OpenRouter response: {}\n{}", e, text))?;
+    let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse OpenRouter response: {}\n{}",
+            e,
+            sanitize_api_response(&text)
+        )
+    })?;
 
     let choice = parsed.choices.first();
 
@@ -593,7 +631,7 @@ where
         anyhow::anyhow!(
             "Failed to parse structured response: {}\nContent: {}",
             e,
-            truncate_str(&content, 200)
+            sanitize_api_response(&content)
         )
     })?;
 

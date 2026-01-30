@@ -313,6 +313,15 @@ fn compute_compact_diff(old: &str, new: &str) -> String {
         std::fs::File::create(&old_path),
         std::fs::File::create(&new_path),
     ) {
+        // Set restrictive permissions on temp files (Unix only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = old_file.set_permissions(perms.clone());
+            let _ = new_file.set_permissions(perms);
+        }
+
         let _ = old_file.write_all(old.as_bytes());
         let _ = new_file.write_all(new.as_bytes());
 

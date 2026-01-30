@@ -996,6 +996,14 @@ fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
     let tmp_path = path.with_extension("tmp");
     fs::write(&tmp_path, content)?;
 
+    // Set restrictive permissions on Unix before renaming
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600); // Owner read/write only
+        let _ = std::fs::set_permissions(&tmp_path, perms);
+    }
+
     #[cfg(windows)]
     {
         let backup_path = path.with_extension("bak");

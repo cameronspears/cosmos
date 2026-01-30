@@ -2,7 +2,7 @@
 //!
 //! Provides branch, stage, commit, and push operations.
 
-use crate::util::{run_command_with_timeout, CommandRunResult};
+use crate::util::{resolve_repo_path_allow_new, run_command_with_timeout, CommandRunResult};
 use anyhow::{Context, Result};
 use git2::{Repository, Signature, StatusOptions};
 use std::path::Path;
@@ -207,19 +207,41 @@ fn sanitize_branch_slug(summary: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
+/// Maximum length for git ref names (prevent buffer overflow attacks)
+const MAX_GIT_REF_LENGTH: usize = 255;
+
 fn is_valid_git_ref(name: &str) -> bool {
+    // Empty check
     if name.is_empty() {
         return false;
     }
+
+    // Length limit to prevent abuse
+    if name.len() > MAX_GIT_REF_LENGTH {
+        return false;
+    }
+
+    // Reject refs starting with hyphen (could be interpreted as git flags)
+    if name.starts_with('-') {
+        return false;
+    }
+
+    // Reject common path component attacks
     if name.starts_with('.') || name.ends_with('.') || name.ends_with('/') {
         return false;
     }
+
+    // Reject .lock suffix (git uses this internally)
     if name.ends_with(".lock") {
         return false;
     }
+
+    // Reject path traversal and special git sequences
     if name.contains("..") || name.contains("@{") || name.contains("//") {
         return false;
     }
+
+    // Reject shell/git dangerous characters
     for c in name.chars() {
         if c.is_control()
             || c == ' '
@@ -230,6 +252,16 @@ fn is_valid_git_ref(name: &str) -> bool {
             || c == '*'
             || c == '['
             || c == '\\'
+            || c == '\''
+            || c == '"'
+            || c == '`'
+            || c == '$'
+            || c == '!'
+            || c == '&'
+            || c == ';'
+            || c == '|'
+            || c == '<'
+            || c == '>'
         {
             return false;
         }
@@ -534,6 +566,10 @@ pub fn read_file_from_head(repo_path: &Path, file_path: &Path) -> Result<Option<
 /// Restore a file to its state at HEAD (undo uncommitted changes)
 /// For new files that don't exist in HEAD, this will remove the file.
 pub fn restore_file(repo_path: &Path, file_path: &Path) -> Result<()> {
+    // Validate path to prevent traversal attacks
+    let resolved = resolve_repo_path_allow_new(repo_path, file_path)
+        .map_err(|e| anyhow::anyhow!("Invalid path '{}': {}", file_path.display(), e))?;
+
     let repo = Repository::open(repo_path)?;
 
     // Get HEAD commit
@@ -541,32 +577,30 @@ pub fn restore_file(repo_path: &Path, file_path: &Path) -> Result<()> {
     let commit = head.peel_to_commit()?;
     let tree = commit.tree()?;
 
-    // Try to find the file in HEAD
-    match tree.get_path(file_path) {
+    // Try to find the file in HEAD (use relative path for git operations)
+    match tree.get_path(&resolved.relative) {
         Ok(entry) => {
             // File exists in HEAD - restore it
             let blob = repo.find_blob(entry.id())?;
             let content = blob.content();
-            let full_path = repo_path.join(file_path);
-            std::fs::write(&full_path, content)
+            std::fs::write(&resolved.absolute, content)
                 .with_context(|| format!("Failed to restore {}", file_path.display()))?;
 
             // Unstage the file (reset index entry to HEAD)
             let mut index = repo.index()?;
-            index.add_path(file_path)?;
+            index.add_path(&resolved.relative)?;
             index.write()?;
         }
         Err(_) => {
             // File doesn't exist in HEAD - it's a new file, remove it
-            let full_path = repo_path.join(file_path);
-            if full_path.exists() {
-                std::fs::remove_file(&full_path).with_context(|| {
+            if resolved.absolute.exists() {
+                std::fs::remove_file(&resolved.absolute).with_context(|| {
                     format!("Failed to remove new file {}", file_path.display())
                 })?;
             }
             // Remove from index if staged
             let mut index = repo.index()?;
-            let _ = index.remove_path(file_path);
+            let _ = index.remove_path(&resolved.relative);
             index.write()?;
         }
     }
@@ -670,8 +704,24 @@ pub fn discard_all_changes(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Allowed URL schemes for security
+const ALLOWED_URL_SCHEMES: &[&str] = &["https://", "http://"];
+
 /// Open a URL in the default browser
+/// Only allows http:// and https:// URLs for security
 pub fn open_url(url: &str) -> Result<()> {
+    // Validate URL scheme to prevent injection attacks
+    let url_lower = url.to_lowercase();
+    let is_safe = ALLOWED_URL_SCHEMES
+        .iter()
+        .any(|scheme| url_lower.starts_with(scheme));
+
+    if !is_safe {
+        return Err(anyhow::anyhow!(
+            "URL scheme not allowed. Only http:// and https:// URLs are permitted."
+        ));
+    }
+
     #[cfg(target_os = "macos")]
     {
         Command::new("open")

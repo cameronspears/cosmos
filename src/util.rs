@@ -131,6 +131,30 @@ pub fn resolve_repo_path_allow_new(repo_root: &Path, candidate: &Path) -> Result
         return Err(format!("Path escapes repository: {}", candidate.display()));
     }
 
+    // Security: Check for symlinks in any existing path components
+    // This prevents TOCTOU attacks where a directory is replaced with a symlink
+    if let Ok(metadata) = std::fs::symlink_metadata(&joined) {
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Symlinks are not allowed for security: {}",
+                candidate.display()
+            ));
+        }
+    }
+
+    // Also check parent directories for symlinks
+    let mut check_path = joined.clone();
+    while check_path.starts_with(&root) && check_path != root {
+        if let Ok(metadata) = std::fs::symlink_metadata(&check_path) {
+            if metadata.file_type().is_symlink() {
+                return Err(format!("Path contains symlink: {}", check_path.display()));
+            }
+        }
+        if !check_path.pop() {
+            break;
+        }
+    }
+
     let relative = joined
         .strip_prefix(&root)
         .map(|p| p.to_path_buf())
