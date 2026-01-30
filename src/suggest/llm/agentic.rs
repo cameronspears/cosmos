@@ -628,7 +628,7 @@ mod tests {
     fn test_reasoning_config_for_all_models() {
         use super::Model;
 
-        // All models should get high reasoning effort
+        // Speed and Balanced get high, Smart gets xhigh
         let speed = reasoning_config(Model::Speed).expect("Speed should have reasoning");
         assert_eq!(speed.effort, "high");
         assert!(speed.exclude);
@@ -637,6 +637,6 @@ mod tests {
         assert_eq!(balanced.effort, "high");
 
         let smart = reasoning_config(Model::Smart).expect("Smart should have reasoning");
-        assert_eq!(smart.effort, "high");
+        assert_eq!(smart.effort, "xhigh");
     }
 }
