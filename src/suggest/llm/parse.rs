@@ -125,7 +125,7 @@ struct CodebaseSuggestionJson {
 /// parse directly without fallback logic.
 pub(crate) fn parse_structured_suggestions(
     response: &str,
-    root: &Path,
+    _root: &Path,
 ) -> anyhow::Result<(Vec<Suggestion>, ParseDiagnostics)> {
     let mut diagnostics = ParseDiagnostics {
         strategy: "structured_output".to_string(),
