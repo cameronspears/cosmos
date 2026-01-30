@@ -1,11 +1,10 @@
-use super::agentic::call_llm_agentic;
+use super::agentic::{call_llm_agentic, schema_to_response_format};
 use super::client::{call_llm_structured_cached, StructuredResponse};
 use super::fix::{
     apply_edits_with_context, fix_response_schema, normalize_generated_content, AppliedFix,
     FixResponse,
 };
 use super::models::{Model, Usage};
-use super::parse::parse_json_with_retry;
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{review_fix_system_prompt, review_system_prompt};
 use serde::{Deserialize, Serialize};
@@ -42,11 +41,114 @@ pub struct ReviewFinding {
     pub recommended: bool, // Reviewer recommends fixing this (true = should fix, false = optional)
 }
 
-/// Response structure for code review (used for JSON parsing with retry)
-#[derive(Debug, Clone, Deserialize)]
+/// Response structure for code review (used for structured output parsing)
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ReviewResponseJson {
+    #[serde(default = "default_review_summary")]
     summary: String,
-    findings: Vec<ReviewFinding>,
+    #[serde(default)]
+    findings: Vec<ReviewFindingJson>,
+}
+
+/// Finding structure for JSON parsing (with defaults for robustness)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ReviewFindingJson {
+    #[serde(default)]
+    file: String,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default = "default_severity")]
+    severity: String,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default = "default_recommended")]
+    recommended: bool,
+}
+
+fn default_severity() -> String {
+    "warning".to_string()
+}
+
+fn default_recommended() -> bool {
+    true
+}
+
+impl From<ReviewFindingJson> for ReviewFinding {
+    fn from(json: ReviewFindingJson) -> Self {
+        ReviewFinding {
+            file: json.file,
+            line: json.line,
+            severity: json.severity,
+            category: json.category,
+            title: json.title,
+            description: json.description,
+            recommended: json.recommended,
+        }
+    }
+}
+
+fn default_review_summary() -> String {
+    "Review completed".to_string()
+}
+
+/// JSON Schema for ReviewResponse - used for structured output
+/// This ensures the LLM returns valid, parseable JSON matching our expected format
+pub(crate) fn review_response_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "Brief overall assessment of the code changes"
+            },
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file": {
+                            "type": "string",
+                            "description": "Path to the file containing the issue"
+                        },
+                        "line": {
+                            "type": ["integer", "null"],
+                            "description": "Line number where the issue occurs"
+                        },
+                        "severity": {
+                            "type": "string",
+                            "enum": ["critical", "warning", "suggestion", "nitpick"],
+                            "description": "Severity level of the finding"
+                        },
+                        "category": {
+                            "type": "string",
+                            "description": "Category like bug, security, performance, logic, error-handling, style"
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Short title for the finding"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Detailed explanation in plain language"
+                        },
+                        "recommended": {
+                            "type": "boolean",
+                            "description": "Whether the reviewer recommends fixing this"
+                        }
+                    },
+                    "required": ["severity", "title", "description", "recommended"],
+                    "additionalProperties": false
+                },
+                "description": "List of issues found in the code"
+            }
+        },
+        "required": ["summary", "findings"],
+        "additionalProperties": false
+    })
 }
 
 /// Result of a deep verification review
@@ -98,19 +200,35 @@ pub async fn verify_changes(
     // Build compact diff summary (not full content)
     let user = build_lean_review_prompt(files_with_content, fix_context);
 
+    // Use structured output to guarantee valid JSON response
+    let response_format = schema_to_response_format("review_response", review_response_schema());
+
     // Use Speed model with high reasoning effort for cost-effective review
     // 4 iterations - diff already provided, occasional context needed
-    let response =
-        call_llm_agentic(&system, &user, Model::Speed, &repo_root, false, 4, None).await?;
+    let response = call_llm_agentic(
+        &system,
+        &user,
+        Model::Speed,
+        &repo_root,
+        false,
+        4,
+        Some(response_format),
+    )
+    .await?;
 
-    // Parse the response with self-correction on failure
-    let (parsed, correction_usage): (ReviewResponseJson, _) =
-        parse_json_with_retry(&response.content, "code review").await?;
+    // Response is guaranteed to be valid JSON matching the schema
+    let parsed: ReviewResponseJson = serde_json::from_str(&response.content).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse review response: {}. Content: {}",
+            e,
+            &response.content.chars().take(200).collect::<String>()
+        )
+    })?;
 
     Ok(VerificationReview {
-        findings: parsed.findings,
+        findings: parsed.findings.into_iter().map(Into::into).collect(),
         summary: parsed.summary,
-        usage: correction_usage, // Agentic doesn't track usage, but correction might
+        usage: None, // Usage is tracked in the agentic call
     })
 }
 

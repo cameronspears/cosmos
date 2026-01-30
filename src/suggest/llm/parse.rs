@@ -79,165 +79,6 @@ pub struct ParseDiagnostics {
     pub parsed_count: usize,
 }
 
-/// Parse suggestions from codebase-wide analysis with diagnostics
-pub(crate) fn parse_codebase_suggestions_with_diagnostics(
-    response: &str,
-) -> anyhow::Result<(Vec<Suggestion>, ParseDiagnostics)> {
-    let mut diagnostics = ParseDiagnostics::default();
-    // Handle empty responses gracefully
-    let trimmed = response.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No suggestions received. The AI may have been rate limited or timed out. Try again."
-        ));
-    }
-
-    let clean = strip_markdown_fences(trimmed);
-    diagnostics.used_markdown_fences = clean != trimmed;
-    let sanitized = fix_json_issues(clean);
-    diagnostics.used_sanitized_fix = sanitized != clean;
-
-    // Handle multiple LLM response formats:
-    // 1. Array: [...] (expected format) - try this FIRST
-    // 2. Object with suggestions key: {"suggestions": [...]}
-    // 3. Single suggestion as object: {file: ..., summary: ...}
-    // 4. Object containing any array value
-    let json_str = if let Some(array_str) = extract_json_fragment(&sanitized, '[', ']') {
-        diagnostics.strategy = "array".to_string();
-        // Preferred: direct array format
-        array_str.to_string()
-    } else if let Some(obj_str) = extract_json_fragment(&sanitized, '{', '}') {
-        // Try to parse as JSON object
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(obj_str) {
-            if let Some(suggestions) = obj.get("suggestions") {
-                diagnostics.strategy = "object:suggestions".to_string();
-                // Format: {"suggestions": [...]}
-                serde_json::to_string(suggestions).unwrap_or_else(|_| obj_str.to_string())
-            } else if obj.get("file").is_some() || obj.get("summary").is_some() {
-                diagnostics.strategy = "object:single".to_string();
-                // Format: Single suggestion as object - wrap in array
-                format!("[{}]", obj_str)
-            } else {
-                // Look for any array value in the object (handles {"data": [...]} etc.)
-                let mut found_array = None;
-                if let Some(map) = obj.as_object() {
-                    for value in map.values() {
-                        if value.is_array() {
-                            found_array = Some(serde_json::to_string(value).unwrap_or_default());
-                            break;
-                        }
-                    }
-                }
-                if found_array.is_some() {
-                    diagnostics.strategy = "object:array-value".to_string();
-                } else {
-                    diagnostics.strategy = "object".to_string();
-                }
-                found_array.unwrap_or_else(|| obj_str.to_string())
-            }
-        } else {
-            diagnostics.strategy = "object".to_string();
-            obj_str.to_string()
-        }
-    } else {
-        // No JSON structure found - return a clear error
-        let preview = truncate_str(&sanitized, 100);
-        return Err(anyhow::anyhow!(
-            "No valid JSON found in response. The AI may have returned text instead of suggestions. Preview: {}",
-            if preview.is_empty() { "(empty)" } else { preview }
-        ));
-    };
-
-    // Try to parse as array first
-    let parsed: Vec<CodebaseSuggestionJson> = match serde_json::from_str(&json_str) {
-        Ok(v) => v,
-        Err(e) => {
-            // Try to fix common JSON issues and retry
-            diagnostics.used_json_fix = true;
-            let fixed = fix_json_issues(&json_str);
-            match serde_json::from_str(&fixed) {
-                Ok(v) => v,
-                Err(_) => {
-                    // If still failing, try to extract individual objects and parse them
-                    diagnostics.used_individual_parse = true;
-                    match try_parse_individual_suggestions(&json_str) {
-                        Ok(v) if !v.is_empty() => v,
-                        _ => {
-                            let preview = truncate_str(&json_str, 200);
-                            return Err(anyhow::anyhow!(
-                                "Suggestions could not be parsed ({}). Try regenerating. Response preview: {}",
-                                e,
-                                preview
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    };
-    diagnostics.parsed_count = parsed.len();
-
-    let suggestions = parsed
-        .into_iter()
-        .map(|s| {
-            let kind = match s.kind.as_str() {
-                "bugfix" => SuggestionKind::BugFix,
-                "feature" => SuggestionKind::Feature,
-                "optimization" => SuggestionKind::Optimization,
-                "quality" => SuggestionKind::Quality,
-                "security" => SuggestionKind::BugFix, // Best available category
-                "reliability" => SuggestionKind::Quality,
-                "refactoring" => SuggestionKind::Refactoring,
-                _ => SuggestionKind::Improvement,
-            };
-            let priority = match s.priority.as_str() {
-                "high" => Priority::High,
-                "low" => Priority::Low,
-                _ => Priority::Medium,
-            };
-            let confidence = match s.confidence.as_str() {
-                "high" => Confidence::High,
-                "low" => Confidence::Low,
-                _ => Confidence::Medium,
-            };
-
-            let mut suggestion = Suggestion::new(
-                kind,
-                priority,
-                PathBuf::from(&s.file),
-                s.summary.clone(),
-                SuggestionSource::LlmDeep,
-            )
-            .with_confidence(confidence);
-
-            if let Some(line) = s.line {
-                suggestion = suggestion.with_line(line);
-            }
-            if !s.detail.trim().is_empty() {
-                suggestion = suggestion.with_detail(s.detail);
-            }
-            if !s.additional_files.is_empty() {
-                suggestion = suggestion.with_additional_files(
-                    s.additional_files
-                        .iter()
-                        .map(|p| PathBuf::from(p))
-                        .collect(),
-                );
-            }
-
-            suggestion
-        })
-        .collect();
-
-    Ok((suggestions, diagnostics))
-}
-
-/// Parse suggestions from codebase-wide analysis
-pub(crate) fn parse_codebase_suggestions(response: &str) -> anyhow::Result<Vec<Suggestion>> {
-    let (suggestions, _) = parse_codebase_suggestions_with_diagnostics(response)?;
-    Ok(suggestions)
-}
-
 #[derive(Deserialize)]
 struct CodebaseSuggestionJson {
     file: String,
@@ -253,6 +94,93 @@ struct CodebaseSuggestionJson {
     #[serde(default)]
     detail: String,
     line: Option<usize>,
+}
+
+/// Parse suggestions from structured output (guaranteed valid JSON from provider)
+///
+/// This is a simplified parser for use when structured output is enabled.
+/// Since the provider guarantees valid JSON matching the schema, we can
+/// parse directly without fallback logic.
+pub(crate) fn parse_structured_suggestions(
+    response: &str,
+    root: &Path,
+) -> anyhow::Result<(Vec<Suggestion>, ParseDiagnostics)> {
+    let mut diagnostics = ParseDiagnostics {
+        strategy: "structured_output".to_string(),
+        ..Default::default()
+    };
+
+    // Handle empty responses
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No suggestions received. The AI may have been rate limited or timed out. Try again."
+        ));
+    }
+
+    // Parse directly - structured output guarantees valid JSON
+    let parsed: Vec<CodebaseSuggestionJson> = serde_json::from_str(trimmed).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse suggestions: {}. Content: {}",
+            e,
+            &trimmed.chars().take(200).collect::<String>()
+        )
+    })?;
+
+    diagnostics.parsed_count = parsed.len();
+
+    // Convert to Suggestion objects
+    let suggestions = parsed
+        .into_iter()
+        .filter(|s| !s.file.is_empty() && !s.summary.is_empty())
+        .map(|s| {
+            let kind = match s.kind.to_lowercase().as_str() {
+                "bugfix" => SuggestionKind::BugFix,
+                "optimization" => SuggestionKind::Optimization,
+                "refactoring" => SuggestionKind::Quality,
+                "security" => SuggestionKind::BugFix, // Security issues map to BugFix
+                "reliability" => SuggestionKind::Quality, // Reliability maps to Quality
+                _ => SuggestionKind::Improvement,
+            };
+
+            let priority = match s.priority.to_lowercase().as_str() {
+                "high" => Priority::High,
+                "low" => Priority::Low,
+                _ => Priority::Medium,
+            };
+
+            let confidence = match s.confidence.to_lowercase().as_str() {
+                "high" => Confidence::High,
+                "low" => Confidence::Low,
+                _ => Confidence::Medium,
+            };
+
+            let file_path = root.join(&s.file);
+
+            let mut suggestion = Suggestion::new(
+                kind,
+                priority,
+                file_path,
+                s.summary,
+                SuggestionSource::LlmDeep,
+            )
+            .with_detail(s.detail)
+            .with_confidence(confidence);
+
+            if let Some(line) = s.line {
+                suggestion = suggestion.with_line(line);
+            }
+
+            if !s.additional_files.is_empty() {
+                suggestion = suggestion
+                    .with_additional_files(s.additional_files.iter().map(PathBuf::from).collect());
+            }
+
+            suggestion
+        })
+        .collect();
+
+    Ok((suggestions, diagnostics))
 }
 
 /// Try to fix common JSON issues from LLM responses
@@ -276,44 +204,6 @@ fn fix_json_issues(json: &str) -> String {
         .collect();
 
     fixed
-}
-
-/// Try to parse individual suggestion objects if array parsing fails
-fn try_parse_individual_suggestions(json: &str) -> anyhow::Result<Vec<CodebaseSuggestionJson>> {
-    let mut suggestions = Vec::new();
-    let mut depth: i32 = 0;
-    let mut start = None;
-
-    for (i, c) in json.char_indices() {
-        match c {
-            '{' => {
-                if depth == 0 {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            '}' => {
-                if depth == 0 {
-                    continue;
-                }
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(s) = start {
-                        let obj_str = &json[s..=i];
-                        if let Ok(suggestion) =
-                            serde_json::from_str::<CodebaseSuggestionJson>(obj_str)
-                        {
-                            suggestions.push(suggestion);
-                        }
-                    }
-                    start = None;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(suggestions)
 }
 
 /// Truncate file contents for prompt safety (keep beginning + end)
@@ -404,11 +294,18 @@ fn extract_json_object(response: &str) -> Option<&str> {
 //  JSON SELF-CORRECTION
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Maximum number of self-correction attempts before giving up
+const MAX_CORRECTION_ATTEMPTS: usize = 3;
+
+/// Base delay between correction attempts (milliseconds)
+const CORRECTION_BACKOFF_MS: u64 = 500;
+
 /// Parse JSON from LLM response with automatic self-correction on failure.
 ///
 /// If the initial parse fails, asks the LLM to fix its own JSON output.
 /// Uses the Speed model for corrections since it's a simple task.
-/// Returns the parsed value and any additional usage from the correction call.
+/// Will retry up to MAX_CORRECTION_ATTEMPTS times with exponential backoff.
+/// Returns the parsed value and any additional usage from correction calls.
 pub(crate) async fn parse_json_with_retry<T>(
     response: &str,
     context_hint: &str,
@@ -420,52 +317,136 @@ where
     let json_str = extract_json_object(response)
         .ok_or_else(|| anyhow::anyhow!("No JSON object found in {} response", context_hint))?;
 
-    // First attempt
+    // First attempt - direct parse
     match serde_json::from_str::<T>(json_str) {
-        Ok(parsed) => Ok((parsed, None)),
-        Err(initial_error) => {
-            let fixed_json = fix_json_issues(json_str);
-            if fixed_json != json_str {
-                if let Ok(parsed) = serde_json::from_str::<T>(&fixed_json) {
-                    return Ok((parsed, None));
-                }
-            }
-            // Self-correction: ask LLM to fix its own JSON
-            let correction_response =
-                request_json_correction(response, &initial_error, context_hint).await?;
+        Ok(parsed) => return Ok((parsed, None)),
+        Err(_) => {}
+    }
 
-            // Extract and parse the corrected JSON
-            let corrected_json =
-                extract_json_object(&correction_response.content).ok_or_else(|| {
-                    anyhow::anyhow!("No JSON found in correction response for {}", context_hint)
-                })?;
-
-            let corrected_json = fix_json_issues(corrected_json);
-            let parsed = serde_json::from_str::<T>(&corrected_json).map_err(|e| {
-                anyhow::anyhow!(
-                    "JSON still invalid after self-correction for {}: {}\nOriginal error: {}",
-                    context_hint,
-                    e,
-                    initial_error
-                )
-            })?;
-
-            Ok((parsed, correction_response.usage))
+    // Second attempt - apply local fixes (trailing commas, quotes, etc.)
+    let fixed_json = fix_json_issues(json_str);
+    if fixed_json != json_str {
+        if let Ok(parsed) = serde_json::from_str::<T>(&fixed_json) {
+            return Ok((parsed, None));
         }
     }
+
+    // Third attempt - try to complete truncated JSON
+    let completed_json = try_complete_truncated_json(&fixed_json);
+    if completed_json != fixed_json {
+        if let Ok(parsed) = serde_json::from_str::<T>(&completed_json) {
+            return Ok((parsed, None));
+        }
+    }
+
+    // LLM self-correction with multiple retries
+    let mut last_error: Option<String> = None;
+    let mut total_usage: Option<Usage> = None;
+    let mut current_response = response.to_string();
+
+    for attempt in 0..MAX_CORRECTION_ATTEMPTS {
+        // Exponential backoff between attempts (skip delay on first attempt)
+        if attempt > 0 {
+            let delay_ms = CORRECTION_BACKOFF_MS * (1 << attempt);
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+        }
+
+        // Build error context for LLM
+        let error_context = last_error
+            .as_deref()
+            .unwrap_or("JSON parsing failed - structure may be malformed or truncated");
+
+        match request_json_correction_generic(&current_response, error_context, context_hint).await
+        {
+            Ok(correction_response) => {
+                // Track usage from correction
+                total_usage = merge_usage(total_usage, correction_response.usage);
+
+                // Try to extract and parse the corrected JSON
+                if let Some(corrected_json) = extract_json_object(&correction_response.content) {
+                    let corrected_json = fix_json_issues(corrected_json);
+
+                    // Try to complete if still truncated
+                    let completed = try_complete_truncated_json(&corrected_json);
+
+                    match serde_json::from_str::<T>(&completed) {
+                        Ok(parsed) => return Ok((parsed, total_usage)),
+                        Err(e) => {
+                            last_error = Some(e.to_string());
+                            current_response = correction_response.content;
+                        }
+                    }
+                } else {
+                    last_error = Some("Correction response did not contain valid JSON".to_string());
+                    current_response = correction_response.content;
+                }
+            }
+            Err(e) => {
+                // Network or API error - still try again
+                last_error = Some(e.to_string());
+            }
+        }
+    }
+
+    // All attempts failed - provide a helpful error
+    Err(anyhow::anyhow!(
+        "Failed to parse {} after {} attempts. The AI response may be malformed. Try again or skip this step.\nLast error: {}",
+        context_hint,
+        MAX_CORRECTION_ATTEMPTS,
+        last_error.unwrap_or_else(|| "unknown".to_string())
+    ))
 }
 
-/// Ask the LLM to fix malformed JSON from a previous response.
-/// Uses Speed model since JSON correction is a simple task.
-pub(crate) async fn request_json_correction(
-    original_response: &str,
-    parse_error: &serde_json::Error,
-    context_hint: &str,
-) -> anyhow::Result<LlmResponse> {
-    request_json_correction_generic(original_response, &parse_error.to_string(), context_hint).await
+/// Attempt to complete truncated JSON by adding missing closing brackets/braces
+fn try_complete_truncated_json(json: &str) -> String {
+    let mut result = json.to_string();
+    let mut open_braces = 0i32;
+    let mut open_brackets = 0i32;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for c in json.chars() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match c {
+            '{' => open_braces += 1,
+            '}' => open_braces -= 1,
+            '[' => open_brackets += 1,
+            ']' => open_brackets -= 1,
+            _ => {}
+        }
+    }
+
+    // If we're still in a string, close it
+    if in_string {
+        result.push('"');
+    }
+
+    // Close any unclosed brackets/braces
+    for _ in 0..open_brackets {
+        result.push(']');
+    }
+    for _ in 0..open_braces {
+        result.push('}');
+    }
+
+    result
 }
 
-/// Ask the LLM to fix malformed JSON (generic version taking error as string).
+/// Ask the LLM to fix malformed JSON.
 pub(crate) async fn request_json_correction_generic(
     original_response: &str,
     error_message: &str,
@@ -691,26 +672,47 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_individual_suggestions_ignores_unmatched_braces() {
-        let json = "}\n{\"file\":\"src/lib.rs\",\"kind\":\"bugfix\",\"priority\":\"high\",\"summary\":\"Issue\",\"detail\":\"Details\"}";
-        let parsed = try_parse_individual_suggestions(json).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].file, "src/lib.rs");
+    fn test_try_complete_truncated_json_closes_braces() {
+        // Simulates a truncated response with unclosed braces
+        let truncated = r#"{"summary":"test","findings":[{"file":"a.rs"#;
+        let completed = try_complete_truncated_json(truncated);
+        // Should add closing quote, brackets, and braces
+        assert!(completed.ends_with("}"));
+        assert!(completed.contains(']'));
     }
 
     #[test]
-    fn test_parse_codebase_suggestions_missing_detail() {
+    fn test_try_complete_truncated_json_handles_strings() {
+        // Truncated in the middle of a string
+        let truncated = r#"{"summary":"test value"#;
+        let completed = try_complete_truncated_json(truncated);
+        // Should close the string and object
+        assert!(completed.ends_with('}'));
+        assert!(completed.contains('"'));
+    }
+
+    #[test]
+    fn test_try_complete_truncated_json_valid_json_unchanged() {
+        let valid = r#"{"summary":"test"}"#;
+        let completed = try_complete_truncated_json(valid);
+        assert_eq!(completed, valid);
+    }
+
+    #[test]
+    fn test_parse_structured_suggestions_basic() {
         let json = r#"[{"file":"src/lib.rs","kind":"bugfix","priority":"low","summary":"Issue"}]"#;
-        let parsed = parse_codebase_suggestions(json).unwrap();
+        let root = std::path::Path::new("/project");
+        let (parsed, diagnostics) = parse_structured_suggestions(json, root).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].summary, "Issue");
+        assert_eq!(diagnostics.strategy, "structured_output");
     }
 
     #[test]
-    fn test_parse_codebase_suggestions_single_object() {
-        // LLM sometimes returns a single suggestion as an object instead of an array
-        let json = r#"{"file":"src/lib.rs","kind":"bugfix","priority":"high","summary":"Fix bug"}"#;
-        let parsed = parse_codebase_suggestions(json).unwrap();
+    fn test_parse_structured_suggestions_with_detail() {
+        let json = r#"[{"file":"src/lib.rs","kind":"bugfix","priority":"high","confidence":"high","summary":"Fix bug","detail":"Detailed description"}]"#;
+        let root = std::path::Path::new("/project");
+        let (parsed, _) = parse_structured_suggestions(json, root).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].summary, "Fix bug");
     }

@@ -201,10 +201,10 @@ fn analyze_project_structure(index: &CodebaseIndex) -> String {
     }
 
     // File count summary
+    let stats = index.stats();
     hints.push(format!(
         "Total: {} files, {} symbols",
-        index.files.len(),
-        index.symbols.len()
+        stats.file_count, stats.symbol_count
     ));
 
     hints.join("\n")

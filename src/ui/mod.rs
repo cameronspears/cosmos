@@ -1241,6 +1241,8 @@ impl App {
             confirm_ship: false,
             review_iteration: 1,
             fixed_titles: Vec::new(),
+            verification_failed: false,
+            verification_error: None,
         };
         self.workflow_step = WorkflowStep::Review;
         self.loading = LoadingState::ReviewingChanges;

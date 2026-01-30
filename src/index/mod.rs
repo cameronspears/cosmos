@@ -124,7 +124,7 @@ pub struct IndexError {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PatternKind {
     /// Long function (>50 lines)
     LongFunction,
@@ -178,8 +178,6 @@ pub struct FileSummary {
     pub used_by: Vec<PathBuf>,
     /// Files this file depends on (imports)
     pub depends_on: Vec<PathBuf>,
-    /// Quick metrics string
-    pub metrics: String,
 }
 
 impl FileSummary {
@@ -197,18 +195,6 @@ impl FileSummary {
             .take(10)
             .collect();
 
-        // Build metrics string
-        let func_count = file_index
-            .symbols
-            .iter()
-            .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
-            .count();
-
-        let metrics = format!(
-            "{} LOC | {} funcs | complexity: {:.0}",
-            file_index.loc, func_count, file_index.complexity
-        );
-
         // depends_on will be populated by the codebase index
         let depends_on: Vec<PathBuf> = file_index
             .dependencies
@@ -222,7 +208,6 @@ impl FileSummary {
             exports,
             used_by: Vec::new(), // Populated later by build_dependency_graph
             depends_on,
-            metrics,
         }
     }
 }
@@ -630,7 +615,6 @@ pub struct FileIndex {
     pub path: PathBuf,
     pub language: Language,
     pub loc: usize,
-    pub sloc: usize, // Source lines (excluding blanks/comments)
     /// Stable hash of file contents for cache invalidation
     #[serde(default)]
     pub content_hash: String,
@@ -690,25 +674,24 @@ impl FileIndex {
 pub struct CodebaseIndex {
     pub root: PathBuf,
     pub files: HashMap<PathBuf, FileIndex>,
-    pub symbols: Vec<Symbol>,
-    pub dependencies: Vec<Dependency>,
-    pub patterns: Vec<Pattern>,
-    pub cached_at: DateTime<Utc>,
     #[serde(default)]
     pub index_errors: Vec<IndexError>,
+    /// Git HEAD commit hash at time of indexing (for fast cache validation)
+    #[serde(default)]
+    pub git_head: Option<String>,
 }
 
 impl CodebaseIndex {
     /// Create a new index for a codebase
     pub fn new(root: &Path) -> anyhow::Result<Self> {
+        // Capture git HEAD for fast cache validation
+        let git_head = get_git_head(root);
+
         let mut index = Self {
             root: root.to_path_buf(),
             files: HashMap::new(),
-            symbols: Vec::new(),
-            dependencies: Vec::new(),
-            patterns: Vec::new(),
-            cached_at: Utc::now(),
             index_errors: Vec::new(),
+            git_head,
         };
 
         index.scan(root)?;
@@ -721,38 +704,48 @@ impl CodebaseIndex {
 
     /// Scan directory and index all supported files
     fn scan(&mut self, root: &Path) -> anyhow::Result<()> {
-        for entry in WalkDir::new(root)
+        use rayon::prelude::*;
+
+        // Phase 1: Collect all file paths (single-threaded, fast)
+        let file_entries: Vec<_> = WalkDir::new(root)
             .into_iter()
             .filter_entry(|e| !is_ignored(e.path()))
             .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
+            .filter(|e| e.path().is_file())
+            .filter_map(|entry| {
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let language = Language::from_extension(ext);
+                if language == Language::Unknown {
+                    None
+                } else {
+                    Some((path.to_path_buf(), language))
+                }
+            })
+            .collect();
 
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        // Phase 2: Index files in parallel
+        let results: Vec<_> = file_entries
+            .par_iter()
+            .map(|(path, language)| {
+                let rel_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+                match Self::index_file_static(path, *language, root) {
+                    Ok(file_index) => Ok((rel_path, file_index)),
+                    Err(err) => Err((rel_path, err.to_string())),
+                }
+            })
+            .collect();
 
-            let language = Language::from_extension(ext);
-            if language == Language::Unknown {
-                continue;
-            }
-
-            match self.index_file(path, language) {
-                Ok(file_index) => {
-                    // Aggregate symbols, dependencies, patterns
-                    self.symbols.extend(file_index.symbols.clone());
-                    self.dependencies.extend(file_index.dependencies.clone());
-                    self.patterns.extend(file_index.patterns.clone());
-
-                    let rel_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+        // Phase 3: Merge results (single-threaded)
+        for result in results {
+            match result {
+                Ok((rel_path, file_index)) => {
                     self.files.insert(rel_path, file_index);
                 }
-                Err(err) => {
-                    let rel_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+                Err((rel_path, reason)) => {
                     self.index_errors.push(IndexError {
                         path: rel_path,
-                        reason: err.to_string(),
+                        reason,
                     });
                 }
             }
@@ -761,8 +754,12 @@ impl CodebaseIndex {
         Ok(())
     }
 
-    /// Index a single file
-    fn index_file(&self, path: &Path, language: Language) -> anyhow::Result<FileIndex> {
+    /// Index a single file (static version for parallel processing)
+    fn index_file_static(
+        path: &Path,
+        language: Language,
+        root: &Path,
+    ) -> anyhow::Result<FileIndex> {
         let metadata = std::fs::metadata(path)?;
         if metadata.len() > MAX_INDEX_FILE_BYTES {
             return Err(anyhow::anyhow!(
@@ -789,14 +786,15 @@ impl CodebaseIndex {
             .map(DateTime::<Utc>::from)
             .unwrap_or_else(|_| Utc::now());
 
-        let loc = content.lines().count();
-        let sloc = content.lines().filter(|l| !l.trim().is_empty()).count();
         let content_hash = hash_str(&content);
+
+        // Single-pass content analysis: loc, sloc, complexity, TODOs
+        let analysis = analyze_content_single_pass(&content);
 
         // Parse with tree-sitter
         let (symbols, deps) = parser::parse_file(path, &content, language)?;
 
-        // Detect patterns
+        // Detect patterns from symbols and analysis
         let mut patterns = Vec::new();
 
         // Check for long functions
@@ -814,50 +812,43 @@ impl CodebaseIndex {
         }
 
         // Check for god module
-        if loc > GOD_MODULE_LOC_THRESHOLD {
+        if analysis.loc > GOD_MODULE_LOC_THRESHOLD {
             patterns.push(Pattern {
                 kind: PatternKind::GodModule,
                 file: path.to_path_buf(),
                 line: 1,
-                description: format!("File has {} lines", loc),
+                description: format!("File has {} lines", analysis.loc),
             });
         }
 
-        // Scan for TODO/FIXME
-        for (i, line) in content.lines().enumerate() {
-            let upper = line.to_uppercase();
-            if upper.contains("TODO") || upper.contains("FIXME") || upper.contains("HACK") {
-                patterns.push(Pattern {
-                    kind: PatternKind::TodoMarker,
-                    file: path.to_path_buf(),
-                    line: i + 1,
-                    description: line.trim().to_string(),
-                });
-            }
+        // Add TODO patterns from single-pass analysis
+        for (line_num, description) in analysis.todo_patterns {
+            patterns.push(Pattern {
+                kind: PatternKind::TodoMarker,
+                file: path.to_path_buf(),
+                line: line_num,
+                description,
+            });
         }
-
-        // Calculate complexity (simplified cyclomatic)
-        let complexity = calculate_complexity(&content, language);
 
         let mut file_index = FileIndex {
             path: path.to_path_buf(),
             language,
-            loc,
-            sloc,
+            loc: analysis.loc,
             content_hash,
             symbols,
             dependencies: deps,
             patterns,
-            complexity,
+            complexity: analysis.complexity,
             last_modified: modified,
             summary: FileSummary::default(),
             layer: None,
             feature: None,
         };
 
-        // Generate summary (rel_path will be set properly after insertion)
-        let rel_path = path.strip_prefix(&self.root).unwrap_or(path);
-        file_index.summary = FileSummary::from_file_index(&file_index, rel_path, &self.root);
+        // Generate summary
+        let rel_path = path.strip_prefix(root).unwrap_or(path);
+        file_index.summary = FileSummary::from_file_index(&file_index, rel_path, root);
 
         Ok(file_index)
     }
@@ -957,13 +948,12 @@ impl CodebaseIndex {
         }
     }
 
-    /// Get files sorted by suggestion density (most actionable first)
     /// Get total statistics
     pub fn stats(&self) -> IndexStats {
         IndexStats {
             file_count: self.files.len(),
             total_loc: self.files.values().map(|f| f.loc).sum(),
-            symbol_count: self.symbols.len(),
+            symbol_count: self.files.values().map(|f| f.symbols.len()).sum(),
             skipped_files: self.index_errors.len(),
         }
     }
@@ -1004,21 +994,45 @@ pub struct FlatTreeEntry {
     pub priority: char,
 }
 
-/// Calculate cyclomatic complexity (simplified)
-fn calculate_complexity(content: &str, _language: Language) -> f64 {
-    // Count decision points
+/// Result of single-pass content analysis
+struct ContentAnalysis {
+    loc: usize,
+    complexity: f64,
+    todo_patterns: Vec<(usize, String)>, // (line_number, description)
+}
+
+/// Analyze content in a single pass: count lines, calculate complexity, find TODOs
+fn analyze_content_single_pass(content: &str) -> ContentAnalysis {
+    let mut loc = 0;
+    let mut complexity = 1.0; // Base complexity
+    let mut todo_patterns = Vec::new();
+
+    // Decision point keywords for complexity
     let decision_keywords = [
         "if ", "else ", "elif ", "for ", "while ", "match ", "case ", "catch ", "&&", "||", "?",
         "try ", "switch ",
     ];
 
-    let mut complexity = 1.0; // Base complexity
+    for (i, line) in content.lines().enumerate() {
+        loc += 1;
 
-    for keyword in &decision_keywords {
-        complexity += content.matches(keyword).count() as f64;
+        // Check for TODO/FIXME/HACK markers
+        let upper = line.to_uppercase();
+        if upper.contains("TODO") || upper.contains("FIXME") || upper.contains("HACK") {
+            todo_patterns.push((i + 1, line.trim().to_string()));
+        }
+
+        // Count complexity decision points in this line
+        for keyword in &decision_keywords {
+            complexity += line.matches(keyword).count() as f64;
+        }
     }
 
-    complexity
+    ContentAnalysis {
+        loc,
+        complexity,
+        todo_patterns,
+    }
 }
 
 /// Check if a path should be ignored
@@ -1062,7 +1076,46 @@ fn normalize_path(path: &Path) -> PathBuf {
     result
 }
 
-/// Check if two paths match (accounting for src/ prefix and extensions)
+/// Get the current git HEAD commit hash for the repository
+fn get_git_head(root: &Path) -> Option<String> {
+    use std::process::Command;
+
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !head.is_empty() {
+            return Some(head);
+        }
+    }
+    None
+}
+
+/// Check if there are uncommitted changes in the git repository
+pub fn has_uncommitted_changes(root: &Path) -> bool {
+    use std::process::Command;
+
+    let output = match Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(root)
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return true, // Assume changes if git fails
+    };
+
+    if output.status.success() {
+        // If output is empty, no uncommitted changes
+        !output.stdout.is_empty()
+    } else {
+        true // Assume changes if command fails
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1082,8 +1135,8 @@ mod tests {
     #[test]
     fn test_complexity_calculation() {
         let code = "if x { } else { } for i in items { if y { } }";
-        let complexity = calculate_complexity(code, Language::Rust);
-        assert!(complexity > 1.0);
+        let analysis = analyze_content_single_pass(code);
+        assert!(analysis.complexity > 1.0);
     }
 
     #[test]

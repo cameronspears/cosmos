@@ -36,6 +36,9 @@ tree-sitter-go = "0.23"
 
 # Unicode text width for proper terminal display
 unicode-width = "0.2"
+
+# Parallel processing for faster indexing
+rayon = "1.10"
 fs2 = "0.4.3"
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "linux-native"] }
 url = "2"

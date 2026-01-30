@@ -873,6 +873,42 @@ pub async fn reset_cosmos(
 }
 
 fn is_index_cache_valid(root: &Path, index: &CodebaseIndex) -> bool {
+    // Fast path: check git HEAD and uncommitted changes
+    // This avoids a full filesystem walk when the repo hasn't changed
+    if let Some(cached_head) = &index.git_head {
+        if let Some(current_head) = get_current_git_head(root) {
+            if cached_head == &current_head && !crate::index::has_uncommitted_changes(root) {
+                // Git HEAD matches and no uncommitted changes - cache is valid
+                return true;
+            }
+        }
+    }
+
+    // Fall back to full hash comparison if git check fails or detects changes
+    is_index_cache_valid_full(root, index)
+}
+
+/// Get current git HEAD commit hash
+fn get_current_git_head(root: &Path) -> Option<String> {
+    use std::process::Command;
+
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !head.is_empty() {
+            return Some(head);
+        }
+    }
+    None
+}
+
+/// Full cache validation by comparing file hashes
+fn is_index_cache_valid_full(root: &Path, index: &CodebaseIndex) -> bool {
     let cached_hashes = compute_file_hashes(index);
     let current_hashes = match compute_current_hashes(root) {
         Ok(map) => map,

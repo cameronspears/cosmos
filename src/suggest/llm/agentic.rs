@@ -120,6 +120,19 @@ struct ReasoningConfig {
     exclude: bool,
 }
 
+/// Create a ResponseFormat from a JSON schema value
+/// Helper for callers that have a schema but need a ResponseFormat
+pub fn schema_to_response_format(name: &str, schema: serde_json::Value) -> ResponseFormat {
+    ResponseFormat {
+        format_type: "json_schema".to_string(),
+        json_schema: Some(JsonSchemaConfig {
+            name: name.to_string(),
+            strict: true,
+            schema,
+        }),
+    }
+}
+
 /// JSON Schema for structured suggestion output
 /// Enforces the LLM to return a valid array of suggestions
 pub fn suggestion_schema() -> ResponseFormat {
@@ -358,12 +371,21 @@ pub async fn call_llm_agentic(
             ));
         }
 
-        // If structured output is requested but content doesn't look like valid JSON array,
+        // If structured output is requested but content doesn't look like valid JSON,
         // make one more call with structured output to format the response
-        if final_response_format.is_some() && !content.trim().starts_with('[') {
+        let needs_formatting = if final_response_format.is_some() {
+            let trimmed = content.trim();
+            // Check if content looks like valid JSON (starts with [ or {)
+            !(trimmed.starts_with('[') || trimmed.starts_with('{'))
+                || serde_json::from_str::<serde_json::Value>(trimmed).is_err()
+        } else {
+            false
+        };
+
+        if needs_formatting {
             formatting_pass = true;
             response_healing_used = true;
-            // Content isn't a JSON array - ask for formatting with structured output
+            // Content isn't valid JSON - ask for formatting with structured output
             messages.push(Message {
                 role: "assistant".to_string(),
                 content: Some(content.clone()),
@@ -372,7 +394,9 @@ pub async fn call_llm_agentic(
             });
             messages.push(Message {
                 role: "user".to_string(),
-                content: Some("Format your response as a JSON array of suggestions.".to_string()),
+                content: Some(
+                    "Format your response as valid JSON matching the required schema.".to_string(),
+                ),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -433,9 +457,14 @@ pub async fn call_llm_agentic(
 
     // If we broke out of loop (hit max iterations), make one final call WITHOUT tools
     // to force the model to respond with whatever it has
+    let final_instruction = if final_response_format.is_some() {
+        "You've gathered enough context. Now respond with valid JSON matching the required schema. No more tool calls."
+    } else {
+        "You've gathered enough context. Now respond based on what you've learned. No more tool calls."
+    };
     messages.push(Message {
         role: "user".to_string(),
-        content: Some("You've gathered enough context. Now respond with your JSON suggestions based on what you've learned. No more tool calls.".to_string()),
+        content: Some(final_instruction.to_string()),
         tool_calls: None,
         tool_call_id: None,
     });

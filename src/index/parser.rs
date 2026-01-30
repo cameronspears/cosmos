@@ -1,8 +1,67 @@
 //! Tree-sitter based parser for multi-language AST analysis
 
 use super::{Dependency, Language, Symbol, SymbolKind, Visibility};
+use std::cell::RefCell;
 use std::path::Path;
 use tree_sitter::Parser;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  THREAD-LOCAL PARSER POOL
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Tree-sitter parsers are expensive to create but can be reused for multiple
+// files of the same language. We use thread-local storage to give each rayon
+// worker thread its own set of pre-configured parsers.
+
+thread_local! {
+    static RUST_PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        // Ignore error here - will be caught at parse time if language fails
+        let _ = p.set_language(&tree_sitter_rust::LANGUAGE.into());
+        p
+    });
+
+    static JS_PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        let _ = p.set_language(&tree_sitter_javascript::LANGUAGE.into());
+        p
+    });
+
+    static TS_PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        let _ = p.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into());
+        p
+    });
+
+    static PYTHON_PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        let _ = p.set_language(&tree_sitter_python::LANGUAGE.into());
+        p
+    });
+
+    static GO_PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        let _ = p.set_language(&tree_sitter_go::LANGUAGE.into());
+        p
+    });
+}
+
+/// Parse content using a thread-local parser for the given language
+fn parse_with_pooled_parser(
+    content: &str,
+    language: Language,
+) -> anyhow::Result<tree_sitter::Tree> {
+    let parse_result = match language {
+        Language::Rust => RUST_PARSER.with(|p| p.borrow_mut().parse(content, None)),
+        Language::JavaScript => JS_PARSER.with(|p| p.borrow_mut().parse(content, None)),
+        Language::TypeScript => TS_PARSER.with(|p| p.borrow_mut().parse(content, None)),
+        Language::Python => PYTHON_PARSER.with(|p| p.borrow_mut().parse(content, None)),
+        Language::Go => GO_PARSER.with(|p| p.borrow_mut().parse(content, None)),
+        Language::Unknown => return Err(anyhow::anyhow!("Unknown language")),
+    };
+
+    parse_result.ok_or_else(|| anyhow::anyhow!("Failed to parse file"))
+}
 
 /// Parse a file and extract symbols and dependencies
 pub fn parse_file(
@@ -10,24 +69,11 @@ pub fn parse_file(
     content: &str,
     language: Language,
 ) -> anyhow::Result<(Vec<Symbol>, Vec<Dependency>)> {
-    let mut parser = Parser::new();
+    if language == Language::Unknown {
+        return Ok((Vec::new(), Vec::new()));
+    }
 
-    // Set the language
-    let ts_language = match language {
-        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
-        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        Language::Python => tree_sitter_python::LANGUAGE.into(),
-        Language::Go => tree_sitter_go::LANGUAGE.into(),
-        Language::Unknown => return Ok((Vec::new(), Vec::new())),
-    };
-
-    parser.set_language(&ts_language)?;
-
-    let tree = parser
-        .parse(content, None)
-        .ok_or_else(|| anyhow::anyhow!("Failed to parse file"))?;
-
+    let tree = parse_with_pooled_parser(content, language)?;
     let root = tree.root_node();
 
     // Extract symbols and dependencies based on language

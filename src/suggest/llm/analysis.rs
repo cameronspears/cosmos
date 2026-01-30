@@ -1,7 +1,7 @@
 use super::agentic::{call_llm_agentic, suggestion_schema};
 use super::client::{call_llm_with_usage, truncate_str};
 use super::models::{Model, Usage};
-use super::parse::{parse_codebase_suggestions_with_diagnostics, ParseDiagnostics};
+use super::parse::{parse_structured_suggestions, ParseDiagnostics};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{ANALYZE_CODEBASE_AGENTIC_SYSTEM, ASK_QUESTION_SYSTEM};
 use super::summaries::discover_project_context;
@@ -21,6 +21,374 @@ use crate::index::GOD_MODULE_LOC_THRESHOLD;
 /// Complexity threshold above which a file is considered a "hotspot"
 const HIGH_COMPLEXITY_THRESHOLD: f64 = 20.0;
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  ADAPTIVE CONTEXT LIMITS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Adaptive limits for context building based on codebase size
+struct AdaptiveLimits {
+    /// Max files to list in ask_question
+    file_list_limit: usize,
+    /// Max symbols to include
+    symbol_limit: usize,
+    /// Max directories to show in key areas
+    key_areas_limit: usize,
+    /// Max changed files to show
+    changed_files_limit: usize,
+    /// Max complex files to show
+    complex_files_limit: usize,
+    /// Max TODO markers to show
+    todo_limit: usize,
+    /// Max files in all files section
+    all_files_limit: usize,
+    /// Max code preview files
+    code_preview_files: usize,
+    /// Max lines per code preview
+    code_preview_lines: usize,
+    /// Max glossary terms
+    glossary_terms: usize,
+}
+
+impl AdaptiveLimits {
+    fn for_codebase(file_count: usize, _total_loc: usize) -> Self {
+        // Scale limits based on codebase size
+        // Smaller codebases: more detail per file
+        // Larger codebases: broader coverage
+        if file_count < 50 {
+            // Small codebase: show more detail
+            Self {
+                file_list_limit: file_count.min(50),
+                symbol_limit: 150,
+                key_areas_limit: 8,
+                changed_files_limit: 8,
+                complex_files_limit: 6,
+                todo_limit: 6,
+                all_files_limit: file_count.min(50),
+                code_preview_files: 4,
+                code_preview_lines: 50,
+                glossary_terms: 10,
+            }
+        } else if file_count < 200 {
+            // Medium codebase: balanced
+            Self {
+                file_list_limit: 50,
+                symbol_limit: 100,
+                key_areas_limit: 6,
+                changed_files_limit: 6,
+                complex_files_limit: 4,
+                todo_limit: 4,
+                all_files_limit: 40,
+                code_preview_files: 3,
+                code_preview_lines: 40,
+                glossary_terms: 8,
+            }
+        } else if file_count < 500 {
+            // Large codebase: prioritize structure
+            Self {
+                file_list_limit: 40,
+                symbol_limit: 80,
+                key_areas_limit: 8,
+                changed_files_limit: 5,
+                complex_files_limit: 4,
+                todo_limit: 4,
+                all_files_limit: 35,
+                code_preview_files: 3,
+                code_preview_lines: 35,
+                glossary_terms: 6,
+            }
+        } else {
+            // Very large codebase: focus on key areas
+            Self {
+                file_list_limit: 30,
+                symbol_limit: 60,
+                key_areas_limit: 10,
+                changed_files_limit: 4,
+                complex_files_limit: 3,
+                todo_limit: 3,
+                all_files_limit: 30,
+                code_preview_files: 2,
+                code_preview_lines: 30,
+                glossary_terms: 6,
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  RELEVANCE-BASED FILE PRIORITIZATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crate::index::FileIndex;
+use chrono::Utc;
+
+/// Calculate a relevance score for a file based on multiple factors.
+///
+/// Higher scores indicate more relevant files that should be prioritized
+/// for inclusion in LLM context. Factors considered:
+/// - Changed status (uncommitted/staged files are highest priority)
+/// - Complexity (complex files need more attention)
+/// - Pattern density (files with detected issues are actionable)
+/// - Centrality (files used by many others are architecturally important)
+/// - Recency (recently modified files are contextually relevant)
+pub fn calculate_relevance_score(
+    file: &FileIndex,
+    context: &WorkContext,
+    file_path: &PathBuf,
+) -> f64 {
+    let mut score = 0.0;
+
+    // Recently changed (highest priority)
+    if context.uncommitted_files.contains(file_path) {
+        score += 100.0;
+    }
+    if context.staged_files.contains(file_path) {
+        score += 80.0;
+    }
+    if context.untracked_files.contains(file_path) {
+        score += 60.0;
+    }
+
+    // High complexity (likely needs attention)
+    // Cap at 20 to avoid overwhelming other factors
+    score += (file.complexity / 10.0).min(20.0);
+
+    // Has detected patterns (actionable)
+    score += file.patterns.len() as f64 * 5.0;
+
+    // Central to codebase (many dependents)
+    score += file.summary.used_by.len() as f64 * 3.0;
+
+    // Has many dependencies (integrator file)
+    score += (file.summary.depends_on.len() as f64 * 1.5).min(10.0);
+
+    // Large files may need more attention
+    if file.loc > 500 {
+        score += 5.0;
+    }
+
+    // Recency bonus - recently modified files are contextually relevant
+    let age_days = (Utc::now() - file.last_modified).num_days();
+    if age_days < 1 {
+        score += 15.0;
+    } else if age_days < 7 {
+        score += 10.0;
+    } else if age_days < 30 {
+        score += 5.0;
+    }
+
+    score
+}
+
+/// Get files sorted by relevance score (most relevant first)
+pub fn get_priority_files(
+    index: &CodebaseIndex,
+    context: &WorkContext,
+    limit: usize,
+) -> Vec<PathBuf> {
+    let mut scored_files: Vec<_> = index
+        .files
+        .iter()
+        .map(|(path, file)| {
+            let score = calculate_relevance_score(file, context, path);
+            (path.clone(), score)
+        })
+        .collect();
+
+    // Sort by score descending
+    scored_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    scored_files
+        .into_iter()
+        .take(limit)
+        .map(|(p, _)| p)
+        .collect()
+}
+
+/// Expand a set of files to include their key dependencies and dependents.
+///
+/// This improves context quality by ensuring the model understands
+/// how files relate to each other. For each file:
+/// - Adds direct dependencies (files it imports)
+/// - Adds files that depend on it (may be affected by changes)
+///
+/// The expansion is limited to avoid bloating context.
+pub fn expand_context_with_dependencies(
+    files: &[PathBuf],
+    index: &CodebaseIndex,
+    max_additions: usize,
+) -> Vec<PathBuf> {
+    let mut expanded: Vec<PathBuf> = files.to_vec();
+    let mut added = 0;
+
+    // Use a set for O(1) lookup
+    let existing: HashSet<_> = files.iter().cloned().collect();
+
+    for file_path in files {
+        if added >= max_additions {
+            break;
+        }
+
+        if let Some(file_index) = index.files.get(file_path) {
+            // Add direct dependencies (imports) - most important for understanding
+            for dep in file_index.summary.depends_on.iter().take(2) {
+                if added >= max_additions {
+                    break;
+                }
+                if !existing.contains(dep) && !expanded.contains(dep) {
+                    if index.files.contains_key(dep) {
+                        expanded.push(dep.clone());
+                        added += 1;
+                    }
+                }
+            }
+
+            // Add files that depend on this (may be affected)
+            for user in file_index.summary.used_by.iter().take(1) {
+                if added >= max_additions {
+                    break;
+                }
+                if !existing.contains(user) && !expanded.contains(user) {
+                    if index.files.contains_key(user) {
+                        expanded.push(user.clone());
+                        added += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    expanded
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PATTERN SUMMARY
+// ═══════════════════════════════════════════════════════════════════════════
+
+use std::collections::HashMap;
+
+/// Summarize all detected patterns in the codebase for LLM context.
+///
+/// Provides a high-level view of code health indicators:
+/// - Long functions (>50 lines)
+/// - Deep nesting issues
+/// - God modules (>500 lines)
+/// - TODO/FIXME markers
+/// - etc.
+pub fn summarize_patterns(index: &CodebaseIndex) -> String {
+    let mut by_kind: HashMap<PatternKind, usize> = HashMap::new();
+
+    for file in index.files.values() {
+        for pattern in &file.patterns {
+            *by_kind.entry(pattern.kind).or_default() += 1;
+        }
+    }
+
+    if by_kind.is_empty() {
+        return String::new();
+    }
+
+    let mut parts = Vec::new();
+
+    if let Some(&count) = by_kind.get(&PatternKind::LongFunction) {
+        if count > 0 {
+            parts.push(format!("{} long functions (>50 lines)", count));
+        }
+    }
+
+    if let Some(&count) = by_kind.get(&PatternKind::GodModule) {
+        if count > 0 {
+            parts.push(format!("{} large modules (>500 lines)", count));
+        }
+    }
+
+    if let Some(&count) = by_kind.get(&PatternKind::DeepNesting) {
+        if count > 0 {
+            parts.push(format!("{} deep nesting issues", count));
+        }
+    }
+
+    if let Some(&count) = by_kind.get(&PatternKind::TodoMarker) {
+        if count > 0 {
+            parts.push(format!("{} TODO/FIXME markers", count));
+        }
+    }
+
+    if let Some(&count) = by_kind.get(&PatternKind::ManyParameters) {
+        if count > 0 {
+            parts.push(format!("{} functions with many parameters", count));
+        }
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("Code health: {}", parts.join(", "))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SMART SYMBOL SELECTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crate::index::{Symbol, Visibility};
+
+/// Select the most important symbols from the codebase.
+///
+/// Prioritizes symbols by:
+/// 1. Visibility (Public > Internal > Private)
+/// 2. Complexity (higher complexity = more interesting)
+/// 3. Kind (Structs/Classes first, then Functions)
+pub fn select_priority_symbols<'a>(index: &'a CodebaseIndex, limit: usize) -> Vec<&'a Symbol> {
+    let mut symbols: Vec<_> = index
+        .files
+        .values()
+        .flat_map(|f| f.symbols.iter())
+        .collect();
+
+    symbols.sort_by(|a, b| {
+        // Public > Internal > Private
+        let vis_ord = visibility_rank(&a.visibility).cmp(&visibility_rank(&b.visibility));
+        if vis_ord != std::cmp::Ordering::Equal {
+            return vis_ord.reverse(); // Higher rank first
+        }
+
+        // Higher complexity = more interesting
+        let complexity_ord = b
+            .complexity
+            .partial_cmp(&a.complexity)
+            .unwrap_or(std::cmp::Ordering::Equal);
+        if complexity_ord != std::cmp::Ordering::Equal {
+            return complexity_ord;
+        }
+
+        // Sort by kind - Structs/Classes first, then Functions
+        kind_rank(&a.kind).cmp(&kind_rank(&b.kind))
+    });
+
+    symbols.into_iter().take(limit).collect()
+}
+
+/// Rank visibility (higher = more important)
+fn visibility_rank(vis: &Visibility) -> u8 {
+    match vis {
+        Visibility::Public => 3,
+        Visibility::Internal => 2,
+        Visibility::Private => 1,
+    }
+}
+
+/// Rank symbol kind (lower = more important)
+fn kind_rank(kind: &SymbolKind) -> u8 {
+    match kind {
+        SymbolKind::Class | SymbolKind::Struct => 1,
+        SymbolKind::Interface | SymbolKind::Trait => 2,
+        SymbolKind::Enum => 3,
+        SymbolKind::Function | SymbolKind::Method => 4,
+        SymbolKind::Module => 5,
+        SymbolKind::Constant | SymbolKind::Variable => 6,
+    }
+}
+
 /// Ask cosmos a general question about the codebase
 /// Uses the Smart model for thoughtful, well-reasoned responses in plain English
 pub async fn ask_question(
@@ -31,10 +399,12 @@ pub async fn ask_question(
 ) -> anyhow::Result<(String, Option<Usage>)> {
     // Build context about the codebase
     let stats = index.stats();
+    let limits = AdaptiveLimits::for_codebase(stats.file_count, stats.total_loc);
+
     let file_list: Vec<_> = index
         .files
         .keys()
-        .take(50) // Limit to avoid huge prompts
+        .take(limits.file_list_limit)
         .map(|p| p.display().to_string())
         .collect();
 
@@ -49,7 +419,7 @@ pub async fn ask_question(
                 SymbolKind::Function | SymbolKind::Struct | SymbolKind::Enum
             )
         })
-        .take(100)
+        .take(limits.symbol_limit)
         .map(|s| format!("{:?}: {}", s.kind, s.name))
         .collect();
 
@@ -147,8 +517,9 @@ pub async fn analyze_codebase_agentic(
     )
     .await?;
 
+    // Parse directly - structured output guarantees valid JSON
     let (mut suggestions, parse_diagnostics) =
-        parse_codebase_suggestions_with_diagnostics(&response.content)?;
+        parse_structured_suggestions(&response.content, &index.root)?;
     let raw_count = suggestions.len();
 
     // Deduplicate suggestions (LLM sometimes returns near-duplicates)
@@ -280,6 +651,7 @@ fn build_lean_analysis_prompt(
     glossary: Option<&DomainGlossary>,
 ) -> String {
     let stats = index.stats();
+    let limits = AdaptiveLimits::for_codebase(stats.file_count, stats.total_loc);
     let project_name = index
         .root
         .file_name()
@@ -290,8 +662,9 @@ fn build_lean_analysis_prompt(
 
     // ═══ TIER 0: THE GIST ═══
     let project_context = discover_project_context(index);
+    let pattern_summary = summarize_patterns(index);
     sections.push(format!(
-        "═══ THE GIST ═══\n{} ({} files, {} LOC)\n{}",
+        "═══ THE GIST ═══\n{} ({} files, {} LOC)\n{}{}",
         project_name,
         stats.file_count,
         stats.total_loc,
@@ -299,6 +672,11 @@ fn build_lean_analysis_prompt(
             truncate_str(&project_context, 300).to_string()
         } else {
             "A software project.".to_string()
+        },
+        if !pattern_summary.is_empty() {
+            format!("\n{}", pattern_summary)
+        } else {
+            String::new()
         }
     ));
 
@@ -318,7 +696,7 @@ fn build_lean_analysis_prompt(
     if !dir_list.is_empty() {
         let areas: Vec<_> = dir_list
             .iter()
-            .take(6)
+            .take(limits.key_areas_limit)
             .map(|(d, c)| format!("{}/ ({} files)", d, c))
             .collect();
         sections.push(format!("\n\n═══ KEY AREAS ═══\n{}", areas.join("\n")));
@@ -328,11 +706,15 @@ fn build_lean_analysis_prompt(
     let changed: HashSet<PathBuf> = context.all_changed_files().into_iter().cloned().collect();
 
     // Collect top priority files for code preview
-    let mut priority_files: Vec<PathBuf> = changed.iter().take(2).cloned().collect();
+    let mut priority_files: Vec<PathBuf> = changed
+        .iter()
+        .take(limits.code_preview_files.min(2))
+        .cloned()
+        .collect();
 
     if !changed.is_empty() {
         let mut s = String::from("\n\n═══ PRIORITY FILES ═══\n[CHANGED] Read these first:");
-        for path in changed.iter().take(6) {
+        for path in changed.iter().take(limits.changed_files_limit) {
             let summary = index
                 .files
                 .get(path)
@@ -358,12 +740,12 @@ fn build_lean_analysis_prompt(
         .iter()
         .filter(|f| f.complexity > HIGH_COMPLEXITY_THRESHOLD || f.loc > GOD_MODULE_LOC_THRESHOLD)
         .filter(|f| !changed.contains(&f.path))
-        .take(4)
+        .take(limits.complex_files_limit)
         .collect();
 
     // Add top complex file to priority list
     if let Some(h) = hot.first() {
-        if priority_files.len() < 3 {
+        if priority_files.len() < limits.code_preview_files {
             priority_files.push(h.path.clone());
         }
     }
@@ -381,12 +763,13 @@ fn build_lean_analysis_prompt(
         sections.push(s);
     }
 
-    // TODOs
+    // TODOs - collect from all files
     let todos: Vec<_> = index
-        .patterns
-        .iter()
+        .files
+        .values()
+        .flat_map(|f| f.patterns.iter())
         .filter(|p| matches!(p.kind, PatternKind::TodoMarker))
-        .take(4)
+        .take(limits.todo_limit)
         .collect();
     if !todos.is_empty() {
         let mut s = String::from("\n[TODO] Known issues:");
@@ -401,15 +784,15 @@ fn build_lean_analysis_prompt(
         sections.push(s);
     }
 
-    // ═══ CODE PREVIEW (first 35 lines of top priority files) ═══
+    // ═══ CODE PREVIEW ═══
     if !priority_files.is_empty() {
         let mut preview_section = String::from("\n\n═══ CODE PREVIEW ═══");
-        for path in priority_files.iter().take(3) {
+        for path in priority_files.iter().take(limits.code_preview_files) {
             let full_path = index.root.join(path);
             if let Ok(content) = std::fs::read_to_string(&full_path) {
                 let lines: String = content
                     .lines()
-                    .take(35)
+                    .take(limits.code_preview_lines)
                     .enumerate()
                     .map(|(i, l)| format!("{:3}| {}", i + 1, l))
                     .collect::<Vec<_>>()
@@ -424,7 +807,7 @@ fn build_lean_analysis_prompt(
     let all_paths: Vec<_> = index
         .files
         .keys()
-        .take(35)
+        .take(limits.all_files_limit)
         .map(|p| p.display().to_string())
         .collect();
     if !all_paths.is_empty() {
@@ -439,7 +822,7 @@ fn build_lean_analysis_prompt(
 
     if let Some(g) = glossary {
         if !g.is_empty() {
-            let terms = g.to_prompt_context(6);
+            let terms = g.to_prompt_context(limits.glossary_terms);
             if !terms.trim().is_empty() {
                 sections.push(format!("\n\nTERMINOLOGY:\n{}", terms));
             }

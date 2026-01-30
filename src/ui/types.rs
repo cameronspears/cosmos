@@ -224,6 +224,10 @@ pub struct ReviewState {
     pub confirm_ship: bool,
     pub review_iteration: u32,
     pub fixed_titles: Vec<String>,
+    /// Set when verification fails - allows user to proceed anyway with a warning
+    pub verification_failed: bool,
+    /// Error message from failed verification (for display)
+    pub verification_error: Option<String>,
 }
 
 /// State for the Ship step

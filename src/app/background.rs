@@ -424,7 +424,23 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 if app.review_state.fixing {
                     app.review_state.fixing = false;
                 }
-                app.show_toast(&truncate(&e, 100));
+
+                // Check if this is a verification error - allow user to proceed anyway
+                if e.contains("verification failed") || e.contains("Re-verification failed") {
+                    app.review_state.reviewing = false;
+                    app.review_state.verification_failed = true;
+                    app.review_state.verification_error = Some(truncate(&e, 200).to_string());
+                    // Set a summary indicating verification was skipped
+                    if app.review_state.summary.is_empty() {
+                        app.review_state.summary =
+                            "Verification unavailable - you can still proceed to ship".to_string();
+                    }
+                    app.show_toast(
+                        "Verification failed - press Enter to ship anyway or fix issues manually",
+                    );
+                } else {
+                    app.show_toast(&truncate(&e, 100));
+                }
             }
             BackgroundMessage::QuestionResponse { answer, usage, .. } => {
                 // Track session cost for display

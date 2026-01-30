@@ -1,7 +1,7 @@
-use super::agentic::call_llm_agentic;
+use super::agentic::{call_llm_agentic, schema_to_response_format};
 use super::client::{call_llm_structured_cached, StructuredResponse};
 use super::models::{Model, Usage};
-use super::parse::{parse_json_with_retry, truncate_content, truncate_content_around_line};
+use super::parse::{truncate_content, truncate_content_around_line};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{fix_content_system, multi_file_fix_system, FIX_PREVIEW_AGENTIC_SYSTEM};
 use crate::suggest::Suggestion;
@@ -821,6 +821,86 @@ impl FixScope {
     }
 }
 
+/// JSON Schema for FixPreview - used for structured output on final agentic response
+/// This ensures the LLM returns valid, parseable JSON matching our expected format
+pub(crate) fn fix_preview_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "verified": {
+                "type": "boolean",
+                "description": "Whether the issue was verified to exist in the code"
+            },
+            "friendly_title": {
+                "type": "string",
+                "description": "Friendly topic name for non-technical users"
+            },
+            "problem_summary": {
+                "type": "string",
+                "description": "Behavior-focused problem description"
+            },
+            "outcome": {
+                "type": "string",
+                "description": "What happens after the fix"
+            },
+            "verification_note": {
+                "type": "string",
+                "description": "Explanation of verification result"
+            },
+            "evidence_snippet": {
+                "type": ["string", "null"],
+                "description": "Code snippet that proves the claim"
+            },
+            "evidence_line": {
+                "type": ["integer", "null"],
+                "description": "Starting line number of the evidence snippet"
+            },
+            "description": {
+                "type": "string",
+                "description": "Human-readable description of what will change"
+            },
+            "affected_areas": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Which functions/areas are affected"
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["small", "medium", "large"],
+                "description": "Estimated scope of the fix"
+            }
+        },
+        "required": ["verified", "friendly_title", "problem_summary", "outcome", "verification_note", "description", "affected_areas", "scope"],
+        "additionalProperties": false
+    })
+}
+
+/// Response structure for fix preview (for structured output parsing)
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct FixPreviewJson {
+    pub verified: bool,
+    #[serde(default)]
+    pub friendly_title: String,
+    #[serde(default)]
+    pub problem_summary: String,
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub verification_note: String,
+    pub evidence_snippet: Option<String>,
+    pub evidence_line: Option<u32>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub affected_areas: Vec<String>,
+    #[serde(default = "default_scope")]
+    pub scope: String,
+}
+
+fn default_scope() -> String {
+    "medium".to_string()
+}
+
 /// Generate a preview using lean hybrid verification.
 ///
 /// Strategy:
@@ -893,6 +973,9 @@ VERIFY:
         suggestion.file.display(),
     );
 
+    // Use structured output to guarantee valid JSON response
+    let response_format = schema_to_response_format("fix_preview", fix_preview_schema());
+
     // Use Speed model with high reasoning effort for cost-effective fix planning
     // 3 iterations - code already provided, minimal exploration needed
     let response = call_llm_agentic(
@@ -902,15 +985,63 @@ VERIFY:
         repo_root,
         false,
         3, // max iterations - verification has code upfront
-        None,
+        Some(response_format),
     )
     .await?;
 
-    // Parse the final response as JSON
-    let (parsed, _correction_usage): (serde_json::Value, _) =
-        parse_json_with_retry(&response.content, "fix preview").await?;
+    // Response is guaranteed to be valid JSON matching the schema
+    let parsed: FixPreviewJson = serde_json::from_str(&response.content).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse fix preview response: {}. Content: {}",
+            e,
+            &response.content.chars().take(200).collect::<String>()
+        )
+    })?;
 
-    build_fix_preview(parsed, modifier.map(String::from))
+    // Convert parsed JSON to FixPreview
+    let scope = match parsed.scope.as_str() {
+        "small" => FixScope::Small,
+        "large" => FixScope::Large,
+        _ => FixScope::Medium,
+    };
+
+    Ok(FixPreview {
+        verified: parsed.verified,
+        friendly_title: if parsed.friendly_title.is_empty() {
+            "Issue".to_string()
+        } else {
+            parsed.friendly_title
+        },
+        problem_summary: if parsed.problem_summary.is_empty() {
+            "An issue was found that needs attention.".to_string()
+        } else {
+            parsed.problem_summary
+        },
+        outcome: if parsed.outcome.is_empty() {
+            "This will be fixed.".to_string()
+        } else {
+            parsed.outcome
+        },
+        verification_note: if parsed.verification_note.is_empty() {
+            if parsed.verified {
+                "Issue verified".to_string()
+            } else {
+                "Issue not found".to_string()
+            }
+        } else {
+            parsed.verification_note
+        },
+        evidence_snippet: parsed.evidence_snippet.filter(|s| !s.trim().is_empty()),
+        evidence_line: parsed.evidence_line,
+        description: if parsed.description.is_empty() {
+            "Fix the identified issue".to_string()
+        } else {
+            parsed.description
+        },
+        affected_areas: parsed.affected_areas,
+        scope,
+        modifier: modifier.map(String::from),
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1172,99 +1303,6 @@ fn is_stopword(token: &str) -> bool {
             | "paths"
             | "mod"
     )
-}
-
-fn build_fix_preview(
-    parsed: serde_json::Value,
-    modifier: Option<String>,
-) -> anyhow::Result<FixPreview> {
-    let verified = parsed
-        .get("verified")
-        .and_then(|v| v.as_bool())
-        .or_else(|| {
-            // Handle string "true"/"false" in case of JSON issues
-            parsed
-                .get("verified")
-                .and_then(|v| v.as_str())
-                .map(|s| s.eq_ignore_ascii_case("true"))
-        })
-        .unwrap_or(true); // Default to true for backwards compatibility
-
-    let verification_note = parsed
-        .get("verification_note")
-        .and_then(|v| v.as_str())
-        .unwrap_or(if verified {
-            "Issue verified"
-        } else {
-            "Issue not found"
-        })
-        .to_string();
-
-    // Parse user-facing fields (non-technical)
-    let friendly_title = parsed
-        .get("friendly_title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Issue")
-        .to_string();
-
-    let problem_summary = parsed
-        .get("problem_summary")
-        .and_then(|v| v.as_str())
-        .unwrap_or("An issue was found that needs attention.")
-        .to_string();
-
-    let outcome = parsed
-        .get("outcome")
-        .and_then(|v| v.as_str())
-        .unwrap_or("This will be fixed.")
-        .to_string();
-
-    let evidence_snippet = parsed
-        .get("evidence_snippet")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.to_string());
-
-    let evidence_line = parsed
-        .get("evidence_line")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32);
-
-    let description = parsed
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Fix the identified issue")
-        .to_string();
-
-    let affected_areas = parsed
-        .get("affected_areas")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let scope = match parsed.get("scope").and_then(|v| v.as_str()) {
-        Some("small") => FixScope::Small,
-        Some("large") => FixScope::Large,
-        _ => FixScope::Medium,
-    };
-
-    Ok(FixPreview {
-        verified,
-        friendly_title,
-        problem_summary,
-        outcome,
-        verification_note,
-        evidence_snippet,
-        evidence_line,
-        description,
-        affected_areas,
-        scope,
-        modifier,
-    })
 }
 
 #[cfg(test)]

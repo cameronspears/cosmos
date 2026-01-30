@@ -833,7 +833,6 @@ mod tests {
 
     #[test]
     fn test_generate_cluster_name_fallback() {
-        use chrono::Utc;
         use std::collections::HashMap;
 
         let files = vec![
@@ -846,11 +845,8 @@ mod tests {
         let index = CodebaseIndex {
             root: PathBuf::new(),
             files: HashMap::new(),
-            symbols: Vec::new(),
-            dependencies: Vec::new(),
-            patterns: Vec::new(),
-            cached_at: Utc::now(),
             index_errors: Vec::new(),
+            git_head: None,
         };
 
         assert_eq!(generate_cluster_name(&files, &index, 0), "user");
