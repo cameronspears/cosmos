@@ -81,6 +81,26 @@ impl Usage {
     }
 }
 
+/// Merge two optional `Usage` values, summing their token counts and costs.
+pub(crate) fn merge_usage(primary: Option<Usage>, secondary: Option<Usage>) -> Option<Usage> {
+    match (primary, secondary) {
+        (Some(p), Some(s)) => Some(Usage {
+            prompt_tokens: p.prompt_tokens + s.prompt_tokens,
+            completion_tokens: p.completion_tokens + s.completion_tokens,
+            total_tokens: p.total_tokens + s.total_tokens,
+            cost: match (p.cost, s.cost) {
+                (Some(pc), Some(sc)) => Some(pc + sc),
+                (Some(pc), None) => Some(pc),
+                (None, Some(sc)) => Some(sc),
+                (None, None) => None,
+            },
+        }),
+        (Some(p), None) => Some(p),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

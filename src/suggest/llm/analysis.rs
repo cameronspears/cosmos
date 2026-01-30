@@ -348,7 +348,7 @@ pub async fn analyze_codebase_agentic(
         final_count,
     );
 
-    Ok((suggestions, None, diagnostics))
+    Ok((suggestions, response.usage, diagnostics))
 }
 
 fn build_suggestion_diagnostics(

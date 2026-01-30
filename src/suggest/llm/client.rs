@@ -527,6 +527,115 @@ pub struct StructuredResponse<T> {
     pub usage: Option<Usage>,
 }
 
+/// Call LLM API with structured output (strict JSON schema).
+///
+/// Uses OpenRouter's structured outputs feature (`json_schema`) and Response Healing.
+/// This is the preferred path for JSON responses that should not rely on custom
+/// "ask the model to fix JSON" retries.
+pub(crate) async fn call_llm_structured<T>(
+    system: &str,
+    user: &str,
+    model: Model,
+    schema_name: &str,
+    schema: serde_json::Value,
+) -> anyhow::Result<StructuredResponse<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let api_key = api_key().ok_or_else(|| {
+        anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
+    })?;
+
+    if !model.supports_structured_outputs() {
+        return Err(anyhow::anyhow!(
+            "Structured outputs aren't supported for {}. Try a different model.",
+            model.id()
+        ));
+    }
+
+    let client = create_http_client(REQUEST_TIMEOUT_SECS)?;
+
+    let response_format = Some(ResponseFormat {
+        format_type: "json_schema".to_string(),
+        json_schema: Some(JsonSchemaWrapper {
+            name: schema_name.to_string(),
+            strict: true,
+            schema,
+        }),
+    });
+
+    let stream = false;
+    let plugins = response_healing_plugins(&response_format, stream);
+    let provider = provider_config(&response_format);
+    let reasoning = reasoning_config(model);
+
+    let request = ChatRequest {
+        model: model.id().to_string(),
+        messages: vec![
+            Message {
+                role: "system".to_string(),
+                content: system.to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: user.to_string(),
+            },
+        ],
+        max_tokens: model.max_tokens(),
+        stream,
+        response_format,
+        reasoning,
+        plugins,
+        provider: Some(provider),
+    };
+
+    let text = send_with_retry(&client, &api_key, &request).await?;
+
+    let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse OpenRouter response: {}\n{}",
+            e,
+            sanitize_api_response(&text)
+        )
+    })?;
+
+    let choice = parsed.choices.first();
+
+    // Check for refusal (content moderation)
+    if let Some(c) = choice {
+        if let Some(refusal) = &c.message.refusal {
+            return Err(anyhow::anyhow!(
+                "Request was refused: {}",
+                truncate_str(refusal, 200)
+            ));
+        }
+    }
+
+    // Extract content, handling null/empty cases
+    let content = choice
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_default();
+
+    if content.is_empty() {
+        return Err(anyhow::anyhow!(
+            "API returned empty response. The model may have been rate limited or failed to generate content. Please try again."
+        ));
+    }
+
+    let data: T = serde_json::from_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse structured response: {}\nContent: {}",
+            e,
+            sanitize_api_response(&content)
+        )
+    })?;
+
+    Ok(StructuredResponse {
+        data,
+        usage: parsed.usage,
+    })
+}
+
 /// Call LLM API with structured output AND Anthropic prompt caching.
 ///
 /// This variant enables prompt caching for Anthropic models (Claude), which:

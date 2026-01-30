@@ -1,6 +1,5 @@
-use super::client::call_llm_with_usage;
+use super::client::{call_llm_structured, StructuredResponse};
 use super::models::{Model, Usage};
-use super::parse::{merge_usage, parse_json_with_retry};
 use super::prompts::GROUPING_CLASSIFY_SYSTEM;
 use crate::cache::normalize_summary_path;
 use crate::grouping::Layer;
@@ -43,6 +42,29 @@ struct GroupingAiFile {
     confidence: f64,
 }
 
+fn grouping_ai_response_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "files": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "path": { "type": "string" },
+                        "layer": { "type": "string" },
+                        "confidence": { "type": "number" }
+                    },
+                    "required": ["path", "layer", "confidence"]
+                }
+            }
+        },
+        "required": ["files"]
+    })
+}
+
 pub async fn classify_grouping_candidates(
     index: &CodebaseIndex,
     candidates: &[PathBuf],
@@ -65,12 +87,17 @@ pub async fn classify_grouping_candidates(
         serde_json::to_string_pretty(&file_contexts)?
     );
 
-    let response =
-        call_llm_with_usage(GROUPING_CLASSIFY_SYSTEM, &user, Model::Balanced, true).await?;
-
-    let (parsed, correction_usage): (GroupingAiResponse, _) =
-        parse_json_with_retry(&response.content, "grouping classification").await?;
-    let total_usage = merge_usage(response.usage, correction_usage);
+    let StructuredResponse {
+        data: parsed,
+        usage,
+    } = call_llm_structured::<GroupingAiResponse>(
+        GROUPING_CLASSIFY_SYSTEM,
+        &user,
+        Model::Balanced,
+        "grouping_classification",
+        grouping_ai_response_schema(),
+    )
+    .await?;
 
     let mut suggestions = Vec::new();
     for file in parsed.files {
@@ -90,7 +117,7 @@ pub async fn classify_grouping_candidates(
         });
     }
 
-    Ok((suggestions, total_usage))
+    Ok((suggestions, usage))
 }
 
 fn build_file_context(path: &std::path::Path, file: &crate::index::FileIndex) -> FileContext {

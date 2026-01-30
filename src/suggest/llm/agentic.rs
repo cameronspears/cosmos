@@ -4,7 +4,7 @@
 //! in a loop until they have enough context to complete their task.
 
 use super::client::{api_key, create_http_client, send_with_retry, REQUEST_TIMEOUT_SECS};
-use super::models::Model;
+use super::models::{merge_usage, Model, Usage};
 use super::tools::{execute_tool, get_tool_definitions, ToolCall, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -14,10 +14,15 @@ use std::time::{Duration, Instant};
 /// Overall timeout for the agentic loop to prevent indefinite hangs
 const LOOP_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Some providers occasionally return a response with no content and no tool calls.
+/// Treat this as transient and retry a few times with backoff.
+const EMPTY_RESPONSE_MAX_RETRIES: u32 = 3;
+
 /// Response from an agentic LLM call
 #[derive(Debug)]
 pub struct AgenticResponse {
     pub content: String,
+    pub usage: Option<Usage>,
     pub trace: AgenticTrace,
 }
 
@@ -218,6 +223,7 @@ fn provider_config(require_parameters: bool) -> ProviderConfig {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -229,6 +235,8 @@ struct Choice {
 struct ResponseMessage {
     content: Option<String>,
     tool_calls: Option<Vec<ToolCallMessage>>,
+    #[serde(default)]
+    refusal: Option<String>,
 }
 
 /// Call LLM with tool-calling capability.
@@ -282,6 +290,8 @@ pub async fn call_llm_agentic(
     let mut formatting_pass = false;
     let mut forced_final = false;
     let mut response_healing_used = false;
+    let mut total_usage: Option<Usage> = None;
+    let mut empty_response_retries: u32 = 0;
 
     loop {
         iteration += 1;
@@ -313,11 +323,20 @@ pub async fn call_llm_agentic(
 
         let parsed: ChatResponse = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("Failed to parse response: {}\n{}", e, text))?;
+        total_usage = merge_usage(total_usage, parsed.usage.clone());
 
         let choice = parsed
             .choices
             .first()
             .ok_or_else(|| anyhow::anyhow!("No response from model"))?;
+
+        // Refusals can come back with no content/tool calls.
+        if let Some(refusal) = &choice.message.refusal {
+            return Err(anyhow::anyhow!(
+                "Request was refused: {}",
+                refusal.chars().take(200).collect::<String>()
+            ));
+        }
 
         // Check if model wants to call tools
         if let Some(tool_calls) = &choice.message.tool_calls {
@@ -366,6 +385,16 @@ pub async fn call_llm_agentic(
 
         // Validate we got actual content
         if content.trim().is_empty() {
+            if empty_response_retries < EMPTY_RESPONSE_MAX_RETRIES && start.elapsed() < LOOP_TIMEOUT
+            {
+                empty_response_retries += 1;
+                if iteration > 0 {
+                    iteration -= 1; // don't count empty response against iteration budget
+                }
+                let delay_ms = 250u64 * (1 << empty_response_retries);
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                continue;
+            }
             return Err(anyhow::anyhow!(
                 "Model returned empty response. This may be due to rate limiting or an API issue. Try again."
             ));
@@ -418,17 +447,32 @@ pub async fn call_llm_agentic(
             let text = send_with_retry(&client, &api_key, &format_request).await?;
             let parsed: ChatResponse = serde_json::from_str(&text)
                 .map_err(|e| anyhow::anyhow!("Failed to parse format response: {}\n{}", e, text))?;
+            total_usage = merge_usage(total_usage, parsed.usage.clone());
 
-            let formatted = parsed
+            let choice = parsed
                 .choices
                 .first()
-                .and_then(|c| c.message.content.clone())
-                .unwrap_or(content);
+                .ok_or_else(|| anyhow::anyhow!("No response from model"))?;
+
+            if let Some(refusal) = &choice.message.refusal {
+                return Err(anyhow::anyhow!(
+                    "Request was refused: {}",
+                    refusal.chars().take(200).collect::<String>()
+                ));
+            }
+
+            let formatted = choice.message.content.clone().unwrap_or(content);
+            if formatted.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Model returned empty response during formatting. This may be due to rate limiting or an API issue. Try again."
+                ));
+            }
 
             let mut tool_name_list: Vec<String> = tool_names.into_iter().collect();
             tool_name_list.sort();
             return Ok(AgenticResponse {
                 content: formatted,
+                usage: total_usage,
                 trace: AgenticTrace {
                     iterations: iteration,
                     tool_calls: tool_calls_total,
@@ -444,6 +488,7 @@ pub async fn call_llm_agentic(
         tool_name_list.sort();
         return Ok(AgenticResponse {
             content,
+            usage: total_usage,
             trace: AgenticTrace {
                 iterations: iteration,
                 tool_calls: tool_calls_total,
@@ -493,11 +538,59 @@ pub async fn call_llm_agentic(
         response_healing_used = true;
     }
 
-    // Use shared retry helper for final request too
-    let text = send_with_retry(&client, &api_key, &final_request).await?;
-
-    let parsed: ChatResponse = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("Failed to parse final response: {}\n{}", e, text))?;
+    // Use shared retry helper for final request too, plus a few retries for empty content.
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut parsed: Option<ChatResponse> = None;
+    for attempt in 0..=EMPTY_RESPONSE_MAX_RETRIES {
+        match send_with_retry(&client, &api_key, &final_request).await {
+            Ok(text) => {
+                let p: ChatResponse = serde_json::from_str(&text).map_err(|e| {
+                    anyhow::anyhow!("Failed to parse final response: {}\n{}", e, text)
+                })?;
+                total_usage = merge_usage(total_usage, p.usage.clone());
+                let choice = p
+                    .choices
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("No response from model"))?;
+                if let Some(refusal) = &choice.message.refusal {
+                    return Err(anyhow::anyhow!(
+                        "Request was refused: {}",
+                        refusal.chars().take(200).collect::<String>()
+                    ));
+                }
+                let content = choice.message.content.clone().unwrap_or_default();
+                if content.trim().is_empty() {
+                    if attempt < EMPTY_RESPONSE_MAX_RETRIES && start.elapsed() < LOOP_TIMEOUT {
+                        let delay_ms = 250u64 * (1 << attempt);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "Model returned empty response after exploration. This may be due to rate limiting or an API issue. Try again."
+                    ));
+                }
+                parsed = Some(p);
+                break;
+            }
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < EMPTY_RESPONSE_MAX_RETRIES && start.elapsed() < LOOP_TIMEOUT {
+                    let delay_ms = 250u64 * (1 << attempt);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+            }
+        }
+    }
+    let parsed = match (parsed, last_error) {
+        (Some(p), _) => p,
+        (None, Some(e)) => return Err(e),
+        (None, None) => {
+            return Err(anyhow::anyhow!(
+                "Model returned empty response after exploration. This may be due to rate limiting or an API issue. Try again."
+            ))
+        }
+    };
 
     let content = parsed
         .choices
@@ -516,6 +609,7 @@ pub async fn call_llm_agentic(
     tool_name_list.sort();
     Ok(AgenticResponse {
         content,
+        usage: total_usage,
         trace: AgenticTrace {
             iterations: iteration,
             tool_calls: tool_calls_total,

@@ -43,6 +43,19 @@ fn credentials_cache() -> &'static Mutex<CredentialsCache> {
     CREDENTIALS_CACHE.get_or_init(|| Mutex::new(CredentialsCache::default()))
 }
 
+fn keyring_disabled() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    matches!(
+        std::env::var("COSMOS_DISABLE_KEYRING")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
 fn keyring_entry() -> Result<Entry, keyring::Error> {
     Entry::new(KEYRING_SERVICE, KEYRING_USERNAME)
 }
@@ -72,6 +85,9 @@ pub fn warn_keychain_error_once(context: &str, err: &str) {
 
 /// Read credentials from the unified keychain entry
 fn read_credentials_uncached() -> KeyringResult<StoredCredentials> {
+    if keyring_disabled() {
+        return Ok(StoredCredentials::default());
+    }
     let entry = keyring_entry().map_err(|e| e.to_string())?;
     match entry.get_password() {
         Ok(json) => {

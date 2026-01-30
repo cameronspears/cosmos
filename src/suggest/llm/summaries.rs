@@ -1,4 +1,4 @@
-use super::client::call_llm_with_usage;
+use super::agentic::{call_llm_agentic, schema_to_response_format};
 use super::models::{Model, Usage};
 use super::parse::{parse_summaries_and_terms_response, SummariesAndTerms};
 use super::prompts::SUMMARY_BATCH_SYSTEM;
@@ -27,6 +27,31 @@ pub struct SummaryBatchResult {
     /// Domain terms mapped to their source files
     pub terms_by_file: HashMap<PathBuf, HashMap<String, String>>,
     pub usage: Option<Usage>,
+}
+
+fn summary_batch_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "summaries": {
+                "type": "object",
+                "additionalProperties": { "type": "string" }
+            },
+            "terms": {
+                "type": "object",
+                "additionalProperties": { "type": "string" }
+            },
+            "terms_by_file": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" }
+                }
+            }
+        },
+        "required": ["summaries"]
+    })
 }
 
 /// Discover project context from README and key files
@@ -371,7 +396,6 @@ pub fn prioritize_files_for_summary(
 
 /// Generate summaries for a single batch of files
 /// Also extracts domain-specific terminology for the glossary
-/// Includes automatic retry with self-correction on parse failure
 async fn generate_summary_batch(
     index: &CodebaseIndex,
     files: &[PathBuf],
@@ -379,49 +403,30 @@ async fn generate_summary_batch(
 ) -> anyhow::Result<SummaryBatchResult> {
     let user_prompt = build_batch_context(index, files, project_context);
 
-    let response =
-        call_llm_with_usage(SUMMARY_BATCH_SYSTEM, &user_prompt, Model::Speed, true).await?;
+    let response_format = schema_to_response_format("summary_batch", summary_batch_schema());
+    let response = call_llm_agentic(
+        SUMMARY_BATCH_SYSTEM,
+        &user_prompt,
+        Model::Speed,
+        &index.root,
+        false,
+        4,
+        Some(response_format),
+    )
+    .await?;
 
-    // Try to parse the response
-    match parse_summaries_and_terms_response(&response.content, &index.root) {
-        Ok(SummariesAndTerms {
-            summaries,
-            terms,
-            terms_by_file,
-        }) => Ok(SummaryBatchResult {
-            summaries,
-            terms,
-            terms_by_file,
-            usage: response.usage,
-        }),
-        Err(initial_error) => {
-            // Parse failed - try self-correction
-            let correction_response = super::parse::request_json_correction_generic(
-                &response.content,
-                &initial_error.to_string(),
-                "file summaries",
-            )
-            .await?;
+    let SummariesAndTerms {
+        summaries,
+        terms,
+        terms_by_file,
+    } = parse_summaries_and_terms_response(&response.content, &index.root)?;
 
-            // Merge usage from both calls
-            let combined_usage =
-                super::parse::merge_usage(response.usage, correction_response.usage);
-
-            // Try parsing the corrected response
-            let SummariesAndTerms {
-                summaries,
-                terms,
-                terms_by_file,
-            } = parse_summaries_and_terms_response(&correction_response.content, &index.root)?;
-
-            Ok(SummaryBatchResult {
-                summaries,
-                terms,
-                terms_by_file,
-                usage: combined_usage,
-            })
-        }
-    }
+    Ok(SummaryBatchResult {
+        summaries,
+        terms,
+        terms_by_file,
+        usage: response.usage,
+    })
 }
 
 /// Build context for a batch of files
