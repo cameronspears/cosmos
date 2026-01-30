@@ -43,15 +43,23 @@ pub enum ApplyError {
 
 impl ApplyError {
     /// Returns a user-friendly message for display in toasts
+    ///
+    /// NOTE: Messages must contain "error" or "failed" (lowercase) or "Error"
+    /// for the toast system to display them. Otherwise they're classified as
+    /// Info toasts and silently ignored.
     pub fn user_message(&self) -> String {
         match self {
-            Self::PreviewNotReady => "Preview not ready. Please wait for verification.".into(),
-            Self::AlreadyApplying => "Already applying fix...".into(),
+            Self::PreviewNotReady => {
+                "Apply failed: preview not ready. Please wait for verification.".into()
+            }
+            Self::AlreadyApplying => "Apply failed: already in progress...".into(),
             Self::MissingState(what) => format!("Internal error: missing {}. Try again.", what),
-            Self::SuggestionNotFound => "Suggestion no longer exists. Select another.".into(),
+            Self::SuggestionNotFound => {
+                "Apply failed: suggestion no longer exists. Select another.".into()
+            }
             Self::GitStatusFailed(e) => format!("Git error: {}. Check repo state.", e),
             Self::DirtyWorkingTree => {
-                "Working tree has changes. Commit or stash before applying.".into()
+                "Apply failed: working tree has changes. Commit or stash first.".into()
             }
             Self::FilesChanged(paths) => {
                 let names: Vec<String> = paths
@@ -66,13 +74,17 @@ impl ApplyError {
                     String::new()
                 };
                 format!(
-                    "Files changed: {}{}. Re-verify first.",
+                    "Apply failed: files changed ({}{}). Re-verify first.",
                     names.join(", "),
                     suffix
                 )
             }
-            Self::UnsafePath(path, e) => format!("Unsafe path {}: {}", path.display(), e),
-            Self::FileReadFailed(path, e) => format!("Failed to read {}: {}", path.display(), e),
+            Self::UnsafePath(path, e) => {
+                format!("Apply failed: unsafe path {}: {}", path.display(), e)
+            }
+            Self::FileReadFailed(path, e) => {
+                format!("Apply failed: couldn't read {}: {}", path.display(), e)
+            }
         }
     }
 }
@@ -1069,15 +1081,16 @@ mod tests {
     fn test_apply_error_preview_not_ready() {
         let err = ApplyError::PreviewNotReady;
         let msg = err.user_message();
-        assert!(msg.contains("Preview not ready"));
-        assert!(msg.contains("wait"));
+        assert!(msg.contains("preview not ready"));
+        assert!(msg.contains("failed")); // Must contain for toast visibility
     }
 
     #[test]
     fn test_apply_error_already_applying() {
         let err = ApplyError::AlreadyApplying;
         let msg = err.user_message();
-        assert!(msg.contains("Already applying"));
+        assert!(msg.contains("in progress"));
+        assert!(msg.contains("failed")); // Must contain for toast visibility
     }
 
     #[test]
@@ -1093,6 +1106,7 @@ mod tests {
         let err = ApplyError::SuggestionNotFound;
         let msg = err.user_message();
         assert!(msg.contains("no longer exists"));
+        assert!(msg.contains("failed")); // Must contain for toast visibility
     }
 
     #[test]
@@ -1108,16 +1122,18 @@ mod tests {
         let err = ApplyError::DirtyWorkingTree;
         let msg = err.user_message();
         assert!(msg.contains("changes"));
-        assert!(msg.contains("Commit") || msg.contains("stash"));
+        assert!(msg.contains("stash"));
+        assert!(msg.contains("failed")); // Must contain for toast visibility
     }
 
     #[test]
     fn test_apply_error_files_changed_single() {
         let err = ApplyError::FilesChanged(vec![PathBuf::from("src/main.rs")]);
         let msg = err.user_message();
-        assert!(msg.contains("Files changed"));
+        assert!(msg.contains("files changed"));
         assert!(msg.contains("src/main.rs"));
         assert!(msg.contains("Re-verify"));
+        assert!(msg.contains("failed")); // Must contain for toast visibility
     }
 
     #[test]
@@ -1133,22 +1149,25 @@ mod tests {
         assert!(msg.contains("b.rs"));
         assert!(msg.contains("c.rs"));
         assert!(msg.contains("+1 more"));
+        assert!(msg.contains("failed")); // Must contain for toast visibility
     }
 
     #[test]
     fn test_apply_error_unsafe_path() {
         let err = ApplyError::UnsafePath(PathBuf::from("../evil"), "path traversal".into());
         let msg = err.user_message();
-        assert!(msg.contains("Unsafe path"));
+        assert!(msg.contains("unsafe path"));
         assert!(msg.contains("../evil"));
+        assert!(msg.contains("failed")); // Must contain for toast visibility
     }
 
     #[test]
     fn test_apply_error_file_read_failed() {
         let err = ApplyError::FileReadFailed(PathBuf::from("missing.rs"), "not found".into());
         let msg = err.user_message();
-        assert!(msg.contains("Failed to read"));
+        assert!(msg.contains("couldn't read"));
         assert!(msg.contains("missing.rs"));
+        assert!(msg.contains("failed")); // Must contain for toast visibility
     }
 
     // ========================================================================
