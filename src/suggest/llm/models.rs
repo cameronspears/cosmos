@@ -16,7 +16,7 @@ const MODEL_MAX_TOKENS: u32 = 16384;
 
 /// Models we allow to use JSON formatting / structured outputs.
 const JSON_FORMAT_MODELS: [&str; 3] = [
-    "openai/gpt-oss-120b:exacto",
+    "openai/gpt-oss-120b",
     "openai/gpt-5.2:nitro",
     "openai/gpt-5.2-codex:nitro",
 ];
@@ -28,7 +28,7 @@ fn supports_json_format(model_id: &str) -> bool {
 impl Model {
     pub fn id(&self) -> &'static str {
         match self {
-            Model::Speed => "openai/gpt-oss-120b:exacto",
+            Model::Speed => "openai/gpt-oss-120b",
             Model::Balanced => "openai/gpt-5.2-codex:nitro",
             Model::Smart => "openai/gpt-5.2:nitro",
         }
@@ -51,7 +51,8 @@ impl Model {
     /// Reasoning effort level to use, if supported.
     pub fn reasoning_effort(&self) -> Option<&'static str> {
         match self {
-            Model::Speed | Model::Balanced => Some("high"),
+            Model::Speed => Some("low"),
+            Model::Balanced => Some("high"),
             Model::Smart => Some("xhigh"),
         }
     }
@@ -127,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_supports_json_format_allowlist() {
-        assert!(supports_json_format("openai/gpt-oss-120b:exacto"));
+        assert!(supports_json_format("openai/gpt-oss-120b"));
         assert!(supports_json_format("openai/gpt-5.2:nitro"));
         assert!(supports_json_format("openai/gpt-5.2-codex:nitro"));
         assert!(!supports_json_format("openai/gpt-4o"));
@@ -135,7 +136,7 @@ mod tests {
 
     #[test]
     fn test_reasoning_effort_by_model() {
-        assert_eq!(Model::Speed.reasoning_effort(), Some("high"));
+        assert_eq!(Model::Speed.reasoning_effort(), Some("low"));
         assert_eq!(Model::Balanced.reasoning_effort(), Some("high"));
         assert_eq!(Model::Smart.reasoning_effort(), Some("xhigh"));
     }

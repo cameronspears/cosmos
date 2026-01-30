@@ -1,14 +1,12 @@
-use super::agentic::{call_llm_agentic, suggestion_schema};
-use super::client::{call_llm_with_usage, truncate_str};
+use super::client::{call_llm_structured_with_provider, call_llm_with_usage, truncate_str};
+use super::models::merge_usage;
 use super::models::{Model, Usage};
-use super::parse::{parse_structured_suggestions, ParseDiagnostics};
 use super::prompt_utils::format_repo_memory_section;
-use super::prompts::{ANALYZE_CODEBASE_AGENTIC_SYSTEM, ASK_QUESTION_SYSTEM};
-use super::summaries::discover_project_context;
-use crate::cache::DomainGlossary;
+use super::prompts::{ASK_QUESTION_SYSTEM, FAST_GROUNDED_SUGGESTIONS_SYSTEM};
 use crate::context::WorkContext;
-use crate::index::{CodebaseIndex, PatternKind, SymbolKind};
+use crate::index::{CodebaseIndex, PatternSeverity, SymbolKind};
 use crate::suggest::Suggestion;
+use regex::Regex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +18,9 @@ use crate::index::GOD_MODULE_LOC_THRESHOLD;
 
 /// Complexity threshold above which a file is considered a "hotspot"
 const HIGH_COMPLEXITY_THRESHOLD: f64 = 20.0;
+const FAST_EVIDENCE_PACK_MAX_ITEMS: usize = 25;
+const FAST_EVIDENCE_SNIPPET_LINES_BEFORE: usize = 8;
+const FAST_EVIDENCE_SNIPPET_LINES_AFTER: usize = 12;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ADAPTIVE CONTEXT LIMITS
@@ -31,22 +32,6 @@ struct AdaptiveLimits {
     file_list_limit: usize,
     /// Max symbols to include
     symbol_limit: usize,
-    /// Max directories to show in key areas
-    key_areas_limit: usize,
-    /// Max changed files to show
-    changed_files_limit: usize,
-    /// Max complex files to show
-    complex_files_limit: usize,
-    /// Max TODO markers to show
-    todo_limit: usize,
-    /// Max files in all files section
-    all_files_limit: usize,
-    /// Max code preview files
-    code_preview_files: usize,
-    /// Max lines per code preview
-    code_preview_lines: usize,
-    /// Max glossary terms
-    glossary_terms: usize,
 }
 
 impl AdaptiveLimits {
@@ -59,124 +44,26 @@ impl AdaptiveLimits {
             Self {
                 file_list_limit: file_count.min(50),
                 symbol_limit: 150,
-                key_areas_limit: 8,
-                changed_files_limit: 8,
-                complex_files_limit: 6,
-                todo_limit: 6,
-                all_files_limit: file_count.min(50),
-                code_preview_files: 4,
-                code_preview_lines: 50,
-                glossary_terms: 10,
             }
         } else if file_count < 200 {
             // Medium codebase: balanced
             Self {
                 file_list_limit: 50,
                 symbol_limit: 100,
-                key_areas_limit: 6,
-                changed_files_limit: 6,
-                complex_files_limit: 4,
-                todo_limit: 4,
-                all_files_limit: 40,
-                code_preview_files: 3,
-                code_preview_lines: 40,
-                glossary_terms: 8,
             }
         } else if file_count < 500 {
             // Large codebase: prioritize structure
             Self {
                 file_list_limit: 40,
                 symbol_limit: 80,
-                key_areas_limit: 8,
-                changed_files_limit: 5,
-                complex_files_limit: 4,
-                todo_limit: 4,
-                all_files_limit: 35,
-                code_preview_files: 3,
-                code_preview_lines: 35,
-                glossary_terms: 6,
             }
         } else {
             // Very large codebase: focus on key areas
             Self {
                 file_list_limit: 30,
                 symbol_limit: 60,
-                key_areas_limit: 10,
-                changed_files_limit: 4,
-                complex_files_limit: 3,
-                todo_limit: 3,
-                all_files_limit: 30,
-                code_preview_files: 2,
-                code_preview_lines: 30,
-                glossary_terms: 6,
             }
         }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  PATTERN SUMMARY
-// ═══════════════════════════════════════════════════════════════════════════
-
-use std::collections::HashMap;
-
-/// Summarize all detected patterns in the codebase for LLM context.
-///
-/// Provides a high-level view of code health indicators:
-/// - Long functions (>50 lines)
-/// - Deep nesting issues
-/// - God modules (>500 lines)
-/// - TODO/FIXME markers
-/// - etc.
-pub fn summarize_patterns(index: &CodebaseIndex) -> String {
-    let mut by_kind: HashMap<PatternKind, usize> = HashMap::new();
-
-    for file in index.files.values() {
-        for pattern in &file.patterns {
-            *by_kind.entry(pattern.kind).or_default() += 1;
-        }
-    }
-
-    if by_kind.is_empty() {
-        return String::new();
-    }
-
-    let mut parts = Vec::new();
-
-    if let Some(&count) = by_kind.get(&PatternKind::LongFunction) {
-        if count > 0 {
-            parts.push(format!("{} long functions (>50 lines)", count));
-        }
-    }
-
-    if let Some(&count) = by_kind.get(&PatternKind::GodModule) {
-        if count > 0 {
-            parts.push(format!("{} large modules (>500 lines)", count));
-        }
-    }
-
-    if let Some(&count) = by_kind.get(&PatternKind::DeepNesting) {
-        if count > 0 {
-            parts.push(format!("{} deep nesting issues", count));
-        }
-    }
-
-    if let Some(&count) = by_kind.get(&PatternKind::TodoMarker) {
-        if count > 0 {
-            parts.push(format!("{} TODO/FIXME markers", count));
-        }
-    }
-
-    if let Some(&count) = by_kind.get(&PatternKind::ManyParameters) {
-        if count > 0 {
-            parts.push(format!("{} functions with many parameters", count));
-        }
-    }
-
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!("Code health: {}", parts.join(", "))
     }
 }
 
@@ -243,21 +130,15 @@ QUESTION:
     Ok((response.content, response.usage))
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  LEAN HYBRID ANALYSIS (Compact Context + Surgical Tool Use)
-// ═══════════════════════════════════════════════════════════════════════════
-
-use crate::suggest::Confidence;
-
-/// Maximum suggestions to return after quality filtering
-const MAX_SUGGESTIONS: usize = 15;
-
 #[derive(Debug, Clone)]
 pub struct SuggestionDiagnostics {
     pub model: String,
     pub iterations: usize,
     pub tool_calls: usize,
     pub tool_names: Vec<String>,
+    pub tool_exec_ms: u64,
+    pub llm_ms: u64,
+    pub batch_verify_ms: u64,
     pub forced_final: bool,
     pub formatting_pass: bool,
     pub response_format: bool,
@@ -269,89 +150,541 @@ pub struct SuggestionDiagnostics {
     pub parse_used_individual_parse: bool,
     pub raw_count: usize,
     pub deduped_count: usize,
+    pub grounding_filtered: usize,
     pub low_confidence_filtered: usize,
+    pub batch_verify_attempted: usize,
+    pub batch_verify_verified: usize,
+    pub batch_verify_not_found: usize,
+    pub batch_verify_errors: usize,
     pub truncated_count: usize,
     pub final_count: usize,
     pub response_chars: usize,
     pub response_preview: String,
+    pub evidence_pack_ms: u64,
 }
 
-/// Analyze codebase with compact context and minimal, surgical tool use
-///
-/// Strategy:
-/// 1. Start with synthesized context (summaries, not full files)
-/// 2. Model can make 1-3 targeted tool calls to verify specific issues
-/// 3. Uses gpt-oss-120b for cost efficiency
-/// 4. Quality-gated: filters out low-confidence suggestions, caps at MAX_SUGGESTIONS
-///
-/// This balances accuracy (model can verify) with speed/cost (minimal calls).
-pub async fn analyze_codebase_agentic(
+#[derive(Debug, Clone)]
+struct EvidenceItem {
+    id: usize,
+    file: PathBuf,
+    line: usize, // 1-based
+    snippet: String,
+    why_interesting: String,
+}
+
+fn normalize_repo_relative(repo_root: &Path, path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        path.strip_prefix(repo_root).ok().map(|p| p.to_path_buf())
+    } else {
+        Some(path.to_path_buf())
+    }
+}
+
+fn read_snippet_around_line(
+    repo_root: &Path,
+    rel_path: &Path,
+    line_1_based: usize,
+) -> Option<String> {
+    let full = repo_root.join(rel_path);
+    let content = std::fs::read_to_string(&full).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let target = line_1_based.max(1).min(lines.len());
+    let start = target
+        .saturating_sub(FAST_EVIDENCE_SNIPPET_LINES_BEFORE)
+        .max(1);
+    let end = (target + FAST_EVIDENCE_SNIPPET_LINES_AFTER).min(lines.len());
+    let snippet = lines
+        .iter()
+        .enumerate()
+        .skip(start - 1)
+        .take(end - start + 1)
+        .map(|(i, l)| format!("{:4}| {}", i + 1, l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(snippet)
+}
+
+fn build_evidence_pack(
+    repo_root: &Path,
+    index: &CodebaseIndex,
+    context: &WorkContext,
+) -> Vec<EvidenceItem> {
+    let changed: HashSet<PathBuf> = context.all_changed_files().into_iter().cloned().collect();
+    let mut candidates: Vec<(f64, EvidenceItem)> = Vec::new();
+
+    // Patterns (high signal)
+    for file in index.files.values() {
+        for p in &file.patterns {
+            let Some(rel_file) = normalize_repo_relative(repo_root, &p.file) else {
+                continue;
+            };
+            let severity_score = match p.kind.severity() {
+                PatternSeverity::High => 3.0,
+                PatternSeverity::Medium => 2.0,
+                PatternSeverity::Low => 1.0,
+                PatternSeverity::Info => 0.5,
+            };
+            let changed_boost = if changed.contains(&rel_file) {
+                0.2
+            } else {
+                0.0
+            };
+            let score = severity_score + changed_boost;
+            if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, p.line) {
+                candidates.push((
+                    score,
+                    EvidenceItem {
+                        id: 0,
+                        file: rel_file,
+                        line: p.line.max(1),
+                        snippet,
+                        why_interesting: format!("Detected {:?}: {}", p.kind, p.description),
+                    },
+                ));
+            }
+        }
+    }
+
+    // Hotspots (complexity/LOC)
+    let mut hotspot_files: Vec<_> = index.files.values().collect();
+    hotspot_files.sort_by(|a, b| {
+        b.complexity
+            .partial_cmp(&a.complexity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for f in hotspot_files
+        .iter()
+        .filter(|f| f.complexity > HIGH_COMPLEXITY_THRESHOLD || f.loc > GOD_MODULE_LOC_THRESHOLD)
+        .take(6)
+    {
+        let Some(rel_file) = normalize_repo_relative(repo_root, &f.path) else {
+            continue;
+        };
+        let anchor = f
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
+            .max_by(|a, b| {
+                a.complexity
+                    .partial_cmp(&b.complexity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|s| s.line)
+            .unwrap_or(1);
+        if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
+            candidates.push((
+                2.0 + (f.complexity / 50.0).min(1.0),
+                EvidenceItem {
+                    id: 0,
+                    file: rel_file,
+                    line: anchor.max(1),
+                    snippet,
+                    why_interesting: format!(
+                        "Hotspot file (complexity {:.1}, {} LOC)",
+                        f.complexity, f.loc
+                    ),
+                },
+            ));
+        }
+    }
+
+    // Core files (fan-in)
+    let mut core_files: Vec<_> = index.files.values().collect();
+    core_files.sort_by(|a, b| b.summary.used_by.len().cmp(&a.summary.used_by.len()));
+    for f in core_files
+        .iter()
+        .filter(|f| f.summary.used_by.len() >= 3)
+        .take(6)
+    {
+        let Some(rel_file) = normalize_repo_relative(repo_root, &f.path) else {
+            continue;
+        };
+        let anchor = f
+            .symbols
+            .iter()
+            .find(|s| {
+                matches!(
+                    s.kind,
+                    SymbolKind::Function | SymbolKind::Struct | SymbolKind::Enum
+                )
+            })
+            .map(|s| s.line)
+            .unwrap_or(1);
+        if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
+            candidates.push((
+                1.5 + (f.summary.used_by.len() as f64 / 20.0).min(1.0),
+                EvidenceItem {
+                    id: 0,
+                    file: rel_file,
+                    line: anchor.max(1),
+                    snippet,
+                    why_interesting: format!(
+                        "Core file used by {} other files",
+                        f.summary.used_by.len()
+                    ),
+                },
+            ));
+        }
+    }
+
+    // Rank and dedupe by (file,line)
+    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut seen: HashSet<(PathBuf, usize)> = HashSet::new();
+    let mut out: Vec<EvidenceItem> = Vec::new();
+    for (_score, mut item) in candidates {
+        let key = (item.file.clone(), item.line);
+        if seen.insert(key) {
+            item.id = out.len();
+            out.push(item);
+        }
+        if out.len() >= FAST_EVIDENCE_PACK_MAX_ITEMS {
+            break;
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct FastGroundedSuggestionJson {
+    #[serde(default)]
+    evidence_id: Option<usize>,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    priority: String,
+    #[serde(default)]
+    confidence: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    detail: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct FastGroundedResponseJson {
+    suggestions: Vec<FastGroundedSuggestionJson>,
+}
+
+fn extract_evidence_id(text: &str) -> Option<usize> {
+    // Accept a few common patterns:
+    // - "EVIDENCE 12"
+    // - "(EVIDENCE 12)"
+    // - "evidence_id: 12"
+    let hay = text.as_bytes();
+    let needles: [&[u8]; 3] = [b"EVIDENCE ", b"evidence ", b"evidence_id"];
+
+    for needle in needles {
+        let mut i = 0;
+        while i + needle.len() <= hay.len() {
+            if &hay[i..i + needle.len()] == needle {
+                let mut j = i + needle.len();
+                // skip separators like ':', '=', whitespace
+                while j < hay.len() && matches!(hay[j], b' ' | b'\t' | b':' | b'=') {
+                    j += 1;
+                }
+                let start = j;
+                while j < hay.len() && hay[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > start {
+                    if let Ok(v) = std::str::from_utf8(&hay[start..j]).ok()?.parse::<usize>() {
+                        return Some(v);
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+pub async fn analyze_codebase_fast_grounded(
     repo_root: &Path,
     index: &CodebaseIndex,
     context: &WorkContext,
     repo_memory: Option<String>,
-    glossary: Option<&DomainGlossary>,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
-    let user_prompt = build_lean_analysis_prompt(index, context, repo_memory.as_deref(), glossary);
+    let overall_start = std::time::Instant::now();
+    let pack_start = std::time::Instant::now();
+    let pack = build_evidence_pack(repo_root, index, context);
+    let evidence_pack_ms = pack_start.elapsed().as_millis() as u64;
 
-    // Use Speed model with high reasoning effort and tools for cost-effective analysis
-    // 4 iterations is sufficient for: tree -> search -> read_range -> finalize
-    // Structured output is only applied on the final call (no tools) to ensure valid JSON
-    let response = call_llm_agentic(
-        ANALYZE_CODEBASE_AGENTIC_SYSTEM,
-        &user_prompt,
-        Model::Speed,
-        repo_root,
-        false,
-        4, // max iterations - focused exploration
-        Some(suggestion_schema()),
-    )
-    .await?;
+    if pack.len() < 12 {
+        return Err(anyhow::anyhow!(
+            "Not enough grounded evidence items found to generate suggestions. Try again after indexing completes."
+        ));
+    }
 
-    // Parse directly - structured output guarantees valid JSON
-    let (mut suggestions, parse_diagnostics) =
-        parse_structured_suggestions(&response.content, &index.root)?;
-    let raw_count = suggestions.len();
+    let memory_section =
+        format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
+    let format_user = |items: &[EvidenceItem], count_hint: &str| -> String {
+        let mut user = String::new();
+        if !memory_section.trim().is_empty() {
+            user.push_str(&memory_section);
+            user.push_str("\n\n");
+        }
+        user.push_str(count_hint);
+        user.push_str("\n\nEVIDENCE PACK (internal grounding only):\n");
+        for item in items {
+            user.push_str(&format!(
+                "EVIDENCE {id}:\nSignal: {why}\nSNIPPET:\n{snippet}\n\n",
+                id = item.id,
+                why = item.why_interesting,
+                snippet = item.snippet
+            ));
+        }
+        user
+    };
 
-    // Deduplicate suggestions (LLM sometimes returns near-duplicates)
-    suggestions = deduplicate_suggestions(suggestions);
-    let deduped_count = suggestions.len();
-
-    // Filter out low confidence suggestions
-    let low_confidence_filtered = suggestions
-        .iter()
-        .filter(|s| s.confidence == Confidence::Low)
-        .count();
-    suggestions.retain(|s| s.confidence != Confidence::Low);
-
-    // Sort by confidence (high first), then priority
-    suggestions.sort_by(|a, b| {
-        b.confidence
-            .cmp(&a.confidence)
-            .then_with(|| b.priority.cmp(&a.priority))
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "suggestions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "evidence_id": { "type": "integer", "minimum": 0, "maximum": pack.len().saturating_sub(1) },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["bugfix", "improvement", "optimization", "refactoring", "security", "reliability"]
+                        },
+                        "priority": { "type": "string", "enum": ["high", "medium", "low"] },
+                        "confidence": { "type": "string", "enum": ["high", "medium"] },
+                        "summary": { "type": "string" },
+                        "detail": { "type": "string" }
+                    },
+                    "required": ["evidence_id", "kind", "priority", "confidence", "summary", "detail"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["suggestions"],
+        "additionalProperties": false
     });
 
-    // Cap at MAX_SUGGESTIONS
-    let truncated_count = suggestions.len().saturating_sub(MAX_SUGGESTIONS);
-    suggestions.truncate(MAX_SUGGESTIONS);
-    let final_count = suggestions.len();
+    // Two sharded calls in parallel to reduce tail latency and improve chance of
+    // reaching 10+ usable suggestions under provider quirks.
+    let mid = pack.len() / 2;
+    let (left, right) = pack.split_at(mid);
 
-    let diagnostics = build_suggestion_diagnostics(
-        Model::Speed,
-        &response.content,
-        &response.trace,
-        &parse_diagnostics,
-        raw_count,
-        deduped_count,
-        low_confidence_filtered,
-        truncated_count,
-        final_count,
+    let shard_timeout_ms: u64 = 6_800;
+    let shard_max_tokens: u32 = 420;
+    let user_left = format_user(left, "For this request, return 7 to 9 suggestions.");
+    let user_right = format_user(right, "For this request, return 7 to 9 suggestions.");
+
+    let llm_start = std::time::Instant::now();
+    let (resp_a, resp_b) = tokio::join!(
+        call_llm_structured_with_provider::<FastGroundedResponseJson>(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM,
+            &user_left,
+            Model::Speed,
+            "fast_grounded_suggestions",
+            schema.clone(),
+            super::client::provider_cerebras_fp16(),
+            shard_max_tokens,
+            shard_timeout_ms,
+        ),
+        call_llm_structured_with_provider::<FastGroundedResponseJson>(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM,
+            &user_right,
+            Model::Speed,
+            "fast_grounded_suggestions",
+            schema.clone(),
+            super::client::provider_cerebras_fp16(),
+            shard_max_tokens,
+            shard_timeout_ms,
+        ),
     );
+    let mut llm_ms = llm_start.elapsed().as_millis() as u64;
 
-    Ok((suggestions, response.usage, diagnostics))
+    let mut usage = None;
+    let mut raw_items: Vec<FastGroundedSuggestionJson> = Vec::new();
+    if let Ok(r) = resp_a {
+        usage = merge_usage(usage, r.usage);
+        raw_items.extend(r.data.suggestions);
+    }
+    if let Ok(r) = resp_b {
+        usage = merge_usage(usage, r.usage);
+        raw_items.extend(r.data.suggestions);
+    }
+
+    // If we still don't have enough material, try one more fast call with the remaining budget.
+    if raw_items.len() < 10 {
+        let total_budget_ms: u64 = 10_000;
+        let elapsed = overall_start.elapsed().as_millis() as u64;
+        let remaining = total_budget_ms.saturating_sub(elapsed).saturating_sub(250);
+        if remaining >= 900 {
+            let extra_start = std::time::Instant::now();
+            if let Ok(r) = call_llm_structured_with_provider::<FastGroundedResponseJson>(
+                FAST_GROUNDED_SUGGESTIONS_SYSTEM,
+                &format_user(&pack, "Return 10 to 15 suggestions. Avoid repeating the same evidence_id across suggestions."),
+                Model::Speed,
+                "fast_grounded_suggestions",
+                schema,
+                super::client::provider_cerebras_fp16(),
+                380,
+                remaining,
+            )
+            .await
+            {
+                llm_ms += extra_start.elapsed().as_millis() as u64;
+                usage = merge_usage(usage, r.usage);
+                raw_items.extend(r.data.suggestions);
+            }
+        }
+    }
+
+    let mut mapped: Vec<(usize, Suggestion)> = Vec::new();
+    let mut missing_or_invalid = 0usize;
+
+    fn scrub_user_summary(summary: &str) -> String {
+        // Extra safety: even if the model slips, ensure the user-facing title
+        // doesn't contain file paths / line numbers / evidence markers.
+        let mut s = summary.to_string();
+
+        // Remove explicit evidence markers.
+        let re_evidence = Regex::new(r"(?i)\b(evidence\s*id|evidence)\s*[:=]?\s*\d*\b")
+            .unwrap_or_else(|_| Regex::new("$^").unwrap());
+        s = re_evidence.replace_all(&s, "").to_string();
+
+        // Remove "(path:123)" style suffixes.
+        let re_path_line =
+            Regex::new(r"\s*\(([^)]*/[^)]*?):\d+\)").unwrap_or_else(|_| Regex::new("$^").unwrap());
+        s = re_path_line.replace_all(&s, "").to_string();
+
+        // Remove bare path-like tokens ("src/foo.rs", "foo.tsx", etc).
+        let re_path_token =
+            Regex::new(r"(?i)\b[\w./-]+\.(rs|tsx|ts|jsx|js|py|go|java|kt|cs|cpp|c|h)\b")
+                .unwrap_or_else(|_| Regex::new("$^").unwrap());
+        s = re_path_token.replace_all(&s, "").to_string();
+
+        // Collapse whitespace after removals.
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    for s in raw_items {
+        let evidence_id = s
+            .evidence_id
+            .or_else(|| extract_evidence_id(&s.summary))
+            .or_else(|| extract_evidence_id(&s.detail));
+        let Some(evidence_id) = evidence_id else {
+            missing_or_invalid += 1;
+            continue;
+        };
+        let Some(item) = pack.get(evidence_id) else {
+            missing_or_invalid += 1;
+            continue;
+        };
+        let kind = match s.kind.to_lowercase().as_str() {
+            "bugfix" => crate::suggest::SuggestionKind::BugFix,
+            "optimization" => crate::suggest::SuggestionKind::Optimization,
+            "refactoring" => crate::suggest::SuggestionKind::Quality,
+            "security" => crate::suggest::SuggestionKind::BugFix,
+            "reliability" => crate::suggest::SuggestionKind::Quality,
+            _ => crate::suggest::SuggestionKind::Improvement,
+        };
+        let priority = match s.priority.to_lowercase().as_str() {
+            "high" => crate::suggest::Priority::High,
+            "low" => crate::suggest::Priority::Low,
+            _ => crate::suggest::Priority::Medium,
+        };
+        let confidence = match s.confidence.to_lowercase().as_str() {
+            "high" => crate::suggest::Confidence::High,
+            _ => crate::suggest::Confidence::Medium,
+        };
+
+        let mut summary = scrub_user_summary(&s.summary);
+        if summary.trim().is_empty() {
+            // Provider didn't follow schema; recover a minimally useful summary.
+            summary = scrub_user_summary(
+                s.detail
+                    .lines()
+                    .next()
+                    .unwrap_or("Potential improvement found.")
+                    .trim(),
+            );
+            summary = truncate_str(&summary, 120).to_string();
+        }
+
+        let suggestion = Suggestion::new(
+            kind,
+            priority,
+            item.file.clone(),
+            summary,
+            crate::suggest::SuggestionSource::LlmDeep,
+        )
+        .with_confidence(confidence)
+        .with_line(item.line)
+        .with_detail(s.detail)
+        .with_evidence(item.snippet.clone());
+
+        mapped.push((evidence_id, suggestion));
+    }
+
+    if mapped.is_empty() {
+        return Err(anyhow::anyhow!(
+            "AI returned no usable grounded suggestions. Try again."
+        ));
+    }
+
+    // Prefer unique evidence_id, but allow duplicates if needed to reach 10.
+    let mut seen_ids: HashSet<usize> = HashSet::new();
+    let mut unique = Vec::new();
+    let mut dupes = Vec::new();
+    for (eid, s) in mapped {
+        if seen_ids.insert(eid) {
+            unique.push(s);
+        } else {
+            dupes.push(s);
+        }
+    }
+    let mut suggestions = unique;
+    if suggestions.len() < 10 {
+        let need = 10usize.saturating_sub(suggestions.len());
+        suggestions.extend(dupes.into_iter().take(need));
+    }
+    suggestions.truncate(15);
+
+    let diagnostics = SuggestionDiagnostics {
+        model: Model::Speed.id().to_string(),
+        iterations: 1,
+        tool_calls: 0,
+        tool_names: Vec::new(),
+        tool_exec_ms: 0,
+        llm_ms,
+        batch_verify_ms: 0,
+        forced_final: false,
+        formatting_pass: false,
+        response_format: true,
+        response_healing: true,
+        parse_strategy: "fast_grounded".to_string(),
+        parse_stripped_markdown: false,
+        parse_used_sanitized_fix: false,
+        parse_used_json_fix: false,
+        parse_used_individual_parse: false,
+        raw_count: suggestions.len(),
+        deduped_count: suggestions.len(),
+        grounding_filtered: missing_or_invalid,
+        low_confidence_filtered: 0,
+        batch_verify_attempted: 0,
+        batch_verify_verified: 0,
+        batch_verify_not_found: 0,
+        batch_verify_errors: 0,
+        truncated_count: 0,
+        final_count: suggestions.len(),
+        response_chars: 0,
+        response_preview: String::new(),
+        evidence_pack_ms,
+    };
+
+    Ok((suggestions, usage, diagnostics))
 }
 
-fn build_suggestion_diagnostics(
+/* fn build_suggestion_diagnostics(
     model: Model,
     response_content: &str,
     trace: &super::agentic::AgenticTrace,
@@ -807,3 +1140,4 @@ mod tests {
         );
     }
 }
+*/

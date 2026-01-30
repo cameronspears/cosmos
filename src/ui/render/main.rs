@@ -793,13 +793,24 @@ fn render_suggestion_diagnostics<'a>(lines: &mut Vec<Line<'a>>, app: &App, inner
         };
 
         let meta = format!(
-            "Model: {} · iterations {} · tool calls {} ({})",
-            diag.model, diag.iterations, diag.tool_calls, tool_names
+            "Model: {} · {}ms · iterations {} · tool calls {} ({})",
+            diag.model, diag.llm_ms, diag.iterations, diag.tool_calls, tool_names
         );
         for line in wrap_text(&meta, text_width) {
             lines.push(Line::from(vec![Span::styled(
                 format!("{indent}{line}"),
                 Style::default().fg(Theme::GREY_400),
+            )]));
+        }
+
+        let timing = format!(
+            "Timing: evidence pack {}ms · tools {}ms · batch verify {}ms",
+            diag.evidence_pack_ms, diag.tool_exec_ms, diag.batch_verify_ms
+        );
+        for line in wrap_text(&timing, text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::GREY_500),
             )]));
         }
 
@@ -818,9 +829,10 @@ fn render_suggestion_diagnostics<'a>(lines: &mut Vec<Line<'a>>, app: &App, inner
         }
 
         let counts = format!(
-            "Parsed: {} · deduped: {} · low confidence removed: {} · truncated: {} · final: {}",
+            "Parsed: {} · deduped: {} · grounded removed: {} · low confidence removed: {} · truncated: {} · final: {}",
             diag.raw_count,
             diag.deduped_count,
+            diag.grounding_filtered,
             diag.low_confidence_filtered,
             diag.truncated_count,
             diag.final_count
@@ -830,6 +842,22 @@ fn render_suggestion_diagnostics<'a>(lines: &mut Vec<Line<'a>>, app: &App, inner
                 format!("{indent}{line}"),
                 Style::default().fg(Theme::GREY_400),
             )]));
+        }
+
+        if diag.batch_verify_attempted > 0 {
+            let batch_verify = format!(
+                "Batch verify: attempted {} · confirmed {} · not found {} · errors {}",
+                diag.batch_verify_attempted,
+                diag.batch_verify_verified,
+                diag.batch_verify_not_found,
+                diag.batch_verify_errors
+            );
+            for line in wrap_text(&batch_verify, text_width) {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{indent}{line}"),
+                    Style::default().fg(Theme::GREY_500),
+                )]));
+            }
         }
 
         let parse = format!(

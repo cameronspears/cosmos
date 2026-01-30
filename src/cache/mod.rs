@@ -556,32 +556,6 @@ impl DomainGlossary {
         self.generated_at = Utc::now();
     }
 
-    /// Format glossary for inclusion in LLM prompts
-    pub fn to_prompt_context(&self, max_terms: usize) -> String {
-        if self.terms.is_empty() {
-            return String::new();
-        }
-
-        let mut lines = Vec::new();
-
-        // Sort by number of files (most used terms first)
-        let mut sorted: Vec<_> = self.terms.iter().collect();
-        sorted.sort_by(|a, b| b.1.files.len().cmp(&a.1.files.len()));
-
-        for (name, entry) in sorted.into_iter().take(max_terms) {
-            lines.push(format!("- {}: {}", name, entry.definition));
-        }
-
-        if lines.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "DOMAIN TERMINOLOGY (use these terms, not generic descriptions):\n{}",
-                lines.join("\n")
-            )
-        }
-    }
-
     /// Check if glossary is empty
     pub fn is_empty(&self) -> bool {
         self.terms.is_empty()

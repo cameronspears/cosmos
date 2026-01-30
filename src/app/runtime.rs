@@ -427,18 +427,13 @@ pub async fn run_tui(
                 } else {
                     Some(repo_memory_context)
                 };
-                let glossary_ref = if glossary_clone.is_empty() {
-                    None
-                } else {
-                    Some(&glossary_clone)
-                };
-                // Use agentic analysis for highest accuracy - model explores codebase with tools
-                match suggest::llm::analyze_codebase_agentic(
+                // Fast grounded suggestions: one LLM call, no tools, strict latency budget.
+                // Agentic deep scan remains available elsewhere but should not block the user.
+                match suggest::llm::analyze_codebase_fast_grounded(
                     &repo_root,
                     &index_clone,
                     &context_clone,
                     mem,
-                    glossary_ref,
                 )
                 .await
                 {
@@ -446,7 +441,7 @@ pub async fn run_tui(
                         let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                             suggestions,
                             usage,
-                            model: "speed-lean".to_string(),
+                            model: "fast-grounded".to_string(),
                             diagnostics,
                         });
                     }

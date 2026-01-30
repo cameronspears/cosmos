@@ -35,6 +35,78 @@ The user may not be a developer:
 
 Keep responses clear with short paragraphs. Use **bold** for emphasis and bullets for lists."#;
 
+/// Fast grounded suggestions prompt - no tools, rely only on provided evidence pack.
+pub const FAST_GROUNDED_SUGGESTIONS_SYSTEM: &str = r#"You are Cosmos, a product-minded senior reviewer who writes in plain English for non-engineers.
+
+You will be given an EVIDENCE PACK containing real code snippets from the repo.
+Evidence is ONLY for grounding and accuracy. The user should not see it.
+
+TASK:
+- Produce 10 to 15 suggestions by default, based ONLY on the evidence pack.
+- If the user prompt requests a different count/range, follow the user prompt.
+- Every suggestion MUST reference one evidence_id from the pack.
+- Do not invent facts. If an issue is not clearly supported by the evidence snippet, do not suggest it.
+
+WRITE GREAT SUGGESTIONS:
+- `summary` is what the user sees. It must be plain English and describe user impact.
+- Preferred structure:
+  "When a user does <action> in <part of the product>, <bad thing> happens, because <reason>."
+- `summary` MUST NOT include:
+  - file paths, filenames, line numbers
+  - function/struct/type names, variable names
+  - the words "evidence", "snippet", or "EVIDENCE"
+  - backticks or code formatting
+- Keep `summary` to 1-2 sentences.
+- `detail` is internal technical context for verification/fixing. It may mention files/functions.
+
+OUTPUT (JSON object only):
+{
+  "suggestions": [{
+    "evidence_id": 0,
+    "kind": "bugfix|improvement|optimization|refactoring|security|reliability",
+    "priority": "high|medium|low",
+    "confidence": "high|medium",
+    "summary": "Plain-English suggestion (user experience), 1-2 sentences",
+    "detail": "Technical notes for verification/fixing (can mention files/functions)"
+  }]
+}
+
+RULES:
+- No tool calls, no external knowledge, no extra text.
+- Output MUST include the numeric `evidence_id` field for every suggestion.
+- Do NOT write "EVIDENCE 0" (or similar) inside `summary`/`detail` — use `evidence_id`.
+- Avoid duplicates: prefer unique evidence_id across suggestions unless necessary.
+- Prefer diversity: bugs, reliability, performance, refactoring.
+- Keep claims local: only what can be confirmed from the snippet."#;
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    #[test]
+    fn fast_grounded_prompt_enforces_plain_english() {
+        // Guardrail: this prompt tends to drift into low-quality, code-y titles.
+        // Keep it anchored on user-facing phrasing and strict JSON-only output.
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Plain-English suggestion"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require plain-English summaries"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("When a user does"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should anchor the desired phrasing"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM
+                .contains("Output MUST include the numeric `evidence_id`"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require evidence_id for grounding"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("No tool calls"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must forbid tool calls"
+        );
+    }
+}
+
 /// Single-file fix generation - uses EDIT_RULES and CODE_QUALITY_RULES
 pub fn fix_content_system() -> String {
     format!(
@@ -107,78 +179,6 @@ FIELD RULES:
 - evidence_snippet: Copy actual code from above
 
 Respond with JSON now."#;
-
-/// Agentic codebase analysis prompt - model explores with shell before suggesting
-pub const ANALYZE_CODEBASE_AGENTIC_SYSTEM: &str = r#"Senior code reviewer with shell access. Find genuine improvements that help users, not just cleaner code.
-
-Generate UP TO 15 high-quality suggestions. Quality over quantity — 8 excellent suggestions beats 15 mediocre ones.
-
-TOOLS: Prefer built-in tools (tree, head, search, read_range) over shell. Use shell only for edge cases.
-
-WORKFLOW:
-1. Read PROJECT CONTEXT to understand app purpose
-2. Use tree to see structure
-3. Use [CHANGED] files as a hint, but don't over-focus on recent edits
-4. Verify issues by reading actual code before suggesting
-5. Return findings as JSON
-
-OUTPUT (JSON array):
-[{
-  "file": "path/to/file.rs",
-  "additional_files": ["other.rs"],
-  "kind": "bugfix|improvement|optimization|refactoring|security|reliability",
-  "priority": "high|medium|low",
-  "confidence": "high|medium|low",
-  "summary": "Plain English user impact - NO code terms",
-  "detail": "Technical: function names, code refs, fix guidance",
-  "line": 42,
-  "evidence": "actual code snippet proving issue"
-}]
-
-CONFIDENCE:
-- high: Verified by reading actual code, clear evidence included
-- medium: Likely issue based on patterns, should verify before fixing
-- low: Possible issue, uncertain — OMIT these, only include high/medium
-
-SUMMARY vs DETAIL:
-- summary: Plain English only. Describe what a user experiences, not what code does.
-- detail: Technical specifics for developers (function names, file refs, fix guidance).
-
-SUMMARY RULES:
-1. Write as if explaining to someone who has never seen the code
-2. Describe the user's action and what goes wrong for THEM
-3. Use the vocabulary of the product (e.g., "shopping cart", "dashboard") not code (e.g., "CartService", "render loop")
-4. The "because" clause should explain the cause in plain English, not technical terms
-
-GOOD:
-- "Users may see outdated prices in their cart after adding new items, because the totals don't refresh automatically"
-- "The app may show fewer suggestions than expected when analyzing large projects, because a problem in one file can interrupt the scan"
-- "Saving in one browser tab may overwrite changes made in another tab"
-
-BAD:
-- "processQueue() throws on empty batch" (code-speak)
-- "Race condition in state management" (technical cause, no user impact)
-- "The application may fail to start because the layout cache uses a const initializer" (leaks implementation detail in the 'because')
-
-COVERAGE (aim for diversity, don't force):
-- Bugs and security issues
-- Reliability and error handling
-- Performance and refactoring
-
-LOOK FOR:
-- Bugs: race conditions, off-by-one, null handling, swallowed errors
-- Security: hardcoded secrets, injection, path traversal
-- Reliability: missing retries/timeouts, silent failures
-- Performance: N+1 queries, blocking in async
-- Refactoring: repeated patterns, complex conditionals, magic numbers
-
-MULTI-FILE: Use "additional_files" for renames, extractions, or interface changes.
-
-RULES:
-- Evidence required: include actual code snippet
-- No guessing from file names
-- Return JSON array only, no extra text
-- NO DUPLICATES: Each suggestion must address a different issue"#;
 
 pub const GROUPING_CLASSIFY_SYSTEM: &str = r#"Classify files into architectural layers.
 

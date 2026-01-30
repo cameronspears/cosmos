@@ -9,12 +9,14 @@ use super::client::{
 use super::models::{merge_usage, Model, Usage};
 use super::tools::{execute_tool, get_tool_definitions, ToolCall, ToolDefinition};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 /// Overall timeout for the agentic loop to prevent indefinite hangs
 const LOOP_TIMEOUT: Duration = Duration::from_secs(90);
+const MAX_PARALLEL_TOOL_EXECUTIONS: usize = 4;
 
 /// Some providers occasionally return a response with no content and no tool calls.
 /// Treat this as transient and retry a few times with backoff.
@@ -25,18 +27,46 @@ const EMPTY_RESPONSE_MAX_RETRIES: u32 = 3;
 pub struct AgenticResponse {
     pub content: String,
     pub usage: Option<Usage>,
-    pub trace: AgenticTrace,
 }
 
-/// Trace metadata for troubleshooting agentic runs
-#[derive(Debug, Clone, Default)]
-pub struct AgenticTrace {
-    pub iterations: usize,
-    pub tool_calls: usize,
-    pub tool_names: Vec<String>,
-    pub forced_final: bool,
-    pub formatting_pass: bool,
-    pub response_healing_used: bool,
+async fn run_parallel_ordered_blocking<I, O, F>(
+    inputs: Vec<I>,
+    max_parallel: usize,
+    f: Arc<F>,
+) -> Vec<Option<O>>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+    F: Fn(I) -> O + Send + Sync + 'static,
+{
+    if inputs.is_empty() || max_parallel == 0 {
+        return Vec::new();
+    }
+
+    let semaphore = Arc::new(Semaphore::new(max_parallel));
+    let mut handles = Vec::with_capacity(inputs.len());
+    let mut results: Vec<Option<O>> = std::iter::repeat_with(|| None).take(inputs.len()).collect();
+
+    for (idx, input) in inputs.into_iter().enumerate() {
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let f = f.clone();
+        handles.push((
+            idx,
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                (f)(input)
+            }),
+        ));
+    }
+
+    for (idx, handle) in handles {
+        results[idx] = handle.await.ok();
+    }
+
+    results
 }
 
 /// A message in the conversation
@@ -158,68 +188,6 @@ pub fn schema_to_response_format(name: &str, schema: serde_json::Value) -> Respo
     }
 }
 
-/// JSON Schema for structured suggestion output
-/// Enforces the LLM to return a valid array of suggestions
-pub fn suggestion_schema() -> ResponseFormat {
-    ResponseFormat {
-        format_type: "json_schema".to_string(),
-        json_schema: Some(JsonSchemaConfig {
-            name: "suggestions".to_string(),
-            strict: true,
-            schema: serde_json::json!({
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "file": {
-                            "type": "string",
-                            "description": "Path to the file"
-                        },
-                        "additional_files": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Additional files affected"
-                        },
-                        "kind": {
-                            "type": "string",
-                            "enum": ["bugfix", "improvement", "optimization", "refactoring", "security", "reliability"],
-                            "description": "Type of suggestion"
-                        },
-                        "priority": {
-                            "type": "string",
-                            "enum": ["high", "medium", "low"],
-                            "description": "Priority level"
-                        },
-                        "confidence": {
-                            "type": "string",
-                            "enum": ["high", "medium", "low"],
-                            "description": "Confidence level"
-                        },
-                        "summary": {
-                            "type": "string",
-                            "description": "Plain English: what users experience and why, no code terms"
-                        },
-                        "detail": {
-                            "type": "string",
-                            "description": "Technical details and fix guidance"
-                        },
-                        "line": {
-                            "type": "integer",
-                            "description": "Line number in the file"
-                        },
-                        "evidence": {
-                            "type": "string",
-                            "description": "Code snippet proving the issue"
-                        }
-                    },
-                    "required": ["file", "kind", "priority", "confidence", "summary", "detail"],
-                    "additionalProperties": false
-                }
-            }),
-        }),
-    }
-}
-
 fn reasoning_config(model: Model) -> Option<ReasoningConfig> {
     model.reasoning_effort().map(|effort| ReasoningConfig {
         effort: effort.to_string(),
@@ -317,11 +285,6 @@ pub async fn call_llm_agentic(
 
     let mut iteration = 0;
     let start = Instant::now();
-    let mut tool_calls_total = 0;
-    let mut tool_names = HashSet::new();
-    let mut formatting_pass = false;
-    let mut forced_final = false;
-    let mut response_healing_used = false;
     let mut total_usage: Option<Usage> = None;
     let mut empty_response_retries: u32 = 0;
 
@@ -331,7 +294,6 @@ pub async fn call_llm_agentic(
         // Check both iteration limit and wall-clock timeout
         if iteration > max_iterations || start.elapsed() > LOOP_TIMEOUT {
             // Force the model to respond with what it has
-            forced_final = true;
             break;
         }
         // During exploration, don't use structured output (incompatible with tools for many models)
@@ -374,10 +336,6 @@ pub async fn call_llm_agentic(
         // Check if model wants to call tools
         if let Some(tool_calls) = &choice.message.tool_calls {
             if !tool_calls.is_empty() {
-                tool_calls_total += tool_calls.len();
-                for tc in tool_calls {
-                    tool_names.insert(tc.function.name.clone());
-                }
                 // Add assistant message with tool calls
                 messages.push(Message {
                     role: "assistant".to_string(),
@@ -386,23 +344,49 @@ pub async fn call_llm_agentic(
                     tool_call_id: None,
                 });
 
-                // Execute each tool and add results
-                for tc in tool_calls {
-                    let tool_call = ToolCall {
-                        id: tc.id.clone(),
-                        function: super::tools::FunctionCall {
-                            name: tc.function.name.clone(),
-                            arguments: tc.function.arguments.clone(),
-                        },
-                    };
+                // Execute tool calls in parallel (bounded) and add results in stable order.
+                let repo_root_buf = repo_root.to_path_buf();
+                let inputs: Vec<(PathBuf, ToolCall)> = tool_calls
+                    .iter()
+                    .map(|tc| {
+                        let tool_call_id = tc.id.clone();
+                        let tool_call = ToolCall {
+                            id: tool_call_id.clone(),
+                            function: super::tools::FunctionCall {
+                                name: tc.function.name.clone(),
+                                arguments: tc.function.arguments.clone(),
+                            },
+                        };
+                        (repo_root_buf.clone(), tool_call)
+                    })
+                    .collect();
 
-                    let result = execute_tool(repo_root, &tool_call);
+                let results = run_parallel_ordered_blocking(
+                    inputs,
+                    MAX_PARALLEL_TOOL_EXECUTIONS,
+                    Arc::new(|(repo_root, tool_call): (PathBuf, ToolCall)| {
+                        execute_tool(&repo_root, &tool_call)
+                    }),
+                )
+                .await;
 
+                for (idx, tc) in tool_calls.iter().enumerate() {
+                    let tc_id = tc.id.clone();
+                    let result = results
+                        .get(idx)
+                        .and_then(|r| r.as_ref())
+                        .cloned()
+                        .unwrap_or_else(|| super::tools::ToolResult {
+                            tool_call_id: tc_id.clone(),
+                            content:
+                                "Tool execution failed. Please try again. (no tool result returned)"
+                                    .to_string(),
+                        });
                     messages.push(Message {
                         role: "tool".to_string(),
                         content: Some(result.content),
                         tool_calls: None,
-                        tool_call_id: Some(tc.id.clone()),
+                        tool_call_id: Some(tc_id),
                     });
                 }
 
@@ -445,8 +429,6 @@ pub async fn call_llm_agentic(
         };
 
         if needs_formatting {
-            formatting_pass = true;
-            response_healing_used = true;
             // Content isn't valid JSON - ask for formatting with structured output
             messages.push(Message {
                 role: "assistant".to_string(),
@@ -502,35 +484,15 @@ pub async fn call_llm_agentic(
                 ));
             }
 
-            let mut tool_name_list: Vec<String> = tool_names.into_iter().collect();
-            tool_name_list.sort();
             return Ok(AgenticResponse {
                 content: formatted,
                 usage: total_usage,
-                trace: AgenticTrace {
-                    iterations: iteration,
-                    tool_calls: tool_calls_total,
-                    tool_names: tool_name_list,
-                    forced_final,
-                    formatting_pass,
-                    response_healing_used,
-                },
             });
         }
 
-        let mut tool_name_list: Vec<String> = tool_names.into_iter().collect();
-        tool_name_list.sort();
         return Ok(AgenticResponse {
             content,
             usage: total_usage,
-            trace: AgenticTrace {
-                iterations: iteration,
-                tool_calls: tool_calls_total,
-                tool_names: tool_name_list,
-                forced_final,
-                formatting_pass,
-                response_healing_used,
-            },
         });
     }
 
@@ -569,10 +531,6 @@ pub async fn call_llm_agentic(
         parallel_tool_calls: None,
         provider: Some(provider_config(use_structured_output)),
     };
-    if use_structured_output {
-        response_healing_used = true;
-    }
-
     // Use shared retry helper for final request too, plus a few retries for empty content.
     let mut last_error: Option<anyhow::Error> = None;
     let mut parsed: Option<ChatResponse> = None;
@@ -640,19 +598,9 @@ pub async fn call_llm_agentic(
         ));
     }
 
-    let mut tool_name_list: Vec<String> = tool_names.into_iter().collect();
-    tool_name_list.sort();
     Ok(AgenticResponse {
         content,
         usage: total_usage,
-        trace: AgenticTrace {
-            iterations: iteration,
-            tool_calls: tool_calls_total,
-            tool_names: tool_name_list,
-            forced_final,
-            formatting_pass,
-            response_healing_used,
-        },
     })
 }
 
@@ -758,9 +706,9 @@ mod tests {
     fn test_reasoning_config_for_all_models() {
         use super::Model;
 
-        // Speed and Balanced get high, Smart gets xhigh
+        // Speed gets low, Balanced high, Smart xhigh
         let speed = reasoning_config(Model::Speed).expect("Speed should have reasoning");
-        assert_eq!(speed.effort, "high");
+        assert_eq!(speed.effort, "low");
         assert!(speed.exclude);
 
         let balanced = reasoning_config(Model::Balanced).expect("Balanced should have reasoning");
@@ -768,5 +716,23 @@ mod tests {
 
         let smart = reasoning_config(Model::Smart).expect("Smart should have reasoning");
         assert_eq!(smart.effort, "xhigh");
+    }
+
+    #[tokio::test]
+    async fn parallel_blocking_runner_preserves_input_order() {
+        let inputs = vec![3u64, 1u64, 2u64];
+        let results = run_parallel_ordered_blocking(
+            inputs,
+            2,
+            Arc::new(|v| {
+                // Invert delay so completion order differs from input order.
+                std::thread::sleep(std::time::Duration::from_millis(50 * (4 - v)));
+                v
+            }),
+        )
+        .await;
+
+        let out: Vec<u64> = results.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(out, vec![3, 1, 2]);
     }
 }

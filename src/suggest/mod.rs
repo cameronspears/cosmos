@@ -102,6 +102,9 @@ pub struct Suggestion {
     pub line: Option<usize>,
     pub summary: String,
     pub detail: Option<String>,
+    /// Raw code snippet proving the issue (used for grounding and UI citations).
+    #[serde(default)]
+    pub evidence: Option<String>,
     pub source: SuggestionSource,
     pub created_at: DateTime<Utc>,
     /// Whether the user has dismissed this suggestion
@@ -128,6 +131,7 @@ impl Suggestion {
             line: None,
             summary,
             detail: None,
+            evidence: None,
             source,
             created_at: Utc::now(),
             dismissed: false,
@@ -150,8 +154,8 @@ impl Suggestion {
         self
     }
 
-    pub fn with_additional_files(mut self, files: Vec<PathBuf>) -> Self {
-        self.additional_files = files;
+    pub fn with_evidence(mut self, evidence: String) -> Self {
+        self.evidence = Some(evidence);
         self
     }
 
@@ -289,6 +293,7 @@ impl SuggestionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn test_priority_ordering() {
@@ -308,6 +313,27 @@ mod tests {
 
         assert!(!suggestion.dismissed);
         assert!(!suggestion.applied);
+    }
+
+    #[test]
+    fn test_suggestion_deserialize_without_evidence_is_backward_compatible() {
+        let suggestion = Suggestion::new(
+            SuggestionKind::BugFix,
+            Priority::High,
+            PathBuf::from("src/lib.rs"),
+            "Example".to_string(),
+            SuggestionSource::LlmDeep,
+        )
+        .with_line(3)
+        .with_detail("Details".to_string());
+
+        let mut value = serde_json::to_value(&suggestion).unwrap();
+        if let Value::Object(map) = &mut value {
+            map.remove("evidence");
+        }
+
+        let round: Suggestion = serde_json::from_value(value).unwrap();
+        assert!(round.evidence.is_none());
     }
 
     #[test]

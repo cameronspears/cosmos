@@ -1,29 +1,5 @@
-use crate::suggest::{Confidence, Priority, Suggestion, SuggestionKind, SuggestionSource};
-use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
-
-/// Check if a path is safe (relative, no parent traversal, no absolute)
-fn is_safe_relative_path(path: &Path) -> bool {
-    // Reject empty paths
-    if path.as_os_str().is_empty() {
-        return false;
-    }
-
-    // Reject absolute paths
-    if path.is_absolute() {
-        return false;
-    }
-
-    // Reject paths with parent directory traversal
-    for component in path.components() {
-        if matches!(component, Component::ParentDir) {
-            return false;
-        }
-    }
-
-    true
-}
+use std::path::{Path, PathBuf};
 
 /// Strip markdown code fences from a response
 fn strip_markdown_fences(text: &str) -> &str {
@@ -87,139 +63,6 @@ fn extract_json_fragment(text: &str, open: char, close: char) -> Option<&str> {
     }
 
     None
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ParseDiagnostics {
-    pub strategy: String,
-    pub used_markdown_fences: bool,
-    pub used_sanitized_fix: bool,
-    pub used_json_fix: bool,
-    pub used_individual_parse: bool,
-    pub parsed_count: usize,
-}
-
-#[derive(Deserialize)]
-struct CodebaseSuggestionJson {
-    file: String,
-    #[serde(default)]
-    additional_files: Vec<String>,
-    #[serde(default)]
-    kind: String,
-    #[serde(default)]
-    priority: String,
-    #[serde(default)]
-    confidence: String,
-    summary: String,
-    #[serde(default)]
-    detail: String,
-    line: Option<usize>,
-}
-
-/// Parse suggestions from structured output (guaranteed valid JSON from provider)
-///
-/// This is a simplified parser for use when structured output is enabled.
-/// Since the provider guarantees valid JSON matching the schema, we can
-/// parse directly without fallback logic.
-pub(crate) fn parse_structured_suggestions(
-    response: &str,
-    _root: &Path,
-) -> anyhow::Result<(Vec<Suggestion>, ParseDiagnostics)> {
-    let mut diagnostics = ParseDiagnostics {
-        strategy: "structured_output".to_string(),
-        ..Default::default()
-    };
-
-    // Handle empty responses
-    let trimmed = response.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No suggestions received. The AI may have been rate limited or timed out. Try again."
-        ));
-    }
-
-    // Parse directly - structured output guarantees valid JSON
-    let parsed: Vec<CodebaseSuggestionJson> = serde_json::from_str(trimmed).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse suggestions: {}. Content: {}",
-            e,
-            &trimmed.chars().take(200).collect::<String>()
-        )
-    })?;
-
-    diagnostics.parsed_count = parsed.len();
-
-    // Convert to Suggestion objects, filtering out invalid paths
-    let suggestions = parsed
-        .into_iter()
-        .filter(|s| !s.file.is_empty() && !s.summary.is_empty())
-        .filter_map(|s| {
-            // Validate file path for security (no traversal, no absolute paths)
-            let file_path = PathBuf::from(&s.file);
-            if !is_safe_relative_path(&file_path) {
-                // Skip suggestions with unsafe paths
-                return None;
-            }
-
-            // Validate additional files too
-            let additional_files: Vec<PathBuf> = s
-                .additional_files
-                .iter()
-                .filter_map(|f| {
-                    let path = PathBuf::from(f);
-                    if is_safe_relative_path(&path) {
-                        Some(path)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let kind = match s.kind.to_lowercase().as_str() {
-                "bugfix" => SuggestionKind::BugFix,
-                "optimization" => SuggestionKind::Optimization,
-                "refactoring" => SuggestionKind::Quality,
-                "security" => SuggestionKind::BugFix, // Security issues map to BugFix
-                "reliability" => SuggestionKind::Quality, // Reliability maps to Quality
-                _ => SuggestionKind::Improvement,
-            };
-
-            let priority = match s.priority.to_lowercase().as_str() {
-                "high" => Priority::High,
-                "low" => Priority::Low,
-                _ => Priority::Medium,
-            };
-
-            let confidence = match s.confidence.to_lowercase().as_str() {
-                "high" => Confidence::High,
-                "low" => Confidence::Low,
-                _ => Confidence::Medium,
-            };
-
-            // Store relative path (not absolute) for consistent handling downstream
-            let mut suggestion = Suggestion::new(
-                kind,
-                priority,
-                file_path,
-                s.summary,
-                SuggestionSource::LlmDeep,
-            )
-            .with_detail(s.detail)
-            .with_confidence(confidence);
-
-            if let Some(line) = s.line {
-                suggestion = suggestion.with_line(line);
-            }
-
-            if !additional_files.is_empty() {
-                suggestion = suggestion.with_additional_files(additional_files);
-            }
-
-            Some(suggestion)
-        })
-        .collect();
-
-    Ok((suggestions, diagnostics))
 }
 
 /// Try to fix common JSON issues from LLM responses
@@ -503,25 +346,6 @@ mod tests {
         let truncated = truncate_content(content, 15);
         assert!(truncated.contains("truncated"));
         assert!(truncated.len() < content.len() + 20);
-    }
-
-    #[test]
-    fn test_parse_structured_suggestions_basic() {
-        let json = r#"[{"file":"src/lib.rs","kind":"bugfix","priority":"low","summary":"Issue"}]"#;
-        let root = std::path::Path::new("/project");
-        let (parsed, diagnostics) = parse_structured_suggestions(json, root).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].summary, "Issue");
-        assert_eq!(diagnostics.strategy, "structured_output");
-    }
-
-    #[test]
-    fn test_parse_structured_suggestions_with_detail() {
-        let json = r#"[{"file":"src/lib.rs","kind":"bugfix","priority":"high","confidence":"high","summary":"Fix bug","detail":"Detailed description"}]"#;
-        let root = std::path::Path::new("/project");
-        let (parsed, _) = parse_structured_suggestions(json, root).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].summary, "Fix bug");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

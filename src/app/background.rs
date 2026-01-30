@@ -132,18 +132,12 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                             } else {
                                 Some(repo_memory_context)
                             };
-                            let glossary_ref = if glossary_clone.is_empty() {
-                                None
-                            } else {
-                                Some(&glossary_clone)
-                            };
-                            // Use agentic analysis for highest accuracy - model explores codebase with tools
-                            match suggest::llm::analyze_codebase_agentic(
+                            // Fast grounded suggestions: one LLM call, no tools, strict latency budget.
+                            match suggest::llm::analyze_codebase_fast_grounded(
                                 &repo_root,
                                 &index_clone,
                                 &context_clone,
                                 mem,
-                                glossary_ref,
                             )
                             .await
                             {
@@ -152,7 +146,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                                         tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                                             suggestions,
                                             usage,
-                                            model: "speed-lean".to_string(),
+                                            model: "fast-grounded".to_string(),
                                             diagnostics,
                                         });
                                 }
