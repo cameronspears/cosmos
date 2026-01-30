@@ -260,24 +260,24 @@ impl SuggestionEngine {
                 return pri;
             }
 
-            // Within the same priority, prefer changed files
+            // Then kind weight
+            let kw = kind_weight(b.kind).cmp(&kind_weight(a.kind));
+            if kw != std::cmp::Ordering::Equal {
+                return kw;
+            }
+
+            // Git context is a *weak* tie-breaker: it helps relevance, but shouldn't
+            // dominate results when users want broader codebase improvements.
             let a_changed = changed.contains(&a.file);
             let b_changed = changed.contains(&b.file);
             if a_changed != b_changed {
                 return b_changed.cmp(&a_changed);
             }
 
-            // Then blast radius files
             let a_blast = blast.contains(&a.file);
             let b_blast = blast.contains(&b.file);
             if a_blast != b_blast {
                 return b_blast.cmp(&a_blast);
-            }
-
-            // Then kind weight
-            let kw = kind_weight(b.kind).cmp(&kind_weight(a.kind));
-            if kw != std::cmp::Ordering::Equal {
-                return kw;
             }
 
             // Finally: newest first
@@ -308,5 +308,48 @@ mod tests {
 
         assert!(!suggestion.dismissed);
         assert!(!suggestion.applied);
+    }
+
+    #[test]
+    fn test_sort_with_context_prefers_kind_over_changed() {
+        let index = CodebaseIndex {
+            root: PathBuf::from("."),
+            files: std::collections::HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: None,
+        };
+
+        let mut engine = SuggestionEngine::new(index);
+
+        // Same priority; one is in a changed file but lower kind weight.
+        let changed_doc = Suggestion::new(
+            SuggestionKind::Documentation,
+            Priority::High,
+            PathBuf::from("src/changed.rs"),
+            "Docs".to_string(),
+            SuggestionSource::Static,
+        );
+        let unchanged_bug = Suggestion::new(
+            SuggestionKind::BugFix,
+            Priority::High,
+            PathBuf::from("src/other.rs"),
+            "Bug".to_string(),
+            SuggestionSource::Static,
+        );
+
+        engine.suggestions = vec![changed_doc, unchanged_bug];
+
+        let context = crate::context::WorkContext {
+            branch: "test".to_string(),
+            uncommitted_files: vec![PathBuf::from("src/changed.rs")],
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 1,
+            repo_root: PathBuf::from("."),
+        };
+
+        engine.sort_with_context(&context);
+        assert_eq!(engine.suggestions[0].kind, SuggestionKind::BugFix);
     }
 }

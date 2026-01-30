@@ -495,17 +495,24 @@ fn build_lean_analysis_prompt(
 
     // ═══ TIER 2: PRIORITY FILES ═══
     let changed: HashSet<PathBuf> = context.all_changed_files().into_iter().cloned().collect();
+    let mut changed_list: Vec<PathBuf> = changed.iter().cloned().collect();
+    changed_list.sort();
 
-    // Collect top priority files for code preview
-    let mut priority_files: Vec<PathBuf> = changed
-        .iter()
-        .take(limits.code_preview_files.min(2))
-        .cloned()
-        .collect();
+    // We'll build a balanced set of preview files so the model doesn't
+    // over-fit to whatever was recently edited.
+    let mut priority_files: Vec<PathBuf> = Vec::new();
 
-    if !changed.is_empty() {
-        let mut s = String::from("\n\n═══ PRIORITY FILES ═══\n[CHANGED] Read these first:");
-        for path in changed.iter().take(limits.changed_files_limit) {
+    let mut push_unique = |p: PathBuf| {
+        if !priority_files.contains(&p) {
+            priority_files.push(p);
+        }
+    };
+
+    if !changed_list.is_empty() {
+        let mut s = String::from(
+            "\n\n═══ PRIORITY FILES ═══\nRECENT WORK (context only — don't limit suggestions to these):",
+        );
+        for path in changed_list.iter().take(limits.changed_files_limit) {
             let summary = index
                 .files
                 .get(path)
@@ -534,11 +541,29 @@ fn build_lean_analysis_prompt(
         .take(limits.complex_files_limit)
         .collect();
 
-    // Add top complex file to priority list
+    // Core files: high fan-in (many other files use/import them)
+    let mut core_files: Vec<_> = index.files.values().collect();
+    core_files.sort_by(|a, b| b.summary.used_by.len().cmp(&a.summary.used_by.len()));
+    let core = core_files
+        .iter()
+        .filter(|f| !changed.contains(&f.path))
+        .filter(|f| f.summary.used_by.len() >= 2)
+        .take(2)
+        .map(|f| f.path.clone())
+        .collect::<Vec<_>>();
+
+    // Build preview list in a balanced order:
+    // - one core file (if any)
+    // - one hotspot (if any)
+    // - one recently changed file (if any)
+    if let Some(c) = core.first() {
+        push_unique(c.clone());
+    }
     if let Some(h) = hot.first() {
-        if priority_files.len() < limits.code_preview_files {
-            priority_files.push(h.path.clone());
-        }
+        push_unique(h.path.clone());
+    }
+    if let Some(ch) = changed_list.first() {
+        push_unique(ch.clone());
     }
 
     if !hot.is_empty() {
@@ -549,6 +574,23 @@ fn build_lean_analysis_prompt(
                 f.path.display(),
                 f.loc,
                 truncate_str(&f.summary.purpose, 50)
+            ));
+        }
+        sections.push(s);
+    }
+
+    if !core.is_empty() {
+        let mut s = String::from("\n[CORE] Widely used modules (good for global issues):");
+        for p in core.iter().take(2) {
+            let summary = index
+                .files
+                .get(p)
+                .map(|f| f.summary.purpose.as_str())
+                .unwrap_or("");
+            s.push_str(&format!(
+                "\n• {} - {}",
+                p.display(),
+                truncate_str(summary, 60)
             ));
         }
         sections.push(s);
@@ -643,6 +685,10 @@ EXAMPLE WORKFLOW:
 3. read_range to examine specific sections
 4. Find issue → record with evidence and confidence
 
+BALANCE:
+- Recent edits are useful context, but avoid making all suggestions about only the changed files.
+- Prefer high-impact issues that affect the overall app (core or complex areas), even if unrelated to the latest diff.
+
 RULES:
 - Only suggest issues you've verified by reading actual code
 - Include confidence: high (verified), medium (likely), low (uncertain)
@@ -650,4 +696,114 @@ RULES:
     ));
 
     sections.join("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{
+        CodebaseIndex, Dependency, FileIndex, FileSummary, Language, Pattern, Symbol,
+    };
+    use chrono::Utc;
+    use std::collections::HashMap;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn make_file_index(rel: &Path, purpose: &str, used_by: Vec<PathBuf>) -> FileIndex {
+        let mut summary = FileSummary::default();
+        summary.purpose = purpose.to_string();
+        summary.used_by = used_by;
+
+        FileIndex {
+            path: rel.to_path_buf(),
+            language: Language::Rust,
+            loc: 10,
+            content_hash: "x".to_string(),
+            symbols: Vec::<Symbol>::new(),
+            dependencies: Vec::<Dependency>::new(),
+            patterns: Vec::<Pattern>::new(),
+            complexity: 1.0,
+            last_modified: Utc::now(),
+            summary,
+            layer: None,
+            feature: None,
+        }
+    }
+
+    #[test]
+    fn analysis_prompt_does_not_tell_model_to_read_changed_first() {
+        assert!(
+            !ANALYZE_CODEBASE_AGENTIC_SYSTEM.contains("Read [CHANGED] files"),
+            "System prompt should not instruct reading changed files first"
+        );
+        assert!(
+            ANALYZE_CODEBASE_AGENTIC_SYSTEM.contains("Use [CHANGED] files as a hint"),
+            "System prompt should mention changed files as a hint"
+        );
+    }
+
+    #[test]
+    fn lean_prompt_mentions_recent_work_without_overweighting_it() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Create files for CODE PREVIEW reads
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/changed.rs"), "pub fn a() {}\n").unwrap();
+        fs::write(root.join("src/core.rs"), "pub fn b() {}\n").unwrap();
+        fs::write(root.join("src/hot.rs"), "pub fn c() {}\n").unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            PathBuf::from("src/changed.rs"),
+            make_file_index(
+                Path::new("src/changed.rs"),
+                "Recently edited module",
+                vec![],
+            ),
+        );
+        files.insert(
+            PathBuf::from("src/core.rs"),
+            make_file_index(
+                Path::new("src/core.rs"),
+                "Core module used by many",
+                vec![PathBuf::from("src/one.rs"), PathBuf::from("src/two.rs")],
+            ),
+        );
+        // Hotspot: make it exceed threshold
+        let mut hot = make_file_index(Path::new("src/hot.rs"), "Complex area", vec![]);
+        hot.complexity = HIGH_COMPLEXITY_THRESHOLD + 1.0;
+        files.insert(PathBuf::from("src/hot.rs"), hot);
+
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files,
+            index_errors: Vec::new(),
+            git_head: None,
+        };
+
+        let context = WorkContext {
+            branch: "test".to_string(),
+            uncommitted_files: vec![PathBuf::from("src/changed.rs")],
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 1,
+            repo_root: root,
+        };
+
+        let prompt = build_lean_analysis_prompt(&index, &context, None, None);
+        assert!(
+            prompt.contains("RECENT WORK (context only"),
+            "Prompt should label recent work as context-only"
+        );
+        assert!(
+            !prompt.contains("Read these first"),
+            "Prompt should not instruct reading changed files first"
+        );
+        assert!(
+            prompt.contains("BALANCE:"),
+            "Prompt should include explicit balancing guidance"
+        );
+    }
 }

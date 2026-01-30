@@ -118,7 +118,7 @@ TOOLS: Prefer built-in tools (tree, head, search, read_range) over shell. Use sh
 WORKFLOW:
 1. Read PROJECT CONTEXT to understand app purpose
 2. Use tree to see structure
-3. Read [CHANGED] files and dependencies first
+3. Use [CHANGED] files as a hint, but don't over-focus on recent edits
 4. Verify issues by reading actual code before suggesting
 5. Return findings as JSON
 
