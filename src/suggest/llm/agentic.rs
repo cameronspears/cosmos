@@ -172,7 +172,7 @@ pub fn suggestion_schema() -> ResponseFormat {
                         },
                         "summary": {
                             "type": "string",
-                            "description": "Plain English user impact"
+                            "description": "Plain English: what users experience and why, no code terms"
                         },
                         "detail": {
                             "type": "string",

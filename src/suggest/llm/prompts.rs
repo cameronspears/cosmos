@@ -141,11 +141,24 @@ CONFIDENCE:
 - low: Possible issue, uncertain — OMIT these, only include high/medium
 
 SUMMARY vs DETAIL:
-- summary: NON-TECHNICAL. What user experiences. No function names, no jargon.
-- detail: TECHNICAL. Function names, file refs, fix guidance.
+- summary: Plain English only. Describe what a user experiences, not what code does.
+- detail: Technical specifics for developers (function names, file refs, fix guidance).
 
-GOOD summary: "When generating suggestions, if one file fails the user will see fewer results than expected, which can make it seem like the analysis missed issues"
-BAD summary: "processQueue() throws on empty batch" (code terms belong in detail)
+SUMMARY RULES:
+1. Write as if explaining to someone who has never seen the code
+2. Describe the user's action and what goes wrong for THEM
+3. Use the vocabulary of the product (e.g., "shopping cart", "dashboard") not code (e.g., "CartService", "render loop")
+4. The "because" clause should explain the cause in plain English, not technical terms
+
+GOOD:
+- "Users may see outdated prices in their cart after adding new items, because the totals don't refresh automatically"
+- "The app may show fewer suggestions than expected when analyzing large projects, because a problem in one file can interrupt the scan"
+- "Saving in one browser tab may overwrite changes made in another tab"
+
+BAD:
+- "processQueue() throws on empty batch" (code-speak)
+- "Race condition in state management" (technical cause, no user impact)
+- "The application may fail to start because the layout cache uses a const initializer" (leaks implementation detail in the 'because')
 
 COVERAGE (aim for diversity, don't force):
 - Bugs and security issues
