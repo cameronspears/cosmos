@@ -12,6 +12,9 @@ use std::path::PathBuf;
 pub struct Config {
     /// Legacy field for migration - API key is now stored in system keychain
     pub openrouter_api_key: Option<String>,
+    /// Anonymous per-install identifier for OpenRouter user tracking.
+    /// Helps OpenRouter keep routing/caches sticky to reduce cold starts.
+    pub openrouter_user_id: Option<String>,
 }
 
 impl Config {

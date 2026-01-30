@@ -2,6 +2,7 @@ use super::models::{Model, Usage};
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use uuid::Uuid;
 
 /// OpenRouter direct API URL (BYOK mode)
 pub(crate) const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -40,6 +41,24 @@ pub(crate) fn api_key() -> Option<String> {
     config.get_api_key()
 }
 
+/// Stable anonymous identifier for OpenRouter's `user` field.
+///
+/// OpenRouter uses this for user tracking to improve routing stickiness and caching.
+/// We store an anonymous UUID in config so the same user gets consistent routing.
+pub(crate) fn openrouter_user() -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    let mut config = Config::load();
+    if let Some(id) = config.openrouter_user_id.clone() {
+        return Some(id);
+    }
+    let id = format!("cosmos_{}", Uuid::new_v4());
+    config.openrouter_user_id = Some(id.clone());
+    let _ = config.save();
+    Some(id)
+}
+
 /// Response from LLM including content and usage stats
 #[derive(Debug)]
 pub struct LlmResponse {
@@ -51,6 +70,8 @@ pub struct LlmResponse {
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
     max_tokens: u32,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,12 +87,33 @@ struct ChatRequest {
 
 /// OpenRouter provider configuration
 #[derive(Serialize)]
+struct ProviderThresholds {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p75: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p90: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p99: Option<f64>,
+}
+
+/// OpenRouter provider routing preferences
+///
+/// See: https://openrouter.ai/docs/guides/routing/provider-selection
+#[derive(Serialize)]
 struct ProviderConfig {
     /// Allow OpenRouter to try other providers if the primary fails
     allow_fallbacks: bool,
     /// Only use providers that support all parameters in the request
     #[serde(skip_serializing_if = "Option::is_none")]
     require_parameters: Option<bool>,
+    /// Prefer providers below this latency (seconds). Deprioritizes slow providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferred_max_latency: Option<ProviderThresholds>,
+    /// Prefer providers above this throughput (tokens/sec). Deprioritizes slow providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferred_min_throughput: Option<ProviderThresholds>,
 }
 
 /// OpenRouter plugin configuration
@@ -158,6 +200,8 @@ struct CachedMessage {
 struct CachedChatRequest {
     model: String,
     messages: Vec<CachedMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
     max_tokens: u32,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,6 +306,20 @@ fn provider_config(response_format: &Option<ResponseFormat>) -> ProviderConfig {
     ProviderConfig {
         allow_fallbacks: true,
         require_parameters: response_format.as_ref().map(|_| true),
+        // Soft routing preferences to reduce cold-start/no-content responses without
+        // hard-pinning to a single provider.
+        preferred_max_latency: Some(ProviderThresholds {
+            p50: None,
+            p75: None,
+            p90: Some(8.0),
+            p99: None,
+        }),
+        preferred_min_throughput: Some(ProviderThresholds {
+            p50: None,
+            p75: None,
+            p90: Some(15.0),
+            p99: None,
+        }),
     }
 }
 
@@ -473,6 +531,7 @@ pub(crate) async fn call_llm_with_usage(
                 content: user.to_string(),
             },
         ],
+        user: openrouter_user(),
         max_tokens: model.max_tokens(),
         stream,
         response_format,
@@ -581,6 +640,7 @@ where
                 content: user.to_string(),
             },
         ],
+        user: openrouter_user(),
         max_tokens: model.max_tokens(),
         stream,
         response_format,
@@ -695,6 +755,7 @@ where
     let request = CachedChatRequest {
         model: model.id().to_string(),
         messages: build_cached_messages(system, user),
+        user: openrouter_user(),
         max_tokens: model.max_tokens(),
         stream,
         response_format,

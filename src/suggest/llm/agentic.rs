@@ -3,7 +3,9 @@
 //! Enables models to explore codebases by calling tools (grep, read, ls)
 //! in a loop until they have enough context to complete their task.
 
-use super::client::{api_key, create_http_client, send_with_retry, REQUEST_TIMEOUT_SECS};
+use super::client::{
+    api_key, create_http_client, openrouter_user, send_with_retry, REQUEST_TIMEOUT_SECS,
+};
 use super::models::{merge_usage, Model, Usage};
 use super::tools::{execute_tool, get_tool_definitions, ToolCall, ToolDefinition};
 use serde::{Deserialize, Serialize};
@@ -66,6 +68,8 @@ pub struct FunctionCallMessage {
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
     max_tokens: u32,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -111,10 +115,26 @@ struct PluginConfig {
 }
 
 #[derive(Serialize)]
+struct ProviderThresholds {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p75: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p90: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p99: Option<f64>,
+}
+
+#[derive(Serialize)]
 struct ProviderConfig {
     allow_fallbacks: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     require_parameters: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferred_max_latency: Option<ProviderThresholds>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferred_min_throughput: Option<ProviderThresholds>,
 }
 
 /// OpenRouter reasoning configuration for extended thinking
@@ -217,6 +237,18 @@ fn provider_config(require_parameters: bool) -> ProviderConfig {
     ProviderConfig {
         allow_fallbacks: true,
         require_parameters: if require_parameters { Some(true) } else { None },
+        preferred_max_latency: Some(ProviderThresholds {
+            p50: None,
+            p75: None,
+            p90: Some(8.0),
+            p99: None,
+        }),
+        preferred_min_throughput: Some(ProviderThresholds {
+            p50: None,
+            p75: None,
+            p90: Some(15.0),
+            p99: None,
+        }),
     }
 }
 
@@ -307,6 +339,7 @@ pub async fn call_llm_agentic(
         let request = ChatRequest {
             model: model.id().to_string(),
             messages: messages.clone(),
+            user: openrouter_user(),
             max_tokens: model.max_tokens(),
             stream: false,
             response_format: None,
@@ -433,6 +466,7 @@ pub async fn call_llm_agentic(
             let format_request = ChatRequest {
                 model: model.id().to_string(),
                 messages: messages.clone(),
+                user: openrouter_user(),
                 max_tokens: model.max_tokens(),
                 stream: false,
                 response_format: final_response_format.clone(),
@@ -520,6 +554,7 @@ pub async fn call_llm_agentic(
     let final_request = ChatRequest {
         model: model.id().to_string(),
         messages: messages.clone(),
+        user: openrouter_user(),
         max_tokens: model.max_tokens(),
         stream: false,
         response_format: final_response_format,
@@ -701,6 +736,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
             }],
+            user: None,
             max_tokens: 128,
             stream: false,
             response_format: None,
