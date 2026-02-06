@@ -54,11 +54,11 @@ impl SuggestionKind {
             SuggestionKind::Improvement => "Improve",
             SuggestionKind::BugFix => "Fix",
             SuggestionKind::Feature => "Feature",
-            SuggestionKind::Optimization => "Optimize",
-            SuggestionKind::Quality => "Quality",
-            SuggestionKind::Documentation => "Docs",
-            SuggestionKind::Testing => "Test",
-            SuggestionKind::Refactoring => "Refactor",
+            SuggestionKind::Optimization => "Speed",
+            SuggestionKind::Quality => "Stability",
+            SuggestionKind::Documentation => "Guidance",
+            SuggestionKind::Testing => "Safety",
+            SuggestionKind::Refactoring => "Cleanup",
         }
     }
 }
@@ -416,5 +416,14 @@ mod tests {
 
         engine.sort_with_context(&context);
         assert_eq!(engine.suggestions[0].kind, SuggestionKind::BugFix);
+    }
+
+    #[test]
+    fn test_kind_labels_are_plain_language() {
+        assert_eq!(SuggestionKind::Refactoring.label(), "Cleanup");
+        assert_eq!(SuggestionKind::Optimization.label(), "Speed");
+        assert_eq!(SuggestionKind::Quality.label(), "Stability");
+        assert_eq!(SuggestionKind::Testing.label(), "Safety");
+        assert_eq!(SuggestionKind::Documentation.label(), "Guidance");
     }
 }

@@ -48,14 +48,25 @@ TASK:
 - Do not invent facts. If an issue is not clearly supported by the evidence snippet, do not suggest it.
 
 WRITE GREAT SUGGESTIONS:
-- `summary` is what the user sees. It must be plain English and describe user impact.
-- Preferred structure:
-  "When a user does <action> in <part of the product>, <bad thing> happens, because <reason>."
+- `summary` is what the user sees. The reader is non-technical.
+- Write for someone building an app or website, not for engineers.
+- `summary` must answer two things:
+  1) What goes wrong for the person using the product.
+  2) Why that matters in real life (lost sign-ins, failed saves, slower app, crashes, trust/support cost).
+- Preferred structure (2 short sentences):
+  "When someone <user action>, <visible bad outcome>."
+  "This matters because <real-world impact>."
+- Mention concrete product moments (like sign-in, upload, save, checkout), not vague wording.
+- Avoid unexplained jargon in `summary`. If evidence is technical, translate it:
+  - token -> sign-in key
+  - cached data -> temporarily saved info
+  - parser pool grows unbounded -> memory use keeps growing, which can slow or crash the app
 - `summary` MUST NOT include:
   - file paths, filenames, line numbers
   - function/struct/type names, variable names
   - the words "evidence", "snippet", or "EVIDENCE"
   - backticks or code formatting
+- `summary` should be understandable on first read.
 - Keep `summary` to 1-2 sentences.
 - `detail` is internal technical context for verification/fixing. It may mention files/functions.
 
@@ -92,8 +103,12 @@ mod prompt_tests {
             "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require plain-English summaries"
         );
         assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("When a user does"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should anchor the desired phrasing"
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("This matters because"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should require user-impact framing"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("non-technical"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should target non-technical readers"
         );
         assert!(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Output MUST include `evidence_refs`"),
