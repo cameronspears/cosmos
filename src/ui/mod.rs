@@ -16,8 +16,8 @@ pub use render::render;
 // Re-export all types for backward compatibility
 pub use types::{
     ActivePanel, AskCosmosState, FileChange, InputMode, LoadingState, Overlay, PendingChange,
-    ReviewState, ShipState, ShipStep, Toast, ToastKind, VerifyState, ViewMode, WorkflowStep,
-    SPINNER_FRAMES,
+    ReviewFileContent, ReviewState, ShipState, ShipStep, Toast, ToastKind, VerifyState, ViewMode,
+    WorkflowStep, SPINNER_FRAMES,
 };
 
 use crate::context::WorkContext;
@@ -133,6 +133,10 @@ pub struct App {
     pub update_available: Option<String>,
     /// Update download progress (0-100), None if not downloading
     pub update_progress: Option<u8>,
+    /// Soft budget warning already shown ($0.04)
+    pub budget_warned_soft: bool,
+    /// Hard budget warning already shown ($0.05)
+    pub budget_warned_hard: bool,
 }
 
 impl App {
@@ -200,6 +204,8 @@ impl App {
             last_suggestion_error: None,
             update_available: None,
             update_progress: None,
+            budget_warned_soft: false,
+            budget_warned_hard: false,
         }
     }
 
@@ -1129,6 +1135,16 @@ impl App {
         preview: crate::suggest::llm::FixPreview,
         file_hashes: std::collections::HashMap<PathBuf, String>,
     ) {
+        if let Some(suggestion_id) = self.verify_state.suggestion_id {
+            if let Some(suggestion) = self
+                .suggestions
+                .suggestions
+                .iter_mut()
+                .find(|s| s.id == suggestion_id)
+            {
+                suggestion.verification_state = preview.verification_state;
+            }
+        }
         self.verify_state.preview = Some(preview);
         self.verify_state.loading = false;
         self.verify_state.preview_hashes = file_hashes;
@@ -1220,17 +1236,10 @@ impl App {
         self.ship_state.scroll = self.ship_state.scroll.saturating_sub(1);
     }
 
-    /// Move to the Review step after applying a fix
-    pub fn start_review(
-        &mut self,
-        file_path: PathBuf,
-        original_content: String,
-        new_content: String,
-    ) {
+    /// Move to the Review step after applying a fix.
+    pub fn start_review(&mut self, files: Vec<ReviewFileContent>) {
         self.review_state = ReviewState {
-            file_path: Some(file_path),
-            original_content,
-            new_content,
+            files,
             findings: Vec::new(),
             selected: std::collections::HashSet::new(),
             cursor: 0,
@@ -1241,6 +1250,7 @@ impl App {
             confirm_ship: false,
             review_iteration: 1,
             fixed_titles: Vec::new(),
+            confirm_extra_review_budget: false,
             verification_failed: false,
             verification_error: None,
         };
@@ -1258,6 +1268,7 @@ impl App {
         self.review_state.summary = summary;
         self.review_state.reviewing = false;
         self.review_state.confirm_ship = false;
+        self.review_state.confirm_extra_review_budget = false;
         // Pre-select recommended findings
         for (i, finding) in findings.iter().enumerate() {
             if finding.recommended {
@@ -1278,6 +1289,7 @@ impl App {
             }
         }
         self.review_state.confirm_ship = false;
+        self.review_state.confirm_extra_review_budget = false;
     }
 
     /// Select all findings in review
@@ -1286,6 +1298,7 @@ impl App {
             self.review_state.selected.insert(i);
         }
         self.review_state.confirm_ship = false;
+        self.review_state.confirm_extra_review_budget = false;
     }
 
     /// Move cursor up in review
@@ -1295,6 +1308,7 @@ impl App {
             self.review_state.scroll = self.review_state.cursor;
         }
         self.review_state.confirm_ship = false;
+        self.review_state.confirm_extra_review_budget = false;
     }
 
     /// Move cursor down in review
@@ -1307,6 +1321,7 @@ impl App {
             }
         }
         self.review_state.confirm_ship = false;
+        self.review_state.confirm_extra_review_budget = false;
     }
 
     /// Check if review passed (no recommended fixes remaining)
@@ -1336,8 +1351,8 @@ impl App {
         }
     }
 
-    /// Update review with new content after a fix, trigger re-review
-    pub fn review_fix_complete(&mut self, new_content: String) {
+    /// Update review with new file contents after applying selected fixes.
+    pub fn review_fix_complete(&mut self, file_updates: Vec<(PathBuf, String)>) {
         // Add fixed finding titles for context in next review
         for i in &self.review_state.selected {
             if let Some(f) = self.review_state.findings.get(*i) {
@@ -1345,13 +1360,18 @@ impl App {
             }
         }
 
-        self.review_state.new_content = new_content;
+        for (path, new_content) in file_updates {
+            if let Some(file) = self.review_state.files.iter_mut().find(|f| f.path == path) {
+                file.new_content = new_content;
+            }
+        }
         self.review_state.findings.clear();
         self.review_state.selected.clear();
         self.review_state.summary.clear();
         self.review_state.reviewing = false;
         self.review_state.fixing = false;
         self.review_state.confirm_ship = false;
+        self.review_state.confirm_extra_review_budget = false;
         self.review_state.review_iteration += 1;
         self.loading = LoadingState::None;
     }

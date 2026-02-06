@@ -301,6 +301,7 @@ pub async fn run_tui(
             let total_to_process = high_priority.len() + medium_priority.len() + low_priority.len();
 
             background::spawn_background(tx.clone(), "summary_generation", async move {
+                let stage_start = std::time::Instant::now();
                 let cache = cache::Cache::new(&cache_path);
 
                 // Load existing cache to update incrementally
@@ -400,6 +401,7 @@ pub async fn run_tui(
                     summaries: HashMap::new(),
                     usage: final_usage,
                     failed_files,
+                    duration_ms: stage_start.elapsed().as_millis() as u64,
                 });
             });
         } else {
@@ -411,6 +413,7 @@ pub async fn run_tui(
             let tx_suggestions = tx.clone();
             let cache_clone_path = repo_path.clone();
             let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
+            let summaries_for_suggestions = app.llm_summaries.clone();
             let glossary_clone = app.glossary.clone();
 
             if !glossary_clone.is_empty() {
@@ -422,6 +425,7 @@ pub async fn run_tui(
 
             let repo_root = cache_clone_path.clone();
             background::spawn_background(tx.clone(), "suggestions_generation", async move {
+                let stage_start = std::time::Instant::now();
                 let mem = if repo_memory_context.trim().is_empty() {
                     None
                 } else {
@@ -434,6 +438,7 @@ pub async fn run_tui(
                     &index_clone,
                     &context_clone,
                     mem,
+                    Some(&summaries_for_suggestions),
                 )
                 .await
                 {
@@ -443,6 +448,7 @@ pub async fn run_tui(
                             usage,
                             model: "fast-grounded".to_string(),
                             diagnostics,
+                            duration_ms: stage_start.elapsed().as_millis() as u64,
                         });
                     }
                     Err(e) => {

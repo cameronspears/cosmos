@@ -1,13 +1,15 @@
-use super::client::{call_llm_structured_with_provider, call_llm_with_usage, truncate_str};
+use super::client::{
+    call_llm_structured, call_llm_structured_with_provider, call_llm_with_usage, truncate_str,
+};
 use super::models::merge_usage;
 use super::models::{Model, Usage};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{ASK_QUESTION_SYSTEM, FAST_GROUNDED_SUGGESTIONS_SYSTEM};
 use crate::context::WorkContext;
 use crate::index::{CodebaseIndex, PatternSeverity, SymbolKind};
-use crate::suggest::Suggestion;
+use crate::suggest::{Suggestion, SuggestionEvidenceRef};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -350,7 +352,15 @@ fn build_evidence_pack(
 #[derive(Debug, Clone, serde::Deserialize)]
 struct FastGroundedSuggestionJson {
     #[serde(default)]
+    evidence_refs: Vec<FastGroundedEvidenceRefJson>,
+    #[serde(default)]
     evidence_id: Option<usize>,
+    #[serde(default)]
+    snippet_id: Option<usize>,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    line: Option<usize>,
     #[serde(default)]
     kind: String,
     #[serde(default)]
@@ -368,8 +378,25 @@ struct FastGroundedResponseJson {
     suggestions: Vec<FastGroundedSuggestionJson>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+enum FastGroundedEvidenceRefJson {
+    Object {
+        #[serde(default)]
+        evidence_id: Option<usize>,
+        #[serde(default)]
+        snippet_id: Option<usize>,
+        #[serde(default)]
+        file: Option<String>,
+        #[serde(default)]
+        line: Option<usize>,
+    },
+    Integer(usize),
+    String(String),
+}
+
 fn extract_evidence_id(text: &str) -> Option<usize> {
-    // Accept a few common patterns:
+    // Accept common variants:
     // - "EVIDENCE 12"
     // - "(EVIDENCE 12)"
     // - "evidence_id: 12"
@@ -381,7 +408,6 @@ fn extract_evidence_id(text: &str) -> Option<usize> {
         while i + needle.len() <= hay.len() {
             if &hay[i..i + needle.len()] == needle {
                 let mut j = i + needle.len();
-                // skip separators like ':', '=', whitespace
                 while j < hay.len() && matches!(hay[j], b' ' | b'\t' | b':' | b'=') {
                     j += 1;
                 }
@@ -398,6 +424,7 @@ fn extract_evidence_id(text: &str) -> Option<usize> {
             i += 1;
         }
     }
+
     None
 }
 
@@ -406,6 +433,7 @@ pub async fn analyze_codebase_fast_grounded(
     index: &CodebaseIndex,
     context: &WorkContext,
     repo_memory: Option<String>,
+    summaries: Option<&HashMap<PathBuf, String>>,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
     let overall_start = std::time::Instant::now();
     let pack_start = std::time::Instant::now();
@@ -425,6 +453,25 @@ pub async fn analyze_codebase_fast_grounded(
         if !memory_section.trim().is_empty() {
             user.push_str(&memory_section);
             user.push_str("\n\n");
+        }
+        if let Some(summaries) = summaries {
+            user.push_str("FILE SUMMARIES (grounding context):\n");
+            for item in items {
+                if let Some(summary) = summaries.get(&item.file) {
+                    user.push_str(&format!(
+                        "- {}: {}\n",
+                        item.file.display(),
+                        truncate_str(summary, 180)
+                    ));
+                } else if let Some(file_index) = index.files.get(&item.file) {
+                    user.push_str(&format!(
+                        "- {}: {}\n",
+                        item.file.display(),
+                        truncate_str(&file_index.summary.purpose, 180)
+                    ));
+                }
+            }
+            user.push('\n');
         }
         user.push_str(count_hint);
         user.push_str("\n\nEVIDENCE PACK (internal grounding only):\n");
@@ -447,7 +494,18 @@ pub async fn analyze_codebase_fast_grounded(
                 "items": {
                     "type": "object",
                     "properties": {
-                        "evidence_id": { "type": "integer", "minimum": 0, "maximum": pack.len().saturating_sub(1) },
+                        "evidence_refs": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "evidence_id": { "type": "integer", "minimum": 0, "maximum": pack.len().saturating_sub(1) }
+                                },
+                                "required": ["evidence_id"],
+                                "additionalProperties": false
+                            },
+                            "minItems": 1
+                        },
                         "kind": {
                             "type": "string",
                             "enum": ["bugfix", "improvement", "optimization", "refactoring", "security", "reliability"]
@@ -457,7 +515,7 @@ pub async fn analyze_codebase_fast_grounded(
                         "summary": { "type": "string" },
                         "detail": { "type": "string" }
                     },
-                    "required": ["evidence_id", "kind", "priority", "confidence", "summary", "detail"],
+                    "required": ["evidence_refs", "kind", "priority", "confidence", "summary", "detail"],
                     "additionalProperties": false
                 }
             }
@@ -521,10 +579,13 @@ pub async fn analyze_codebase_fast_grounded(
             let extra_start = std::time::Instant::now();
             if let Ok(r) = call_llm_structured_with_provider::<FastGroundedResponseJson>(
                 FAST_GROUNDED_SUGGESTIONS_SYSTEM,
-                &format_user(&pack, "Return 10 to 15 suggestions. Avoid repeating the same evidence_id across suggestions."),
+                &format_user(
+                    &pack,
+                    "Return 10 to 15 suggestions. Prefer diverse evidence refs and avoid reusing the same evidence_id unless necessary.",
+                ),
                 Model::Speed,
                 "fast_grounded_suggestions",
-                schema,
+                schema.clone(),
                 super::client::provider_cerebras_fp16(),
                 380,
                 remaining,
@@ -537,7 +598,175 @@ pub async fn analyze_codebase_fast_grounded(
             }
         }
     }
+    // Provider resilience: if the pinned provider yields no shard output, retry once with
+    // normal provider routing before we declare failure.
+    if raw_items.is_empty() {
+        let rescue_start = std::time::Instant::now();
+        if let Ok(r) = call_llm_structured::<FastGroundedResponseJson>(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM,
+            &format_user(
+                &pack,
+                "Return 10 to 15 suggestions and include evidence refs for each suggestion.",
+            ),
+            Model::Speed,
+            "fast_grounded_suggestions_rescue",
+            schema.clone(),
+        )
+        .await
+        {
+            llm_ms += rescue_start.elapsed().as_millis() as u64;
+            usage = merge_usage(usage, r.usage);
+            raw_items.extend(r.data.suggestions);
+        }
+    }
 
+    fn collect_valid_evidence_refs(
+        suggestion: &FastGroundedSuggestionJson,
+        pack: &[EvidenceItem],
+    ) -> Vec<SuggestionEvidenceRef> {
+        fn push_evidence_id(
+            evidence_id: usize,
+            pack: &[EvidenceItem],
+            seen: &mut HashSet<usize>,
+            refs: &mut Vec<SuggestionEvidenceRef>,
+        ) {
+            if seen.insert(evidence_id) {
+                if let Some(item) = pack.get(evidence_id) {
+                    refs.push(SuggestionEvidenceRef {
+                        snippet_id: item.id,
+                        file: item.file.clone(),
+                        line: item.line,
+                    });
+                }
+            }
+        }
+
+        let mut refs = Vec::new();
+        let mut seen = HashSet::new();
+
+        let resolve_by_file_line = |file: &str, line: Option<usize>| -> Option<usize> {
+            let normalized = file.replace('\\', "/");
+            let target_line = line.unwrap_or(0);
+
+            // First try exact path match with nearest line.
+            let mut best_exact: Option<(usize, usize)> = None; // (distance, id)
+            for item in pack {
+                let item_path = item.file.to_string_lossy().replace('\\', "/");
+                if item_path == normalized || normalized.ends_with(&item_path) {
+                    let distance = if target_line > 0 {
+                        item.line.abs_diff(target_line)
+                    } else {
+                        0
+                    };
+                    match best_exact {
+                        Some((best_dist, _)) if distance >= best_dist => {}
+                        _ => best_exact = Some((distance, item.id)),
+                    }
+                }
+            }
+            if let Some((_, id)) = best_exact {
+                return Some(id);
+            }
+
+            // Fallback to basename match if unique.
+            let file_name = std::path::Path::new(&normalized)
+                .file_name()
+                .and_then(|n| n.to_str())?;
+            let mut matched: Option<usize> = None;
+            for item in pack {
+                let candidate = item.file.file_name().and_then(|n| n.to_str());
+                if candidate == Some(file_name) {
+                    if matched.is_some() {
+                        return None;
+                    }
+                    matched = Some(item.id);
+                }
+            }
+            matched
+        };
+
+        let infer_id_from_text = |text: &str| -> Option<usize> {
+            let text_norm = text.to_lowercase();
+            for item in pack {
+                let item_path = item
+                    .file
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_lowercase();
+                if text_norm.contains(&item_path) {
+                    return Some(item.id);
+                }
+            }
+            None
+        };
+
+        let parse_ref_id = |reference: &FastGroundedEvidenceRefJson| -> Option<usize> {
+            match reference {
+                FastGroundedEvidenceRefJson::Object {
+                    evidence_id,
+                    snippet_id,
+                    file,
+                    line,
+                } => (*evidence_id)
+                    .or(*snippet_id)
+                    .or_else(|| file.as_deref().and_then(|f| resolve_by_file_line(f, *line))),
+                FastGroundedEvidenceRefJson::Integer(id) => Some(*id),
+                FastGroundedEvidenceRefJson::String(raw) => raw
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .or_else(|| extract_evidence_id(raw))
+                    .or_else(|| infer_id_from_text(raw)),
+            }
+        };
+
+        for r in &suggestion.evidence_refs {
+            if let Some(id) = parse_ref_id(r) {
+                push_evidence_id(id, pack, &mut seen, &mut refs);
+            }
+        }
+
+        // Backward compatibility: older suggestion shape used top-level `evidence_id`.
+        if refs.is_empty() {
+            if let Some(id) = suggestion.evidence_id {
+                push_evidence_id(id, pack, &mut seen, &mut refs);
+            }
+        }
+
+        if refs.is_empty() {
+            if let Some(id) = suggestion.snippet_id {
+                push_evidence_id(id, pack, &mut seen, &mut refs);
+            }
+        }
+
+        if refs.is_empty() {
+            if let Some(id) = suggestion
+                .file
+                .as_deref()
+                .and_then(|f| resolve_by_file_line(f, suggestion.line))
+            {
+                push_evidence_id(id, pack, &mut seen, &mut refs);
+            }
+        }
+
+        // Last-chance compatibility: extract explicit evidence markers from text.
+        if refs.is_empty() {
+            if let Some(id) = suggestion
+                .evidence_id
+                .or(suggestion.snippet_id)
+                .or_else(|| extract_evidence_id(&suggestion.summary))
+                .or_else(|| extract_evidence_id(&suggestion.detail))
+                .or_else(|| infer_id_from_text(&suggestion.summary))
+                .or_else(|| infer_id_from_text(&suggestion.detail))
+            {
+                push_evidence_id(id, pack, &mut seen, &mut refs);
+            }
+        }
+
+        refs
+    }
+
+    let raw_count = raw_items.len();
     let mut mapped: Vec<(usize, Suggestion)> = Vec::new();
     let mut missing_or_invalid = 0usize;
 
@@ -567,10 +796,8 @@ pub async fn analyze_codebase_fast_grounded(
     }
 
     for s in raw_items {
-        let evidence_id = s
-            .evidence_id
-            .or_else(|| extract_evidence_id(&s.summary))
-            .or_else(|| extract_evidence_id(&s.detail));
+        let evidence_refs = collect_valid_evidence_refs(&s, &pack);
+        let evidence_id = evidence_refs.first().map(|r| r.snippet_id);
         let Some(evidence_id) = evidence_id else {
             missing_or_invalid += 1;
             continue;
@@ -582,7 +809,7 @@ pub async fn analyze_codebase_fast_grounded(
         let kind = match s.kind.to_lowercase().as_str() {
             "bugfix" => crate::suggest::SuggestionKind::BugFix,
             "optimization" => crate::suggest::SuggestionKind::Optimization,
-            "refactoring" => crate::suggest::SuggestionKind::Quality,
+            "refactoring" => crate::suggest::SuggestionKind::Refactoring,
             "security" => crate::suggest::SuggestionKind::BugFix,
             "reliability" => crate::suggest::SuggestionKind::Quality,
             _ => crate::suggest::SuggestionKind::Improvement,
@@ -620,14 +847,15 @@ pub async fn analyze_codebase_fast_grounded(
         .with_confidence(confidence)
         .with_line(item.line)
         .with_detail(s.detail)
-        .with_evidence(item.snippet.clone());
+        .with_evidence(item.snippet.clone())
+        .with_evidence_refs(evidence_refs);
 
         mapped.push((evidence_id, suggestion));
     }
 
     if mapped.is_empty() {
         return Err(anyhow::anyhow!(
-            "AI returned no usable grounded suggestions. Try again."
+            "AI suggestions arrived without valid evidence links, so Cosmos could not safely ground them. Please try again."
         ));
     }
 
@@ -666,7 +894,7 @@ pub async fn analyze_codebase_fast_grounded(
         parse_used_sanitized_fix: false,
         parse_used_json_fix: false,
         parse_used_individual_parse: false,
-        raw_count: suggestions.len(),
+        raw_count,
         deduped_count: suggestions.len(),
         grounding_filtered: missing_or_invalid,
         low_confidence_filtered: 0,
@@ -682,6 +910,96 @@ pub async fn analyze_codebase_fast_grounded(
     };
 
     Ok((suggestions, usage, diagnostics))
+}
+
+#[cfg(test)]
+mod grounded_parser_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_legacy_top_level_evidence_id_shape() {
+        let parsed: FastGroundedSuggestionJson = serde_json::from_value(json!({
+            "evidence_id": 7,
+            "kind": "bugfix",
+            "priority": "high",
+            "confidence": "high",
+            "summary": "Legacy shape",
+            "detail": "Still supported"
+        }))
+        .expect("legacy shape should deserialize");
+
+        assert_eq!(parsed.evidence_id, Some(7));
+        assert!(parsed.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn parses_mixed_evidence_refs_shapes() {
+        let parsed: FastGroundedSuggestionJson = serde_json::from_value(json!({
+            "evidence_refs": [1, "2", {"evidence_id": 3}],
+            "kind": "improvement",
+            "priority": "medium",
+            "confidence": "medium",
+            "summary": "Mixed shape",
+            "detail": "Accepted for robustness"
+        }))
+        .expect("mixed evidence_refs shape should deserialize");
+
+        assert!(matches!(
+            parsed.evidence_refs[0],
+            FastGroundedEvidenceRefJson::Integer(1)
+        ));
+        assert!(matches!(
+            parsed.evidence_refs[1],
+            FastGroundedEvidenceRefJson::String(ref raw) if raw == "2"
+        ));
+        assert!(matches!(
+            parsed.evidence_refs[2],
+            FastGroundedEvidenceRefJson::Object {
+                evidence_id: Some(3),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_object_evidence_ref_with_snippet_and_file_line() {
+        let parsed: FastGroundedSuggestionJson = serde_json::from_value(json!({
+            "evidence_refs": [{
+                "snippet_id": 5,
+                "file": "src/main.rs",
+                "line": 42
+            }],
+            "kind": "reliability",
+            "priority": "high",
+            "confidence": "medium",
+            "summary": "Object shape",
+            "detail": "Should deserialize robustly"
+        }))
+        .expect("object evidence ref shape should deserialize");
+
+        match &parsed.evidence_refs[0] {
+            FastGroundedEvidenceRefJson::Object {
+                evidence_id,
+                snippet_id,
+                file,
+                line,
+            } => {
+                assert_eq!(*evidence_id, None);
+                assert_eq!(*snippet_id, Some(5));
+                assert_eq!(file.as_deref(), Some("src/main.rs"));
+                assert_eq!(*line, Some(42));
+            }
+            _ => panic!("expected object evidence ref"),
+        }
+    }
+
+    #[test]
+    fn extracts_evidence_id_from_common_text_markers() {
+        assert_eq!(extract_evidence_id("EVIDENCE 12"), Some(12));
+        assert_eq!(extract_evidence_id("evidence_id: 4"), Some(4));
+        assert_eq!(extract_evidence_id("No marker here"), None);
+    }
 }
 
 /* fn build_suggestion_diagnostics(

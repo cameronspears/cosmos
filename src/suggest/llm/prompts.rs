@@ -44,7 +44,7 @@ Evidence is ONLY for grounding and accuracy. The user should not see it.
 TASK:
 - Produce 10 to 15 suggestions by default, based ONLY on the evidence pack.
 - If the user prompt requests a different count/range, follow the user prompt.
-- Every suggestion MUST reference one evidence_id from the pack.
+- Every suggestion MUST include one or more `evidence_refs` from the pack.
 - Do not invent facts. If an issue is not clearly supported by the evidence snippet, do not suggest it.
 
 WRITE GREAT SUGGESTIONS:
@@ -62,7 +62,7 @@ WRITE GREAT SUGGESTIONS:
 OUTPUT (JSON object only):
 {
   "suggestions": [{
-    "evidence_id": 0,
+    "evidence_refs": [{"evidence_id": 0}],
     "kind": "bugfix|improvement|optimization|refactoring|security|reliability",
     "priority": "high|medium|low",
     "confidence": "high|medium",
@@ -73,9 +73,9 @@ OUTPUT (JSON object only):
 
 RULES:
 - No tool calls, no external knowledge, no extra text.
-- Output MUST include the numeric `evidence_id` field for every suggestion.
-- Do NOT write "EVIDENCE 0" (or similar) inside `summary`/`detail` — use `evidence_id`.
-- Avoid duplicates: prefer unique evidence_id across suggestions unless necessary.
+- Output MUST include `evidence_refs` with valid numeric `evidence_id` values for every suggestion.
+- Do NOT write "EVIDENCE 0" (or similar) inside `summary`/`detail`.
+- Avoid duplicates: prefer unique evidence references across suggestions unless necessary.
 - Prefer diversity: bugs, reliability, performance, refactoring.
 - Keep claims local: only what can be confirmed from the snippet."#;
 
@@ -96,9 +96,8 @@ mod prompt_tests {
             "FAST_GROUNDED_SUGGESTIONS_SYSTEM should anchor the desired phrasing"
         );
         assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM
-                .contains("Output MUST include the numeric `evidence_id`"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require evidence_id for grounding"
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Output MUST include `evidence_refs`"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require evidence_refs for grounding"
         );
         assert!(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("No tool calls"),
@@ -160,7 +159,7 @@ Code is already included - you should NOT need tool calls (only for different fi
 
 OUTPUT (JSON):
 {
-  "verified": true,
+  "verification_state": "verified|contradicted|insufficient_evidence",
   "friendly_title": "Short topic (2-4 words, no code terms)",
   "problem_summary": "User-facing behavior description",
   "outcome": "What changes after fix",
@@ -173,7 +172,10 @@ OUTPUT (JSON):
 }
 
 FIELD RULES:
-- verified: true=exists, false=not found or already fixed
+- verification_state:
+  - verified = issue confirmed in code
+  - contradicted = issue claim is incorrect or already fixed
+  - insufficient_evidence = code/context not sufficient to confirm safely
 - friendly_title: NO file/function names
 - problem_summary: Plain English behavior, not code
 - evidence_snippet: Copy actual code from above
@@ -203,6 +205,8 @@ OUTPUT (JSON):
 }
 
 RULES:
+- Include a summary for EVERY file listed in FILES TO SUMMARIZE.
+- If a file is unclear, still return a best-effort short summary instead of omitting it.
 - 3-8 domain terms per batch (skip generic: Controller, Service, Handler)
 - terms_by_file: only terms from that specific file
 - Omit files with no terms from terms_by_file"#;

@@ -778,6 +778,8 @@ fn extract_modified_area(old_string: &str) -> Option<String> {
 pub struct FixPreview {
     /// Whether the issue was verified to exist in the code
     pub verified: bool,
+    /// Explicit verification contract result.
+    pub verification_state: crate::suggest::VerificationState,
 
     // ─── User-facing fields (non-technical) ───────────────────────────────
     /// Friendly topic name for non-technical users (e.g. "Batch Processing")
@@ -831,6 +833,11 @@ pub(crate) fn fix_preview_schema() -> serde_json::Value {
                 "type": "boolean",
                 "description": "Whether the issue was verified to exist in the code"
             },
+            "verification_state": {
+                "type": "string",
+                "enum": ["verified", "contradicted", "insufficient_evidence"],
+                "description": "Explicit verification contract result"
+            },
             "friendly_title": {
                 "type": "string",
                 "description": "Friendly topic name for non-technical users"
@@ -870,7 +877,7 @@ pub(crate) fn fix_preview_schema() -> serde_json::Value {
                 "description": "Estimated scope of the fix"
             }
         },
-        "required": ["verified", "friendly_title", "problem_summary", "outcome", "verification_note", "description", "affected_areas", "scope"],
+        "required": ["verification_state", "friendly_title", "problem_summary", "outcome", "verification_note", "description", "affected_areas", "scope"],
         "additionalProperties": false
     })
 }
@@ -878,7 +885,10 @@ pub(crate) fn fix_preview_schema() -> serde_json::Value {
 /// Response structure for fix preview (for structured output parsing)
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct FixPreviewJson {
+    #[serde(default)]
     pub verified: bool,
+    #[serde(default)]
+    pub verification_state: String,
     #[serde(default)]
     pub friendly_title: String,
     #[serde(default)]
@@ -901,6 +911,25 @@ fn default_scope() -> String {
     "medium".to_string()
 }
 
+fn parse_verification_state(
+    verification_state: &str,
+    verified_fallback: bool,
+) -> crate::suggest::VerificationState {
+    match verification_state.trim().to_lowercase().as_str() {
+        "verified" => crate::suggest::VerificationState::Verified,
+        "contradicted" => crate::suggest::VerificationState::Contradicted,
+        "insufficient_evidence" => crate::suggest::VerificationState::InsufficientEvidence,
+        // Backward compatibility for older responses that only include `verified`
+        _ => {
+            if verified_fallback {
+                crate::suggest::VerificationState::Verified
+            } else {
+                crate::suggest::VerificationState::Contradicted
+            }
+        }
+    }
+}
+
 /// Generate a preview using lean hybrid verification.
 ///
 /// Strategy:
@@ -915,7 +944,7 @@ pub async fn generate_fix_preview_agentic(
     suggestion: &Suggestion,
     modifier: Option<&str>,
     repo_memory: Option<String>,
-) -> anyhow::Result<FixPreview> {
+) -> anyhow::Result<(FixPreview, Option<Usage>)> {
     let modifier_text = modifier
         .map(|m| format!("\n\nUser modification request: {}", m))
         .unwrap_or_default();
@@ -999,49 +1028,54 @@ VERIFY:
     })?;
 
     // Convert parsed JSON to FixPreview
+    let verification_state = parse_verification_state(&parsed.verification_state, parsed.verified);
     let scope = match parsed.scope.as_str() {
         "small" => FixScope::Small,
         "large" => FixScope::Large,
         _ => FixScope::Medium,
     };
 
-    Ok(FixPreview {
-        verified: parsed.verified,
-        friendly_title: if parsed.friendly_title.is_empty() {
-            "Issue".to_string()
-        } else {
-            parsed.friendly_title
-        },
-        problem_summary: if parsed.problem_summary.is_empty() {
-            "An issue was found that needs attention.".to_string()
-        } else {
-            parsed.problem_summary
-        },
-        outcome: if parsed.outcome.is_empty() {
-            "This will be fixed.".to_string()
-        } else {
-            parsed.outcome
-        },
-        verification_note: if parsed.verification_note.is_empty() {
-            if parsed.verified {
-                "Issue verified".to_string()
+    Ok((
+        FixPreview {
+            verified: verification_state == crate::suggest::VerificationState::Verified,
+            verification_state,
+            friendly_title: if parsed.friendly_title.is_empty() {
+                "Issue".to_string()
             } else {
-                "Issue not found".to_string()
-            }
-        } else {
-            parsed.verification_note
+                parsed.friendly_title
+            },
+            problem_summary: if parsed.problem_summary.is_empty() {
+                "An issue was found that needs attention.".to_string()
+            } else {
+                parsed.problem_summary
+            },
+            outcome: if parsed.outcome.is_empty() {
+                "This will be fixed.".to_string()
+            } else {
+                parsed.outcome
+            },
+            verification_note: if parsed.verification_note.is_empty() {
+                if parsed.verified {
+                    "Issue verified".to_string()
+                } else {
+                    "Issue not found".to_string()
+                }
+            } else {
+                parsed.verification_note
+            },
+            evidence_snippet: parsed.evidence_snippet.filter(|s| !s.trim().is_empty()),
+            evidence_line: parsed.evidence_line,
+            description: if parsed.description.is_empty() {
+                "Fix the identified issue".to_string()
+            } else {
+                parsed.description
+            },
+            affected_areas: parsed.affected_areas,
+            scope,
+            modifier: modifier.map(String::from),
         },
-        evidence_snippet: parsed.evidence_snippet.filter(|s| !s.trim().is_empty()),
-        evidence_line: parsed.evidence_line,
-        description: if parsed.description.is_empty() {
-            "Fix the identified issue".to_string()
-        } else {
-            parsed.description
-        },
-        affected_areas: parsed.affected_areas,
-        scope,
-        modifier: modifier.map(String::from),
-    })
+        response.usage,
+    ))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1314,6 +1348,7 @@ mod tests {
     fn sample_preview(evidence_line: Option<u32>) -> FixPreview {
         FixPreview {
             verified: true,
+            verification_state: crate::suggest::VerificationState::Verified,
             friendly_title: "Issue".to_string(),
             problem_summary: "Problem".to_string(),
             outcome: "Outcome".to_string(),

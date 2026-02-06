@@ -6,7 +6,7 @@
 pub mod llm;
 
 /// Maximum suggestions to display to avoid overwhelming users
-const MAX_SUGGESTIONS: usize = 10;
+const MAX_SUGGESTIONS: usize = 15;
 
 use crate::index::CodebaseIndex;
 use chrono::{DateTime, Utc};
@@ -85,6 +85,28 @@ impl Default for Confidence {
     }
 }
 
+/// Verification state for a suggestion (explicit verify contract)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationState {
+    #[default]
+    Unverified,
+    Verified,
+    Contradicted,
+    InsufficientEvidence,
+}
+
+/// A concrete evidence reference backing a suggestion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuggestionEvidenceRef {
+    /// Stable snippet/evidence item ID from the evidence pack
+    pub snippet_id: usize,
+    /// Repo-relative file path for the evidence
+    pub file: PathBuf,
+    /// 1-based line where the evidence is anchored
+    pub line: usize,
+}
+
 /// A suggestion for improvement
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Suggestion {
@@ -105,6 +127,12 @@ pub struct Suggestion {
     /// Raw code snippet proving the issue (used for grounding and UI citations).
     #[serde(default)]
     pub evidence: Option<String>,
+    /// Structured evidence references tied to real file/line/snippet IDs.
+    #[serde(default)]
+    pub evidence_refs: Vec<SuggestionEvidenceRef>,
+    /// Explicit verification contract state.
+    #[serde(default)]
+    pub verification_state: VerificationState,
     pub source: SuggestionSource,
     pub created_at: DateTime<Utc>,
     /// Whether the user has dismissed this suggestion
@@ -132,6 +160,8 @@ impl Suggestion {
             summary,
             detail: None,
             evidence: None,
+            evidence_refs: Vec::new(),
+            verification_state: VerificationState::Unverified,
             source,
             created_at: Utc::now(),
             dismissed: false,
@@ -156,6 +186,11 @@ impl Suggestion {
 
     pub fn with_evidence(mut self, evidence: String) -> Self {
         self.evidence = Some(evidence);
+        self
+    }
+
+    pub fn with_evidence_refs(mut self, evidence_refs: Vec<SuggestionEvidenceRef>) -> Self {
+        self.evidence_refs = evidence_refs;
         self
     }
 
@@ -330,10 +365,14 @@ mod tests {
         let mut value = serde_json::to_value(&suggestion).unwrap();
         if let Value::Object(map) = &mut value {
             map.remove("evidence");
+            map.remove("evidence_refs");
+            map.remove("verification_state");
         }
 
         let round: Suggestion = serde_json::from_value(value).unwrap();
         assert!(round.evidence.is_none());
+        assert!(round.evidence_refs.is_empty());
+        assert_eq!(round.verification_state, VerificationState::Unverified);
     }
 
     #[test]

@@ -305,8 +305,9 @@ fn compute_compact_diff(old: &str, new: &str) -> String {
 
     // Create temp files for git diff
     let temp_dir = std::env::temp_dir();
-    let old_path = temp_dir.join("cosmos_diff_old.tmp");
-    let new_path = temp_dir.join("cosmos_diff_new.tmp");
+    let nonce = format!("{}_{}", std::process::id(), uuid::Uuid::new_v4());
+    let old_path = temp_dir.join(format!("cosmos_diff_old_{}.tmp", nonce));
+    let new_path = temp_dir.join(format!("cosmos_diff_new_{}.tmp", nonce));
 
     // Write content to temp files
     if let (Ok(mut old_file), Ok(mut new_file)) = (

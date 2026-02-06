@@ -29,6 +29,7 @@ const SUGGESTIONS_CACHE_FILE: &str = "suggestions.json";
 const MEMORY_FILE: &str = "memory.json";
 const GLOSSARY_FILE: &str = "glossary.json";
 const GROUPING_AI_CACHE_FILE: &str = "grouping_ai.json";
+const PIPELINE_METRICS_FILE: &str = "pipeline_metrics.jsonl";
 const CACHE_LOCK_TIMEOUT_SECS: u64 = 5;
 const CACHE_LOCK_RETRY_MS: u64 = 50;
 
@@ -376,6 +377,22 @@ pub struct GroupingAiEntry {
 pub struct GroupingAiCache {
     pub entries: HashMap<PathBuf, GroupingAiEntry>,
     pub cached_at: DateTime<Utc>,
+}
+
+/// Lightweight pipeline metric row written as JSONL to `.cosmos/pipeline_metrics.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineMetricRecord {
+    pub timestamp: DateTime<Utc>,
+    pub stage: String,
+    pub summary_ms: Option<u64>,
+    pub suggest_ms: Option<u64>,
+    pub verify_ms: Option<u64>,
+    pub apply_ms: Option<u64>,
+    pub review_ms: Option<u64>,
+    pub tokens: u32,
+    pub cost: f64,
+    pub gate: String,
+    pub passed: bool,
 }
 
 impl GroupingAiCache {
@@ -806,6 +823,17 @@ impl Cache {
         let path = self.cache_dir.join(QUESTION_CACHE_FILE);
         let content = serde_json::to_string_pretty(cache)?;
         write_atomic(&path, &content)?;
+        Ok(())
+    }
+
+    /// Append a pipeline metric record (JSONL) for latency/cost tracking.
+    pub fn append_pipeline_metric(&self, record: &PipelineMetricRecord) -> anyhow::Result<()> {
+        let _lock = self.lock(true)?;
+        let path = self.cache_dir.join(PIPELINE_METRICS_FILE);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let row = serde_json::to_string(record)?;
+        use std::io::Write;
+        writeln!(file, "{}", row)?;
         Ok(())
     }
 

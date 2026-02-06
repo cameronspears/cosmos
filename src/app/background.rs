@@ -19,6 +19,7 @@ use crate::suggest;
 use crate::ui;
 use crate::ui::{App, LoadingState, WorkflowStep};
 use crate::util::truncate;
+use chrono::Utc;
 use futures::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -33,6 +34,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 usage,
                 model,
                 diagnostics,
+                duration_ms,
             } => {
                 let count = suggestions.len();
                 for s in suggestions {
@@ -42,14 +44,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 // Diff-first ordering: changed files and their blast radius float to the top.
                 app.suggestions.sort_with_context(&app.context);
 
-                // Track session cost for display
-                if let Some(u) = usage {
-                    let cost = u.cost();
-                    app.session_cost += cost;
-                    app.session_tokens += u.total_tokens;
-                    // Refresh wallet balance after spending
-                    spawn_balance_refresh(ctx.tx.clone());
-                }
+                let (tokens, cost) = track_usage(app, usage.as_ref(), ctx);
 
                 // If summaries are still generating, switch to that loading state
                 // Otherwise, clear loading
@@ -64,6 +59,15 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 app.active_model = Some(model);
                 app.last_suggestion_diagnostics = Some(diagnostics);
                 app.last_suggestion_error = None;
+                record_pipeline_metric(
+                    app,
+                    "suggest",
+                    duration_ms,
+                    tokens,
+                    cost,
+                    "suggestions",
+                    true,
+                );
             }
             BackgroundMessage::SuggestionsError(e) => {
                 // If summaries are still generating, switch to that loading state
@@ -79,19 +83,22 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 summaries,
                 usage,
                 failed_files,
+                duration_ms,
             } => {
                 let new_count = summaries.len();
                 app.update_summaries(summaries);
                 let failed_count = failed_files.len();
                 app.summary_failed_files = failed_files;
-                // Track session cost for display
-                if let Some(u) = usage {
-                    let cost = u.cost();
-                    app.session_cost += cost;
-                    app.session_tokens += u.total_tokens;
-                    // Refresh wallet balance after spending
-                    spawn_balance_refresh(ctx.tx.clone());
-                }
+                let (tokens, cost) = track_usage(app, usage.as_ref(), ctx);
+                record_pipeline_metric(
+                    app,
+                    "summary",
+                    duration_ms,
+                    tokens,
+                    cost,
+                    "summaries_complete",
+                    failed_count == 0,
+                );
 
                 // Reload glossary from cache (it was built during summary generation)
                 let cache = cache::Cache::new(ctx.repo_path);
@@ -109,12 +116,22 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     // Check if AI is still available
                     let ai_enabled = suggest::llm::is_available();
 
-                    if ai_enabled {
+                    // Strict summary gate: do not generate suggestions until summaries are complete.
+                    if failed_count > 0 {
+                        app.loading = LoadingState::None;
+                        let message = format!(
+                            "Summaries incomplete: {} files failed. Retry summaries before suggestions.{}",
+                            failed_count,
+                            failed_files_hint(&app.summary_failed_files)
+                        );
+                        app.show_toast(&message);
+                    } else if ai_enabled {
                         let index_clone = app.index.clone();
                         let context_clone = app.context.clone();
                         let tx_suggestions = ctx.tx.clone();
                         let cache_clone_path = ctx.repo_path.clone();
                         let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
+                        let summaries_for_suggestions = app.llm_summaries.clone();
                         let glossary_clone = app.glossary.clone();
 
                         app.loading = LoadingState::GeneratingSuggestions;
@@ -127,6 +144,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
 
                         let repo_root = cache_clone_path.clone();
                         spawn_background(ctx.tx.clone(), "suggestions_generation", async move {
+                            let stage_start = std::time::Instant::now();
                             let mem = if repo_memory_context.trim().is_empty() {
                                 None
                             } else {
@@ -138,6 +156,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                                 &index_clone,
                                 &context_clone,
                                 mem,
+                                Some(&summaries_for_suggestions),
                             )
                             .await
                             {
@@ -148,6 +167,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                                             usage,
                                             model: "fast-grounded".to_string(),
                                             diagnostics,
+                                            duration_ms: stage_start.elapsed().as_millis() as u64,
                                         });
                                 }
                                 Err(e) => {
@@ -160,8 +180,9 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                         app.loading = LoadingState::None;
                         if failed_count > 0 {
                             let message = format!(
-                                "Summaries incomplete: {} files failed. Press 'R' to retry.",
-                                failed_count
+                                "Summaries incomplete: {} files failed. Press 'R' to retry.{}",
+                                failed_count,
+                                failed_files_hint(&app.summary_failed_files)
                             );
                             app.show_toast(&message);
                         } else if new_count > 0 {
@@ -179,8 +200,9 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     }
                     if failed_count > 0 {
                         let message = format!(
-                            "Summaries incomplete: {} files failed. Press 'R' to retry.",
-                            failed_count
+                            "Summaries incomplete: {} files failed. Press 'R' to retry.{}",
+                            failed_count,
+                            failed_files_hint(&app.summary_failed_files)
                         );
                         app.show_toast(&message);
                     } else if new_count > 0 {
@@ -217,13 +239,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     app.apply_grouping_update(grouping);
                 }
 
-                if let Some(u) = usage {
-                    let cost = u.cost();
-                    app.session_cost += cost;
-                    app.session_tokens += u.total_tokens;
-                    // Refresh wallet balance after spending
-                    spawn_balance_refresh(ctx.tx.clone());
-                }
+                let _ = track_usage(app, usage.as_ref(), ctx);
 
                 if updated_files > 0 {
                     app.show_toast(&format!(
@@ -238,9 +254,29 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
             }
             BackgroundMessage::PreviewReady {
                 preview,
+                usage,
                 file_hashes,
+                duration_ms,
             } => {
                 app.loading = LoadingState::None;
+                let (tokens, cost) = track_usage(app, usage.as_ref(), ctx);
+                let gate = match preview.verification_state {
+                    crate::suggest::VerificationState::Verified => "verified",
+                    crate::suggest::VerificationState::Contradicted => "contradicted",
+                    crate::suggest::VerificationState::InsufficientEvidence => {
+                        "insufficient_evidence"
+                    }
+                    crate::suggest::VerificationState::Unverified => "unverified",
+                };
+                record_pipeline_metric(
+                    app,
+                    "verify",
+                    duration_ms,
+                    tokens,
+                    cost,
+                    gate,
+                    preview.verification_state == crate::suggest::VerificationState::Verified,
+                );
                 // Set the preview in the Verify workflow step
                 app.set_verify_preview(preview, file_hashes);
             }
@@ -262,15 +298,10 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 friendly_title,
                 problem_summary,
                 outcome,
+                duration_ms,
             } => {
-                // Track session cost for display
-                if let Some(u) = usage {
-                    let cost = u.cost();
-                    app.session_cost += cost;
-                    app.session_tokens += u.total_tokens;
-                    // Refresh wallet balance after spending
-                    spawn_balance_refresh(ctx.tx.clone());
-                }
+                let (tokens, cost) = track_usage(app, usage.as_ref(), ctx);
+                record_pipeline_metric(app, "apply", duration_ms, tokens, cost, "apply_fix", true);
 
                 app.loading = LoadingState::None;
                 app.suggestions.mark_applied(suggestion_id);
@@ -309,20 +340,16 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     })
                     .collect();
 
-                // Transition to Review workflow step (use first file for display)
-                let first_file = file_changes
-                    .first()
-                    .map(|(p, _)| p.clone())
-                    .unwrap_or_default();
-                let first_original = files_with_content
-                    .first()
-                    .map(|(_, o, _)| o.clone())
-                    .unwrap_or_default();
-                let first_new = files_with_content
-                    .first()
-                    .map(|(_, _, n)| n.clone())
-                    .unwrap_or_default();
-                app.start_review(first_file, first_original.clone(), first_new.clone());
+                // Transition to Review workflow step (multi-file aware)
+                let review_files = files_with_content
+                    .iter()
+                    .map(|(path, original, new_content)| ui::ReviewFileContent {
+                        path: path.clone(),
+                        original_content: original.clone(),
+                        new_content: new_content.clone(),
+                    })
+                    .collect();
+                app.start_review(review_files);
 
                 // Trigger verification in background (all files)
                 {
@@ -337,6 +364,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     };
 
                     spawn_background(ctx.tx.clone(), "verification", async move {
+                        let review_start = std::time::Instant::now();
                         match suggest::llm::verify_changes(
                             &files_with_content,
                             1,
@@ -350,6 +378,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                                     findings: review.findings,
                                     summary: review.summary,
                                     usage: review.usage,
+                                    duration_ms: review_start.elapsed().as_millis() as u64,
                                 });
                             }
                             Err(e) => {
@@ -437,14 +466,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 }
             }
             BackgroundMessage::QuestionResponse { answer, usage, .. } => {
-                // Track session cost for display
-                if let Some(u) = usage {
-                    let cost = u.cost();
-                    app.session_cost += cost;
-                    app.session_tokens += u.total_tokens;
-                    // Refresh wallet balance after spending
-                    spawn_balance_refresh(ctx.tx.clone());
-                }
+                let _ = track_usage(app, usage.as_ref(), ctx);
 
                 app.loading = LoadingState::None;
                 // Show the response in the ask cosmos panel
@@ -456,14 +478,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 usage,
                 context_hash,
             } => {
-                // Track session cost for display
-                if let Some(u) = &usage {
-                    let cost = u.cost();
-                    app.session_cost += cost;
-                    app.session_tokens += u.total_tokens;
-                    // Refresh wallet balance after spending
-                    spawn_balance_refresh(ctx.tx.clone());
-                }
+                let _ = track_usage(app, usage.as_ref(), ctx);
 
                 // Store answer in cache
                 app.question_cache
@@ -480,78 +495,144 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 findings,
                 summary,
                 usage,
+                duration_ms,
             } => {
-                // Track session cost for display
-                if let Some(u) = usage {
-                    let cost = u.cost();
-                    app.session_cost += cost;
-                    app.session_tokens += u.total_tokens;
-                    // Refresh wallet balance after spending
-                    spawn_balance_refresh(ctx.tx.clone());
-                }
+                let (tokens, cost) = track_usage(app, usage.as_ref(), ctx);
+                record_pipeline_metric(
+                    app,
+                    "review",
+                    duration_ms,
+                    tokens,
+                    cost,
+                    "review_complete",
+                    true,
+                );
                 // Update the Review workflow step with findings
                 app.set_review_findings(findings, summary);
             }
             BackgroundMessage::VerificationFixComplete {
-                new_content,
+                file_changes,
                 description,
                 usage,
+                duration_ms,
             } => {
-                // Track session cost for display
-                if let Some(u) = usage {
-                    let cost = u.cost();
-                    app.session_cost += cost;
-                    app.session_tokens += u.total_tokens;
-                    // Refresh wallet balance after spending
-                    spawn_balance_refresh(ctx.tx.clone());
-                }
+                let (tokens, cost) = track_usage(app, usage.as_ref(), ctx);
+                record_pipeline_metric(
+                    app,
+                    "review",
+                    duration_ms,
+                    tokens,
+                    cost,
+                    "review_fix_applied",
+                    true,
+                );
 
                 app.show_toast(&format!("Fixed: {}", truncate(&description, 40)));
 
-                // Update workflow review state
-                let file_path = app.review_state.file_path.clone();
-                let original_content = app.review_state.original_content.clone();
+                // Apply file updates to disk and stage them.
+                let mut apply_failed = false;
+                for (path, new_content) in &file_changes {
+                    let full_path = app.repo_path.join(path);
+                    if let Some(parent) = full_path.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            app.review_state.fixing = false;
+                            app.loading = LoadingState::None;
+                            app.show_toast(&format!(
+                                "Review fix failed: could not create {} ({})",
+                                parent.display(),
+                                e
+                            ));
+                            apply_failed = true;
+                            break;
+                        }
+                    }
+
+                    if let Err(e) = std::fs::write(&full_path, new_content) {
+                        app.review_state.fixing = false;
+                        app.loading = LoadingState::None;
+                        app.show_toast(&format!(
+                            "Review fix failed: could not write {} ({})",
+                            path.display(),
+                            e
+                        ));
+                        apply_failed = true;
+                        break;
+                    }
+
+                    let rel_path = path.to_string_lossy().to_string();
+                    if let Err(e) = crate::git_ops::stage_file(&app.repo_path, &rel_path) {
+                        app.review_state.fixing = false;
+                        app.loading = LoadingState::None;
+                        app.show_toast(&format!(
+                            "Review fix failed: could not stage {} ({})",
+                            path.display(),
+                            e
+                        ));
+                        apply_failed = true;
+                        break;
+                    }
+                }
+                if apply_failed {
+                    continue;
+                }
+
+                let mut updated_files = app.review_state.files.clone();
+                for (path, new_content) in &file_changes {
+                    if let Some(file) = updated_files.iter_mut().find(|f| f.path == *path) {
+                        file.new_content = new_content.clone();
+                    }
+                }
+
                 let iteration = app.review_state.review_iteration + 1;
                 let fixed_titles = app.review_state.fixed_titles.clone();
-
-                app.review_fix_complete(new_content.clone());
+                app.review_fix_complete(file_changes.clone());
 
                 // Trigger re-review
                 // Note: On re-reviews, we don't pass suggestion context because we're
                 // verifying fixes to the reviewer's findings, not the original suggestion
-                if let Some(fp) = file_path {
-                    app.review_state.reviewing = true;
-                    app.loading = LoadingState::ReviewingChanges;
-
-                    let tx_verify = ctx.tx.clone();
-                    spawn_background(ctx.tx.clone(), "re_verification", async move {
-                        let files_with_content = vec![(fp, original_content, new_content)];
-                        // For re-reviews, we pass None for fix_context since we're now
-                        // verifying the fix to the reviewer's findings, not the original fix
-                        match suggest::llm::verify_changes(
-                            &files_with_content,
-                            iteration,
-                            &fixed_titles,
-                            None,
+                let files_with_content: Vec<(PathBuf, String, String)> = updated_files
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.path.clone(),
+                            f.original_content.clone(),
+                            f.new_content.clone(),
                         )
-                        .await
-                        {
-                            Ok(review) => {
-                                let _ = tx_verify.send(BackgroundMessage::VerificationComplete {
-                                    findings: review.findings,
-                                    summary: review.summary,
-                                    usage: review.usage,
-                                });
-                            }
-                            Err(e) => {
-                                let _ = tx_verify.send(BackgroundMessage::Error(format!(
-                                    "Re-verification failed: {}",
-                                    e
-                                )));
-                            }
+                    })
+                    .collect();
+
+                app.review_state.reviewing = true;
+                app.loading = LoadingState::ReviewingChanges;
+
+                let tx_verify = ctx.tx.clone();
+                spawn_background(ctx.tx.clone(), "re_verification", async move {
+                    let review_start = std::time::Instant::now();
+                    // For re-reviews, we pass None for fix_context since we're now
+                    // verifying the fix to the reviewer's findings, not the original fix
+                    match suggest::llm::verify_changes(
+                        &files_with_content,
+                        iteration,
+                        &fixed_titles,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(review) => {
+                            let _ = tx_verify.send(BackgroundMessage::VerificationComplete {
+                                findings: review.findings,
+                                summary: review.summary,
+                                usage: review.usage,
+                                duration_ms: review_start.elapsed().as_millis() as u64,
+                            });
                         }
-                    });
-                }
+                        Err(e) => {
+                            let _ = tx_verify.send(BackgroundMessage::Error(format!(
+                                "Re-verification failed: {}",
+                                e
+                            )));
+                        }
+                    }
+                });
             }
             BackgroundMessage::UpdateAvailable { latest_version } => {
                 // Store the available version - don't show overlay automatically
@@ -571,6 +652,91 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
             }
         }
     }
+}
+
+fn track_usage(
+    app: &mut App,
+    usage: Option<&suggest::llm::Usage>,
+    ctx: &RuntimeContext,
+) -> (u32, f64) {
+    let Some(usage) = usage else {
+        return (0, 0.0);
+    };
+
+    let cost = usage.cost();
+    app.session_cost += cost;
+    app.session_tokens += usage.total_tokens;
+    spawn_balance_refresh(ctx.tx.clone());
+    maybe_show_budget_guardrails(app);
+
+    (usage.total_tokens, cost)
+}
+
+fn maybe_show_budget_guardrails(app: &mut App) {
+    if app.session_cost >= 0.04 && !app.budget_warned_soft {
+        app.budget_warned_soft = true;
+        app.show_toast("Budget guardrail: approaching $0.04 session spend.");
+    }
+    if app.session_cost >= 0.05 && !app.budget_warned_hard {
+        app.budget_warned_hard = true;
+        app.show_toast(
+            "Budget guardrail: hard limit ($0.05) reached. Extra review loops require confirmation.",
+        );
+    }
+}
+
+fn record_pipeline_metric(
+    app: &App,
+    stage: &str,
+    duration_ms: u64,
+    tokens: u32,
+    cost: f64,
+    gate: &str,
+    passed: bool,
+) {
+    let cache = cache::Cache::new(&app.repo_path);
+    let mut metric = cache::PipelineMetricRecord {
+        timestamp: Utc::now(),
+        stage: stage.to_string(),
+        summary_ms: None,
+        suggest_ms: None,
+        verify_ms: None,
+        apply_ms: None,
+        review_ms: None,
+        tokens,
+        cost,
+        gate: gate.to_string(),
+        passed,
+    };
+
+    match stage {
+        "summary" => metric.summary_ms = Some(duration_ms),
+        "suggest" => metric.suggest_ms = Some(duration_ms),
+        "verify" => metric.verify_ms = Some(duration_ms),
+        "apply" => metric.apply_ms = Some(duration_ms),
+        "review" => metric.review_ms = Some(duration_ms),
+        _ => {}
+    }
+
+    let _ = cache.append_pipeline_metric(&metric);
+}
+
+fn failed_files_hint(files: &[PathBuf]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+
+    let mut shown = files
+        .iter()
+        .take(3)
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>();
+    let extra = files.len().saturating_sub(shown.len());
+    if extra > 0 {
+        shown.push(format!("+{} more", extra));
+    }
+
+    format!(" Failed file(s): {}.", shown.join(", "))
 }
 
 /// Spawn a background task to fetch the wallet balance

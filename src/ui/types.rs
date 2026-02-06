@@ -210,10 +210,17 @@ impl VerifyState {
 
 /// State for the Review step
 #[derive(Debug, Clone, Default)]
-pub struct ReviewState {
-    pub file_path: Option<PathBuf>,
+pub struct ReviewFileContent {
+    pub path: PathBuf,
     pub original_content: String,
     pub new_content: String,
+}
+
+/// State for the Review step
+#[derive(Debug, Clone, Default)]
+pub struct ReviewState {
+    /// All files involved in this review cycle (multi-file aware)
+    pub files: Vec<ReviewFileContent>,
     pub findings: Vec<crate::suggest::llm::ReviewFinding>,
     pub selected: HashSet<usize>,
     pub cursor: usize,
@@ -224,6 +231,8 @@ pub struct ReviewState {
     pub confirm_ship: bool,
     pub review_iteration: u32,
     pub fixed_titles: Vec<String>,
+    /// Explicit user confirmation needed before spending beyond hard budget guardrail.
+    pub confirm_extra_review_budget: bool,
     /// Set when verification fails - allows user to proceed anyway with a warning
     pub verification_failed: bool,
     /// Error message from failed verification (for display)
@@ -284,7 +293,10 @@ pub struct Toast {
 impl Toast {
     pub fn new(message: &str) -> Self {
         // Auto-detect toast type - check success indicators BEFORE error keywords
-        let kind = if message.contains("Rate limit") || message.contains("rate limited") {
+        let kind = if message.contains("Rate limit")
+            || message.contains("rate limited")
+            || message.contains("Budget guardrail")
+        {
             ToastKind::RateLimit
         } else if message.starts_with("Fixed:") || message.starts_with('+') {
             ToastKind::Success

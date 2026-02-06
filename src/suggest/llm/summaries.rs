@@ -29,6 +29,83 @@ pub struct SummaryBatchResult {
     pub usage: Option<Usage>,
 }
 
+fn build_fallback_summary(index: &CodebaseIndex, path: &Path) -> Option<String> {
+    let file_index = index.files.get(path)?;
+
+    let mut parts: Vec<String> = Vec::new();
+
+    let purpose = file_index.summary.purpose.trim();
+    if !purpose.is_empty() {
+        parts.push(purpose.trim_end_matches('.').to_string());
+    } else {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("this file");
+        parts.push(format!("{} supports part of the project logic", name));
+    }
+
+    let function_count = file_index
+        .symbols
+        .iter()
+        .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
+        .count();
+    let type_count = file_index
+        .symbols
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SymbolKind::Struct
+                    | SymbolKind::Class
+                    | SymbolKind::Interface
+                    | SymbolKind::Trait
+                    | SymbolKind::Enum
+            )
+        })
+        .count();
+    if function_count > 0 || type_count > 0 {
+        parts.push(format!(
+            "It contains {} function{} and {} type{}",
+            function_count,
+            if function_count == 1 { "" } else { "s" },
+            type_count,
+            if type_count == 1 { "" } else { "s" }
+        ));
+    }
+
+    if !file_index.summary.depends_on.is_empty() {
+        let deps = file_index
+            .summary
+            .depends_on
+            .iter()
+            .take(3)
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>();
+        if !deps.is_empty() {
+            parts.push(format!("It depends on {}", deps.join(", ")));
+        }
+    }
+
+    if !file_index.summary.used_by.is_empty() {
+        parts.push(format!(
+            "It is used by {} other file{}",
+            file_index.summary.used_by.len(),
+            if file_index.summary.used_by.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    Some(format!("{}.", parts.join(". ")))
+}
+
 fn summary_batch_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -313,17 +390,28 @@ pub async fn generate_summaries_for_files(
                     }
 
                     if !missing_files.is_empty() {
-                        // Track missing files for retry; caller handles user notification
+                        // Try deterministic fallback summaries so one malformed model response
+                        // does not block the whole pipeline.
                         for missing in missing_files {
-                            failed_files.insert(missing);
+                            if let Some(fallback) = build_fallback_summary(index, &missing) {
+                                all_summaries.insert(missing.clone(), fallback);
+                                failed_files.remove(&missing);
+                            } else {
+                                failed_files.insert(missing);
+                            }
                         }
                     }
                 }
                 Err(_e) => {
-                    // Batch failed - track files for caller to handle
-                    // Error details are internal; user sees "X files failed" via UI
+                    // Batch failed. Use deterministic fallback summaries where possible
+                    // to keep startup resilient and summaries-first gate satisfied.
                     for file in batch_files {
-                        failed_files.insert(file);
+                        if let Some(fallback) = build_fallback_summary(index, &file) {
+                            all_summaries.insert(file.clone(), fallback);
+                            failed_files.remove(&file);
+                        } else {
+                            failed_files.insert(file);
+                        }
                     }
                 }
             }

@@ -956,10 +956,15 @@ fn render_verify_content<'a>(
         content.push(Line::from(""));
 
         // Simple verification status (no verbose explanation)
-        let (status_icon, status_text, status_color) = if preview.verified {
-            ("✓", "Confirmed", Theme::GREEN)
-        } else {
-            ("✗", "Not Found", Theme::BADGE_BUG)
+        let (status_icon, status_text, status_color) = match preview.verification_state {
+            crate::suggest::VerificationState::Verified => ("✓", "Confirmed", Theme::GREEN),
+            crate::suggest::VerificationState::Contradicted => {
+                ("✗", "Contradicted", Theme::BADGE_BUG)
+            }
+            crate::suggest::VerificationState::InsufficientEvidence => {
+                ("?", "Needs More Evidence", Theme::YELLOW)
+            }
+            crate::suggest::VerificationState::Unverified => ("?", "Unverified", Theme::GREY_500),
         };
         content.push(Line::from(vec![
             Span::styled(
@@ -1219,8 +1224,9 @@ fn render_review_content<'a>(
     }
 
     let file_name = state
-        .file_path
-        .as_ref()
+        .files
+        .first()
+        .map(|f| f.path.as_path())
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
         .unwrap_or("file");
@@ -1233,6 +1239,14 @@ fn render_review_content<'a>(
                 .fg(Theme::WHITE)
                 .add_modifier(Modifier::BOLD),
         ),
+        if state.files.len() > 1 {
+            Span::styled(
+                format!(" (+{} files)", state.files.len().saturating_sub(1)),
+                Style::default().fg(Theme::GREY_400),
+            )
+        } else {
+            Span::styled("", Style::default())
+        },
         if state.review_iteration > 1 {
             Span::styled(
                 format!(" (round {})", state.review_iteration),

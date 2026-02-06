@@ -39,6 +39,8 @@ pub enum ApplyError {
     UnsafePath(PathBuf, String),
     /// File read failed
     FileReadFailed(PathBuf, String),
+    /// Verify stage explicitly did not confirm this suggestion
+    SuggestionNotVerified(crate::suggest::VerificationState),
 }
 
 impl ApplyError {
@@ -85,6 +87,15 @@ impl ApplyError {
             Self::FileReadFailed(path, e) => {
                 format!("Apply failed: couldn't read {}: {}", path.display(), e)
             }
+            Self::SuggestionNotVerified(state) => match state {
+                crate::suggest::VerificationState::Contradicted => {
+                    "Apply failed: verify contradicted this suggestion. Pick another suggestion or re-run verification.".into()
+                }
+                crate::suggest::VerificationState::InsufficientEvidence => {
+                    "Apply failed: verify did not find enough evidence. Refine and verify again.".into()
+                }
+                _ => "Apply failed: suggestion is not verified yet.".into(),
+            },
         }
     }
 }
@@ -118,6 +129,12 @@ fn validate_apply_fix(app: &App) -> std::result::Result<ApplyContext, ApplyError
         .preview
         .clone()
         .ok_or(ApplyError::PreviewNotReady)?;
+
+    if preview.verification_state != crate::suggest::VerificationState::Verified {
+        return Err(ApplyError::SuggestionNotVerified(
+            preview.verification_state,
+        ));
+    }
 
     // Get suggestion_id
     let suggestion_id = app
@@ -195,6 +212,157 @@ fn validate_apply_fix(app: &App) -> std::result::Result<ApplyContext, ApplyError
     })
 }
 
+fn resolve_review_file_path(
+    finding_file: &str,
+    files: &[crate::ui::ReviewFileContent],
+) -> Option<PathBuf> {
+    let normalized = finding_file.replace('\\', "/");
+    let candidate = PathBuf::from(&normalized);
+
+    if let Some(found) = files.iter().find(|f| f.path == candidate) {
+        return Some(found.path.clone());
+    }
+
+    for file in files {
+        let file_str = file.path.to_string_lossy().replace('\\', "/");
+        if normalized.ends_with(&file_str) {
+            return Some(file.path.clone());
+        }
+    }
+
+    let file_name = PathBuf::from(&normalized)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string);
+    if let Some(file_name) = file_name {
+        let matches: Vec<_> = files
+            .iter()
+            .filter(|f| {
+                f.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n == file_name)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0].path.clone());
+        }
+    }
+
+    None
+}
+
+fn start_review_fix_for_selected_findings(app: &mut App, ctx: &RuntimeContext) {
+    if app.review_state.selected.is_empty() || app.review_state.reviewing || app.review_state.fixing
+    {
+        return;
+    }
+
+    if app.session_cost >= 0.05 && !app.review_state.confirm_extra_review_budget {
+        app.review_state.confirm_extra_review_budget = true;
+        app.show_toast(
+            "Budget guardrail: press f/Enter again to run another review-fix cycle beyond $0.05.",
+        );
+        return;
+    }
+    app.review_state.confirm_extra_review_budget = false;
+
+    let selected_findings = app.get_selected_review_findings();
+    let files = app.review_state.files.clone();
+    let iter = app.review_state.review_iteration;
+    let fixed = app.review_state.fixed_titles.clone();
+    let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
+    let memory = if repo_memory_context.trim().is_empty() {
+        None
+    } else {
+        Some(repo_memory_context)
+    };
+    let tx_fix = ctx.tx.clone();
+
+    app.set_review_fixing(true);
+
+    background::spawn_background(ctx.tx.clone(), "verification_fix", async move {
+        let stage_start = std::time::Instant::now();
+        let mut findings_by_file: HashMap<PathBuf, Vec<suggest::llm::ReviewFinding>> =
+            HashMap::new();
+
+        for finding in selected_findings {
+            let Some(path) = resolve_review_file_path(&finding.file, &files) else {
+                let _ = tx_fix.send(BackgroundMessage::Error(format!(
+                    "Review fix failed: finding file '{}' does not match changed files.",
+                    finding.file
+                )));
+                return;
+            };
+            findings_by_file.entry(path).or_default().push(finding);
+        }
+
+        let mut file_changes: Vec<(PathBuf, String)> = Vec::new();
+        let mut descriptions: Vec<String> = Vec::new();
+        let mut total_usage = suggest::llm::Usage::default();
+        let mut saw_usage = false;
+
+        for (path, findings) in findings_by_file {
+            let Some(file_state) = files.iter().find(|f| f.path == path) else {
+                let _ = tx_fix.send(BackgroundMessage::Error(format!(
+                    "Review fix failed: missing state for {}",
+                    path.display()
+                )));
+                return;
+            };
+
+            let original_ref = if iter > 1 {
+                Some(file_state.original_content.as_str())
+            } else {
+                None
+            };
+
+            match suggest::llm::fix_review_findings(
+                &file_state.path,
+                &file_state.new_content,
+                original_ref,
+                &findings,
+                memory.clone(),
+                iter,
+                &fixed,
+            )
+            .await
+            {
+                Ok(fix) => {
+                    descriptions.push(format!("{}: {}", path.display(), fix.description));
+                    file_changes.push((path.clone(), fix.new_content));
+                    if let Some(u) = fix.usage {
+                        total_usage.prompt_tokens += u.prompt_tokens;
+                        total_usage.completion_tokens += u.completion_tokens;
+                        total_usage.total_tokens += u.total_tokens;
+                        total_usage.cost = Some(total_usage.cost.unwrap_or(0.0) + u.cost());
+                        saw_usage = true;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx_fix.send(BackgroundMessage::Error(e.to_string()));
+                    return;
+                }
+            }
+        }
+
+        let usage = if saw_usage { Some(total_usage) } else { None };
+        let description = if descriptions.is_empty() {
+            "Fixed selected review findings".to_string()
+        } else {
+            descriptions.join("; ")
+        };
+
+        let _ = tx_fix.send(BackgroundMessage::VerificationFixComplete {
+            file_changes,
+            description,
+            usage,
+            duration_ms: stage_start.elapsed().as_millis() as u64,
+        });
+    });
+}
+
 /// Handle key events in normal mode (no special input active)
 pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> Result<()> {
     match key.code {
@@ -268,53 +436,7 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                 && !app.review_state.fixing
                 && !app.review_state.selected.is_empty()
             {
-                let selected_findings = app.get_selected_review_findings();
-                let file = app.review_state.file_path.clone();
-                let content = app.review_state.new_content.clone();
-                let original = app.review_state.original_content.clone();
-                let iter = app.review_state.review_iteration;
-                let fixed = app.review_state.fixed_titles.clone();
-                let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
-                let memory = if repo_memory_context.trim().is_empty() {
-                    None
-                } else {
-                    Some(repo_memory_context)
-                };
-                let tx_fix = ctx.tx.clone();
-
-                if let Some(file_path) = file {
-                    app.set_review_fixing(true);
-
-                    background::spawn_background(ctx.tx.clone(), "verification_fix", async move {
-                        let orig_ref = if iter > 1 {
-                            Some(original.as_str())
-                        } else {
-                            None
-                        };
-                        match suggest::llm::fix_review_findings(
-                            &file_path,
-                            &content,
-                            orig_ref,
-                            &selected_findings,
-                            memory,
-                            iter,
-                            &fixed,
-                        )
-                        .await
-                        {
-                            Ok(fix) => {
-                                let _ = tx_fix.send(BackgroundMessage::VerificationFixComplete {
-                                    new_content: fix.new_content,
-                                    description: fix.description,
-                                    usage: fix.usage,
-                                });
-                            }
-                            Err(e) => {
-                                let _ = tx_fix.send(BackgroundMessage::Error(e.to_string()));
-                            }
-                        }
-                    });
-                }
+                start_review_fix_for_selected_findings(app, ctx);
             }
         }
         KeyCode::Char('d') => {
@@ -380,6 +502,7 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                                 ctx.tx.clone(),
                                                 "preview_generation",
                                                 async move {
+                                                    let stage_start = std::time::Instant::now();
                                                     let mem =
                                                         if repo_memory_context.trim().is_empty() {
                                                             None
@@ -448,11 +571,16 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                                 )
                                                 .await
                                                 {
-                                                    Ok(preview) => {
+                                                    Ok((preview, usage)) => {
                                                         let _ = tx_preview.send(
                                                             BackgroundMessage::PreviewReady {
                                                                 preview,
+                                                                usage,
                                                                 file_hashes,
+                                                                duration_ms: stage_start
+                                                                    .elapsed()
+                                                                    .as_millis()
+                                                                    as u64,
                                                             },
                                                         );
                                                     }
@@ -490,6 +618,7 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                             ctx.tx.clone(),
                                             "apply_fix",
                                             async move {
+                                                let stage_start = std::time::Instant::now();
                                                 // Create branch from main
                                                 let branch_name = git_ops::generate_fix_branch_name(
                                                     &suggestion.id.to_string(),
@@ -686,6 +815,10 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                                                             .problem_summary
                                                                             .clone(),
                                                                         outcome: preview.outcome.clone(),
+                                                                        duration_ms: stage_start
+                                                                            .elapsed()
+                                                                            .as_millis()
+                                                                            as u64,
                                                                     },
                                                                 );
                                                         }
@@ -794,6 +927,10 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                                                                     .problem_summary
                                                                                     .clone(),
                                                                                 outcome: preview.outcome.clone(),
+                                                                                duration_ms: stage_start
+                                                                                    .elapsed()
+                                                                                    .as_millis()
+                                                                                    as u64,
                                                                             },
                                                                         );
                                                                 }
@@ -826,6 +963,15 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                         );
                                     }
                                     Err(e) => {
+                                        if matches!(
+                                            e,
+                                            ApplyError::SuggestionNotVerified(
+                                                crate::suggest::VerificationState::Contradicted
+                                            )
+                                        ) {
+                                            app.workflow_step = WorkflowStep::Suggestions;
+                                            app.verify_state = crate::ui::VerifyState::default();
+                                        }
                                         // Show user-friendly error message
                                         app.show_toast(&e.user_message());
                                     }
@@ -835,64 +981,7 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                 if !app.review_state.reviewing && !app.review_state.fixing {
                                     if !app.review_state.selected.is_empty() {
                                         // Fix selected findings (same as 'f' key)
-                                        let selected_findings = app.get_selected_review_findings();
-                                        let file = app.review_state.file_path.clone();
-                                        let content = app.review_state.new_content.clone();
-                                        let original = app.review_state.original_content.clone();
-                                        let iter = app.review_state.review_iteration;
-                                        let fixed = app.review_state.fixed_titles.clone();
-                                        let repo_memory_context =
-                                            app.repo_memory.to_prompt_context(12, 900);
-                                        let memory = if repo_memory_context.trim().is_empty() {
-                                            None
-                                        } else {
-                                            Some(repo_memory_context)
-                                        };
-                                        let tx_fix = ctx.tx.clone();
-
-                                        if let Some(file_path) = file {
-                                            app.set_review_fixing(true);
-
-                                            background::spawn_background(
-                                                ctx.tx.clone(),
-                                                "verification_fix",
-                                                async move {
-                                                    let orig_ref = if iter > 1 {
-                                                        Some(original.as_str())
-                                                    } else {
-                                                        None
-                                                    };
-                                                    match suggest::llm::fix_review_findings(
-                                                        &file_path,
-                                                        &content,
-                                                        orig_ref,
-                                                        &selected_findings,
-                                                        memory,
-                                                        iter,
-                                                        &fixed,
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(fix) => {
-                                                            let _ = tx_fix.send(
-                                                                BackgroundMessage::VerificationFixComplete {
-                                                                    new_content: fix.new_content,
-                                                                    description: fix.description,
-                                                                    usage: fix.usage,
-                                                                },
-                                                            );
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = tx_fix.send(
-                                                                BackgroundMessage::Error(
-                                                                    e.to_string(),
-                                                                ),
-                                                            );
-                                                        }
-                                                    }
-                                                },
-                                            );
-                                        }
+                                        start_review_fix_for_selected_findings(app, ctx);
                                     } else if app.review_passed() {
                                         // Review passed - move to Ship
                                         app.start_ship();

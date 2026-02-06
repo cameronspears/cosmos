@@ -11,12 +11,14 @@ pub enum BackgroundMessage {
         usage: Option<suggest::llm::Usage>,
         model: String,
         diagnostics: suggest::llm::SuggestionDiagnostics,
+        duration_ms: u64,
     },
     SuggestionsError(String),
     SummariesReady {
         summaries: HashMap<PathBuf, String>,
         usage: Option<suggest::llm::Usage>,
         failed_files: Vec<PathBuf>,
+        duration_ms: u64,
     },
     /// Incremental summary progress update
     SummaryProgress {
@@ -35,7 +37,9 @@ pub enum BackgroundMessage {
     /// Quick preview ready (Phase 1 - fast)
     PreviewReady {
         preview: suggest::llm::FixPreview,
+        usage: Option<suggest::llm::Usage>,
         file_hashes: HashMap<PathBuf, String>,
+        duration_ms: u64,
     },
     PreviewError(String),
     /// Direct fix applied (Smart preset generated + applied the change)
@@ -53,6 +57,8 @@ pub enum BackgroundMessage {
         problem_summary: String,
         /// What will be different after the fix
         outcome: String,
+        /// Time spent generating + applying this fix
+        duration_ms: u64,
     },
     DirectFixError(String),
     /// Ship workflow progress update
@@ -90,12 +96,14 @@ pub enum BackgroundMessage {
         findings: Vec<suggest::llm::ReviewFinding>,
         summary: String,
         usage: Option<suggest::llm::Usage>,
+        duration_ms: u64,
     },
     /// Verification fix completed (Smart fixed the selected findings)
     VerificationFixComplete {
-        new_content: String,
+        file_changes: Vec<(PathBuf, String)>,
         description: String,
         usage: Option<suggest::llm::Usage>,
+        duration_ms: u64,
     },
     /// New version available - show update panel
     UpdateAvailable {
