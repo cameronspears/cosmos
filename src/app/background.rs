@@ -120,7 +120,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     if failed_count > 0 {
                         app.loading = LoadingState::None;
                         let message = format!(
-                            "Summaries incomplete: {} files failed. Retry summaries before suggestions.{}",
+                            "Summaries incomplete: {} files failed. Open Reset Cosmos (R), clear summaries, then restart Cosmos.{}",
                             failed_count,
                             failed_files_hint(&app.summary_failed_files)
                         );
@@ -180,7 +180,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                         app.loading = LoadingState::None;
                         if failed_count > 0 {
                             let message = format!(
-                                "Summaries incomplete: {} files failed. Press 'R' to retry.{}",
+                                "Summaries incomplete: {} files failed. Press 'R' to open Reset Cosmos, clear summaries, then restart Cosmos.{}",
                                 failed_count,
                                 failed_files_hint(&app.summary_failed_files)
                             );
@@ -200,7 +200,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     }
                     if failed_count > 0 {
                         let message = format!(
-                            "Summaries incomplete: {} files failed. Press 'R' to retry.{}",
+                            "Summaries incomplete: {} files failed. Press 'R' to open Reset Cosmos, clear summaries, then restart Cosmos.{}",
                             failed_count,
                             failed_files_hint(&app.summary_failed_files)
                         );
@@ -295,6 +295,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                 description,
                 usage,
                 branch_name,
+                source_branch,
                 friendly_title,
                 problem_summary,
                 outcome,
@@ -308,6 +309,7 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
 
                 // Store the cosmos branch name - this enables the Ship workflow
                 app.cosmos_branch = Some(branch_name.clone());
+                app.cosmos_base_branch = Some(source_branch);
 
                 // Convert file_changes to FileChange structs for multi-file support
                 let ui_file_changes: Vec<ui::FileChange> = file_changes
@@ -426,6 +428,12 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
             }
             BackgroundMessage::ResetComplete { options } => {
                 app.loading = LoadingState::None;
+                if options
+                    .iter()
+                    .any(|o| *o == crate::cache::ResetOption::QuestionCache)
+                {
+                    app.question_cache = crate::cache::QuestionCache::default();
+                }
                 let labels: Vec<&str> = options.iter().map(|o| o.label()).collect();
                 if labels.is_empty() {
                     app.show_toast("Reset complete");
@@ -448,18 +456,20 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
                     app.review_state.fixing = false;
                 }
 
-                // Check if this is a verification error - allow user to proceed anyway
+                // Verification failures are explicit and require manual override in Review.
                 if e.contains("verification failed") || e.contains("Re-verification failed") {
                     app.review_state.reviewing = false;
                     app.review_state.verification_failed = true;
                     app.review_state.verification_error = Some(truncate(&e, 200).to_string());
-                    // Set a summary indicating verification was skipped
+                    app.review_state.confirm_ship = false;
+                    // Set a summary indicating verification did not complete.
                     if app.review_state.summary.is_empty() {
                         app.review_state.summary =
-                            "Verification unavailable - you can still proceed to ship".to_string();
+                            "Verification failed before completion. Review manually before shipping."
+                                .to_string();
                     }
                     app.show_toast(
-                        "Verification failed - press Enter to ship anyway or fix issues manually",
+                        "Verification failed. Review manually, then press Enter twice to override and ship.",
                     );
                 } else {
                     app.show_toast(&truncate(&e, 100));

@@ -98,6 +98,7 @@ pub fn checkout_branch(repo_path: &Path, name: &str) -> Result<()> {
 
 /// Create a new branch from main (or master) and check it out
 /// Used for creating fix branches before applying changes
+#[allow(dead_code)]
 pub fn create_fix_branch_from_main(repo_path: &Path, branch_name: &str) -> Result<String> {
     let repo = Repository::open(repo_path)?;
 
@@ -116,6 +117,43 @@ pub fn create_fix_branch_from_main(repo_path: &Path, branch_name: &str) -> Resul
         .peel_to_commit()
         .context("Failed to get commit from main branch")?;
 
+    create_fix_branch_from_base_commit(
+        repo_path,
+        &repo,
+        branch_name,
+        &main_commit,
+        &format!("main branch '{}'", main_branch_name),
+    )
+}
+
+/// Create a new branch from the current checkout/HEAD and check it out.
+/// Used when the user chooses to continue from their current branch context.
+pub fn create_fix_branch_from_current(repo_path: &Path, branch_name: &str) -> Result<String> {
+    let repo = Repository::open(repo_path)?;
+    let head = repo
+        .head()
+        .context("Failed to get HEAD for current branch")?;
+    let head_label = head.shorthand().unwrap_or("detached HEAD").to_string();
+    let head_commit = head
+        .peel_to_commit()
+        .context("Failed to get commit from current checkout")?;
+
+    create_fix_branch_from_base_commit(
+        repo_path,
+        &repo,
+        branch_name,
+        &head_commit,
+        &format!("current checkout '{}'", head_label),
+    )
+}
+
+fn create_fix_branch_from_base_commit(
+    repo_path: &Path,
+    repo: &Repository,
+    branch_name: &str,
+    base_commit: &git2::Commit<'_>,
+    base_label: &str,
+) -> Result<String> {
     // Check if branch already exists (avoid deleting user work)
     let mut final_name = branch_name.to_string();
     if let Ok(existing) = repo.find_branch(branch_name, git2::BranchType::Local) {
@@ -123,20 +161,20 @@ pub fn create_fix_branch_from_main(repo_path: &Path, branch_name: &str) -> Resul
             .get()
             .peel_to_commit()
             .context("Failed to get commit from existing branch")?;
-        if existing_commit.id() == main_commit.id() {
-            // Branch already points at main; just reuse it.
+        if existing_commit.id() == base_commit.id() {
+            // Branch already points at desired base; just reuse it.
             checkout_branch(repo_path, branch_name)?;
             return Ok(branch_name.to_string());
         }
 
-        final_name = unique_branch_name(&repo, branch_name)?;
+        final_name = unique_branch_name(repo, branch_name)?;
     }
 
-    // Create the new branch from main
-    repo.branch(&final_name, &main_commit, false)
+    // Create the new branch from selected base commit.
+    repo.branch(&final_name, base_commit, false)
         .context(format!(
-            "Failed to create branch '{}' from main",
-            final_name
+            "Failed to create branch '{}' from {}",
+            final_name, base_label
         ))?;
 
     // Checkout the new branch
@@ -902,6 +940,48 @@ mod tests {
         let repo_path = env::current_dir().unwrap();
         let branch = get_current_branch(&repo_path).unwrap();
         assert!(is_valid_git_ref(&branch));
+    }
+
+    #[test]
+    fn test_create_fix_branch_from_current_uses_current_head() {
+        let (_temp_dir, repo_path) = create_temp_repo();
+        let repo = Repository::open(&repo_path).unwrap();
+
+        let initial_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature/base", &initial_commit, false).unwrap();
+        checkout_branch(&repo_path, "feature/base").unwrap();
+
+        let feature_file = repo_path.join("feature.txt");
+        std::fs::write(&feature_file, "feature work").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("feature.txt")).unwrap();
+        index.write().unwrap();
+        let sig = Signature::now("Test User", "test@example.com").unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "Feature commit",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+
+        let feature_head = repo.head().unwrap().target().unwrap();
+        let created = create_fix_branch_from_current(&repo_path, "fix/from-current").unwrap();
+        assert_eq!(created, "fix/from-current");
+        assert_eq!(get_current_branch(&repo_path).unwrap(), created);
+
+        let created_head = Repository::open(&repo_path)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap();
+        assert_eq!(created_head, feature_head);
     }
 
     // ========================================================================

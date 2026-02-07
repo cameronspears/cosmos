@@ -308,10 +308,10 @@ fn get_primary_buttons(app: &App) -> Vec<FooterButton> {
                 }
             }
             WorkflowStep::Review => {
-                let review_passed =
-                    app.review_state.findings.is_empty() && !app.review_state.summary.is_empty();
-                if review_passed {
+                if app.review_passed() {
                     vec![primary_button("↵", "ship")]
+                } else if app.review_state.verification_failed {
+                    vec![primary_button("↵", "override")]
                 } else {
                     vec![primary_button("↵", "fix")]
                 }
@@ -351,9 +351,9 @@ fn get_secondary_buttons(app: &App) -> Vec<FooterButton> {
                 }
             }
             WorkflowStep::Review => {
-                let review_passed =
-                    app.review_state.findings.is_empty() && !app.review_state.summary.is_empty();
-                if review_passed {
+                if app.review_passed() {
+                    vec![secondary_button("Esc", "back")]
+                } else if app.review_state.verification_failed {
                     vec![secondary_button("Esc", "back")]
                 } else {
                     vec![hint_button("␣", "select"), secondary_button("Esc", "back")]

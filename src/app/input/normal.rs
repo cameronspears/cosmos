@@ -45,10 +45,6 @@ pub enum ApplyError {
 
 impl ApplyError {
     /// Returns a user-friendly message for display in toasts
-    ///
-    /// NOTE: Messages must contain "error" or "failed" (lowercase) or "Error"
-    /// for the toast system to display them. Otherwise they're classified as
-    /// Info toasts and silently ignored.
     pub fn user_message(&self) -> String {
         match self {
             Self::PreviewNotReady => {
@@ -619,14 +615,19 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                             "apply_fix",
                                             async move {
                                                 let stage_start = std::time::Instant::now();
-                                                // Create branch from main
+                                                let source_branch =
+                                                    git_ops::current_status(&repo_path)
+                                                        .map(|s| s.branch)
+                                                        .unwrap_or_else(|_| "unknown".to_string());
+
+                                                // Create branch from current checkout/HEAD
                                                 let branch_name = git_ops::generate_fix_branch_name(
                                                     &suggestion.id.to_string(),
                                                     &suggestion.summary,
                                                 );
 
                                                 let created_branch =
-                                                    match git_ops::create_fix_branch_from_main(
+                                                    match git_ops::create_fix_branch_from_current(
                                                         &repo_path,
                                                         &branch_name,
                                                     ) {
@@ -808,6 +809,8 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                                                             .description,
                                                                         usage: multi_fix.usage,
                                                                         branch_name: created_branch,
+                                                                        source_branch: source_branch
+                                                                            .clone(),
                                                                         friendly_title: preview
                                                                             .friendly_title
                                                                             .clone(),
@@ -920,6 +923,8 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                                                                 description: applied_fix.description,
                                                                                 usage: applied_fix.usage,
                                                                                 branch_name: created_branch,
+                                                                                source_branch: source_branch
+                                                                                    .clone(),
                                                                                 friendly_title: preview
                                                                                     .friendly_title
                                                                                     .clone(),
@@ -985,6 +990,16 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                     } else if app.review_passed() {
                                         // Review passed - move to Ship
                                         app.start_ship();
+                                    } else if app.review_state.verification_failed {
+                                        if app.review_state.confirm_ship {
+                                            app.review_state.confirm_ship = false;
+                                            app.start_ship();
+                                        } else {
+                                            app.review_state.confirm_ship = true;
+                                            app.show_toast(
+                                                "Verification failed. Press Enter again to ship with manual override.",
+                                            );
+                                        }
                                     } else if app.review_state.confirm_ship {
                                         app.review_state.confirm_ship = false;
                                         app.start_ship();

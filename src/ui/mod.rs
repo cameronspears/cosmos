@@ -102,6 +102,8 @@ pub struct App {
     // Pending changes for batch commit workflow
     pub pending_changes: Vec<PendingChange>,
     pub cosmos_branch: Option<String>,
+    /// Branch user was on before Cosmos created a working fix branch.
+    pub cosmos_base_branch: Option<String>,
 
     // PR URL for "press Enter to open" flow
     pub pr_url: Option<String>,
@@ -190,6 +192,7 @@ impl App {
             filtered_grouped_tree,
             pending_changes: Vec::new(),
             cosmos_branch: None,
+            cosmos_base_branch: None,
             pr_url: None,
             ship_step: None,
             workflow_step: WorkflowStep::default(),
@@ -226,6 +229,7 @@ impl App {
     pub fn clear_pending_changes(&mut self) {
         self.pending_changes.clear();
         self.cosmos_branch = None;
+        self.cosmos_base_branch = None;
     }
 
     /// Undo the most recent applied change by restoring files from git.
@@ -253,15 +257,18 @@ impl App {
         // Mark suggestion as not applied (so it can be re-applied if desired).
         self.suggestions.unmark_applied(change.suggestion_id);
 
-        // If no more pending changes, reset to main branch and suggestions step
+        // If no more pending changes, return to original branch and suggestions step
         if self.pending_changes.is_empty() {
-            // Switch back to main branch
-            if let Ok(main_name) = crate::git_ops::get_main_branch_name(&self.repo_path) {
+            if let Some(base_branch) = self.cosmos_base_branch.as_deref() {
+                let _ = crate::git_ops::checkout_branch(&self.repo_path, base_branch);
+            } else if let Ok(main_name) = crate::git_ops::get_main_branch_name(&self.repo_path) {
+                // Fallback for older pending state that predates base-branch tracking.
                 let _ = crate::git_ops::checkout_branch(&self.repo_path, &main_name);
             }
 
             // Clear cosmos branch tracking
             self.cosmos_branch = None;
+            self.cosmos_base_branch = None;
 
             // Return to suggestions workflow step
             self.workflow_step = WorkflowStep::Suggestions;
@@ -765,13 +772,9 @@ impl App {
         }
     }
 
-    /// Show a toast message (errors, rate limits, and success messages are displayed)
+    /// Show a toast message.
     pub fn show_toast(&mut self, message: &str) {
-        let toast = Toast::new(message);
-        // Display error and success toasts; info toasts are silently ignored
-        if toast.is_error() || matches!(toast.kind, ToastKind::Success) {
-            self.toast = Some(toast);
-        }
+        self.toast = Some(Toast::new(message));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1324,12 +1327,15 @@ impl App {
         self.review_state.confirm_extra_review_budget = false;
     }
 
-    /// Check if review passed (no recommended fixes remaining)
+    /// Check if review passed with completed verification and no remaining findings.
     pub fn review_passed(&self) -> bool {
         if self.review_state.reviewing {
             return false;
         }
-        !self.review_state.findings.iter().any(|f| f.recommended)
+        if self.review_state.verification_failed {
+            return false;
+        }
+        self.review_state.findings.is_empty() && !self.review_state.summary.trim().is_empty()
     }
 
     /// Get selected findings for fixing
@@ -1423,10 +1429,61 @@ impl App {
         self.ship_state = ShipState::default();
         self.pending_changes.clear();
         self.cosmos_branch = None;
+        self.cosmos_base_branch = None;
     }
 
     /// Check if currently on main/master branch
     pub fn is_on_main_branch(&self) -> bool {
         self.context.branch == "main" || self.context.branch == "master"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::WorkContext;
+    use crate::index::CodebaseIndex;
+    use crate::suggest::SuggestionEngine;
+    use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_test_app() -> App {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_ui_test_{}", nanos));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files: HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: Some("deadbeef".to_string()),
+        };
+        let suggestions = SuggestionEngine::new(index.clone());
+        let context = WorkContext {
+            branch: "main".to_string(),
+            uncommitted_files: Vec::new(),
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 0,
+            repo_root: root,
+        };
+
+        App::new(index, suggestions, context)
+    }
+
+    #[test]
+    fn review_passed_is_false_when_verification_failed() {
+        let mut app = make_test_app();
+        app.review_state.reviewing = false;
+        app.review_state.findings.clear();
+        app.review_state.summary = "Looks good".to_string();
+        app.review_state.verification_failed = true;
+
+        assert!(!app.review_passed());
     }
 }

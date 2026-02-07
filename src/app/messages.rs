@@ -51,6 +51,8 @@ pub enum BackgroundMessage {
         description: String,
         usage: Option<suggest::llm::Usage>,
         branch_name: String,
+        /// Branch that was checked out before Cosmos created its fix branch.
+        source_branch: String,
         /// Human-friendly title for PR (e.g., "Batch Processing")
         friendly_title: String,
         /// Behavior-focused problem description for non-technical readers

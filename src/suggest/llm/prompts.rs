@@ -42,7 +42,7 @@ You will be given an EVIDENCE PACK containing real code snippets from the repo.
 Evidence is ONLY for grounding and accuracy. The user should not see it.
 
 TASK:
-- Produce 10 to 15 suggestions by default, based ONLY on the evidence pack.
+- Produce 6 to 8 suggestions by default, based ONLY on the evidence pack.
 - If the user prompt requests a different count/range, follow the user prompt.
 - Every suggestion MUST include one or more `evidence_refs` from the pack.
 - Do not invent facts. If an issue is not clearly supported by the evidence snippet, do not suggest it.
@@ -117,6 +117,14 @@ mod prompt_tests {
         assert!(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("No tool calls"),
             "FAST_GROUNDED_SUGGESTIONS_SYSTEM must forbid tool calls"
+        );
+    }
+
+    #[test]
+    fn fast_grounded_prompt_targets_six_to_eight() {
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Produce 6 to 8 suggestions by default"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should prefer 6-8 suggestions by default"
         );
     }
 }

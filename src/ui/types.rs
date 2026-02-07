@@ -319,10 +319,6 @@ impl Toast {
     pub fn is_expired(&self) -> bool {
         self.created_at.elapsed().as_secs() >= self.kind.duration_secs()
     }
-
-    pub fn is_error(&self) -> bool {
-        matches!(self.kind, ToastKind::Error | ToastKind::RateLimit)
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

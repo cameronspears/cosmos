@@ -637,6 +637,10 @@ pub(super) fn render_startup_check(
             ),
             Span::styled("  Continue as-is", Style::default().fg(Theme::GREY_100)),
         ]));
+        lines.push(Line::from(Span::styled(
+            "      Keep your current branch as the base for applied fixes.",
+            Style::default().fg(Theme::GREY_500),
+        )));
         lines.push(Line::from(""));
     }
 

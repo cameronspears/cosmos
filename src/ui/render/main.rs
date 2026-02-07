@@ -499,7 +499,7 @@ fn render_suggestions_content<'a>(
     visible_height: usize,
     inner_width: usize,
 ) {
-    use crate::suggest::Priority;
+    use crate::suggest::{Confidence, Priority};
 
     let suggestions = app.suggestions.active_suggestions();
 
@@ -550,6 +550,8 @@ fn render_suggestions_content<'a>(
 
     if suggestions.is_empty() {
         let has_ai = crate::suggest::llm::is_available();
+        let summaries_incomplete =
+            app.needs_summary_generation && !app.summary_failed_files.is_empty();
 
         lines.push(Line::from(vec![
             Span::styled("    ╭", Style::default().fg(Theme::GREY_700)),
@@ -565,7 +567,38 @@ fn render_suggestions_content<'a>(
             Span::styled("│", Style::default().fg(Theme::GREY_700)),
         ]));
 
-        if has_ai {
+        if summaries_incomplete {
+            lines.push(Line::from(vec![
+                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
+                Span::styled("       ! ", Style::default().fg(Theme::YELLOW)),
+                Span::styled("Summaries incomplete", Style::default().fg(Theme::GREY_300)),
+                Span::styled("      │", Style::default().fg(Theme::GREY_700)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
+                Span::styled(
+                    format!("         {} file(s) failed", app.summary_failed_files.len()),
+                    Style::default().fg(Theme::GREY_500),
+                ),
+                Span::styled("      │", Style::default().fg(Theme::GREY_700)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
+                Span::styled(
+                    "   Press R to open Reset Cosmos",
+                    Style::default().fg(Theme::GREY_500),
+                ),
+                Span::styled("   │", Style::default().fg(Theme::GREY_700)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
+                Span::styled(
+                    "   then restart to regenerate",
+                    Style::default().fg(Theme::GREY_500),
+                ),
+                Span::styled("       │", Style::default().fg(Theme::GREY_700)),
+            ]));
+        } else if has_ai {
             lines.push(Line::from(vec![
                 Span::styled("    │", Style::default().fg(Theme::GREY_700)),
                 Span::styled("       + ", Style::default().fg(Theme::GREEN)),
@@ -650,6 +683,13 @@ fn render_suggestions_content<'a>(
             Style::default().fg(Theme::GREY_500)
         };
 
+        let (confidence_label, confidence_style) = match suggestion.confidence {
+            Confidence::High => ("high", Style::default().fg(Theme::GREEN)),
+            Confidence::Medium => ("med", Style::default().fg(Theme::YELLOW)),
+            Confidence::Low => ("low", Style::default().fg(Theme::GREY_500)),
+        };
+        let confidence_prefix = format!(" [{}]", confidence_label);
+
         // Multi-file indicator
         let multi_file_indicator = if suggestion.is_multi_file() {
             format!(" [{}]", suggestion.file_count())
@@ -667,8 +707,9 @@ fn render_suggestions_content<'a>(
             Style::default().fg(Theme::GREY_300)
         };
 
-        // First line has: padding (2) + priority (3) + kind + multi-file indicator + ": "
-        let first_prefix_len = 2 + 3 + kind_label.len() + multi_file_indicator.len() + 2;
+        // First line has: padding (2) + priority (3) + kind + multi-file + confidence + ": "
+        let first_prefix_len =
+            2 + 3 + kind_label.len() + multi_file_indicator.len() + confidence_prefix.len() + 2;
         let first_line_width = text_width.saturating_sub(first_prefix_len);
         // Continuation lines just have small indent (5 chars)
         let cont_indent = "     ";
@@ -688,6 +729,7 @@ fn render_suggestions_content<'a>(
             if suggestion.is_multi_file() {
                 spans.push(Span::styled(multi_file_indicator, multi_file_style));
             }
+            spans.push(Span::styled(confidence_prefix, confidence_style));
             spans.push(Span::styled(": ", kind_style));
             spans.push(Span::styled(first_line.clone(), summary_style));
             lines.push(Line::from(spans));
@@ -1258,17 +1300,29 @@ fn render_review_content<'a>(
     ]));
     lines.push(Line::from(""));
 
-    // Check if review passed
+    // Check if review reached a terminal state (pass or verification failure)
     if state.findings.is_empty() && !state.summary.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("  + ", Style::default().fg(Theme::GREEN)),
-            Span::styled(
-                "No issues found!",
-                Style::default()
-                    .fg(Theme::GREEN)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        if state.verification_failed {
+            lines.push(Line::from(vec![
+                Span::styled("  ! ", Style::default().fg(Theme::YELLOW)),
+                Span::styled(
+                    "Verification failed",
+                    Style::default()
+                        .fg(Theme::YELLOW)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  + ", Style::default().fg(Theme::GREEN)),
+                Span::styled(
+                    "No issues found!",
+                    Style::default()
+                        .fg(Theme::GREEN)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
         lines.push(Line::from(""));
 
         let text_width = inner_width.saturating_sub(6);
@@ -1277,6 +1331,17 @@ fn render_review_content<'a>(
                 format!("  {}", line),
                 Style::default().fg(Theme::GREY_300),
             )]));
+        }
+        if state.verification_failed {
+            if let Some(err) = state.verification_error.as_ref() {
+                lines.push(Line::from(""));
+                for line in wrap_text(&format!("  {}", err), text_width) {
+                    lines.push(Line::from(vec![Span::styled(
+                        line,
+                        Style::default().fg(Theme::GREY_500),
+                    )]));
+                }
+            }
         }
 
         // Action to continue to ship
@@ -1294,8 +1359,28 @@ fn render_review_content<'a>(
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(" ↵ ", Style::default().fg(Theme::GREY_900).bg(Theme::GREEN)),
-            Span::styled(" Continue to Ship", Style::default().fg(Theme::GREY_300)),
+            Span::styled(
+                " ↵ ",
+                Style::default()
+                    .fg(Theme::GREY_900)
+                    .bg(if state.verification_failed {
+                        Theme::YELLOW
+                    } else {
+                        Theme::GREEN
+                    }),
+            ),
+            Span::styled(
+                if state.verification_failed {
+                    if state.confirm_ship {
+                        " Ship with Override"
+                    } else {
+                        " Arm Ship Override"
+                    }
+                } else {
+                    " Continue to Ship"
+                },
+                Style::default().fg(Theme::GREY_300),
+            ),
         ]));
         return;
     }

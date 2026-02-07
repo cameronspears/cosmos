@@ -23,6 +23,8 @@ const HIGH_COMPLEXITY_THRESHOLD: f64 = 20.0;
 const FAST_EVIDENCE_PACK_MAX_ITEMS: usize = 25;
 const FAST_EVIDENCE_SNIPPET_LINES_BEFORE: usize = 8;
 const FAST_EVIDENCE_SNIPPET_LINES_AFTER: usize = 12;
+const FAST_GROUNDED_TARGET_MIN: usize = 6;
+const FAST_GROUNDED_TARGET_MAX: usize = 8;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ADAPTIVE CONTEXT LIMITS
@@ -428,6 +430,18 @@ fn extract_evidence_id(text: &str) -> Option<usize> {
     None
 }
 
+fn dedupe_and_cap_grounded_suggestions(mapped: Vec<(usize, Suggestion)>) -> Vec<Suggestion> {
+    let mut seen_ids: HashSet<usize> = HashSet::new();
+    let mut unique = Vec::new();
+    for (evidence_id, suggestion) in mapped {
+        if seen_ids.insert(evidence_id) {
+            unique.push(suggestion);
+        }
+    }
+    unique.truncate(FAST_GROUNDED_TARGET_MAX);
+    unique
+}
+
 pub async fn analyze_codebase_fast_grounded(
     repo_root: &Path,
     index: &CodebaseIndex,
@@ -525,14 +539,14 @@ pub async fn analyze_codebase_fast_grounded(
     });
 
     // Two sharded calls in parallel to reduce tail latency and improve chance of
-    // reaching 10+ usable suggestions under provider quirks.
+    // reaching 6-8 usable suggestions under provider quirks.
     let mid = pack.len() / 2;
     let (left, right) = pack.split_at(mid);
 
     let shard_timeout_ms: u64 = 6_800;
     let shard_max_tokens: u32 = 420;
-    let user_left = format_user(left, "For this request, return 7 to 9 suggestions.");
-    let user_right = format_user(right, "For this request, return 7 to 9 suggestions.");
+    let user_left = format_user(left, "For this request, return 3 to 4 suggestions.");
+    let user_right = format_user(right, "For this request, return 3 to 4 suggestions.");
 
     let llm_start = std::time::Instant::now();
     let (resp_a, resp_b) = tokio::join!(
@@ -571,7 +585,7 @@ pub async fn analyze_codebase_fast_grounded(
     }
 
     // If we still don't have enough material, try one more fast call with the remaining budget.
-    if raw_items.len() < 10 {
+    if raw_items.len() < FAST_GROUNDED_TARGET_MIN {
         let total_budget_ms: u64 = 10_000;
         let elapsed = overall_start.elapsed().as_millis() as u64;
         let remaining = total_budget_ms.saturating_sub(elapsed).saturating_sub(250);
@@ -579,10 +593,10 @@ pub async fn analyze_codebase_fast_grounded(
             let extra_start = std::time::Instant::now();
             if let Ok(r) = call_llm_structured_with_provider::<FastGroundedResponseJson>(
                 FAST_GROUNDED_SUGGESTIONS_SYSTEM,
-                &format_user(
-                    &pack,
-                    "Return 10 to 15 suggestions. Prefer diverse evidence refs and avoid reusing the same evidence_id unless necessary.",
-                ),
+                    &format_user(
+                        &pack,
+                        "Return 6 to 8 suggestions. Prefer diverse evidence refs and avoid reusing the same evidence_id unless necessary.",
+                    ),
                 Model::Speed,
                 "fast_grounded_suggestions",
                 schema.clone(),
@@ -606,7 +620,7 @@ pub async fn analyze_codebase_fast_grounded(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM,
             &format_user(
                 &pack,
-                "Return 10 to 15 suggestions and include evidence refs for each suggestion.",
+                "Return 6 to 8 suggestions and include evidence refs for each suggestion.",
             ),
             Model::Speed,
             "fast_grounded_suggestions_rescue",
@@ -859,23 +873,7 @@ pub async fn analyze_codebase_fast_grounded(
         ));
     }
 
-    // Prefer unique evidence_id, but allow duplicates if needed to reach 10.
-    let mut seen_ids: HashSet<usize> = HashSet::new();
-    let mut unique = Vec::new();
-    let mut dupes = Vec::new();
-    for (eid, s) in mapped {
-        if seen_ids.insert(eid) {
-            unique.push(s);
-        } else {
-            dupes.push(s);
-        }
-    }
-    let mut suggestions = unique;
-    if suggestions.len() < 10 {
-        let need = 10usize.saturating_sub(suggestions.len());
-        suggestions.extend(dupes.into_iter().take(need));
-    }
-    suggestions.truncate(15);
+    let suggestions = dedupe_and_cap_grounded_suggestions(mapped);
 
     let diagnostics = SuggestionDiagnostics {
         model: Model::Speed.id().to_string(),
@@ -915,7 +913,18 @@ pub async fn analyze_codebase_fast_grounded(
 #[cfg(test)]
 mod grounded_parser_tests {
     use super::*;
+    use crate::suggest::{Priority, SuggestionKind, SuggestionSource};
     use serde_json::json;
+
+    fn test_suggestion(summary: &str) -> Suggestion {
+        Suggestion::new(
+            SuggestionKind::Improvement,
+            Priority::Medium,
+            std::path::PathBuf::from("src/lib.rs"),
+            summary.to_string(),
+            SuggestionSource::LlmDeep,
+        )
+    }
 
     #[test]
     fn parses_legacy_top_level_evidence_id_shape() {
@@ -999,6 +1008,31 @@ mod grounded_parser_tests {
         assert_eq!(extract_evidence_id("EVIDENCE 12"), Some(12));
         assert_eq!(extract_evidence_id("evidence_id: 4"), Some(4));
         assert_eq!(extract_evidence_id("No marker here"), None);
+    }
+
+    #[test]
+    fn grounded_finalizer_does_not_backfill_duplicates() {
+        let mapped = vec![
+            (1, test_suggestion("a")),
+            (1, test_suggestion("a-duplicate")),
+            (2, test_suggestion("b")),
+            (2, test_suggestion("b-duplicate")),
+        ];
+
+        let result = dedupe_and_cap_grounded_suggestions(mapped);
+
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn grounded_finalizer_caps_results_at_eight() {
+        let mapped: Vec<(usize, Suggestion)> = (0..12)
+            .map(|i| (i, test_suggestion(&format!("item-{}", i))))
+            .collect();
+
+        let result = dedupe_and_cap_grounded_suggestions(mapped);
+
+        assert_eq!(result.len(), FAST_GROUNDED_TARGET_MAX);
     }
 }
 

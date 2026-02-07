@@ -48,6 +48,10 @@ pub enum ResetOption {
     Memory,
     /// Clear grouping_ai.json - AI grouping cache
     GroupingAi,
+    /// Clear question_cache.json - persisted question/answer history
+    QuestionCache,
+    /// Clear pipeline_metrics.jsonl - latency/cost telemetry rows
+    PipelineMetrics,
 }
 
 impl ResetOption {
@@ -60,6 +64,8 @@ impl ResetOption {
             ResetOption::Glossary => "Domain Glossary",
             ResetOption::Memory => "Repo Memory",
             ResetOption::GroupingAi => "Grouping AI",
+            ResetOption::QuestionCache => "Question Cache",
+            ResetOption::PipelineMetrics => "Pipeline Metrics",
         }
     }
 
@@ -72,6 +78,8 @@ impl ResetOption {
             ResetOption::Glossary => "extract terminology",
             ResetOption::Memory => "decisions/conventions",
             ResetOption::GroupingAi => "rebuild AI grouping",
+            ResetOption::QuestionCache => "clear saved Q&A",
+            ResetOption::PipelineMetrics => "clear latency/cost logs",
         }
     }
 
@@ -84,6 +92,8 @@ impl ResetOption {
             ResetOption::Glossary,
             ResetOption::Memory,
             ResetOption::GroupingAi,
+            ResetOption::QuestionCache,
+            ResetOption::PipelineMetrics,
         ]
     }
 
@@ -616,23 +626,35 @@ impl Cache {
     fn ensure_dir(&self) -> anyhow::Result<()> {
         if !self.cache_dir.exists() {
             fs::create_dir_all(&self.cache_dir)?;
+        }
+        self.ensure_cosmos_ignored()?;
+        Ok(())
+    }
 
-            // Add to .gitignore if it exists
-            let gitignore = self
-                .cache_dir
-                .parent()
-                .map(|p| p.join(".gitignore"))
-                .filter(|p| p.exists());
+    fn ensure_cosmos_ignored(&self) -> anyhow::Result<()> {
+        let Some(repo_root) = self.cache_dir.parent() else {
+            return Ok(());
+        };
 
-            if let Some(gitignore_path) = gitignore {
-                let content = fs::read_to_string(&gitignore_path)?;
-                if !content.contains(".cosmos") {
-                    let mut file = fs::OpenOptions::new().append(true).open(&gitignore_path)?;
-                    use std::io::Write;
-                    writeln!(file, "\n# Cosmos cache\n.cosmos/")?;
+        let gitignore_path = repo_root.join(".gitignore");
+        if gitignore_path.exists() {
+            append_ignore_entry(&gitignore_path, ".cosmos/")?;
+            return Ok(());
+        }
+
+        let git_dir = repo_root.join(".git");
+        if git_dir.is_dir() {
+            let info_exclude_path = git_dir.join("info").join("exclude");
+            if let Some(parent) = info_exclude_path.parent() {
+                if fs::create_dir_all(parent).is_ok() {
+                    if append_ignore_entry(&info_exclude_path, ".cosmos/").is_ok() {
+                        return Ok(());
+                    }
                 }
             }
         }
+
+        append_ignore_entry(&gitignore_path, ".cosmos/")?;
         Ok(())
     }
 
@@ -850,6 +872,8 @@ impl Cache {
                 ResetOption::Glossary => vec![GLOSSARY_FILE],
                 ResetOption::Memory => vec![MEMORY_FILE],
                 ResetOption::GroupingAi => vec![GROUPING_AI_CACHE_FILE],
+                ResetOption::QuestionCache => vec![QUESTION_CACHE_FILE],
+                ResetOption::PipelineMetrics => vec![PIPELINE_METRICS_FILE],
             };
 
             for file in files_to_remove {
@@ -863,6 +887,26 @@ impl Cache {
 
         Ok(cleared)
     }
+}
+
+fn append_ignore_entry(path: &Path, entry: &str) -> anyhow::Result<()> {
+    let content = fs::read_to_string(path).unwrap_or_default();
+    let already_present = content.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == entry || trimmed == ".cosmos"
+    });
+    if already_present {
+        return Ok(());
+    }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    use std::io::Write;
+    if !content.trim().is_empty() && !content.ends_with('\n') {
+        writeln!(file)?;
+    }
+    writeln!(file, "# Cosmos cache")?;
+    writeln!(file, "{}", entry)?;
+    Ok(())
 }
 
 /// Reset selected Cosmos cache files for the given repository.
@@ -1073,6 +1117,71 @@ mod tests {
         fs::write(&file_path, "pub fn hello() { println!(\"hi\"); }").unwrap();
         let invalidated = cache.load_index_cache(&root);
         assert!(invalidated.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reset_options_include_question_cache_and_pipeline_metrics() {
+        let options = ResetOption::all();
+        assert!(options.contains(&ResetOption::QuestionCache));
+        assert!(options.contains(&ResetOption::PipelineMetrics));
+        assert!(!ResetOption::defaults().contains(&ResetOption::QuestionCache));
+        assert!(!ResetOption::defaults().contains(&ResetOption::PipelineMetrics));
+    }
+
+    #[test]
+    fn clear_selective_removes_question_cache_and_pipeline_metrics() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_reset_cache_test_{}", nanos));
+        fs::create_dir_all(&root).unwrap();
+
+        // Make this a git repo so ensure_dir can write to .git/info/exclude.
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .expect("git init should run");
+
+        let cache = Cache::new(&root);
+
+        let mut question_cache = QuestionCache::default();
+        question_cache.set(
+            "What does this do?".to_string(),
+            "It processes requests.".to_string(),
+            "ctx".to_string(),
+        );
+        cache.save_question_cache(&question_cache).unwrap();
+
+        let metric = PipelineMetricRecord {
+            timestamp: Utc::now(),
+            stage: "summary".to_string(),
+            summary_ms: Some(10),
+            suggest_ms: None,
+            verify_ms: None,
+            apply_ms: None,
+            review_ms: None,
+            tokens: 123,
+            cost: 0.01,
+            gate: "ok".to_string(),
+            passed: true,
+        };
+        cache.append_pipeline_metric(&metric).unwrap();
+
+        let cache_dir = root.join(CACHE_DIR);
+        assert!(cache_dir.join(QUESTION_CACHE_FILE).exists());
+        assert!(cache_dir.join(PIPELINE_METRICS_FILE).exists());
+
+        cache
+            .clear_selective(&[ResetOption::QuestionCache, ResetOption::PipelineMetrics])
+            .unwrap();
+
+        assert!(!cache_dir.join(QUESTION_CACHE_FILE).exists());
+        assert!(!cache_dir.join(PIPELINE_METRICS_FILE).exists());
 
         let _ = fs::remove_dir_all(&root);
     }
