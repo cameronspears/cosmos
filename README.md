@@ -8,6 +8,12 @@ Cosmos is a terminal-based AI code reviewer. Point it at your project, and it wi
 
 ---
 
+## Project Ethos
+
+See [ETHOS.md](ETHOS.md) for the principles that guide Cosmos product decisions, language, and safety standards.
+
+---
+
 ## Who Is Cosmos For?
 
 - **Non-engineers maintaining code** — Cosmos explains issues in plain English and guides you through fixes step by step
