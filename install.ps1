@@ -79,16 +79,16 @@ Write-Host ""
 Write-Host "  This compiles cosmos for your system. It may take a few minutes."
 Write-Host ""
 
-# Install cosmos via cargo
+# Install cosmos via cargo (distribution profile for smallest/fastest binary)
 $installSuccess = $false
 
 # Try crates.io first
-& $cargoCmd install cosmos-tui 2>&1
+& $cargoCmd install cosmos-tui --profile release-dist 2>&1
 if ($LASTEXITCODE -eq 0) {
     $installSuccess = $true
 } else {
     Write-Warn "crates.io install failed, trying from GitHub..."
-    & $cargoCmd install --git "https://github.com/$REPO" --locked 2>&1
+    & $cargoCmd install --git "https://github.com/$REPO" --locked --profile release-dist 2>&1
     if ($LASTEXITCODE -eq 0) {
         $installSuccess = $true
     }

@@ -40,6 +40,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked -- -D warnings
 
+      - name: Performance gate
+        run: bash scripts/perf/gate.sh
+
+      - name: Upload perf artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-artifacts
+          path: |
+            target/perf-metrics.env
+            target/criterion
+
   # Test install scripts on all platforms
   install-script-test:
     name: Install Script (${{ matrix.os }})

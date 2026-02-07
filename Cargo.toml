@@ -40,16 +40,29 @@ unicode-width = "0.2"
 # Parallel processing for faster indexing
 rayon = "1.10"
 fs2 = "0.4.3"
-keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "linux-native"] }
 url = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native"] }
 
 
 [[bin]]
 name = "cosmos"
 path = "src/main.rs"
 
+[[bench]]
+name = "perf_core"
+harness = false
+
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 # ============================================================================
 # Release Profile Optimizations
@@ -58,8 +71,9 @@ tempfile = "3"
 # Default release profile with ThinLTO - good balance of performance and compile time
 [profile.release]
 lto = "thin"
-codegen-units = 16
+codegen-units = 8
 opt-level = 3
+strip = "debuginfo"
 
 # Maximum optimization profile for distribution builds
 # Build with: cargo build --profile release-dist

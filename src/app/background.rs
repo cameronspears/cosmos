@@ -26,8 +26,14 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx: &RuntimeContext) {
+pub fn drain_messages(
+    app: &mut App,
+    rx: &mpsc::Receiver<BackgroundMessage>,
+    ctx: &RuntimeContext,
+) -> bool {
+    let mut changed = false;
     while let Ok(msg) = rx.try_recv() {
+        changed = true;
         match msg {
             BackgroundMessage::SuggestionsReady {
                 suggestions,
@@ -662,6 +668,10 @@ pub fn drain_messages(app: &mut App, rx: &mpsc::Receiver<BackgroundMessage>, ctx
             }
         }
     }
+    if changed {
+        app.needs_redraw = true;
+    }
+    changed
 }
 
 fn track_usage(

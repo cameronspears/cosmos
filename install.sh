@@ -91,14 +91,14 @@ echo ""
 echo "  This compiles cosmos for your system. It may take a few minutes."
 echo ""
 
-# Install cosmos via cargo
+# Install cosmos via cargo (distribution profile for smallest/fastest binary)
 # Using --locked to ensure reproducible builds when Cargo.lock is present
-if cargo install cosmos-tui 2>&1; then
+if cargo install cosmos-tui --profile release-dist 2>&1; then
     print_success "cosmos installed successfully!"
 else
     # If crates.io install fails, try from git
     print_warning "crates.io install failed, trying from GitHub..."
-    cargo install --git "https://github.com/$REPO" --locked
+    cargo install --git "https://github.com/$REPO" --locked --profile release-dist
     print_success "cosmos installed successfully!"
 fi
 

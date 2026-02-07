@@ -96,7 +96,8 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
 
 /// Install the latest version from crates.io using cargo
 ///
-/// This function runs `cargo install cosmos-tui --force` to update to the latest version,
+/// This function runs `cargo install cosmos-tui --force --profile release-dist`
+/// to update to the latest version,
 /// then exec()s into the new binary.
 ///
 /// On success, this function does not return (the process is replaced).
@@ -121,7 +122,13 @@ where
     // Note: We don't use --locked because it requires exact Cargo.lock match,
     // which can fail if dependencies have been updated since publishing.
     let output = Command::new("cargo")
-        .args(["install", "cosmos-tui", "--force"])
+        .args([
+            "install",
+            "cosmos-tui",
+            "--force",
+            "--profile",
+            "release-dist",
+        ])
         .output()
         .context("Failed to run cargo install")?;
 
@@ -132,7 +139,7 @@ where
         let stderr = String::from_utf8_lossy(&output.stderr);
         let error_msg = extract_cargo_error(&stderr);
         return Err(anyhow::anyhow!(
-            "{}. Try manually: cargo install cosmos-tui --force",
+            "{}. Try manually: cargo install cosmos-tui --force --profile release-dist",
             error_msg
         ));
     }

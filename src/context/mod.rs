@@ -55,8 +55,19 @@ impl WorkContext {
 
     /// Refresh the context (e.g., after a change)
     pub fn refresh(&mut self) -> anyhow::Result<()> {
-        let new_context = Self::load(&self.repo_root)?;
-        *self = new_context;
+        // We already know the repo root; avoid Repository::discover on every refresh.
+        let repo = Repository::open(&self.repo_root)?;
+        let branch = get_current_branch(&repo)?;
+        let (uncommitted, staged, untracked) = get_file_statuses(&repo)?;
+        let modified_count = uncommitted.len() + staged.len() + untracked.len();
+        let inferred_focus = infer_focus(&uncommitted, &staged, &untracked);
+
+        self.branch = branch;
+        self.uncommitted_files = uncommitted;
+        self.staged_files = staged;
+        self.untracked_files = untracked;
+        self.inferred_focus = inferred_focus;
+        self.modified_count = modified_count;
         Ok(())
     }
 

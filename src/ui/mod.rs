@@ -24,6 +24,7 @@ use crate::context::WorkContext;
 use crate::index::{CodebaseIndex, FlatTreeEntry};
 use crate::suggest::{Suggestion, SuggestionEngine};
 use helpers::lowercase_first;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tree::{build_file_tree, build_grouped_tree};
@@ -31,6 +32,25 @@ use tree::{build_file_tree, build_grouped_tree};
 // ═══════════════════════════════════════════════════════════════════════════
 //  APP STATE
 // ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+struct FlatSearchEntry {
+    name_lower: String,
+    path_lower: String,
+}
+
+#[derive(Debug, Clone)]
+struct GroupedSearchEntry {
+    name_lower: String,
+    path_lower: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GroupingSearchFile {
+    layer: crate::grouping::Layer,
+    name_lower: String,
+    path_lower: String,
+}
 
 /// Main application state for Cosmos
 pub struct App {
@@ -91,13 +111,16 @@ pub struct App {
 
     // Cached data for display
     pub file_tree: Vec<FlatTreeEntry>,
-    pub filtered_tree: Vec<FlatTreeEntry>,
+    pub filtered_tree_indices: Vec<usize>,
+    flat_search_entries: Vec<FlatSearchEntry>,
     pub repo_path: PathBuf,
 
     // Grouped view data
     pub grouping: crate::grouping::CodebaseGrouping,
     pub grouped_tree: Vec<crate::grouping::GroupedTreeEntry>,
-    pub filtered_grouped_tree: Vec<crate::grouping::GroupedTreeEntry>,
+    pub filtered_grouped_indices: Vec<usize>,
+    grouped_search_entries: Vec<GroupedSearchEntry>,
+    grouping_search_files: Vec<GroupingSearchFile>,
 
     // Pending changes for batch commit workflow
     pub pending_changes: Vec<PendingChange>,
@@ -139,19 +162,24 @@ pub struct App {
     pub budget_warned_soft: bool,
     /// Hard budget warning already shown ($0.05)
     pub budget_warned_hard: bool,
+    /// Runtime redraw hint for dirty-frame rendering.
+    pub needs_redraw: bool,
 }
 
 impl App {
     /// Create a new Cosmos app
     pub fn new(index: CodebaseIndex, suggestions: SuggestionEngine, context: WorkContext) -> Self {
         let file_tree = build_file_tree(&index);
-        let filtered_tree = file_tree.clone();
+        let flat_search_entries = build_flat_search_entries(&file_tree);
+        let filtered_tree_indices = (0..file_tree.len()).collect();
         let repo_path = index.root.clone();
 
         // Generate grouping for the codebase
         let grouping = index.generate_grouping();
         let grouped_tree = build_grouped_tree(&grouping, &index);
-        let filtered_grouped_tree = grouped_tree.clone();
+        let grouped_search_entries = build_grouped_search_entries(&grouped_tree);
+        let filtered_grouped_indices = (0..grouped_tree.len()).collect();
+        let grouping_search_files = build_grouping_search_files(&grouping);
 
         Self {
             index,
@@ -185,11 +213,14 @@ impl App {
             summary_progress: None,
             summary_failed_files: Vec::new(),
             file_tree,
-            filtered_tree,
+            filtered_tree_indices,
+            flat_search_entries,
             repo_path,
             grouping,
             grouped_tree,
-            filtered_grouped_tree,
+            filtered_grouped_indices,
+            grouped_search_entries,
+            grouping_search_files,
             pending_changes: Vec::new(),
             cosmos_branch: None,
             cosmos_base_branch: None,
@@ -209,6 +240,7 @@ impl App {
             update_progress: None,
             budget_warned_soft: false,
             budget_warned_hard: false,
+            needs_redraw: true,
         }
     }
 
@@ -217,12 +249,15 @@ impl App {
         self.index.apply_grouping(&grouping);
         self.grouping = grouping;
         self.grouped_tree = build_grouped_tree(&self.grouping, &self.index);
-        self.filtered_grouped_tree = self.grouped_tree.clone();
+        self.grouped_search_entries = build_grouped_search_entries(&self.grouped_tree);
+        self.grouping_search_files = build_grouping_search_files(&self.grouping);
+        self.filtered_grouped_indices = (0..self.grouped_tree.len()).collect();
 
-        if self.project_selected >= self.filtered_grouped_tree.len() {
-            self.project_selected = self.filtered_grouped_tree.len().saturating_sub(1);
+        if self.project_selected >= self.filtered_grouped_indices.len() {
+            self.project_selected = self.filtered_grouped_indices.len().saturating_sub(1);
         }
         self.project_scroll = 0;
+        self.needs_redraw = true;
     }
 
     /// Clear all pending changes (after commit)
@@ -396,169 +431,151 @@ impl App {
         self.apply_filter();
     }
 
+    /// Set search query and re-apply filtering in one pass.
+    pub fn set_search_query(&mut self, query: &str) {
+        self.search_query.clear();
+        self.search_query.push_str(query);
+        self.apply_filter();
+    }
+
     /// Apply search filter to file tree
     fn apply_filter(&mut self) {
         match self.view_mode {
-            ViewMode::Flat => {
-                if self.search_query.is_empty() {
-                    self.filtered_tree = self.file_tree.clone();
-                } else {
-                    let query = self.search_query.to_lowercase();
-                    self.filtered_tree = self
-                        .file_tree
-                        .iter()
-                        .filter(|entry| {
-                            entry.name.to_lowercase().contains(&query)
-                                || entry.path.to_string_lossy().to_lowercase().contains(&query)
-                        })
-                        .cloned()
-                        .collect();
-                }
-
-                // Reset selection if it's out of bounds
-                if self.project_selected >= self.filtered_tree.len() {
-                    self.project_selected = self.filtered_tree.len().saturating_sub(1);
-                }
-            }
-            ViewMode::Grouped => {
-                if self.search_query.is_empty() {
-                    // No search - restore original expand states and use cached tree
-                    self.filtered_grouped_tree = self.grouped_tree.clone();
-                } else {
-                    let query = self.search_query.to_lowercase();
-
-                    // Search through ALL files in the grouping (not just visible ones)
-                    // and find which layers contain matching files
-                    let mut matching_layers = std::collections::HashSet::new();
-
-                    for (path, assignment) in &self.grouping.file_assignments {
-                        let path_str = path.to_string_lossy().to_lowercase();
-                        let name = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            .to_lowercase();
-
-                        if name.contains(&query) || path_str.contains(&query) {
-                            matching_layers.insert(assignment.layer);
-                        }
-                    }
-
-                    // Auto-expand layers that contain matching files
-                    for layer in &matching_layers {
-                        if let Some(group) = self.grouping.groups.get_mut(layer) {
-                            group.expanded = true;
-                        }
-                    }
-
-                    // Rebuild the grouped tree with expanded layers
-                    self.grouped_tree = build_grouped_tree(&self.grouping, &self.index);
-
-                    // Now filter the rebuilt tree to show only matching entries
-                    self.filtered_grouped_tree = self
-                        .grouped_tree
-                        .iter()
-                        .filter(|entry| {
-                            use crate::grouping::GroupedEntryKind;
-                            match &entry.kind {
-                                // Always show layer headers that contain matches
-                                GroupedEntryKind::Layer(layer) => matching_layers.contains(layer),
-                                // Include all features initially; filter_empty_features()
-                                // removes features without matching child files
-                                GroupedEntryKind::Feature => true,
-                                // Show files that match the query
-                                GroupedEntryKind::File => {
-                                    entry.name.to_lowercase().contains(&query)
-                                        || entry
-                                            .path
-                                            .as_ref()
-                                            .map(|p| {
-                                                p.to_string_lossy().to_lowercase().contains(&query)
-                                            })
-                                            .unwrap_or(false)
-                                }
-                            }
-                        })
-                        .cloned()
-                        .collect();
-
-                    // Remove features that have no matching files under them
-                    // by checking if the next entries are files that match
-                    self.filtered_grouped_tree = self.filter_empty_features(&query);
-                }
-
-                // Reset selection if it's out of bounds
-                if self.project_selected >= self.filtered_grouped_tree.len() {
-                    self.project_selected = self.filtered_grouped_tree.len().saturating_sub(1);
-                }
-            }
+            ViewMode::Flat => self.apply_flat_filter(),
+            ViewMode::Grouped => self.apply_grouped_filter(),
         }
         self.project_scroll = 0;
+        self.needs_redraw = true;
     }
 
-    /// Filter out features that have no matching files
-    fn filter_empty_features(&self, query: &str) -> Vec<crate::grouping::GroupedTreeEntry> {
+    fn apply_flat_filter(&mut self) {
+        if self.search_query.is_empty() {
+            self.filtered_tree_indices = (0..self.file_tree.len()).collect();
+        } else {
+            let query = self.search_query.to_lowercase();
+            self.filtered_tree_indices = self
+                .flat_search_entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry.name_lower.contains(&query) || entry.path_lower.contains(&query)
+                })
+                .map(|(idx, _)| idx)
+                .collect();
+        }
+
+        if self.project_selected >= self.filtered_tree_indices.len() {
+            self.project_selected = self.filtered_tree_indices.len().saturating_sub(1);
+        }
+    }
+
+    fn apply_grouped_filter(&mut self) {
+        if self.search_query.is_empty() {
+            self.filtered_grouped_indices = (0..self.grouped_tree.len()).collect();
+            if self.project_selected >= self.filtered_grouped_indices.len() {
+                self.project_selected = self.filtered_grouped_indices.len().saturating_sub(1);
+            }
+            return;
+        }
+
+        let query = self.search_query.to_lowercase();
+        let mut matching_layers: HashSet<crate::grouping::Layer> = HashSet::new();
+
+        for entry in &self.grouping_search_files {
+            if entry.name_lower.contains(&query) || entry.path_lower.contains(&query) {
+                matching_layers.insert(entry.layer);
+            }
+        }
+
+        for layer in &matching_layers {
+            if let Some(group) = self.grouping.groups.get_mut(layer) {
+                group.expanded = true;
+            }
+        }
+
+        self.rebuild_grouped_tree_cache();
+        self.filtered_grouped_indices = self.filter_grouped_indices(&query, &matching_layers);
+
+        if self.project_selected >= self.filtered_grouped_indices.len() {
+            self.project_selected = self.filtered_grouped_indices.len().saturating_sub(1);
+        }
+    }
+
+    /// Filter out grouped entries in a single pass.
+    fn filter_grouped_indices(
+        &self,
+        query: &str,
+        matching_layers: &HashSet<crate::grouping::Layer>,
+    ) -> Vec<usize> {
         use crate::grouping::GroupedEntryKind;
 
         let mut result = Vec::new();
-        let entries = &self.filtered_grouped_tree;
-        let mut i = 0;
+        let mut current_layer_matches = false;
+        let mut current_feature_idx: Option<usize> = None;
+        let mut current_feature_name_match = false;
+        let mut current_feature_emitted = false;
 
-        while i < entries.len() {
-            let entry = &entries[i];
-
+        for (idx, entry) in self.grouped_tree.iter().enumerate() {
             match &entry.kind {
-                GroupedEntryKind::Layer(_) => {
-                    // Always include layers (they were already filtered to have matches)
-                    result.push(entry.clone());
-                    i += 1;
-                }
-                GroupedEntryKind::Feature => {
-                    // Check if this feature has any matching files after it
-                    let mut has_matching_files = false;
-                    let mut j = i + 1;
-
-                    while j < entries.len() {
-                        match &entries[j].kind {
-                            GroupedEntryKind::File => {
-                                // Check if this file matches the query
-                                let name_matches = entries[j].name.to_lowercase().contains(query);
-                                let path_matches = entries[j]
-                                    .path
-                                    .as_ref()
-                                    .map(|p| p.to_string_lossy().to_lowercase().contains(query))
-                                    .unwrap_or(false);
-
-                                if name_matches || path_matches {
-                                    has_matching_files = true;
-                                    break;
-                                }
-                                j += 1;
-                            }
-                            // Stop when we hit another feature or layer
-                            _ => break,
+                GroupedEntryKind::Layer(layer) => {
+                    if let Some(feature_idx) = current_feature_idx.take() {
+                        if current_feature_name_match && !current_feature_emitted {
+                            result.push(feature_idx);
                         }
                     }
+                    current_layer_matches = matching_layers.contains(layer);
+                    current_feature_name_match = false;
+                    current_feature_emitted = false;
 
-                    if has_matching_files || entry.name.to_lowercase().contains(query) {
-                        result.push(entry.clone());
+                    if current_layer_matches {
+                        result.push(idx);
                     }
-                    i += 1;
+                }
+                GroupedEntryKind::Feature => {
+                    if let Some(feature_idx) = current_feature_idx.take() {
+                        if current_feature_name_match && !current_feature_emitted {
+                            result.push(feature_idx);
+                        }
+                    }
+                    if !current_layer_matches {
+                        current_feature_name_match = false;
+                        current_feature_emitted = false;
+                        continue;
+                    }
+                    current_feature_idx = Some(idx);
+                    current_feature_name_match =
+                        self.grouped_search_entries[idx].name_lower.contains(query);
+                    current_feature_emitted = false;
                 }
                 GroupedEntryKind::File => {
-                    // Files were already filtered, include them
-                    let name_matches = entry.name.to_lowercase().contains(query);
-                    let path_matches = entry
-                        .path
+                    if !current_layer_matches {
+                        continue;
+                    }
+
+                    let search = &self.grouped_search_entries[idx];
+                    let name_matches = search.name_lower.contains(query);
+                    let path_matches = search
+                        .path_lower
                         .as_ref()
-                        .map(|p| p.to_string_lossy().to_lowercase().contains(query))
+                        .map(|p| p.contains(query))
                         .unwrap_or(false);
 
                     if name_matches || path_matches {
-                        result.push(entry.clone());
+                        if let Some(feature_idx) = current_feature_idx {
+                            if !current_feature_emitted {
+                                result.push(feature_idx);
+                                current_feature_emitted = true;
+                            }
+                        }
+                        result.push(idx);
                     }
-                    i += 1;
                 }
+            }
+        }
+
+        if let Some(feature_idx) = current_feature_idx {
+            if current_feature_name_match && !current_feature_emitted {
+                result.push(feature_idx);
             }
         }
 
@@ -580,11 +597,12 @@ impl App {
             return;
         }
 
-        if let Some(entry) = self.filtered_grouped_tree.get(self.project_selected) {
+        let selected_kind = self.current_grouped_entry().map(|entry| entry.kind.clone());
+        if let Some(kind) = selected_kind {
             use crate::grouping::GroupedEntryKind;
-            match &entry.kind {
+            match kind {
                 GroupedEntryKind::Layer(layer) => {
-                    if let Some(group) = self.grouping.groups.get_mut(layer) {
+                    if let Some(group) = self.grouping.groups.get_mut(&layer) {
                         group.expanded = !group.expanded;
                         self.rebuild_grouped_tree();
                     }
@@ -602,7 +620,7 @@ impl App {
 
     /// Rebuild the grouped tree after a toggle
     fn rebuild_grouped_tree(&mut self) {
-        self.grouped_tree = build_grouped_tree(&self.grouping, &self.index);
+        self.rebuild_grouped_tree_cache();
         self.apply_filter();
     }
 
@@ -623,7 +641,7 @@ impl App {
     pub fn show_file_detail(&mut self) {
         match self.view_mode {
             ViewMode::Flat => {
-                if let Some(entry) = self.filtered_tree.get(self.project_selected) {
+                if let Some(entry) = self.current_flat_entry() {
                     self.overlay = Overlay::FileDetail {
                         path: entry.path.clone(),
                         scroll: 0,
@@ -631,7 +649,7 @@ impl App {
                 }
             }
             ViewMode::Grouped => {
-                if let Some(entry) = self.filtered_grouped_tree.get(self.project_selected) {
+                if let Some(entry) = self.current_grouped_entry() {
                     if let Some(path) = &entry.path {
                         self.overlay = Overlay::FileDetail {
                             path: path.clone(),
@@ -688,9 +706,24 @@ impl App {
     /// Get the length of the current project tree based on view mode
     fn project_tree_len(&self) -> usize {
         match self.view_mode {
-            ViewMode::Flat => self.filtered_tree.len(),
-            ViewMode::Grouped => self.filtered_grouped_tree.len(),
+            ViewMode::Flat => self.filtered_tree_indices.len(),
+            ViewMode::Grouped => self.filtered_grouped_indices.len(),
         }
+    }
+
+    fn current_flat_entry(&self) -> Option<&FlatTreeEntry> {
+        let idx = *self.filtered_tree_indices.get(self.project_selected)?;
+        self.file_tree.get(idx)
+    }
+
+    fn current_grouped_entry(&self) -> Option<&crate::grouping::GroupedTreeEntry> {
+        let idx = *self.filtered_grouped_indices.get(self.project_selected)?;
+        self.grouped_tree.get(idx)
+    }
+
+    fn rebuild_grouped_tree_cache(&mut self) {
+        self.grouped_tree = build_grouped_tree(&self.grouping, &self.index);
+        self.grouped_search_entries = build_grouped_search_entries(&self.grouped_tree);
     }
 
     fn ensure_project_visible(&mut self) {
@@ -768,6 +801,7 @@ impl App {
         if let Some(ref toast) = self.toast {
             if toast.is_expired() {
                 self.toast = None;
+                self.needs_redraw = true;
             }
         }
     }
@@ -775,6 +809,7 @@ impl App {
     /// Show a toast message.
     pub fn show_toast(&mut self, message: &str) {
         self.toast = Some(Toast::new(message));
+        self.needs_redraw = true;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1436,6 +1471,47 @@ impl App {
     pub fn is_on_main_branch(&self) -> bool {
         self.context.branch == "main" || self.context.branch == "master"
     }
+}
+
+fn build_flat_search_entries(tree: &[FlatTreeEntry]) -> Vec<FlatSearchEntry> {
+    tree.iter()
+        .map(|entry| FlatSearchEntry {
+            name_lower: entry.name.to_lowercase(),
+            path_lower: entry.path.to_string_lossy().to_lowercase(),
+        })
+        .collect()
+}
+
+fn build_grouped_search_entries(
+    tree: &[crate::grouping::GroupedTreeEntry],
+) -> Vec<GroupedSearchEntry> {
+    tree.iter()
+        .map(|entry| GroupedSearchEntry {
+            name_lower: entry.name.to_lowercase(),
+            path_lower: entry
+                .path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_lowercase()),
+        })
+        .collect()
+}
+
+fn build_grouping_search_files(
+    grouping: &crate::grouping::CodebaseGrouping,
+) -> Vec<GroupingSearchFile> {
+    grouping
+        .file_assignments
+        .iter()
+        .map(|(path, assignment)| GroupingSearchFile {
+            layer: assignment.layer,
+            name_lower: path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_lowercase(),
+            path_lower: path.to_string_lossy().to_lowercase(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

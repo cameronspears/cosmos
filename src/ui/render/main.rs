@@ -13,6 +13,8 @@ use ratatui::{
     Frame,
 };
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 /// Cached main layout to avoid recomputing on every frame
 struct CachedMainLayout {
@@ -21,8 +23,15 @@ struct CachedMainLayout {
     suggestions_panel: Rect,
 }
 
+struct CachedAskMarkdown {
+    response_hash: u64,
+    width: usize,
+    padded_lines: Vec<Line<'static>>,
+}
+
 thread_local! {
     static MAIN_LAYOUT_CACHE: RefCell<Option<CachedMainLayout>> = const { RefCell::new(None) };
+    static ASK_MARKDOWN_CACHE: RefCell<Option<CachedAskMarkdown>> = const { RefCell::new(None) };
 }
 
 pub(super) fn render_main(frame: &mut Frame, area: Rect, app: &App) {
@@ -158,15 +167,17 @@ fn render_flat_tree<'a>(
     is_active: bool,
     visible_height: usize,
 ) {
-    let tree = &app.filtered_tree;
-    let total = tree.len();
+    let tree = &app.file_tree;
+    let indices = &app.filtered_tree_indices;
+    let total = indices.len();
 
-    for (i, entry) in tree
+    for (i, entry_idx) in indices
         .iter()
         .enumerate()
         .skip(app.project_scroll)
         .take(visible_height)
     {
+        let entry = &tree[*entry_idx];
         let is_selected = i == app.project_selected && is_active;
 
         // Calculate tree connectors
@@ -174,7 +185,8 @@ fn render_flat_tree<'a>(
             if i + 1 >= total {
                 true
             } else {
-                tree[i + 1].depth <= entry.depth
+                let next_entry = &tree[indices[i + 1]];
+                next_entry.depth <= entry.depth
             }
         };
 
@@ -182,7 +194,10 @@ fn render_flat_tree<'a>(
         let indent_str: String = (0..entry.depth.saturating_sub(1))
             .map(|d| {
                 // Check if ancestor at this depth has more siblings
-                let has_more = tree.iter().skip(i + 1).any(|e| e.depth == d + 1);
+                let has_more = indices
+                    .iter()
+                    .skip(i + 1)
+                    .any(|next_idx| tree[*next_idx].depth == d + 1);
                 if has_more {
                     "│ "
                 } else {
@@ -228,7 +243,7 @@ fn render_flat_tree<'a>(
             lines.push(Line::from(vec![
                 Span::styled("   ", Style::default()),
                 Span::styled(format!("{} ", file_icon_str), icon_style),
-                Span::styled(entry.name.clone(), name_style),
+                Span::styled(entry.name.as_str(), name_style),
                 priority_indicator,
             ]));
         } else {
@@ -239,7 +254,7 @@ fn render_flat_tree<'a>(
                     Style::default().fg(Theme::GREY_700),
                 ),
                 Span::styled(format!(" {} ", file_icon_str), icon_style),
-                Span::styled(entry.name.clone(), name_style),
+                Span::styled(entry.name.as_str(), name_style),
                 priority_indicator,
             ]));
         }
@@ -286,14 +301,16 @@ fn render_grouped_tree<'a>(
 ) {
     use crate::grouping::GroupedEntryKind;
 
-    let tree = &app.filtered_grouped_tree;
+    let tree = &app.grouped_tree;
+    let indices = &app.filtered_grouped_indices;
 
-    for (i, entry) in tree
+    for (i, entry_idx) in indices
         .iter()
         .enumerate()
         .skip(app.project_scroll)
         .take(visible_height)
     {
+        let entry = &tree[*entry_idx];
         let is_selected = i == app.project_selected && is_active;
 
         match &entry.kind {
@@ -304,7 +321,8 @@ fn render_grouped_tree<'a>(
                 {
                     // Check if previous visible item was a file - add separator
                     if i > 0 {
-                        if let Some(prev) = tree.get(i.saturating_sub(1)) {
+                        if let Some(prev_idx) = indices.get(i.saturating_sub(1)) {
+                            let prev = &tree[*prev_idx];
                             if prev.kind == GroupedEntryKind::File {
                                 lines.push(Line::from(""));
                             }
@@ -354,7 +372,7 @@ fn render_grouped_tree<'a>(
                 lines.push(Line::from(vec![
                     Span::styled("   ", Style::default()),
                     Span::styled("   ├─ ", Style::default().fg(Theme::GREY_700)),
-                    Span::styled(entry.name.clone(), style),
+                    Span::styled(entry.name.as_str(), style),
                     Span::styled(count_str, Style::default().fg(Theme::GREY_600)),
                 ]));
             }
@@ -391,7 +409,7 @@ fn render_grouped_tree<'a>(
                     Span::styled("   ", Style::default()),
                     Span::styled(indent.to_string(), Style::default().fg(Theme::GREY_800)),
                     Span::styled(format!("{} ", file_icon_str), icon_style),
-                    Span::styled(entry.name.clone(), name_style),
+                    Span::styled(entry.name.as_str(), name_style),
                     priority_indicator,
                 ]));
             }
@@ -1856,19 +1874,36 @@ fn render_ask_cosmos_content<'a>(
     // Top padding for breathing room (matching other panels)
     lines.push(Line::from(""));
 
-    // Parse markdown and render with styling
     let text_width = inner_width.saturating_sub(6);
-    let parsed_lines = markdown::parse_markdown(&ask_state.response, text_width);
+    let response_hash = stable_hash(&ask_state.response);
 
-    // Add simple left padding to each line (matching verify/suggestions pattern)
-    let padded_lines: Vec<Line<'static>> = parsed_lines
-        .into_iter()
-        .map(|line| {
-            let mut spans = vec![Span::styled("  ", Style::default())];
-            spans.extend(line.spans);
-            Line::from(spans)
-        })
-        .collect();
+    let padded_lines = ASK_MARKDOWN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let needs_reparse = cache
+            .as_ref()
+            .map(|cached| cached.response_hash != response_hash || cached.width != text_width)
+            .unwrap_or(true);
+
+        if needs_reparse {
+            let parsed_lines = markdown::parse_markdown(&ask_state.response, text_width);
+            let mut with_padding = Vec::with_capacity(parsed_lines.len());
+            for line in parsed_lines {
+                let mut spans = vec![Span::styled("  ", Style::default())];
+                spans.extend(line.spans);
+                with_padding.push(Line::from(spans));
+            }
+            *cache = Some(CachedAskMarkdown {
+                response_hash,
+                width: text_width,
+                padded_lines: with_padding,
+            });
+        }
+
+        cache
+            .as_ref()
+            .map(|cached| cached.padded_lines.clone())
+            .unwrap_or_default()
+    });
 
     // Calculate available height for content
     // Account for: 1 empty top + 1 scroll indicator + 1 empty + 1 hint = 4 lines overhead
@@ -1912,4 +1947,10 @@ fn render_ask_cosmos_content<'a>(
         ),
         Span::styled(" back ", Style::default().fg(Theme::GREY_400)),
     ]));
+}
+
+fn stable_hash(input: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    hasher.finish()
 }

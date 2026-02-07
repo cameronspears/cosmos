@@ -25,6 +25,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 const CACHE_DIR: &str = ".cosmos";
 const INDEX_CACHE_FILE: &str = "index.json";
+const INDEX_META_FILE: &str = "index.meta.json";
 const SUGGESTIONS_CACHE_FILE: &str = "suggestions.json";
 const MEMORY_FILE: &str = "memory.json";
 const GLOSSARY_FILE: &str = "glossary.json";
@@ -129,6 +130,15 @@ pub struct IndexCache {
     pub symbol_count: usize,
     pub cached_at: DateTime<Utc>,
     pub file_hashes: HashMap<PathBuf, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexMeta {
+    root: PathBuf,
+    git_head: Option<String>,
+    file_count: usize,
+    symbol_count: usize,
+    cached_at: DateTime<Utc>,
 }
 
 // Note: Suggestions are generated fresh each session (not cached across restarts)
@@ -703,21 +713,51 @@ impl Cache {
     /// Save full index cache (CodebaseIndex)
     pub fn save_index_cache(&self, index: &CodebaseIndex) -> anyhow::Result<()> {
         let _lock = self.lock(true)?;
-        let path = self.cache_dir.join(INDEX_CACHE_FILE);
-        let content = serde_json::to_string_pretty(index)?;
-        write_atomic(&path, &content)?;
+        let index_path = self.cache_dir.join(INDEX_CACHE_FILE);
+        let meta_path = self.cache_dir.join(INDEX_META_FILE);
+
+        let index_content = serde_json::to_string(index)?;
+        write_atomic(&index_path, &index_content)?;
+
+        let stats = index.stats();
+        let meta = IndexMeta {
+            root: index.root.clone(),
+            git_head: index.git_head.clone(),
+            file_count: stats.file_count,
+            symbol_count: stats.symbol_count,
+            cached_at: Utc::now(),
+        };
+        let meta_content = serde_json::to_string(&meta)?;
+        write_atomic(&meta_path, &meta_content)?;
         Ok(())
     }
 
     /// Load index cache if valid for current repo state
     pub fn load_index_cache(&self, root: &Path) -> Option<CodebaseIndex> {
-        let path = self.cache_dir.join(INDEX_CACHE_FILE);
-        if !path.exists() {
+        let index_path = self.cache_dir.join(INDEX_CACHE_FILE);
+        if !index_path.exists() {
             return None;
         }
 
         let _lock = self.lock(false).ok()?;
-        let content = fs::read_to_string(&path).ok()?;
+        let meta_path = self.cache_dir.join(INDEX_META_FILE);
+        if meta_path.exists() {
+            let meta_content = fs::read_to_string(&meta_path).ok()?;
+            let meta: IndexMeta = serde_json::from_str(&meta_content).ok()?;
+            if meta.root != root {
+                return None;
+            }
+            if is_index_meta_valid(root, &meta) {
+                let content = fs::read_to_string(&index_path).ok()?;
+                let index: CodebaseIndex = serde_json::from_str(&content).ok()?;
+                if index.root == root {
+                    return Some(index);
+                }
+                return None;
+            }
+        }
+
+        let content = fs::read_to_string(&index_path).ok()?;
 
         // Try to parse as full CodebaseIndex (current format)
         if let Ok(index) = serde_json::from_str::<CodebaseIndex>(&content) {
@@ -751,7 +791,7 @@ impl Cache {
     pub fn save_llm_summaries_cache(&self, cache: &LlmSummaryCache) -> anyhow::Result<()> {
         let _lock = self.lock(true)?;
         let path = self.cache_dir.join(LLM_SUMMARIES_CACHE_FILE);
-        let content = serde_json::to_string_pretty(cache)?;
+        let content = serde_json::to_string(cache)?;
         write_atomic(&path, &content)?;
         Ok(())
     }
@@ -771,7 +811,7 @@ impl Cache {
     pub fn save_grouping_ai_cache(&self, cache: &GroupingAiCache) -> anyhow::Result<()> {
         let _lock = self.lock(true)?;
         let path = self.cache_dir.join(GROUPING_AI_CACHE_FILE);
-        let content = serde_json::to_string_pretty(cache)?;
+        let content = serde_json::to_string(cache)?;
         write_atomic(&path, &content)?;
         Ok(())
     }
@@ -808,7 +848,7 @@ impl Cache {
     pub fn save_glossary(&self, glossary: &DomainGlossary) -> anyhow::Result<()> {
         let _lock = self.lock(true)?;
         let path = self.cache_dir.join(GLOSSARY_FILE);
-        let content = serde_json::to_string_pretty(glossary)?;
+        let content = serde_json::to_string(glossary)?;
         write_atomic(&path, &content)?;
         Ok(())
     }
@@ -843,7 +883,7 @@ impl Cache {
     pub fn save_question_cache(&self, cache: &QuestionCache) -> anyhow::Result<()> {
         let _lock = self.lock(true)?;
         let path = self.cache_dir.join(QUESTION_CACHE_FILE);
-        let content = serde_json::to_string_pretty(cache)?;
+        let content = serde_json::to_string(cache)?;
         write_atomic(&path, &content)?;
         Ok(())
     }
@@ -866,7 +906,7 @@ impl Cache {
 
         for option in options {
             let files_to_remove: Vec<&str> = match option {
-                ResetOption::Index => vec![INDEX_CACHE_FILE],
+                ResetOption::Index => vec![INDEX_CACHE_FILE, INDEX_META_FILE],
                 ResetOption::Suggestions => vec![SUGGESTIONS_CACHE_FILE],
                 ResetOption::Summaries => vec![LLM_SUMMARIES_CACHE_FILE],
                 ResetOption::Glossary => vec![GLOSSARY_FILE],
@@ -930,8 +970,23 @@ fn is_index_cache_valid(root: &Path, index: &CodebaseIndex) -> bool {
         }
     }
 
-    // Fall back to full hash comparison if git check fails or detects changes
+    // Full hash fallback is expensive on large repos. For bigger indexes,
+    // invalidate and rebuild instead of walking every file on startup.
+    if index.files.len() > 2_000 {
+        return false;
+    }
+
+    // Fall back to full hash comparison only for smaller repositories.
     is_index_cache_valid_full(root, index)
+}
+
+fn is_index_meta_valid(root: &Path, meta: &IndexMeta) -> bool {
+    if let Some(cached_head) = &meta.git_head {
+        if let Some(current_head) = get_current_git_head(root) {
+            return cached_head == &current_head && !crate::index::has_uncommitted_changes(root);
+        }
+    }
+    false
 }
 
 /// Get current git HEAD commit hash
@@ -1117,6 +1172,56 @@ mod tests {
         fs::write(&file_path, "pub fn hello() { println!(\"hi\"); }").unwrap();
         let invalidated = cache.load_index_cache(&root);
         assert!(invalidated.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_index_cache_meta_fast_path() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_index_meta_test_{}", nanos));
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let file_path = src_dir.join("lib.rs");
+        fs::write(&file_path, "pub fn hello() -> i32 { 1 }").unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .expect("git commit");
+
+        let index = CodebaseIndex::new(&root).unwrap();
+        let cache = Cache::new(&root);
+        cache.save_index_cache(&index).unwrap();
+
+        assert!(root.join(CACHE_DIR).join(INDEX_META_FILE).exists());
+        assert!(cache.load_index_cache(&root).is_some());
+
+        fs::write(&file_path, "pub fn hello() -> i32 { 2 }").unwrap();
+        assert!(cache.load_index_cache(&root).is_none());
 
         let _ = fs::remove_dir_all(&root);
     }

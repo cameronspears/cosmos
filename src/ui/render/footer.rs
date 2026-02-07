@@ -7,6 +7,32 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use std::cell::RefCell;
+
+#[derive(Clone, PartialEq, Eq)]
+struct FooterCacheKey {
+    available_width: usize,
+    project_name: String,
+    branch_display: String,
+    stale: bool,
+    balance_text: String,
+    cost_suffix: String,
+    active_panel: ActivePanel,
+    workflow_step: WorkflowStep,
+    loading: LoadingState,
+    verify_loading: bool,
+    verify_has_preview: bool,
+    verify_show_details: bool,
+    review_passed: bool,
+    review_verification_failed: bool,
+    ship_step: ShipStep,
+    has_pending_changes: bool,
+    has_update_available: bool,
+}
+
+thread_local! {
+    static FOOTER_SPANS_CACHE: RefCell<Option<(FooterCacheKey, Vec<Span<'static>>)>> = const { RefCell::new(None) };
+}
 
 /// A footer button with its key and label
 struct FooterButton {
@@ -127,6 +153,39 @@ pub(super) fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
     // Base status: "  project ⎇ branch"
     let base_status_width = 2 + project_name.chars().count() + 3 + branch_display.chars().count();
+
+    let cache_key = FooterCacheKey {
+        available_width,
+        project_name: project_name.to_string(),
+        branch_display: branch_display.clone(),
+        stale: !stale_text.is_empty(),
+        balance_text: balance_text.clone(),
+        cost_suffix: cost_suffix.clone(),
+        active_panel: app.active_panel,
+        workflow_step: app.workflow_step,
+        loading: app.loading,
+        verify_loading: app.verify_state.loading,
+        verify_has_preview: app.verify_state.preview.is_some(),
+        verify_show_details: app.verify_state.show_technical_details,
+        review_passed: app.review_passed(),
+        review_verification_failed: app.review_state.verification_failed,
+        ship_step: app.ship_state.step,
+        has_pending_changes: !app.pending_changes.is_empty(),
+        has_update_available: app.update_available.is_some(),
+    };
+
+    if let Some(cached_spans) = FOOTER_SPANS_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        cache
+            .as_ref()
+            .and_then(|(cached_key, spans)| (cached_key == &cache_key).then(|| spans.clone()))
+    }) {
+        let footer_line = Line::from(cached_spans);
+        let footer = Paragraph::new(vec![Line::from(""), footer_line])
+            .style(Style::default().bg(Theme::GREY_900));
+        frame.render_widget(footer, area);
+        return;
+    }
 
     // Build button lists by priority
     // Priority 1: Essential (always shown if possible)
@@ -280,6 +339,10 @@ pub(super) fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     spans.extend(help_btn.to_spans());
     spans.extend(quit_btn.to_spans());
     spans.push(Span::styled(" ", Style::default()));
+
+    FOOTER_SPANS_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some((cache_key, spans.clone()));
+    });
 
     let footer_line = Line::from(spans);
 

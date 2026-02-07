@@ -484,8 +484,14 @@ fn run_loop<B: Backend>(
     repo_path: PathBuf,
     index: CodebaseIndex,
 ) -> Result<()> {
-    // Track last git status refresh time
+    // Track scheduled maintenance ticks
     let mut last_git_refresh = std::time::Instant::now();
+    let mut last_spinner_tick = std::time::Instant::now();
+    let mut last_toast_check = std::time::Instant::now();
+    let spinner_interval = Duration::from_millis(100);
+    let toast_check_interval = Duration::from_millis(250);
+    let idle_poll_cap = Duration::from_millis(500);
+
     let git_refresh_interval = if index.stats().file_count > 20000 {
         std::time::Duration::from_secs(10)
     } else if index.stats().file_count > 5000 {
@@ -499,20 +505,33 @@ fn run_loop<B: Backend>(
         repo_path: &repo_path,
         tx: &tx,
     };
+    let mut needs_redraw = app.needs_redraw;
 
     loop {
-        // Clear expired toasts
-        app.clear_expired_toast();
+        // Advance spinner only while loading to avoid idle frame churn.
+        if app.loading.is_loading() && last_spinner_tick.elapsed() >= spinner_interval {
+            app.tick_loading();
+            last_spinner_tick = std::time::Instant::now();
+            needs_redraw = true;
+        }
 
-        // Advance spinner animation
-        app.tick_loading();
+        // Check toast expiration on a coarse timer.
+        if last_toast_check.elapsed() >= toast_check_interval {
+            let had_toast = app.toast.is_some();
+            app.clear_expired_toast();
+            if had_toast && app.toast.is_none() {
+                needs_redraw = true;
+            }
+            last_toast_check = std::time::Instant::now();
+        }
 
-        // Periodically refresh git status (every 2 seconds)
+        // Periodically refresh git status.
         if last_git_refresh.elapsed() >= git_refresh_interval {
             match app.context.refresh() {
                 Ok(_) => {
                     app.git_refresh_error = None;
                     app.git_refresh_error_at = None;
+                    needs_redraw = true;
                 }
                 Err(e) => {
                     let message = format!("Git status refresh failed: {}", e);
@@ -523,6 +542,7 @@ fn run_loop<B: Backend>(
                     if should_log {
                         app.show_toast(&message);
                         app.git_refresh_error_at = Some(std::time::Instant::now());
+                        needs_redraw = true;
                     }
                     app.git_refresh_error = Some(message);
                 }
@@ -531,18 +551,44 @@ fn run_loop<B: Backend>(
         }
 
         // Check for background messages (non-blocking)
-        background::drain_messages(app, &rx, &ctx);
+        if background::drain_messages(app, &rx, &ctx) {
+            needs_redraw = true;
+        }
+        if app.needs_redraw {
+            needs_redraw = true;
+        }
 
-        // Render
-        terminal.draw(|f| ui::render(f, app))?;
+        if needs_redraw {
+            terminal.draw(|f| ui::render(f, app))?;
+            needs_redraw = false;
+            app.needs_redraw = false;
+        }
 
-        // Poll for events with fast timeout (snappy animations)
-        if event::poll(Duration::from_millis(50))? {
+        // Poll until the next scheduled tick, or sooner if an input event arrives.
+        let to_next_git = git_refresh_interval.saturating_sub(last_git_refresh.elapsed());
+        let to_next_spinner = if app.loading.is_loading() {
+            spinner_interval.saturating_sub(last_spinner_tick.elapsed())
+        } else {
+            idle_poll_cap
+        };
+        let to_next_toast = if app.toast.is_some() {
+            toast_check_interval.saturating_sub(last_toast_check.elapsed())
+        } else {
+            idle_poll_cap
+        };
+        let poll_timeout = to_next_git
+            .min(to_next_spinner)
+            .min(to_next_toast)
+            .min(idle_poll_cap);
+
+        if event::poll(poll_timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
                 input::handle_key_event(app, key, &ctx)?;
+                needs_redraw = true;
+                app.needs_redraw = true;
             }
         }
 

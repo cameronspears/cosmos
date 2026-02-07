@@ -5,27 +5,11 @@
 //! An AI-powered IDE in the terminal that uses codebase indexing
 //! to suggest improvements, bug fixes, and optimizations.
 
-mod app;
-mod cache;
-mod config;
-mod context;
-mod github;
-mod grouping;
-mod index;
-mod keyring;
-mod onboarding;
-mod suggest;
-mod ui;
-mod update;
-mod util;
-
-// Keep these for compatibility during transition
-mod git_ops;
-
 use anyhow::Result;
 use clap::Parser;
-use context::WorkContext;
-use index::CodebaseIndex;
+use cosmos_tui::context::WorkContext;
+use cosmos_tui::index::CodebaseIndex;
+use cosmos_tui::{app, cache, config, git_ops, github, onboarding, suggest};
 use std::path::{Path, PathBuf};
 use suggest::SuggestionEngine;
 
