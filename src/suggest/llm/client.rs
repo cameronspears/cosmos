@@ -335,7 +335,7 @@ fn provider_config(response_format: &Option<ResponseFormat>) -> ProviderConfig {
 pub(crate) fn provider_cerebras_fp16() -> ProviderConfig {
     ProviderConfig {
         order: Some(vec!["cerebras/fp16".to_string()]),
-        allow_fallbacks: true,
+        allow_fallbacks: false,
         require_parameters: Some(true),
         preferred_max_latency: None,
         preferred_min_throughput: None,
@@ -804,6 +804,116 @@ where
         .and_then(|c| c.message.content.clone())
         .unwrap_or_default();
 
+    if content.is_empty() {
+        return Err(anyhow::anyhow!(
+            "API returned empty response. The model may have been rate limited or failed to generate content. Please try again."
+        ));
+    }
+
+    let data: T = serde_json::from_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse structured response: {}\nContent: {}",
+            e,
+            sanitize_api_response(&content)
+        )
+    })?;
+
+    Ok(StructuredResponse {
+        data,
+        usage: parsed.usage,
+    })
+}
+
+/// Call LLM API with structured output using default provider routing, while
+/// enforcing max tokens and a request timeout.
+pub(crate) async fn call_llm_structured_limited<T>(
+    system: &str,
+    user: &str,
+    model: Model,
+    schema_name: &str,
+    schema: serde_json::Value,
+    max_tokens: u32,
+    timeout_ms: u64,
+) -> anyhow::Result<StructuredResponse<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let api_key = api_key().ok_or_else(|| {
+        anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
+    })?;
+
+    if !model.supports_structured_outputs() {
+        return Err(anyhow::anyhow!(
+            "Structured outputs aren't supported for {}. Try a different model.",
+            model.id()
+        ));
+    }
+
+    let client = create_http_client(REQUEST_TIMEOUT_SECS)?;
+
+    let response_format = Some(ResponseFormat {
+        format_type: "json_schema".to_string(),
+        json_schema: Some(JsonSchemaWrapper {
+            name: schema_name.to_string(),
+            strict: true,
+            schema,
+        }),
+    });
+
+    let stream = false;
+    let plugins = response_healing_plugins(&response_format, stream);
+    let provider = provider_config(&response_format);
+    let reasoning = reasoning_config(model);
+
+    let request = ChatRequest {
+        model: model.id().to_string(),
+        messages: vec![
+            Message {
+                role: "system".to_string(),
+                content: system.to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: user.to_string(),
+            },
+        ],
+        user: openrouter_user(),
+        max_tokens,
+        stream,
+        response_format,
+        reasoning,
+        plugins,
+        provider: Some(provider),
+    };
+
+    let text = timeout(
+        Duration::from_millis(timeout_ms),
+        send_with_retry(&client, &api_key, &request),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Timed out after {}ms.", timeout_ms))??;
+
+    let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse OpenRouter response: {}\n{}",
+            e,
+            sanitize_api_response(&text)
+        )
+    })?;
+
+    let choice = parsed.choices.first();
+    if let Some(c) = choice {
+        if let Some(refusal) = &c.message.refusal {
+            return Err(anyhow::anyhow!(
+                "Request was refused: {}",
+                truncate_str(refusal, 200)
+            ));
+        }
+    }
+
+    let content = choice
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_default();
     if content.is_empty() {
         return Err(anyhow::anyhow!(
             "API returned empty response. The model may have been rate limited or failed to generate content. Please try again."

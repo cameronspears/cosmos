@@ -170,14 +170,17 @@ pub async fn run_trial(
         }
     }
 
-    let provisional_count = diagnostics.provisional_count.max(provisional.len());
     let validated_count = diagnostics.validated_count.max(validated_suggestions.len());
+    let rejected_count = diagnostics.rejected_count;
+    let provisional_count = diagnostics
+        .provisional_count
+        .max(provisional.len())
+        .max(validated_count + rejected_count);
     let final_count = diagnostics
         .final_count
         .max(refined.len())
         .max(validated_count);
     let pending_count = final_count.saturating_sub(validated_count);
-    let rejected_count = diagnostics.rejected_count;
     let displayed_valid_ratio = ratio(validated_count, final_count);
     let validated_ratio = ratio(validated_count, provisional_count);
     let rejected_ratio = ratio(rejected_count, provisional_count);

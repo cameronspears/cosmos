@@ -1,5 +1,6 @@
 use super::client::{
-    call_llm_structured, call_llm_structured_with_provider, call_llm_with_usage, truncate_str,
+    call_llm_structured, call_llm_structured_limited, call_llm_structured_with_provider,
+    call_llm_with_usage, truncate_str, StructuredResponse,
 };
 use super::models::merge_usage;
 use super::models::{Model, Usage};
@@ -23,23 +24,27 @@ use crate::index::GOD_MODULE_LOC_THRESHOLD;
 
 /// Complexity threshold above which a file is considered a "hotspot"
 const HIGH_COMPLEXITY_THRESHOLD: f64 = 20.0;
-const FAST_EVIDENCE_PACK_MAX_ITEMS: usize = 48;
-const FAST_EVIDENCE_SNIPPET_LINES_BEFORE: usize = 8;
-const FAST_EVIDENCE_SNIPPET_LINES_AFTER: usize = 12;
+const FAST_EVIDENCE_PACK_MAX_ITEMS: usize = 36;
+const FAST_EVIDENCE_SNIPPET_LINES_BEFORE: usize = 6;
+const FAST_EVIDENCE_SNIPPET_LINES_AFTER: usize = 8;
 const FAST_GROUNDED_FINAL_TARGET_MIN: usize = 10;
 const FAST_GROUNDED_FINAL_TARGET_MAX: usize = 15;
 const FAST_GROUNDED_VALIDATED_SOFT_FLOOR: usize = 10;
-const FAST_GROUNDED_PROVISIONAL_TARGET_MIN: usize = 22;
-const FAST_GROUNDED_PROVISIONAL_TARGET_MAX: usize = 30;
+const FAST_GROUNDED_VALIDATED_STRETCH_TARGET: usize = FAST_GROUNDED_FINAL_TARGET_MAX;
+const FAST_GROUNDED_PROVISIONAL_TARGET_MIN: usize = 18;
+const FAST_GROUNDED_PROVISIONAL_TARGET_MAX: usize = 24;
 const FAST_EVIDENCE_SOURCE_PATTERN_MAX: usize = 12;
 const FAST_EVIDENCE_SOURCE_HOTSPOT_MAX: usize = 8;
 const FAST_EVIDENCE_SOURCE_CORE_MAX: usize = 8;
 const FAST_EVIDENCE_KIND_GOD_MODULE_MAX: usize = 4;
 const REFINEMENT_MAX_ATTEMPTS: usize = 4;
 const GENERATION_TOPUP_MAX_CALLS: usize = 2;
-const GENERATION_TOPUP_TIMEOUT_MS: u64 = 5_500;
+const GENERATION_TOPUP_TIMEOUT_MS: u64 = 7_800;
 const SUGGEST_BALANCED_BUDGET_MS: u64 = 35_000;
 const VALIDATION_CONCURRENCY: usize = 6;
+const SHARD_COUNT: usize = 3;
+const SHARD_REQUEST_MIN: usize = 6;
+const SHARD_REQUEST_MAX: usize = 8;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ADAPTIVE CONTEXT LIMITS
@@ -902,6 +907,8 @@ fn collect_valid_evidence_refs(
         }
     }
 
+    // Enforce one evidence ref per suggestion at mapping time for stability.
+    refs.truncate(1);
     refs
 }
 
@@ -1000,6 +1007,10 @@ fn regeneration_needed(validated_count: usize) -> usize {
     FAST_GROUNDED_VALIDATED_SOFT_FLOOR.saturating_sub(validated_count)
 }
 
+fn regeneration_needed_for_target(validated_count: usize, target: usize) -> usize {
+    target.saturating_sub(validated_count)
+}
+
 fn regeneration_request_bounds(needed: usize) -> (usize, usize) {
     let min_requested = needed.saturating_mul(2).clamp(4, 12);
     let max_requested = needed.saturating_mul(3).clamp(4, 12).max(min_requested);
@@ -1045,7 +1056,7 @@ fn finalize_validated_suggestions(mut validated: Vec<Suggestion>) -> Vec<Suggest
     validated
 }
 
-fn grounded_suggestion_schema(pack_len: usize) -> serde_json::Value {
+fn grounded_suggestion_schema(_pack_len: usize) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -1059,13 +1070,11 @@ fn grounded_suggestion_schema(pack_len: usize) -> serde_json::Value {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "evidence_id": { "type": "integer", "minimum": 0, "maximum": pack_len.saturating_sub(1) }
+                                    "evidence_id": { "type": "integer" }
                                 },
                                 "required": ["evidence_id"],
                                 "additionalProperties": false
-                            },
-                            "minItems": 1,
-                            "maxItems": 1
+                            }
                         },
                         "kind": {
                             "type": "string",
@@ -1128,6 +1137,52 @@ fn format_grounded_user_prompt(
         ));
     }
     user
+}
+
+async fn call_grounded_suggestions_with_fallback(
+    system: &str,
+    user: &str,
+    schema_name: &str,
+    schema: serde_json::Value,
+    max_tokens: u32,
+    timeout_ms: u64,
+) -> anyhow::Result<StructuredResponse<FastGroundedResponseJson>> {
+    let primary = call_llm_structured_with_provider::<FastGroundedResponseJson>(
+        system,
+        user,
+        Model::Speed,
+        schema_name,
+        schema.clone(),
+        super::client::provider_cerebras_fp16(),
+        max_tokens,
+        timeout_ms,
+    )
+    .await;
+
+    match primary {
+        Ok(response) => Ok(response),
+        Err(primary_err) => {
+            let fallback = call_llm_structured_limited::<FastGroundedResponseJson>(
+                system,
+                user,
+                Model::Speed,
+                schema_name,
+                schema,
+                max_tokens,
+                timeout_ms,
+            )
+            .await;
+
+            match fallback {
+                Ok(response) => Ok(response),
+                Err(fallback_err) => Err(anyhow::anyhow!(
+                    "Primary provider call failed: {} | Fallback routing failed: {}",
+                    truncate_str(&primary_err.to_string(), 700),
+                    truncate_str(&fallback_err.to_string(), 700)
+                )),
+            }
+        }
+    }
 }
 
 async fn validate_suggestion_with_model(
@@ -1373,12 +1428,12 @@ pub async fn analyze_codebase_fast_grounded(
         format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
     let schema = grounded_suggestion_schema(pack.len());
 
-    // Four sharded calls in parallel to push provisional throughput while keeping
-    // each completion short and focused.
-    let shard_count = 4usize;
+    // Three sharded calls in parallel to maintain throughput while reducing
+    // provider fan-out failures under bursty harness runs.
+    let shard_count = SHARD_COUNT;
     let shard_size = (pack.len() + shard_count - 1) / shard_count;
-    let shard_timeout_ms: u64 = 6_800;
-    let shard_max_tokens: u32 = 420;
+    let shard_timeout_ms: u64 = 8_800;
+    let shard_max_tokens: u32 = 620;
     let shard_prompts: Vec<String> = pack
         .chunks(shard_size.max(1))
         .filter(|chunk| !chunk.is_empty())
@@ -1388,7 +1443,10 @@ pub async fn analyze_codebase_fast_grounded(
                 index,
                 summaries,
                 chunk,
-                "For this request, return 4 to 5 suggestions.",
+                &format!(
+                    "For this request, return {} to {} suggestions.",
+                    SHARD_REQUEST_MIN, SHARD_REQUEST_MAX
+                ),
             )
         })
         .collect();
@@ -1397,13 +1455,11 @@ pub async fn analyze_codebase_fast_grounded(
     let shard_responses = join_all(shard_prompts.into_iter().map(|user| {
         let shard_schema = schema.clone();
         async move {
-            call_llm_structured_with_provider::<FastGroundedResponseJson>(
+            call_grounded_suggestions_with_fallback(
                 FAST_GROUNDED_SUGGESTIONS_SYSTEM,
                 &user,
-                Model::Speed,
                 "fast_grounded_suggestions",
                 shard_schema,
-                super::client::provider_cerebras_fp16(),
                 shard_max_tokens,
                 shard_timeout_ms,
             )
@@ -1415,10 +1471,16 @@ pub async fn analyze_codebase_fast_grounded(
 
     let mut usage = None;
     let mut raw_items: Vec<FastGroundedSuggestionJson> = Vec::new();
+    let mut generation_errors: Vec<String> = Vec::new();
     for response in shard_responses {
-        if let Ok(r) = response {
-            usage = merge_usage(usage, r.usage);
-            raw_items.extend(r.data.suggestions);
+        match response {
+            Ok(r) => {
+                usage = merge_usage(usage, r.usage);
+                raw_items.extend(r.data.suggestions);
+            }
+            Err(err) => {
+                generation_errors.push(truncate_str(&err.to_string(), 700).to_string());
+            }
         }
     }
 
@@ -1429,7 +1491,7 @@ pub async fn analyze_codebase_fast_grounded(
     if raw_items.is_empty() {
         generation_waves += 1;
         let rescue_start = std::time::Instant::now();
-        if let Ok(r) = call_llm_structured::<FastGroundedResponseJson>(
+        let rescue_result = call_grounded_suggestions_with_fallback(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM,
             &format_grounded_user_prompt(
                 &memory_section,
@@ -1441,15 +1503,21 @@ pub async fn analyze_codebase_fast_grounded(
                     FAST_GROUNDED_FINAL_TARGET_MIN, FAST_GROUNDED_FINAL_TARGET_MAX
                 ),
             ),
-            Model::Speed,
             "fast_grounded_suggestions_rescue",
             schema.clone(),
+            620,
+            10_500,
         )
-        .await
-        {
-            llm_ms += rescue_start.elapsed().as_millis() as u64;
-            usage = merge_usage(usage, r.usage);
-            raw_items.extend(r.data.suggestions);
+        .await;
+        match rescue_result {
+            Ok(r) => {
+                llm_ms += rescue_start.elapsed().as_millis() as u64;
+                usage = merge_usage(usage, r.usage);
+                raw_items.extend(r.data.suggestions);
+            }
+            Err(err) => {
+                generation_errors.push(truncate_str(&err.to_string(), 700).to_string());
+            }
         }
     }
 
@@ -1468,7 +1536,7 @@ pub async fn analyze_codebase_fast_grounded(
         generation_waves += 1;
 
         let extra_start = std::time::Instant::now();
-        if let Ok(r) = call_llm_structured_with_provider::<FastGroundedResponseJson>(
+        let topup_result = call_grounded_suggestions_with_fallback(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM,
             &format_grounded_user_prompt(
                 &memory_section,
@@ -1480,23 +1548,26 @@ pub async fn analyze_codebase_fast_grounded(
                     request_count
                 ),
             ),
-            Model::Speed,
             "fast_grounded_suggestions_topup",
             schema.clone(),
-            super::client::provider_cerebras_fp16(),
-            420,
+            560,
             GENERATION_TOPUP_TIMEOUT_MS,
         )
-        .await
-        {
-            llm_ms += extra_start.elapsed().as_millis() as u64;
-            usage = merge_usage(usage, r.usage);
-            raw_count += r.data.suggestions.len();
-            let (topup_mapped, topup_missing_or_invalid) =
-                map_raw_items_to_grounded(r.data.suggestions, &pack);
-            mapped.extend(topup_mapped);
-            missing_or_invalid += topup_missing_or_invalid;
-            generation_mapped_count = grounded_mapped_count(&mapped);
+        .await;
+        match topup_result {
+            Ok(r) => {
+                llm_ms += extra_start.elapsed().as_millis() as u64;
+                usage = merge_usage(usage, r.usage);
+                raw_count += r.data.suggestions.len();
+                let (topup_mapped, topup_missing_or_invalid) =
+                    map_raw_items_to_grounded(r.data.suggestions, &pack);
+                mapped.extend(topup_mapped);
+                missing_or_invalid += topup_missing_or_invalid;
+                generation_mapped_count = grounded_mapped_count(&mapped);
+            }
+            Err(err) => {
+                generation_errors.push(truncate_str(&err.to_string(), 700).to_string());
+            }
         }
     }
 
@@ -1504,7 +1575,7 @@ pub async fn analyze_codebase_fast_grounded(
     if should_run_mapping_rescue(raw_count, generation_mapped_count) {
         generation_waves += 1;
         let rescue_start = std::time::Instant::now();
-        if let Ok(r) = call_llm_structured::<FastGroundedResponseJson>(
+        let rescue_result = call_grounded_suggestions_with_fallback(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM,
             &format_grounded_user_prompt(
                 &memory_section,
@@ -1517,26 +1588,37 @@ pub async fn analyze_codebase_fast_grounded(
                     FAST_GROUNDED_FINAL_TARGET_MAX
                 ),
             ),
-            Model::Speed,
             "fast_grounded_mapping_rescue",
-            schema,
+            schema.clone(),
+            620,
+            10_500,
         )
-        .await
-        {
-            llm_ms += rescue_start.elapsed().as_millis() as u64;
-            usage = merge_usage(usage, r.usage);
-            raw_count += r.data.suggestions.len();
-            let (rescue_mapped, rescue_missing_or_invalid) =
-                map_raw_items_to_grounded(r.data.suggestions, &pack);
-            mapped.extend(rescue_mapped);
-            missing_or_invalid += rescue_missing_or_invalid;
-            generation_mapped_count = grounded_mapped_count(&mapped);
+        .await;
+        match rescue_result {
+            Ok(r) => {
+                llm_ms += rescue_start.elapsed().as_millis() as u64;
+                usage = merge_usage(usage, r.usage);
+                raw_count += r.data.suggestions.len();
+                let (rescue_mapped, rescue_missing_or_invalid) =
+                    map_raw_items_to_grounded(r.data.suggestions, &pack);
+                mapped.extend(rescue_mapped);
+                missing_or_invalid += rescue_missing_or_invalid;
+                generation_mapped_count = grounded_mapped_count(&mapped);
+            }
+            Err(err) => {
+                generation_errors.push(truncate_str(&err.to_string(), 700).to_string());
+            }
         }
     }
 
     if mapped.is_empty() {
+        let detail = generation_errors
+            .first()
+            .map(|e| format!(" Latest generation error: {}", e))
+            .unwrap_or_default();
         return Err(anyhow::anyhow!(
-            "AI suggestions arrived without valid evidence links, so Cosmos could not safely ground them. Please try again."
+            "AI suggestions arrived without valid evidence links, so Cosmos could not safely ground them. Please try again.{}",
+            detail
         ));
     }
 
@@ -1625,6 +1707,7 @@ pub async fn refine_grounded_suggestions(
     let mut relaxed_rejected_filter_used = false;
     let mut validated: Vec<Suggestion> = Vec::new();
     let mut notes = diagnostics.notes.clone();
+    let regeneration_target = FAST_GROUNDED_VALIDATED_STRETCH_TARGET;
 
     let batch_usage = validate_batch_suggestions(
         provisional.clone(),
@@ -1640,9 +1723,7 @@ pub async fn refine_grounded_suggestions(
     usage = merge_usage(usage, batch_usage);
 
     let (pack, pack_stats) = build_evidence_pack(repo_root, index, context);
-    while validated.len() < FAST_GROUNDED_VALIDATED_SOFT_FLOOR
-        && regeneration_attempts < REFINEMENT_MAX_ATTEMPTS
-    {
+    while validated.len() < regeneration_target && regeneration_attempts < REFINEMENT_MAX_ATTEMPTS {
         if refine_start.elapsed().as_millis() as u64 >= SUGGEST_BALANCED_BUDGET_MS {
             notes.push("regeneration_budget_reached".to_string());
             break;
@@ -1668,7 +1749,7 @@ pub async fn refine_grounded_suggestions(
         }
         let (remaining_pack_local, local_to_original) = renumber_pack(&remaining_pack_original);
 
-        let needed = regeneration_needed(validated.len());
+        let needed = regeneration_needed_for_target(validated.len(), regeneration_target);
         if needed == 0 {
             break;
         }
@@ -1685,20 +1766,19 @@ pub async fn refine_grounded_suggestions(
             ),
         );
 
-        let regen_response = call_llm_structured_with_provider::<FastGroundedResponseJson>(
+        let regen_response = call_grounded_suggestions_with_fallback(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM,
             &user,
-            Model::Speed,
             "fast_grounded_regeneration",
             schema,
-            super::client::provider_cerebras_fp16(),
-            360,
-            6_800,
+            520,
+            8_200,
         )
         .await;
 
-        let Ok(rebuilt) = regen_response else {
-            continue;
+        let rebuilt = match regen_response {
+            Ok(response) => response,
+            Err(_) => continue,
         };
         usage = merge_usage(usage, rebuilt.usage);
         let (mapped, _missing_or_invalid) =
@@ -1748,7 +1828,12 @@ pub async fn refine_grounded_suggestions(
     diagnostics.deduped_count = validated.len();
     diagnostics.parse_strategy = "fast_grounded_refined".to_string();
     diagnostics.notes = notes;
-    if validated.len() < FAST_GROUNDED_VALIDATED_SOFT_FLOOR {
+    if validated.len() < regeneration_target {
+        diagnostics
+            .notes
+            .push("count_below_stretch_target".to_string());
+    }
+    if regeneration_needed(validated.len()) > 0 {
         diagnostics.notes.push("count_below_soft_floor".to_string());
     }
 
@@ -2184,6 +2269,14 @@ mod grounded_parser_tests {
     }
 
     #[test]
+    fn regeneration_needed_for_target_uses_target_count() {
+        assert_eq!(regeneration_needed_for_target(0, 15), 15);
+        assert_eq!(regeneration_needed_for_target(10, 15), 5);
+        assert_eq!(regeneration_needed_for_target(15, 15), 0);
+        assert_eq!(regeneration_needed_for_target(18, 15), 0);
+    }
+
+    #[test]
     fn build_remaining_pack_excludes_rejected_evidence_when_strict_pack_is_large_enough() {
         let pack = (0..8).map(test_evidence_item).collect::<Vec<_>>();
         let used = HashSet::from([0usize]);
@@ -2309,8 +2402,32 @@ mod grounded_parser_tests {
         let schema = grounded_suggestion_schema(10);
         let evidence_refs =
             &schema["properties"]["suggestions"]["items"]["properties"]["evidence_refs"];
-        assert_eq!(evidence_refs["minItems"], 1);
-        assert_eq!(evidence_refs["maxItems"], 1);
+        assert!(evidence_refs.get("minItems").is_none());
+        assert!(evidence_refs.get("maxItems").is_none());
+    }
+
+    #[test]
+    fn collect_valid_evidence_refs_truncates_to_one_ref() {
+        let pack = vec![test_evidence_item(0), test_evidence_item(1)];
+        let suggestion = FastGroundedSuggestionJson {
+            evidence_refs: vec![
+                FastGroundedEvidenceRefJson::Integer(0),
+                FastGroundedEvidenceRefJson::Integer(1),
+            ],
+            evidence_id: None,
+            snippet_id: None,
+            file: None,
+            line: None,
+            kind: "improvement".to_string(),
+            priority: "medium".to_string(),
+            confidence: "medium".to_string(),
+            summary: "test".to_string(),
+            detail: "detail".to_string(),
+        };
+
+        let refs = collect_valid_evidence_refs(&suggestion, &pack);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].snippet_id, 0);
     }
 }
 
