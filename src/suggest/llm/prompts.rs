@@ -69,9 +69,11 @@ WRITE GREAT SUGGESTIONS:
   - backticks or code formatting
 - `summary` should be understandable on first read.
 - Keep `summary` to 1-2 sentences.
+- `summary` must be complete (at least 8 words). Never output dangling fragments like "When users".
 - `detail` is internal technical context for verification/fixing. It may mention files/functions.
 - For both `summary` and `detail`, keep claims local to what the snippet proves.
 - Keep each suggestion focused on one concrete claim backed by one evidence reference.
+- Use distinct `evidence_id` values across suggestions; avoid reusing IDs until you have at least 10 suggestions.
 - Reject unsupported impact claims immediately instead of softening with assumptions.
 - Reject speculative outcomes (for example: inferred user-facing rollback behavior, audience effects, or unsaved-state claims) unless explicitly shown.
 
@@ -123,6 +125,16 @@ mod prompt_tests {
         assert!(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("No tool calls"),
             "FAST_GROUNDED_SUGGESTIONS_SYSTEM must forbid tool calls"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM
+                .contains("Never output dangling fragments like \"When users\""),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must forbid dangling partial summaries"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM
+                .contains("Use distinct `evidence_id` values across suggestions"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must strongly prefer unique evidence ids for count stability"
         );
     }
 

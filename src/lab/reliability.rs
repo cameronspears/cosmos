@@ -1,9 +1,8 @@
 use crate::cache::SelfIterationSuggestionMetrics;
 use crate::context::WorkContext;
 use crate::index::CodebaseIndex;
-use crate::suggest::llm::models::merge_usage;
 use crate::suggest::llm::{
-    analyze_codebase_fast_grounded, generate_fix_preview_agentic, refine_grounded_suggestions,
+    generate_fix_preview_agentic, run_fast_grounded_with_gate, SuggestionQualityGateConfig,
 };
 use crate::suggest::{Suggestion, SuggestionValidationState, VerificationState};
 use anyhow::anyhow;
@@ -20,6 +19,44 @@ pub struct ReliabilityDiagnosticsSummary {
     pub validated_count: usize,
     pub rejected_count: usize,
     pub regeneration_attempts: usize,
+    #[serde(default)]
+    pub generation_waves: usize,
+    #[serde(default)]
+    pub generation_topup_calls: usize,
+    #[serde(default)]
+    pub generation_mapped_count: usize,
+    #[serde(default)]
+    pub rejected_evidence_skipped_count: usize,
+    #[serde(default)]
+    pub validation_rejection_histogram: HashMap<String, usize>,
+    #[serde(default)]
+    pub validation_deadline_exceeded: bool,
+    #[serde(default)]
+    pub validation_deadline_ms: u64,
+    #[serde(default)]
+    pub validation_transport_retry_count: usize,
+    #[serde(default)]
+    pub validation_transport_recovered_count: usize,
+    #[serde(default)]
+    pub regen_stopped_validation_budget: bool,
+    #[serde(default)]
+    pub attempt_index: usize,
+    #[serde(default)]
+    pub attempt_count: usize,
+    #[serde(default)]
+    pub gate_passed: bool,
+    #[serde(default)]
+    pub gate_fail_reasons: Vec<String>,
+    #[serde(default)]
+    pub attempt_cost_usd: f64,
+    #[serde(default)]
+    pub attempt_ms: u64,
+    #[serde(default)]
+    pub overclaim_rewrite_count: usize,
+    #[serde(default)]
+    pub overclaim_rewrite_validated_count: usize,
+    #[serde(default)]
+    pub notes: Vec<String>,
     pub evidence_pack_line1_ratio: f64,
     pub evidence_source_mix: HashMap<String, usize>,
 }
@@ -129,20 +166,19 @@ pub async fn run_trial(
             .collect::<HashMap<PathBuf, String>>()
     });
 
-    let (provisional, usage_a, diagnostics) =
-        analyze_codebase_fast_grounded(&repo_root, &index, &context, None, summaries.as_ref())
-            .await?;
-    let (refined, usage_b, diagnostics) = refine_grounded_suggestions(
+    let gated = run_fast_grounded_with_gate(
         &repo_root,
         &index,
         &context,
         None,
         summaries.as_ref(),
-        provisional.clone(),
-        diagnostics,
+        SuggestionQualityGateConfig::default(),
     )
     .await?;
-    let total_usage = merge_usage(usage_a, usage_b);
+    let refined = gated.suggestions;
+    let diagnostics = gated.diagnostics;
+    let gate = gated.gate;
+    let total_usage = gated.usage;
     let suggest_total_ms = suggest_start.elapsed().as_millis() as u64;
 
     let validated_suggestions: Vec<Suggestion> = refined
@@ -174,7 +210,6 @@ pub async fn run_trial(
     let rejected_count = diagnostics.rejected_count;
     let provisional_count = diagnostics
         .provisional_count
-        .max(provisional.len())
         .max(validated_count + rejected_count);
     let final_count = diagnostics
         .final_count
@@ -228,6 +263,25 @@ pub async fn run_trial(
         validated_count: diagnostics.validated_count,
         rejected_count: diagnostics.rejected_count,
         regeneration_attempts: diagnostics.regeneration_attempts,
+        generation_waves: diagnostics.generation_waves,
+        generation_topup_calls: diagnostics.generation_topup_calls,
+        generation_mapped_count: diagnostics.generation_mapped_count,
+        rejected_evidence_skipped_count: diagnostics.rejected_evidence_skipped_count,
+        validation_rejection_histogram: diagnostics.validation_rejection_histogram.clone(),
+        validation_deadline_exceeded: diagnostics.validation_deadline_exceeded,
+        validation_deadline_ms: diagnostics.validation_deadline_ms,
+        validation_transport_retry_count: diagnostics.validation_transport_retry_count,
+        validation_transport_recovered_count: diagnostics.validation_transport_recovered_count,
+        regen_stopped_validation_budget: diagnostics.regen_stopped_validation_budget,
+        attempt_index: diagnostics.attempt_index,
+        attempt_count: diagnostics.attempt_count,
+        gate_passed: gate.passed,
+        gate_fail_reasons: gate.fail_reasons.clone(),
+        attempt_cost_usd: diagnostics.attempt_cost_usd,
+        attempt_ms: diagnostics.attempt_ms,
+        overclaim_rewrite_count: diagnostics.overclaim_rewrite_count,
+        overclaim_rewrite_validated_count: diagnostics.overclaim_rewrite_validated_count,
+        notes: diagnostics.notes.clone(),
         evidence_pack_line1_ratio: diagnostics.pack_line1_ratio,
         evidence_source_mix: source_mix,
     };
@@ -335,6 +389,7 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn aggregate_metrics_computes_validated_and_rejected_ratios() {
@@ -478,5 +533,37 @@ mod tests {
             classify_reliability_error(&error),
             ReliabilityFailureKind::Other
         );
+    }
+
+    #[test]
+    fn diagnostics_summary_deserializes_without_optimization_fields() {
+        let row = json!({
+            "run_id": "r1",
+            "model": "openai/gpt-oss-120b",
+            "provisional_count": 14,
+            "final_count": 12,
+            "validated_count": 12,
+            "rejected_count": 2,
+            "regeneration_attempts": 1,
+            "evidence_pack_line1_ratio": 0.2,
+            "evidence_source_mix": {
+                "pattern": 8,
+                "hotspot": 2,
+                "core": 2
+            }
+        });
+
+        let parsed: ReliabilityDiagnosticsSummary = serde_json::from_value(row).unwrap();
+        assert_eq!(parsed.generation_waves, 0);
+        assert_eq!(parsed.generation_topup_calls, 0);
+        assert_eq!(parsed.generation_mapped_count, 0);
+        assert_eq!(parsed.rejected_evidence_skipped_count, 0);
+        assert!(parsed.validation_rejection_histogram.is_empty());
+        assert!(!parsed.validation_deadline_exceeded);
+        assert_eq!(parsed.validation_deadline_ms, 0);
+        assert_eq!(parsed.validation_transport_retry_count, 0);
+        assert_eq!(parsed.validation_transport_recovered_count, 0);
+        assert!(!parsed.regen_stopped_validation_budget);
+        assert!(parsed.notes.is_empty());
     }
 }

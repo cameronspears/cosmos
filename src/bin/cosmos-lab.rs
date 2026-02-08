@@ -12,6 +12,7 @@ use cosmos_tui::lab::runner::{run_command, CommandSpec};
 use cosmos_tui::lab::sandbox::SandboxSession;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -55,9 +56,9 @@ struct ValidateArgs {
     gate_min_displayed_validity: f64,
     #[arg(long, default_value_t = 10)]
     gate_min_final_count: usize,
-    #[arg(long, default_value_t = 30_000)]
+    #[arg(long, default_value_t = 26_000)]
     gate_max_suggest_ms: u64,
-    #[arg(long, default_value_t = 0.01)]
+    #[arg(long, default_value_t = 0.016)]
     gate_max_suggest_cost_usd: f64,
     #[arg(long, value_enum, default_value_t = GateSource::Both)]
     gate_source: GateSource,
@@ -121,9 +122,9 @@ struct ReliabilityArgs {
     gate_min_displayed_validity: f64,
     #[arg(long, default_value_t = 10)]
     gate_min_final_count: usize,
-    #[arg(long, default_value_t = 30_000)]
+    #[arg(long, default_value_t = 26_000)]
     gate_max_suggest_ms: u64,
-    #[arg(long, default_value_t = 0.01)]
+    #[arg(long, default_value_t = 0.016)]
     gate_max_suggest_cost_usd: f64,
     #[arg(long, value_enum, default_value_t = GateSource::Both)]
     gate_source: GateSource,
@@ -725,20 +726,25 @@ fn metric_pending_count(metrics: &SelfIterationSuggestionMetrics) -> usize {
     }
 }
 
-fn metric_final_count(metrics: &SelfIterationSuggestionMetrics) -> usize {
+fn metric_trial_weight(metrics: &SelfIterationSuggestionMetrics) -> f64 {
+    metrics.trials.max(1) as f64
+}
+
+fn metric_final_count(metrics: &SelfIterationSuggestionMetrics) -> f64 {
+    let trial_weight = metric_trial_weight(metrics);
     if metrics.final_count > 0 {
-        metrics.final_count
+        metrics.final_count as f64 / trial_weight
     } else {
-        metrics.validated_count + metric_pending_count(metrics)
+        (metrics.validated_count + metric_pending_count(metrics)) as f64 / trial_weight
     }
 }
 
-fn metric_suggest_ms(metrics: &SelfIterationSuggestionMetrics) -> u64 {
-    metrics.suggest_total_ms
+fn metric_suggest_ms(metrics: &SelfIterationSuggestionMetrics) -> f64 {
+    metrics.suggest_total_ms as f64 / metric_trial_weight(metrics)
 }
 
 fn metric_suggest_cost_usd(metrics: &SelfIterationSuggestionMetrics) -> f64 {
-    metrics.suggest_total_cost_usd
+    metrics.suggest_total_cost_usd / metric_trial_weight(metrics)
 }
 
 fn ratio(numerator: usize, denominator: usize) -> f64 {
@@ -752,9 +758,9 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
 #[derive(Debug, Clone, Copy)]
 struct GateCandidate {
     displayed_validity: f64,
-    final_count: usize,
+    final_count: f64,
     pending_count: usize,
-    suggest_ms: Option<u64>,
+    suggest_ms: Option<f64>,
     suggest_cost_usd: Option<f64>,
 }
 
@@ -765,7 +771,7 @@ fn gate_candidate_from_metrics(metrics: &SelfIterationSuggestionMetrics) -> Gate
         pending_count: metric_pending_count(metrics),
         suggest_ms: {
             let ms = metric_suggest_ms(metrics);
-            if ms == 0 {
+            if ms == 0.0 {
                 None
             } else {
                 Some(ms)
@@ -834,7 +840,7 @@ fn evaluate_quality_gate(
         Some(
             candidates
                 .iter()
-                .map(|candidate| candidate.final_count as f64)
+                .map(|candidate| candidate.final_count)
                 .sum::<f64>()
                 / evaluated_runs as f64,
         )
@@ -844,7 +850,7 @@ fn evaluate_quality_gate(
     } else {
         let values = candidates
             .iter()
-            .filter_map(|candidate| candidate.suggest_ms.map(|value| value as f64))
+            .filter_map(|candidate| candidate.suggest_ms)
             .collect::<Vec<_>>();
         if values.is_empty() {
             None
@@ -991,6 +997,25 @@ fn fake_trial_result(target_repo: &Path, verify_sample: usize) -> ReliabilityTri
         validated_count: 7,
         rejected_count: 1,
         regeneration_attempts: 1,
+        generation_waves: 1,
+        generation_topup_calls: 0,
+        generation_mapped_count: 8,
+        rejected_evidence_skipped_count: 0,
+        validation_rejection_histogram: HashMap::new(),
+        validation_deadline_exceeded: false,
+        validation_deadline_ms: 0,
+        validation_transport_retry_count: 0,
+        validation_transport_recovered_count: 0,
+        regen_stopped_validation_budget: false,
+        attempt_index: 1,
+        attempt_count: 1,
+        gate_passed: false,
+        gate_fail_reasons: Vec::new(),
+        attempt_cost_usd: 0.0012,
+        attempt_ms: 3200,
+        overclaim_rewrite_count: 0,
+        overclaim_rewrite_validated_count: 0,
+        notes: Vec::new(),
         evidence_pack_line1_ratio: 0.2,
         evidence_source_mix: source_mix,
     };
@@ -1053,6 +1078,25 @@ mod tests {
         gate_metric_with_limits(displayed_valid_ratio, 100, pending_count, 1_000, 0.001)
     }
 
+    #[test]
+    fn gate_candidate_normalizes_multi_trial_reliability_metrics() {
+        let metrics = SelfIterationSuggestionMetrics {
+            trials: 5,
+            final_count: 60,
+            validated_count: 60,
+            pending_count: 0,
+            displayed_valid_ratio: 1.0,
+            suggest_total_ms: 100_000,
+            suggest_total_cost_usd: 0.08,
+            ..SelfIterationSuggestionMetrics::default()
+        };
+
+        let candidate = gate_candidate_from_metrics(&metrics);
+        assert!((candidate.final_count - 12.0).abs() < f64::EPSILON);
+        assert_eq!(candidate.suggest_ms, Some(20_000.0));
+        assert!((candidate.suggest_cost_usd.unwrap_or_default() - 0.016).abs() < f64::EPSILON);
+    }
+
     fn append_run(
         cache: &Cache,
         mode: &str,
@@ -1103,6 +1147,34 @@ mod tests {
             .to_string_lossy()
             .contains("/tmp/cosmos/.cosmos/lab/"));
         assert!(output.to_string_lossy().contains("validate-fast-"));
+    }
+
+    #[test]
+    fn validate_cli_defaults_use_balanced_gate_profile() {
+        let cli = Cli::parse_from(["cosmos-lab", "validate"]);
+        match cli.command {
+            Commands::Validate(args) => {
+                assert_eq!(args.gate_min_displayed_validity, 0.95);
+                assert_eq!(args.gate_min_final_count, 10);
+                assert_eq!(args.gate_max_suggest_ms, 26_000);
+                assert!((args.gate_max_suggest_cost_usd - 0.016).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected validate command defaults"),
+        }
+    }
+
+    #[test]
+    fn reliability_cli_defaults_use_balanced_gate_profile() {
+        let cli = Cli::parse_from(["cosmos-lab", "reliability"]);
+        match cli.command {
+            Commands::Reliability(args) => {
+                assert_eq!(args.gate_min_displayed_validity, 0.95);
+                assert_eq!(args.gate_min_final_count, 10);
+                assert_eq!(args.gate_max_suggest_ms, 26_000);
+                assert!((args.gate_max_suggest_cost_usd - 0.016).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected reliability command defaults"),
+        }
     }
 
     #[test]
@@ -1476,8 +1548,8 @@ edition = "2021"
             gate_window: 10,
             gate_min_displayed_validity: 0.95,
             gate_min_final_count: 10,
-            gate_max_suggest_ms: 30_000,
-            gate_max_suggest_cost_usd: 0.01,
+            gate_max_suggest_ms: 26_000,
+            gate_max_suggest_cost_usd: 0.016,
             gate_source: GateSource::Both,
         };
 

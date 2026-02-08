@@ -433,49 +433,34 @@ pub async fn run_tui(
                 } else {
                     Some(repo_memory_context)
                 };
-                let mem_for_refine = mem.clone();
-                // Fast grounded suggestions: provisional output only.
-                // Actionable suggestions are emitted in SuggestionsRefined after validation.
-                match suggest::llm::analyze_codebase_fast_grounded(
+                let gate_config = suggest::llm::SuggestionQualityGateConfig::default();
+                let run = suggest::llm::run_fast_grounded_with_gate_with_progress(
                     &repo_root,
                     &index_clone,
                     &context_clone,
                     mem,
                     Some(&summaries_for_suggestions),
+                    gate_config,
+                    |attempt_index, attempt_count, gate, diagnostics| {
+                        let _ =
+                            tx_suggestions.send(BackgroundMessage::SuggestionsRefinementProgress {
+                                attempt_index,
+                                attempt_count,
+                                gate: gate.clone(),
+                                diagnostics: diagnostics.clone(),
+                            });
+                    },
                 )
-                .await
-                {
-                    Ok((suggestions, usage, diagnostics)) => {
-                        let provisional = suggestions.clone();
-                        let diagnostics_for_refine = diagnostics.clone();
-                        let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
-                            suggestions,
-                            usage,
-                            model: "fast-grounded".to_string(),
-                            diagnostics,
+                .await;
+
+                match run {
+                    Ok(result) => {
+                        let _ = tx_suggestions.send(BackgroundMessage::SuggestionsRefined {
+                            suggestions: result.suggestions,
+                            usage: result.usage,
+                            diagnostics: result.diagnostics,
                             duration_ms: stage_start.elapsed().as_millis() as u64,
                         });
-
-                        let refine_start = std::time::Instant::now();
-                        if let Ok((refined, refine_usage, refined_diag)) =
-                            suggest::llm::refine_grounded_suggestions(
-                                &repo_root,
-                                &index_clone,
-                                &context_clone,
-                                mem_for_refine,
-                                Some(&summaries_for_suggestions),
-                                provisional,
-                                diagnostics_for_refine,
-                            )
-                            .await
-                        {
-                            let _ = tx_suggestions.send(BackgroundMessage::SuggestionsRefined {
-                                suggestions: refined,
-                                usage: refine_usage,
-                                diagnostics: refined_diag,
-                                duration_ms: refine_start.elapsed().as_millis() as u64,
-                            });
-                        }
                     }
                     Err(e) => {
                         let _ =

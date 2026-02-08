@@ -744,17 +744,15 @@ pub(super) fn render_welcome(frame: &mut Frame) {
         Line::from(vec![
             Span::styled("    2. ", Style::default().fg(Theme::GREEN)),
             Span::styled("Press Enter", Style::default().fg(Theme::WHITE)),
-            Span::styled(
-                " to verify the change",
-                Style::default().fg(Theme::GREY_400),
-            ),
+            Span::styled(" to arm apply", Style::default().fg(Theme::GREY_400)),
         ]),
         Line::from(vec![
             Span::styled("    3. ", Style::default().fg(Theme::GREEN)),
-            Span::styled("Review", Style::default().fg(Theme::WHITE)),
-            Span::styled(" the preview, then ", Style::default().fg(Theme::GREY_400)),
             Span::styled("Enter", Style::default().fg(Theme::WHITE)),
-            Span::styled(" to apply", Style::default().fg(Theme::GREY_400)),
+            Span::styled(
+                " again to apply, then review/fix",
+                Style::default().fg(Theme::GREY_400),
+            ),
         ]),
         Line::from(vec![
             Span::styled("    4. ", Style::default().fg(Theme::GREEN)),

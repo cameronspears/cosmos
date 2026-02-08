@@ -106,7 +106,6 @@ impl Theme {
 
     /// Workflow step labels - italic style
     pub const WORKFLOW_SUGGESTIONS: &'static str = "𝘴𝘶𝘨𝘨𝘦𝘴𝘵𝘪𝘰𝘯𝘴";
-    pub const WORKFLOW_VERIFY: &'static str = "𝘷𝘦𝘳𝘪𝘧𝘺";
     pub const WORKFLOW_REVIEW: &'static str = "𝘳𝘦𝘷𝘪𝘦𝘸";
     pub const WORKFLOW_SHIP: &'static str = "𝘴𝘩𝘪𝘱";
 

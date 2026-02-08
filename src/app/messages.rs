@@ -14,6 +14,13 @@ pub enum BackgroundMessage {
         diagnostics: suggest::llm::SuggestionDiagnostics,
         duration_ms: u64,
     },
+    /// Hidden refinement/gate progress update while attempts are running.
+    SuggestionsRefinementProgress {
+        attempt_index: usize,
+        attempt_count: usize,
+        gate: suggest::llm::SuggestionGateSnapshot,
+        diagnostics: suggest::llm::SuggestionDiagnostics,
+    },
     /// Refined suggestions after validation/regeneration (actionable list).
     SuggestionsRefined {
         suggestions: Vec<suggest::Suggestion>,

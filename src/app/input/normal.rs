@@ -14,21 +14,21 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 // =============================================================================
-// Apply Fix Validation (WorkflowStep::Verify Enter key handling)
+// Apply Fix Validation (Suggestions Enter key handling)
 // =============================================================================
 
 /// Errors that can occur when validating the apply fix action.
 /// Each variant has a user-friendly message.
 #[derive(Debug, Clone)]
 pub enum ApplyError {
-    /// Preview is still loading or hasn't been generated yet
-    PreviewNotReady,
+    /// Apply has not been armed by the first Enter press
+    ApplyNotConfirmed,
     /// Fix is already being applied
     AlreadyApplying,
-    /// Internal state is missing (should never happen in normal use)
-    MissingState(&'static str),
-    /// The suggestion was removed from the list (rare edge case)
+    /// The selected suggestion is no longer available
     SuggestionNotFound,
+    /// Suggestion is not in the refined validated set
+    SuggestionNotValidated,
     /// Failed to check git status
     GitStatusFailed(String),
     /// Working tree has uncommitted changes
@@ -39,21 +39,21 @@ pub enum ApplyError {
     UnsafePath(PathBuf, String),
     /// File read failed
     FileReadFailed(PathBuf, String),
-    /// Verify stage explicitly did not confirm this suggestion
-    SuggestionNotVerified(crate::suggest::VerificationState),
 }
 
 impl ApplyError {
     /// Returns a user-friendly message for display in toasts
     pub fn user_message(&self) -> String {
         match self {
-            Self::PreviewNotReady => {
-                "Apply failed: preview not ready. Please wait for verification.".into()
+            Self::ApplyNotConfirmed => {
+                "Apply pending: press Enter again to confirm applying this suggestion.".into()
             }
             Self::AlreadyApplying => "Apply failed: already in progress...".into(),
-            Self::MissingState(what) => format!("Internal error: missing {}. Try again.", what),
             Self::SuggestionNotFound => {
                 "Apply failed: suggestion no longer exists. Select another.".into()
+            }
+            Self::SuggestionNotValidated => {
+                "Apply failed: suggestion is not in the validated set. Regenerate suggestions and try again.".into()
             }
             Self::GitStatusFailed(e) => format!("Git error: {}. Check repo state.", e),
             Self::DirtyWorkingTree => {
@@ -72,7 +72,7 @@ impl ApplyError {
                     String::new()
                 };
                 format!(
-                    "Apply failed: files changed ({}{}). Re-verify first.",
+                    "Apply failed: files changed ({}{}). Refresh suggestions and try again.",
                     names.join(", "),
                     suffix
                 )
@@ -83,15 +83,6 @@ impl ApplyError {
             Self::FileReadFailed(path, e) => {
                 format!("Apply failed: couldn't read {}: {}", path.display(), e)
             }
-            Self::SuggestionNotVerified(state) => match state {
-                crate::suggest::VerificationState::Contradicted => {
-                    "Apply failed: verify contradicted this suggestion. Pick another suggestion or re-run verification.".into()
-                }
-                crate::suggest::VerificationState::InsufficientEvidence => {
-                    "Apply failed: verify did not find enough evidence. Refine and verify again.".into()
-                }
-                _ => "Apply failed: suggestion is not verified yet.".into(),
-            },
         }
     }
 }
@@ -106,49 +97,16 @@ pub struct ApplyContext {
     pub repo_memory_context: String,
 }
 
-/// Validates all preconditions for applying a fix from the Verify step.
+/// Validates all preconditions for applying a fix from the Suggestions step.
 /// Returns an ApplyContext if all conditions are met, or an ApplyError describing what failed.
 fn validate_apply_fix(app: &App) -> std::result::Result<ApplyContext, ApplyError> {
-    // Guard 1: Check if already loading/applying (align with footer UI)
+    let suggestion_id = app
+        .armed_suggestion_id
+        .ok_or(ApplyError::ApplyNotConfirmed)?;
     if app.loading == LoadingState::GeneratingFix {
         return Err(ApplyError::AlreadyApplying);
     }
 
-    // Guard 2: Check if preview is still loading
-    if app.verify_state.loading {
-        return Err(ApplyError::PreviewNotReady);
-    }
-
-    // Get preview
-    let preview = app
-        .verify_state
-        .preview
-        .clone()
-        .ok_or(ApplyError::PreviewNotReady)?;
-
-    if preview.verification_state != crate::suggest::VerificationState::Verified {
-        return Err(ApplyError::SuggestionNotVerified(
-            preview.verification_state,
-        ));
-    }
-
-    // Get suggestion_id
-    let suggestion_id = app
-        .verify_state
-        .suggestion_id
-        .ok_or(ApplyError::MissingState("suggestion_id"))?;
-
-    // Get file_path
-    let file_path = app
-        .verify_state
-        .file_path
-        .clone()
-        .ok_or(ApplyError::MissingState("file_path"))?;
-
-    // Get additional files
-    let additional_files = app.verify_state.additional_files.clone();
-
-    // Find suggestion in list
     let suggestion = app
         .suggestions
         .suggestions
@@ -157,24 +115,54 @@ fn validate_apply_fix(app: &App) -> std::result::Result<ApplyContext, ApplyError
         .cloned()
         .ok_or(ApplyError::SuggestionNotFound)?;
 
-    // Check git status
+    if suggestion.validation_state != crate::suggest::SuggestionValidationState::Validated {
+        return Err(ApplyError::SuggestionNotValidated);
+    }
+
+    let current_hashes = snapshot_suggestion_file_hashes(app, &suggestion)?;
+    let mut changed_files = Vec::new();
+    for (path, current_hash) in &current_hashes {
+        match app.armed_file_hashes.get(path) {
+            Some(expected) if expected == current_hash => {}
+            _ => changed_files.push(path.clone()),
+        }
+    }
+    for path in app.armed_file_hashes.keys() {
+        if !current_hashes.contains_key(path) {
+            changed_files.push(path.clone());
+        }
+    }
+
+    if !changed_files.is_empty() {
+        return Err(ApplyError::FilesChanged(changed_files));
+    }
+
     let status = git_ops::current_status(&app.repo_path)
         .map_err(|e| ApplyError::GitStatusFailed(e.to_string()))?;
-
     let changed_count = status.staged.len() + status.modified.len() + status.untracked.len();
     if changed_count > 0 {
         return Err(ApplyError::DirtyWorkingTree);
     }
 
-    // Validate file hashes haven't changed since preview
-    let mut all_files = vec![file_path.clone()];
-    all_files.extend(additional_files.clone());
+    let preview = suggest::llm::build_fix_preview_from_validated_suggestion(&suggestion);
+    Ok(ApplyContext {
+        preview,
+        file_path: suggestion.file.clone(),
+        suggestion_id: suggestion.id,
+        suggestion,
+        repo_path: app.repo_path.clone(),
+        repo_memory_context: app.repo_memory.to_prompt_context(12, 900),
+    })
+}
 
-    let mut changed_files = Vec::new();
-    for target in &all_files {
+fn snapshot_suggestion_file_hashes(
+    app: &App,
+    suggestion: &Suggestion,
+) -> std::result::Result<HashMap<PathBuf, String>, ApplyError> {
+    let mut hashes = HashMap::new();
+    for target in suggestion.affected_files() {
         let resolved = resolve_repo_path_allow_new(&app.repo_path, target)
             .map_err(|e| ApplyError::UnsafePath(target.clone(), e.to_string()))?;
-
         let bytes = match std::fs::read(&resolved.absolute) {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -185,27 +173,9 @@ fn validate_apply_fix(app: &App) -> std::result::Result<ApplyContext, ApplyError
                 ))
             }
         };
-
-        let current_hash = hash_bytes(&bytes);
-        match app.verify_state.preview_hashes.get(&resolved.relative) {
-            Some(expected) if expected == &current_hash => {}
-            _ => changed_files.push(resolved.relative.clone()),
-        }
+        hashes.insert(resolved.relative, hash_bytes(&bytes));
     }
-
-    if !changed_files.is_empty() {
-        return Err(ApplyError::FilesChanged(changed_files));
-    }
-
-    // All validations passed
-    Ok(ApplyContext {
-        preview,
-        suggestion,
-        suggestion_id,
-        file_path,
-        repo_path: app.repo_path.clone(),
-        repo_memory_context: app.repo_memory.to_prompt_context(12, 900),
-    })
+    Ok(hashes)
 }
 
 fn resolve_review_file_path(
@@ -359,6 +329,234 @@ fn start_review_fix_for_selected_findings(app: &mut App, ctx: &RuntimeContext) {
     });
 }
 
+fn start_apply_for_context(app: &mut App, ctx: &RuntimeContext, apply_ctx: ApplyContext) {
+    app.loading = LoadingState::GeneratingFix;
+    app.clear_apply_confirm();
+
+    let tx_apply = ctx.tx.clone();
+    let repo_path = apply_ctx.repo_path;
+    let preview = apply_ctx.preview;
+    let suggestion = apply_ctx.suggestion;
+    let sid = apply_ctx.suggestion_id;
+    let fp = apply_ctx.file_path;
+    let repo_memory_context = apply_ctx.repo_memory_context;
+
+    background::spawn_background(ctx.tx.clone(), "apply_fix", async move {
+        let stage_start = std::time::Instant::now();
+        let source_branch = git_ops::current_status(&repo_path)
+            .map(|s| s.branch)
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        // Create branch from current checkout/HEAD
+        let branch_name =
+            git_ops::generate_fix_branch_name(&suggestion.id.to_string(), &suggestion.summary);
+
+        let created_branch = match git_ops::create_fix_branch_from_current(&repo_path, &branch_name)
+        {
+            Ok(name) => name,
+            Err(e) => {
+                let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
+                    "Failed to create fix branch: {}",
+                    e
+                )));
+                return;
+            }
+        };
+
+        let mem = if repo_memory_context.trim().is_empty() {
+            None
+        } else {
+            Some(repo_memory_context)
+        };
+
+        // Check if this is a multi-file suggestion
+        if suggestion.is_multi_file() {
+            // Multi-file fix
+            let all_files = suggestion.affected_files();
+
+            // Read all file contents
+            let mut file_inputs: Vec<suggest::llm::FileInput> = Vec::new();
+            for file_path in &all_files {
+                let resolved = match resolve_repo_path_allow_new(&repo_path, file_path) {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
+                            "Unsafe path {}: {}",
+                            file_path.display(),
+                            e
+                        )));
+                        return;
+                    }
+                };
+                let is_new = !resolved.absolute.exists();
+                let content = match std::fs::read_to_string(&resolved.absolute) {
+                    Ok(content) => content,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => {
+                        let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
+                            "Failed to read {}: {}",
+                            file_path.display(),
+                            e
+                        )));
+                        return;
+                    }
+                };
+                file_inputs.push(suggest::llm::FileInput {
+                    path: resolved.relative,
+                    content,
+                    is_new,
+                });
+            }
+
+            // Generate multi-file fix
+            match suggest::llm::generate_multi_file_fix(&file_inputs, &suggestion, &preview, mem)
+                .await
+            {
+                Ok(multi_fix) => {
+                    // Apply all edits
+                    let mut file_changes: Vec<(PathBuf, String)> = Vec::new();
+                    for file_edit in &multi_fix.file_edits {
+                        let resolved =
+                            match resolve_repo_path_allow_new(&repo_path, &file_edit.path) {
+                                Ok(resolved) => resolved,
+                                Err(e) => {
+                                    let _ = tx_apply.send(BackgroundMessage::DirectFixError(
+                                        format!("Unsafe path {}: {}", file_edit.path.display(), e),
+                                    ));
+                                    return;
+                                }
+                            };
+                        let full_path = resolved.absolute;
+
+                        if let Some(parent) = full_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+
+                        // Write file
+                        if let Err(e) = std::fs::write(&full_path, &file_edit.new_content) {
+                            let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
+                                "Failed to write {}: {}",
+                                file_edit.path.display(),
+                                e
+                            )));
+                            return;
+                        }
+
+                        // Stage file
+                        let rel_path_str = resolved.relative.to_string_lossy().to_string();
+                        let _ = git_ops::stage_file(&repo_path, &rel_path_str);
+
+                        // Track changes
+                        let diff = if file_edit.modified_areas.is_empty() {
+                            "Modified".to_string()
+                        } else {
+                            format!("Modified: {}", file_edit.modified_areas.join(", "))
+                        };
+                        file_changes.push((resolved.relative, diff));
+                    }
+
+                    let _ = tx_apply.send(BackgroundMessage::DirectFixApplied {
+                        suggestion_id: sid,
+                        file_changes,
+                        description: multi_fix.description,
+                        usage: multi_fix.usage,
+                        branch_name: created_branch,
+                        source_branch: source_branch.clone(),
+                        friendly_title: preview.friendly_title.clone(),
+                        problem_summary: preview.problem_summary.clone(),
+                        outcome: preview.outcome.clone(),
+                        duration_ms: stage_start.elapsed().as_millis() as u64,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx_apply.send(BackgroundMessage::DirectFixError(e.to_string()));
+                }
+            }
+        } else {
+            // Single-file fix (existing behavior)
+            let resolved = match resolve_repo_path_allow_new(&repo_path, &fp) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
+                        "Unsafe path {}: {}",
+                        fp.display(),
+                        e
+                    )));
+                    return;
+                }
+            };
+            let full_path = resolved.absolute;
+            let is_new_file = !full_path.exists();
+
+            let current_content = if is_new_file {
+                String::new()
+            } else {
+                match std::fs::read_to_string(&full_path) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
+                            "Failed to read file {}: {}",
+                            fp.display(),
+                            e
+                        )));
+                        return;
+                    }
+                }
+            };
+
+            match suggest::llm::generate_fix_content(
+                &fp,
+                &current_content,
+                &suggestion,
+                &preview,
+                mem,
+                is_new_file,
+            )
+            .await
+            {
+                Ok(applied_fix) => {
+                    if let Some(parent) = full_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match std::fs::write(&full_path, &applied_fix.new_content) {
+                        Ok(_) => {
+                            let rel_path_str = resolved.relative.to_string_lossy().to_string();
+                            let _ = git_ops::stage_file(&repo_path, &rel_path_str);
+
+                            let diff =
+                                format!("Modified: {}", applied_fix.modified_areas.join(", "));
+
+                            let _ = tx_apply.send(BackgroundMessage::DirectFixApplied {
+                                suggestion_id: sid,
+                                file_changes: vec![(resolved.relative, diff)],
+                                description: applied_fix.description,
+                                usage: applied_fix.usage,
+                                branch_name: created_branch,
+                                source_branch: source_branch.clone(),
+                                friendly_title: preview.friendly_title.clone(),
+                                problem_summary: preview.problem_summary.clone(),
+                                outcome: preview.outcome.clone(),
+                                duration_ms: stage_start.elapsed().as_millis() as u64,
+                            });
+                        }
+                        Err(e) => {
+                            // Rollback via git restore
+                            let _ = git_ops::restore_file(&repo_path, &fp);
+                            let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
+                                "Failed to write fix: {}",
+                                e
+                            )));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx_apply.send(BackgroundMessage::DirectFixError(e.to_string()));
+                }
+            }
+        }
+    });
+}
+
 /// Handle key events in normal mode (no special input active)
 pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> Result<()> {
     match key.code {
@@ -375,9 +573,6 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                         if !app.review_state.reviewing && !app.review_state.fixing =>
                     {
                         app.review_cursor_down();
-                    }
-                    WorkflowStep::Verify if !app.verify_state.loading => {
-                        app.verify_scroll_down();
                     }
                     WorkflowStep::Ship => {
                         app.ship_scroll_down();
@@ -400,9 +595,6 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                         if !app.review_state.reviewing && !app.review_state.fixing =>
                     {
                         app.review_cursor_up();
-                    }
-                    WorkflowStep::Verify if !app.verify_state.loading => {
-                        app.verify_scroll_up();
                     }
                     WorkflowStep::Ship => {
                         app.ship_scroll_up();
@@ -435,16 +627,6 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                 start_review_fix_for_selected_findings(app, ctx);
             }
         }
-        KeyCode::Char('d') => {
-            // Toggle technical details in Verify step
-            if app.active_panel == ActivePanel::Suggestions
-                && app.workflow_step == WorkflowStep::Verify
-                && !app.verify_state.loading
-                && app.verify_state.preview.is_some()
-            {
-                app.verify_toggle_details();
-            }
-        }
         KeyCode::Enter => {
             // If PR URL is pending, open it in browser
             if let Some(url) = app.pr_url.take() {
@@ -458,533 +640,37 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                             WorkflowStep::Suggestions => {
                                 if app.suggestion_refinement_in_progress {
                                     app.show_toast(
-                                        "Suggestions are still refining. Wait for refined results before verifying.",
+                                        "Suggestions are still refining. Wait for refined results before applying.",
                                     );
                                     return Ok(());
                                 }
-                                // Start verify step with selected suggestion
                                 let suggestion = app.selected_suggestion().cloned();
                                 if let Some(suggestion) = suggestion {
                                     if !suggest::llm::is_available() {
                                         app.show_toast("Run: cosmos --setup");
                                     } else {
-                                        let suggestion_id = suggestion.id;
-                                        let file_path = suggestion.file.clone();
-                                        let additional_files = suggestion.additional_files.clone();
-
-                                        // Check if we have a valid cached preview for this suggestion
-                                        if app.has_valid_cached_preview(
-                                            suggestion_id,
-                                            &file_path,
-                                            &additional_files,
-                                            &app.repo_path,
-                                        ) {
-                                            // Use cached result - instant transition
-                                            app.use_cached_verify();
-                                        } else {
-                                            // Generate new preview
-                                            let additional_files_for_preview =
-                                                additional_files.clone();
-                                            let summary = suggestion.summary.clone();
-                                            let suggestion_clone = suggestion.clone();
-                                            let tx_preview = ctx.tx.clone();
-                                            let repo_root = app.repo_path.clone();
-                                            let repo_memory_context =
-                                                app.repo_memory.to_prompt_context(12, 900);
-
-                                            // Move to Verify step (with multi-file support)
-                                            app.start_verify_multi(
-                                                suggestion_id,
-                                                file_path.clone(),
-                                                additional_files,
-                                                summary.clone(),
-                                            );
-
-                                            background::spawn_background(
-                                                ctx.tx.clone(),
-                                                "preview_generation",
-                                                async move {
-                                                    let stage_start = std::time::Instant::now();
-                                                    let mem =
-                                                        if repo_memory_context.trim().is_empty() {
-                                                            None
-                                                        } else {
-                                                            Some(repo_memory_context)
-                                                        };
-
-                                                    // Build file hashes for change detection
-                                                    let mut file_hashes = HashMap::new();
-                                                    let mut all_files = Vec::new();
-                                                    all_files.push(file_path.clone());
-                                                    all_files.extend(
-                                                        additional_files_for_preview.clone(),
+                                        if app.armed_suggestion_id != Some(suggestion.id) {
+                                            match snapshot_suggestion_file_hashes(app, &suggestion)
+                                            {
+                                                Ok(hashes) => {
+                                                    app.arm_apply_confirm(suggestion.id, hashes);
+                                                    app.show_toast(
+                                                        "Press Enter again to apply this validated suggestion.",
                                                     );
-
-                                                    for target in &all_files {
-                                                        let resolved =
-                                                            match resolve_repo_path_allow_new(
-                                                                &repo_root, target,
-                                                            ) {
-                                                                Ok(resolved) => resolved,
-                                                                Err(e) => {
-                                                                    let _ = tx_preview.send(
-                                                                BackgroundMessage::PreviewError(
-                                                                    format!(
-                                                                        "Unsafe path {}: {}",
-                                                                        target.display(),
-                                                                        e
-                                                                    ),
-                                                                ),
-                                                            );
-                                                                    return;
-                                                                }
-                                                            };
-
-                                                        let bytes = match std::fs::read(&resolved.absolute) {
-                                                        Ok(content) => content,
-                                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                                            Vec::new()
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = tx_preview.send(
-                                                                BackgroundMessage::PreviewError(
-                                                                    format!(
-                                                                        "Failed to read {}: {}",
-                                                                        resolved.relative.display(),
-                                                                        e
-                                                                    ),
-                                                                ),
-                                                            );
-                                                            return;
-                                                        }
-                                                    };
-
-                                                        file_hashes.insert(
-                                                            resolved.relative.clone(),
-                                                            hash_bytes(&bytes),
-                                                        );
-                                                    }
-                                                    // Use agentic verification - model explores with shell
-                                                    match suggest::llm::generate_fix_preview_agentic(
-                                                    &repo_root,
-                                                    &suggestion_clone,
-                                                    None,
-                                                    mem,
-                                                )
-                                                .await
-                                                {
-                                                    Ok((preview, usage)) => {
-                                                        let _ = tx_preview.send(
-                                                            BackgroundMessage::PreviewReady {
-                                                                preview,
-                                                                usage,
-                                                                file_hashes,
-                                                                duration_ms: stage_start
-                                                                    .elapsed()
-                                                                    .as_millis()
-                                                                    as u64,
-                                                            },
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = tx_preview.send(
-                                                            BackgroundMessage::PreviewError(
-                                                                e.to_string(),
-                                                            ),
-                                                        );
-                                                    }
                                                 }
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            WorkflowStep::Verify => {
-                                // Apply the fix and move to Review
-                                // Use validate_apply_fix to check all preconditions
-                                match validate_apply_fix(app) {
-                                    Ok(apply_ctx) => {
-                                        // All validations passed - start applying
-                                        app.loading = LoadingState::GeneratingFix;
-
-                                        let tx_apply = ctx.tx.clone();
-                                        let repo_path = apply_ctx.repo_path;
-                                        let preview = apply_ctx.preview;
-                                        let suggestion = apply_ctx.suggestion;
-                                        let sid = apply_ctx.suggestion_id;
-                                        let fp = apply_ctx.file_path;
-                                        let repo_memory_context = apply_ctx.repo_memory_context;
-
-                                        background::spawn_background(
-                                            ctx.tx.clone(),
-                                            "apply_fix",
-                                            async move {
-                                                let stage_start = std::time::Instant::now();
-                                                let source_branch =
-                                                    git_ops::current_status(&repo_path)
-                                                        .map(|s| s.branch)
-                                                        .unwrap_or_else(|_| "unknown".to_string());
-
-                                                // Create branch from current checkout/HEAD
-                                                let branch_name = git_ops::generate_fix_branch_name(
-                                                    &suggestion.id.to_string(),
-                                                    &suggestion.summary,
-                                                );
-
-                                                let created_branch =
-                                                    match git_ops::create_fix_branch_from_current(
-                                                        &repo_path,
-                                                        &branch_name,
-                                                    ) {
-                                                        Ok(name) => name,
-                                                        Err(e) => {
-                                                            let _ = tx_apply.send(
-                                                                    BackgroundMessage::DirectFixError(
-                                                                        format!(
-                                                                            "Failed to create fix branch: {}",
-                                                                            e
-                                                                        ),
-                                                                    ),
-                                                                );
-                                                            return;
-                                                        }
-                                                    };
-
-                                                let mem = if repo_memory_context.trim().is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(repo_memory_context)
-                                                };
-
-                                                // Check if this is a multi-file suggestion
-                                                if suggestion.is_multi_file() {
-                                                    // Multi-file fix
-                                                    let all_files = suggestion.affected_files();
-
-                                                    // Read all file contents
-                                                    let mut file_inputs: Vec<
-                                                        suggest::llm::FileInput,
-                                                    > = Vec::new();
-                                                    for file_path in &all_files {
-                                                        let resolved =
-                                                            match resolve_repo_path_allow_new(
-                                                                &repo_path, file_path,
-                                                            ) {
-                                                                Ok(resolved) => resolved,
-                                                                Err(e) => {
-                                                                    let _ = tx_apply.send(
-                                                                            BackgroundMessage::DirectFixError(
-                                                                                format!(
-                                                                                    "Unsafe path {}: {}",
-                                                                                    file_path.display(),
-                                                                                    e
-                                                                                ),
-                                                                            ),
-                                                                        );
-                                                                    return;
-                                                                }
-                                                            };
-                                                        let is_new = !resolved.absolute.exists();
-                                                        let content = match std::fs::read_to_string(
-                                                                &resolved.absolute,
-                                                            ) {
-                                                                Ok(content) => content,
-                                                                Err(e)
-                                                                    if e.kind()
-                                                                        == std::io::ErrorKind::NotFound =>
-                                                                {
-                                                                    String::new()
-                                                                }
-                                                                Err(e) => {
-                                                                    let _ = tx_apply.send(
-                                                                        BackgroundMessage::DirectFixError(
-                                                                            format!(
-                                                                                "Failed to read {}: {}",
-                                                                                file_path.display(),
-                                                                                e
-                                                                            ),
-                                                                        ),
-                                                                    );
-                                                                    return;
-                                                                }
-                                                            };
-                                                        file_inputs.push(suggest::llm::FileInput {
-                                                            path: resolved.relative,
-                                                            content,
-                                                            is_new,
-                                                        });
-                                                    }
-
-                                                    // Generate multi-file fix
-                                                    match suggest::llm::generate_multi_file_fix(
-                                                        &file_inputs,
-                                                        &suggestion,
-                                                        &preview,
-                                                        mem,
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(multi_fix) => {
-                                                            // Apply all edits
-                                                            let mut file_changes: Vec<(
-                                                                PathBuf,
-                                                                String,
-                                                            )> = Vec::new();
-                                                            for file_edit in &multi_fix.file_edits {
-                                                                let resolved = match resolve_repo_path_allow_new(
-                                                                        &repo_path,
-                                                                        &file_edit.path,
-                                                                    ) {
-                                                                        Ok(resolved) => resolved,
-                                                                        Err(e) => {
-                                                                            let _ = tx_apply.send(
-                                                                                BackgroundMessage::DirectFixError(
-                                                                                    format!(
-                                                                                        "Unsafe path {}: {}",
-                                                                                        file_edit
-                                                                                            .path
-                                                                                            .display(),
-                                                                                        e
-                                                                                    ),
-                                                                                ),
-                                                                            );
-                                                                            return;
-                                                                        }
-                                                                    };
-                                                                let full_path = resolved.absolute;
-
-                                                                if let Some(parent) =
-                                                                    full_path.parent()
-                                                                {
-                                                                    let _ = std::fs::create_dir_all(
-                                                                        parent,
-                                                                    );
-                                                                }
-                                                                match std::fs::write(
-                                                                    &full_path,
-                                                                    &file_edit.new_content,
-                                                                ) {
-                                                                    Ok(_) => {
-                                                                        // Stage the file
-                                                                        let rel_path = resolved
-                                                                            .relative
-                                                                            .to_string_lossy()
-                                                                            .to_string();
-                                                                        let _ = git_ops::stage_file(
-                                                                            &repo_path, &rel_path,
-                                                                        );
-
-                                                                        let diff = format!(
-                                                                            "Modified: {}",
-                                                                            file_edit
-                                                                                .modified_areas
-                                                                                .join(", ")
-                                                                        );
-                                                                        file_changes.push((
-                                                                            resolved.relative,
-                                                                            diff,
-                                                                        ));
-                                                                    }
-                                                                    Err(e) => {
-                                                                        // Rollback via git restore
-                                                                        for (path, _) in
-                                                                            &file_changes
-                                                                        {
-                                                                            let _ = git_ops::restore_file(&repo_path, path);
-                                                                        }
-                                                                        let _ = tx_apply.send(
-                                                                                BackgroundMessage::DirectFixError(
-                                                                                    format!(
-                                                                                        "Failed to write {}: {}",
-                                                                                        file_edit.path.display(),
-                                                                                        e
-                                                                                    ),
-                                                                                ),
-                                                                            );
-                                                                        return;
-                                                                    }
-                                                                }
-                                                            }
-
-                                                            let _ = tx_apply.send(
-                                                                    BackgroundMessage::DirectFixApplied {
-                                                                        suggestion_id: sid,
-                                                                        file_changes,
-                                                                        description: multi_fix
-                                                                            .description,
-                                                                        usage: multi_fix.usage,
-                                                                        branch_name: created_branch,
-                                                                        source_branch: source_branch
-                                                                            .clone(),
-                                                                        friendly_title: preview
-                                                                            .friendly_title
-                                                                            .clone(),
-                                                                        problem_summary: preview
-                                                                            .problem_summary
-                                                                            .clone(),
-                                                                        outcome: preview.outcome.clone(),
-                                                                        duration_ms: stage_start
-                                                                            .elapsed()
-                                                                            .as_millis()
-                                                                            as u64,
-                                                                    },
-                                                                );
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = tx_apply.send(
-                                                                BackgroundMessage::DirectFixError(
-                                                                    e.to_string(),
-                                                                ),
-                                                            );
-                                                        }
-                                                    }
-                                                } else {
-                                                    // Single-file fix (original logic)
-                                                    let resolved = match resolve_repo_path_allow_new(
-                                                        &repo_path, &fp,
-                                                    ) {
-                                                        Ok(resolved) => resolved,
-                                                        Err(e) => {
-                                                            let _ = tx_apply.send(
-                                                                BackgroundMessage::DirectFixError(
-                                                                    format!(
-                                                                        "Unsafe path {}: {}",
-                                                                        fp.display(),
-                                                                        e
-                                                                    ),
-                                                                ),
-                                                            );
-                                                            return;
-                                                        }
-                                                    };
-                                                    let full_path = resolved.absolute;
-                                                    let rel_path = resolved.relative;
-                                                    let is_new_file = !full_path.exists();
-                                                    let content = match std::fs::read_to_string(
-                                                        &full_path,
-                                                    ) {
-                                                        Ok(c) => c,
-                                                        Err(e)
-                                                            if e.kind()
-                                                                == std::io::ErrorKind::NotFound =>
-                                                        {
-                                                            String::new()
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = tx_apply.send(
-                                                                BackgroundMessage::DirectFixError(
-                                                                    format!(
-                                                                        "Failed to read file: {}",
-                                                                        e
-                                                                    ),
-                                                                ),
-                                                            );
-                                                            return;
-                                                        }
-                                                    };
-
-                                                    match suggest::llm::generate_fix_content(
-                                                        &rel_path,
-                                                        &content,
-                                                        &suggestion,
-                                                        &preview,
-                                                        mem,
-                                                        is_new_file,
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(applied_fix) => {
-                                                            if let Some(parent) = full_path.parent()
-                                                            {
-                                                                let _ =
-                                                                    std::fs::create_dir_all(parent);
-                                                            }
-                                                            match std::fs::write(
-                                                                &full_path,
-                                                                &applied_fix.new_content,
-                                                            ) {
-                                                                Ok(_) => {
-                                                                    let rel_path_str = rel_path
-                                                                        .to_string_lossy()
-                                                                        .to_string();
-                                                                    let _ = git_ops::stage_file(
-                                                                        &repo_path,
-                                                                        &rel_path_str,
-                                                                    );
-
-                                                                    let diff = format!(
-                                                                        "Modified: {}",
-                                                                        applied_fix
-                                                                            .modified_areas
-                                                                            .join(", ")
-                                                                    );
-
-                                                                    let _ = tx_apply.send(
-                                                                            BackgroundMessage::DirectFixApplied {
-                                                                                suggestion_id: sid,
-                                                                                file_changes: vec![(
-                                                                                    rel_path, diff,
-                                                                                )],
-                                                                                description: applied_fix.description,
-                                                                                usage: applied_fix.usage,
-                                                                                branch_name: created_branch,
-                                                                                source_branch: source_branch
-                                                                                    .clone(),
-                                                                                friendly_title: preview
-                                                                                    .friendly_title
-                                                                                    .clone(),
-                                                                                problem_summary: preview
-                                                                                    .problem_summary
-                                                                                    .clone(),
-                                                                                outcome: preview.outcome.clone(),
-                                                                                duration_ms: stage_start
-                                                                                    .elapsed()
-                                                                                    .as_millis()
-                                                                                    as u64,
-                                                                            },
-                                                                        );
-                                                                }
-                                                                Err(e) => {
-                                                                    // Rollback via git restore
-                                                                    let _ = git_ops::restore_file(
-                                                                        &repo_path, &rel_path,
-                                                                    );
-                                                                    let _ = tx_apply.send(
-                                                                            BackgroundMessage::DirectFixError(
-                                                                                format!(
-                                                                                    "Failed to write fix: {}",
-                                                                                    e
-                                                                                ),
-                                                                            ),
-                                                                        );
-                                                                }
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = tx_apply.send(
-                                                                BackgroundMessage::DirectFixError(
-                                                                    e.to_string(),
-                                                                ),
-                                                            );
-                                                        }
-                                                    }
+                                                Err(e) => app.show_toast(&e.user_message()),
+                                            }
+                                        } else {
+                                            match validate_apply_fix(app) {
+                                                Ok(apply_ctx) => {
+                                                    start_apply_for_context(app, ctx, apply_ctx);
                                                 }
-                                            },
-                                        );
-                                    }
-                                    Err(e) => {
-                                        if matches!(
-                                            e,
-                                            ApplyError::SuggestionNotVerified(
-                                                crate::suggest::VerificationState::Contradicted
-                                            )
-                                        ) {
-                                            app.workflow_step = WorkflowStep::Suggestions;
-                                            app.verify_state = crate::ui::VerifyState::default();
+                                                Err(e) => {
+                                                    app.clear_apply_confirm();
+                                                    app.show_toast(&e.user_message());
+                                                }
+                                            }
                                         }
-                                        // Show user-friendly error message
-                                        app.show_toast(&e.user_message());
                                     }
                                 }
                             }
@@ -1112,6 +798,12 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
             if app.is_ask_cosmos_mode() {
                 app.exit_ask_cosmos();
             } else if app.active_panel == ActivePanel::Suggestions
+                && app.workflow_step == WorkflowStep::Suggestions
+                && app.armed_suggestion_id.is_some()
+            {
+                app.clear_apply_confirm();
+                app.show_toast("Apply canceled.");
+            } else if app.active_panel == ActivePanel::Suggestions
                 && app.workflow_step != WorkflowStep::Suggestions
             {
                 // Handle workflow back navigation
@@ -1195,11 +887,10 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_apply_error_preview_not_ready() {
-        let err = ApplyError::PreviewNotReady;
+    fn test_apply_error_apply_not_confirmed() {
+        let err = ApplyError::ApplyNotConfirmed;
         let msg = err.user_message();
-        assert!(msg.contains("preview not ready"));
-        assert!(msg.contains("failed")); // Must contain for toast visibility
+        assert!(msg.contains("press Enter again"));
     }
 
     #[test]
@@ -1211,11 +902,11 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_error_missing_state() {
-        let err = ApplyError::MissingState("suggestion_id");
+    fn test_apply_error_suggestion_not_validated() {
+        let err = ApplyError::SuggestionNotValidated;
         let msg = err.user_message();
-        assert!(msg.contains("Internal error"));
-        assert!(msg.contains("suggestion_id"));
+        assert!(msg.contains("validated"));
+        assert!(msg.contains("failed"));
     }
 
     #[test]
@@ -1249,7 +940,7 @@ mod tests {
         let msg = err.user_message();
         assert!(msg.contains("files changed"));
         assert!(msg.contains("src/main.rs"));
-        assert!(msg.contains("Re-verify"));
+        assert!(msg.contains("Refresh suggestions"));
         assert!(msg.contains("failed")); // Must contain for toast visibility
     }
 
@@ -1294,9 +985,9 @@ mod tests {
     #[test]
     fn test_apply_error_is_debug() {
         // Ensure Debug trait is implemented for logging
-        let err = ApplyError::PreviewNotReady;
+        let err = ApplyError::ApplyNotConfirmed;
         let debug_str = format!("{:?}", err);
-        assert!(debug_str.contains("PreviewNotReady"));
+        assert!(debug_str.contains("ApplyNotConfirmed"));
     }
 
     #[test]
@@ -1355,6 +1046,299 @@ mod tests {
             .unwrap_or_default();
         assert!(toast.contains("still refining"));
         assert_eq!(app.workflow_step, WorkflowStep::Suggestions);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enter_arms_apply_confirmation_on_first_press() {
+        std::env::set_var("OPENROUTER_API_KEY", "test-key");
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_apply_arm_test_{}", nanos));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn demo() {}\n").unwrap();
+
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files: HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: Some("deadbeef".to_string()),
+        };
+        let mut suggestions = SuggestionEngine::new(index.clone());
+        let suggestion = crate::suggest::Suggestion::new(
+            crate::suggest::SuggestionKind::Improvement,
+            crate::suggest::Priority::High,
+            PathBuf::from("src/lib.rs"),
+            "Improve demo".to_string(),
+            crate::suggest::SuggestionSource::LlmDeep,
+        )
+        .with_validation_state(crate::suggest::SuggestionValidationState::Validated)
+        .with_line(1);
+        let suggestion_id = suggestion.id;
+        suggestions.suggestions.push(suggestion);
+
+        let context = WorkContext {
+            branch: "main".to_string(),
+            uncommitted_files: Vec::new(),
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 0,
+            repo_root: root.clone(),
+        };
+        let mut app = App::new(index.clone(), suggestions, context);
+        app.active_panel = ActivePanel::Suggestions;
+        app.workflow_step = WorkflowStep::Suggestions;
+
+        let (tx, _rx) = mpsc::channel();
+        let ctx = crate::app::RuntimeContext {
+            index: &index,
+            repo_path: &root,
+            tx: &tx,
+        };
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_normal_mode(&mut app, key, &ctx).unwrap();
+
+        assert_eq!(app.armed_suggestion_id, Some(suggestion_id));
+        assert!(!app.armed_file_hashes.is_empty());
+        let toast = app
+            .toast
+            .as_ref()
+            .map(|t| t.message.clone())
+            .unwrap_or_default();
+        assert!(toast.contains("Press Enter again"));
+
+        std::env::remove_var("OPENROUTER_API_KEY");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn apply_arm_resets_on_selection_change() {
+        std::env::set_var("OPENROUTER_API_KEY", "test-key");
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_apply_arm_reset_test_{}", nanos));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "fn b() {}\n").unwrap();
+
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files: HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: Some("deadbeef".to_string()),
+        };
+        let mut suggestions = SuggestionEngine::new(index.clone());
+        suggestions.suggestions.push(
+            crate::suggest::Suggestion::new(
+                crate::suggest::SuggestionKind::Improvement,
+                crate::suggest::Priority::High,
+                PathBuf::from("src/a.rs"),
+                "Improve A".to_string(),
+                crate::suggest::SuggestionSource::LlmDeep,
+            )
+            .with_validation_state(crate::suggest::SuggestionValidationState::Validated)
+            .with_line(1),
+        );
+        suggestions.suggestions.push(
+            crate::suggest::Suggestion::new(
+                crate::suggest::SuggestionKind::Improvement,
+                crate::suggest::Priority::High,
+                PathBuf::from("src/b.rs"),
+                "Improve B".to_string(),
+                crate::suggest::SuggestionSource::LlmDeep,
+            )
+            .with_validation_state(crate::suggest::SuggestionValidationState::Validated)
+            .with_line(1),
+        );
+
+        let context = WorkContext {
+            branch: "main".to_string(),
+            uncommitted_files: Vec::new(),
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 0,
+            repo_root: root.clone(),
+        };
+        let mut app = App::new(index.clone(), suggestions, context);
+        app.active_panel = ActivePanel::Suggestions;
+        app.workflow_step = WorkflowStep::Suggestions;
+
+        let (tx, _rx) = mpsc::channel();
+        let ctx = crate::app::RuntimeContext {
+            index: &index,
+            repo_path: &root,
+            tx: &tx,
+        };
+
+        handle_normal_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &ctx,
+        )
+        .unwrap();
+        assert!(app.armed_suggestion_id.is_some());
+
+        app.navigate_down();
+        assert!(app.armed_suggestion_id.is_none());
+        assert!(app.armed_file_hashes.is_empty());
+
+        std::env::remove_var("OPENROUTER_API_KEY");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn esc_clears_apply_confirmation() {
+        std::env::set_var("OPENROUTER_API_KEY", "test-key");
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_apply_arm_esc_test_{}", nanos));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn demo() {}\n").unwrap();
+
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files: HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: Some("deadbeef".to_string()),
+        };
+        let mut suggestions = SuggestionEngine::new(index.clone());
+        suggestions.suggestions.push(
+            crate::suggest::Suggestion::new(
+                crate::suggest::SuggestionKind::Improvement,
+                crate::suggest::Priority::High,
+                PathBuf::from("src/lib.rs"),
+                "Improve demo".to_string(),
+                crate::suggest::SuggestionSource::LlmDeep,
+            )
+            .with_validation_state(crate::suggest::SuggestionValidationState::Validated)
+            .with_line(1),
+        );
+        let context = WorkContext {
+            branch: "main".to_string(),
+            uncommitted_files: Vec::new(),
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 0,
+            repo_root: root.clone(),
+        };
+        let mut app = App::new(index.clone(), suggestions, context);
+        app.active_panel = ActivePanel::Suggestions;
+        app.workflow_step = WorkflowStep::Suggestions;
+
+        let (tx, _rx) = mpsc::channel();
+        let ctx = crate::app::RuntimeContext {
+            index: &index,
+            repo_path: &root,
+            tx: &tx,
+        };
+
+        handle_normal_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &ctx,
+        )
+        .unwrap();
+        assert!(app.armed_suggestion_id.is_some());
+
+        handle_normal_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &ctx,
+        )
+        .unwrap();
+        assert!(app.armed_suggestion_id.is_none());
+        assert!(app.armed_file_hashes.is_empty());
+
+        std::env::remove_var("OPENROUTER_API_KEY");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn second_enter_reports_files_changed_since_arming() {
+        std::env::set_var("OPENROUTER_API_KEY", "test-key");
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_apply_arm_changed_test_{}", nanos));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn demo() {}\n").unwrap();
+
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files: HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: Some("deadbeef".to_string()),
+        };
+        let mut suggestions = SuggestionEngine::new(index.clone());
+        suggestions.suggestions.push(
+            crate::suggest::Suggestion::new(
+                crate::suggest::SuggestionKind::Improvement,
+                crate::suggest::Priority::High,
+                PathBuf::from("src/lib.rs"),
+                "Improve demo".to_string(),
+                crate::suggest::SuggestionSource::LlmDeep,
+            )
+            .with_validation_state(crate::suggest::SuggestionValidationState::Validated)
+            .with_line(1),
+        );
+        let context = WorkContext {
+            branch: "main".to_string(),
+            uncommitted_files: Vec::new(),
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 0,
+            repo_root: root.clone(),
+        };
+        let mut app = App::new(index.clone(), suggestions, context);
+        app.active_panel = ActivePanel::Suggestions;
+        app.workflow_step = WorkflowStep::Suggestions;
+
+        let (tx, _rx) = mpsc::channel();
+        let ctx = crate::app::RuntimeContext {
+            index: &index,
+            repo_path: &root,
+            tx: &tx,
+        };
+
+        handle_normal_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &ctx,
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn demo() { println!(\"x\"); }\n").unwrap();
+        handle_normal_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &ctx,
+        )
+        .unwrap();
+
+        let toast = app
+            .toast
+            .as_ref()
+            .map(|t| t.message.clone())
+            .unwrap_or_default();
+        assert!(toast.contains("files changed"));
+        assert!(app.armed_suggestion_id.is_none());
+
+        std::env::remove_var("OPENROUTER_API_KEY");
         let _ = std::fs::remove_dir_all(root);
     }
 }

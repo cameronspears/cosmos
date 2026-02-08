@@ -24,7 +24,7 @@ use crate::context::WorkContext;
 use crate::index::{CodebaseIndex, FlatTreeEntry};
 use crate::suggest::{Suggestion, SuggestionEngine};
 use helpers::lowercase_first;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tree::{build_file_tree, build_grouped_tree};
@@ -161,6 +161,10 @@ pub struct App {
     pub current_suggestion_run_id: Option<String>,
     /// Rolling precision from recent verify outcomes.
     pub rolling_verify_precision: Option<f64>,
+    /// Armed suggestion id for two-step apply confirmation.
+    pub armed_suggestion_id: Option<uuid::Uuid>,
+    /// File hash snapshot captured when apply confirmation was armed.
+    pub armed_file_hashes: HashMap<PathBuf, String>,
 
     // Flag: generate suggestions once summaries complete (used at init and after reset)
     pub pending_suggestions_on_init: bool,
@@ -254,6 +258,8 @@ impl App {
             suggestion_rejected_count: 0,
             current_suggestion_run_id: None,
             rolling_verify_precision: None,
+            armed_suggestion_id: None,
+            armed_file_hashes: HashMap::new(),
             update_available: None,
             update_progress: None,
             budget_warned_soft: false,
@@ -696,12 +702,18 @@ impl App {
                 self.ensure_project_visible();
             }
             ActivePanel::Suggestions => {
+                let previous = self.suggestion_selected;
                 let max = self
                     .suggestions
                     .active_suggestions()
                     .len()
                     .saturating_sub(1);
                 self.suggestion_selected = (self.suggestion_selected + 1).min(max);
+                if self.workflow_step == WorkflowStep::Suggestions
+                    && self.suggestion_selected != previous
+                {
+                    self.clear_apply_confirm();
+                }
                 self.ensure_suggestion_visible();
             }
         }
@@ -715,7 +727,13 @@ impl App {
                 self.ensure_project_visible();
             }
             ActivePanel::Suggestions => {
+                let previous = self.suggestion_selected;
                 self.suggestion_selected = self.suggestion_selected.saturating_sub(1);
+                if self.workflow_step == WorkflowStep::Suggestions
+                    && self.suggestion_selected != previous
+                {
+                    self.clear_apply_confirm();
+                }
                 self.ensure_suggestion_visible();
             }
         }
@@ -766,6 +784,22 @@ impl App {
     pub fn selected_suggestion(&self) -> Option<&Suggestion> {
         let suggestions = self.suggestions.active_suggestions();
         suggestions.get(self.suggestion_selected).copied()
+    }
+
+    /// Arm two-step apply confirmation for the currently selected suggestion.
+    pub fn arm_apply_confirm(
+        &mut self,
+        suggestion_id: uuid::Uuid,
+        file_hashes: HashMap<PathBuf, String>,
+    ) {
+        self.armed_suggestion_id = Some(suggestion_id);
+        self.armed_file_hashes = file_hashes;
+    }
+
+    /// Clear two-step apply confirmation state.
+    pub fn clear_apply_confirm(&mut self) {
+        self.armed_suggestion_id = None;
+        self.armed_file_hashes.clear();
     }
 
     /// Toggle help overlay
@@ -1155,8 +1189,7 @@ impl App {
     pub fn workflow_back(&mut self) {
         self.workflow_step = match self.workflow_step {
             WorkflowStep::Suggestions => WorkflowStep::Suggestions,
-            WorkflowStep::Verify => WorkflowStep::Suggestions,
-            WorkflowStep::Review => WorkflowStep::Verify,
+            WorkflowStep::Review => WorkflowStep::Suggestions,
             WorkflowStep::Ship => WorkflowStep::Review,
         };
     }
@@ -1181,8 +1214,8 @@ impl App {
             show_technical_details: false,
             preview_hashes: std::collections::HashMap::new(),
         };
-        self.workflow_step = WorkflowStep::Verify;
-        self.loading = LoadingState::GeneratingPreview;
+        self.workflow_step = WorkflowStep::Suggestions;
+        self.loading = LoadingState::None;
     }
 
     /// Set the preview result in the Verify step
@@ -1211,7 +1244,7 @@ impl App {
     pub fn use_cached_verify(&mut self) {
         self.verify_state.loading = false;
         self.verify_state.scroll = 0;
-        self.workflow_step = WorkflowStep::Verify;
+        self.workflow_step = WorkflowStep::Suggestions;
         self.loading = LoadingState::None;
     }
 

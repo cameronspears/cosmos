@@ -287,8 +287,13 @@ impl SuggestionEngine {
         self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
     }
 
-    /// Sort suggestions by priority first, then git context (changed files, blast radius).
-    pub fn sort_with_context(&mut self, context: &crate::context::WorkContext) {
+    /// Sort suggestions by priority first, then confidence and contradiction history,
+    /// then git context (changed files, blast radius).
+    pub fn sort_with_context(
+        &mut self,
+        context: &crate::context::WorkContext,
+        contradicted_evidence_counts: Option<&std::collections::HashMap<usize, usize>>,
+    ) {
         let changed: std::collections::HashSet<PathBuf> =
             context.all_changed_files().into_iter().cloned().collect();
 
@@ -326,6 +331,25 @@ impl SuggestionEngine {
             let pri = b.priority.cmp(&a.priority);
             if pri != std::cmp::Ordering::Equal {
                 return pri;
+            }
+
+            // Higher confidence suggestions should surface first.
+            let conf = b.confidence.cmp(&a.confidence);
+            if conf != std::cmp::Ordering::Equal {
+                return conf;
+            }
+
+            // Suggestions tied to recently contradicted evidence are demoted.
+            let evidence_penalty = |s: &Suggestion| -> usize {
+                let evidence_id = s.evidence_refs.first().map(|r| r.snippet_id);
+                evidence_id
+                    .and_then(|id| contradicted_evidence_counts.and_then(|m| m.get(&id).copied()))
+                    .unwrap_or(0)
+            };
+            let a_penalty = evidence_penalty(a);
+            let b_penalty = evidence_penalty(b);
+            if a_penalty != b_penalty {
+                return a_penalty.cmp(&b_penalty);
             }
 
             // Then kind weight
@@ -445,8 +469,98 @@ mod tests {
             repo_root: PathBuf::from("."),
         };
 
-        engine.sort_with_context(&context);
+        engine.sort_with_context(&context, None);
         assert_eq!(engine.suggestions[0].kind, SuggestionKind::BugFix);
+    }
+
+    #[test]
+    fn test_sort_with_context_prefers_higher_confidence_after_priority() {
+        let index = CodebaseIndex {
+            root: PathBuf::from("."),
+            files: std::collections::HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: None,
+        };
+        let mut engine = SuggestionEngine::new(index);
+        let high = Suggestion::new(
+            SuggestionKind::Improvement,
+            Priority::High,
+            PathBuf::from("src/high.rs"),
+            "High confidence".to_string(),
+            SuggestionSource::LlmDeep,
+        )
+        .with_confidence(Confidence::High);
+        let medium = Suggestion::new(
+            SuggestionKind::Improvement,
+            Priority::High,
+            PathBuf::from("src/medium.rs"),
+            "Medium confidence".to_string(),
+            SuggestionSource::LlmDeep,
+        )
+        .with_confidence(Confidence::Medium);
+        engine.suggestions = vec![medium, high];
+        let context = crate::context::WorkContext {
+            branch: "main".to_string(),
+            uncommitted_files: Vec::new(),
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 0,
+            repo_root: PathBuf::from("."),
+        };
+        engine.sort_with_context(&context, None);
+        assert_eq!(engine.suggestions[0].summary, "High confidence");
+    }
+
+    #[test]
+    fn test_sort_with_context_demotes_contradicted_evidence() {
+        let index = CodebaseIndex {
+            root: PathBuf::from("."),
+            files: std::collections::HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: None,
+        };
+        let mut engine = SuggestionEngine::new(index);
+        let contradicted = Suggestion::new(
+            SuggestionKind::Improvement,
+            Priority::High,
+            PathBuf::from("src/contradicted.rs"),
+            "Contradicted evidence".to_string(),
+            SuggestionSource::LlmDeep,
+        )
+        .with_confidence(Confidence::High)
+        .with_evidence_refs(vec![SuggestionEvidenceRef {
+            snippet_id: 7,
+            file: PathBuf::from("src/contradicted.rs"),
+            line: 10,
+        }]);
+        let clean = Suggestion::new(
+            SuggestionKind::Improvement,
+            Priority::High,
+            PathBuf::from("src/clean.rs"),
+            "Clean evidence".to_string(),
+            SuggestionSource::LlmDeep,
+        )
+        .with_confidence(Confidence::High)
+        .with_evidence_refs(vec![SuggestionEvidenceRef {
+            snippet_id: 9,
+            file: PathBuf::from("src/clean.rs"),
+            line: 12,
+        }]);
+        engine.suggestions = vec![contradicted, clean];
+        let contradicted_counts =
+            std::collections::HashMap::from([(7usize, 3usize), (9usize, 0usize)]);
+        let context = crate::context::WorkContext {
+            branch: "main".to_string(),
+            uncommitted_files: Vec::new(),
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 0,
+            repo_root: PathBuf::from("."),
+        };
+        engine.sort_with_context(&context, Some(&contradicted_counts));
+        assert_eq!(engine.suggestions[0].summary, "Clean evidence");
     }
 
     #[test]

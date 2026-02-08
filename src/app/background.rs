@@ -67,6 +67,7 @@ pub fn drain_messages(
                 app.suggestion_provisional_count = count;
                 app.suggestion_validated_count = 0;
                 app.suggestion_rejected_count = 0;
+                app.clear_apply_confirm();
                 app.current_suggestion_run_id = Some(run_id);
                 record_pipeline_metric(
                     app,
@@ -77,6 +78,25 @@ pub fn drain_messages(
                     "suggestions",
                     true,
                 );
+            }
+            BackgroundMessage::SuggestionsRefinementProgress {
+                attempt_index,
+                attempt_count,
+                gate,
+                diagnostics,
+            } => {
+                app.loading = LoadingState::GeneratingSuggestions;
+                app.last_suggestion_diagnostics = Some(diagnostics);
+                app.last_suggestion_error = None;
+                app.suggestion_refinement_in_progress = true;
+                app.suggestion_provisional_count = 0;
+                app.suggestion_validated_count =
+                    gate.final_count.saturating_sub(gate.pending_count);
+                app.suggestion_rejected_count = 0;
+                app.show_toast(&format!(
+                    "Refining suggestions (attempt {}/{})",
+                    attempt_index, attempt_count
+                ));
             }
             BackgroundMessage::SuggestionsRefined {
                 suggestions,
@@ -92,8 +112,12 @@ pub fn drain_messages(
                     })
                     .count();
                 let count = suggestions.len();
+                let contradiction_counts = cache::Cache::new(&app.repo_path)
+                    .recent_contradicted_evidence_counts(300)
+                    .unwrap_or_default();
                 app.suggestions.replace_llm_suggestions(suggestions);
-                app.suggestions.sort_with_context(&app.context);
+                app.suggestions
+                    .sort_with_context(&app.context, Some(&contradiction_counts));
 
                 let (tokens, cost) = track_usage(app, usage.as_ref(), ctx);
                 record_pipeline_metric(
@@ -106,17 +130,36 @@ pub fn drain_messages(
                     true,
                 );
 
+                if app.needs_summary_generation && app.summary_progress.is_some() {
+                    app.loading = LoadingState::GeneratingSummaries;
+                } else {
+                    app.loading = LoadingState::None;
+                }
                 app.last_suggestion_diagnostics = Some(diagnostics.clone());
                 app.last_suggestion_error = None;
                 app.suggestion_refinement_in_progress = false;
                 app.suggestion_provisional_count = diagnostics.provisional_count;
                 app.suggestion_validated_count = validated_count;
                 app.suggestion_rejected_count = diagnostics.rejected_count;
+                app.clear_apply_confirm();
                 app.current_suggestion_run_id = Some(run_id);
-                app.show_toast(&format!(
-                    "{} suggestions refined · {} validated",
-                    count, validated_count
-                ));
+                if diagnostics.gate_passed {
+                    app.show_toast(&format!(
+                        "{} suggestions refined · {} validated",
+                        count, validated_count
+                    ));
+                } else {
+                    let reasons = if diagnostics.gate_fail_reasons.is_empty() {
+                        "quality gate miss".to_string()
+                    } else {
+                        diagnostics.gate_fail_reasons.join("; ")
+                    };
+                    app.show_toast(&format!(
+                        "{} suggestions (best effort) · {}. Press i to retry if needed.",
+                        count,
+                        truncate(&reasons, 120)
+                    ));
+                }
             }
             BackgroundMessage::SuggestionsError(e) => {
                 // If summaries are still generating, switch to that loading state
@@ -128,6 +171,7 @@ pub fn drain_messages(
                 app.show_toast(&format!("Suggestions error: {}", truncate(&e, 80)));
                 app.last_suggestion_error = Some(e);
                 app.suggestion_refinement_in_progress = false;
+                app.clear_apply_confirm();
             }
             BackgroundMessage::SummariesReady {
                 summaries,
@@ -200,53 +244,37 @@ pub fn drain_messages(
                             } else {
                                 Some(repo_memory_context)
                             };
-                            let mem_for_refine = mem.clone();
-                            // Fast grounded suggestions: provisional output only.
-                            // Actionable suggestions are emitted after refinement.
-                            match suggest::llm::analyze_codebase_fast_grounded(
+                            let gate_config = suggest::llm::SuggestionQualityGateConfig::default();
+                            let run = suggest::llm::run_fast_grounded_with_gate_with_progress(
                                 &repo_root,
                                 &index_clone,
                                 &context_clone,
                                 mem,
                                 Some(&summaries_for_suggestions),
+                                gate_config,
+                                |attempt_index, attempt_count, gate, diagnostics| {
+                                    let _ = tx_suggestions.send(
+                                        BackgroundMessage::SuggestionsRefinementProgress {
+                                            attempt_index,
+                                            attempt_count,
+                                            gate: gate.clone(),
+                                            diagnostics: diagnostics.clone(),
+                                        },
+                                    );
+                                },
                             )
-                            .await
-                            {
-                                Ok((suggestions, usage, diagnostics)) => {
-                                    let provisional = suggestions.clone();
-                                    let diagnostics_for_refine = diagnostics.clone();
-                                    let _ =
-                                        tx_suggestions.send(BackgroundMessage::SuggestionsReady {
-                                            suggestions,
-                                            usage,
-                                            model: "fast-grounded".to_string(),
-                                            diagnostics,
-                                            duration_ms: stage_start.elapsed().as_millis() as u64,
-                                        });
+                            .await;
 
-                                    let refine_start = std::time::Instant::now();
-                                    if let Ok((refined, refine_usage, refined_diag)) =
-                                        suggest::llm::refine_grounded_suggestions(
-                                            &repo_root,
-                                            &index_clone,
-                                            &context_clone,
-                                            mem_for_refine,
-                                            Some(&summaries_for_suggestions),
-                                            provisional,
-                                            diagnostics_for_refine,
-                                        )
-                                        .await
-                                    {
-                                        let _ = tx_suggestions.send(
-                                            BackgroundMessage::SuggestionsRefined {
-                                                suggestions: refined,
-                                                usage: refine_usage,
-                                                diagnostics: refined_diag,
-                                                duration_ms: refine_start.elapsed().as_millis()
-                                                    as u64,
-                                            },
-                                        );
-                                    }
+                            match run {
+                                Ok(result) => {
+                                    let _ = tx_suggestions.send(
+                                        BackgroundMessage::SuggestionsRefined {
+                                            suggestions: result.suggestions,
+                                            usage: result.usage,
+                                            diagnostics: result.diagnostics,
+                                            duration_ms: stage_start.elapsed().as_millis() as u64,
+                                        },
+                                    );
                                 }
                                 Err(e) => {
                                     let _ = tx_suggestions
@@ -390,11 +418,8 @@ pub fn drain_messages(
             }
             BackgroundMessage::PreviewError(e) => {
                 app.loading = LoadingState::None;
-                // Reset workflow if we were in Verify step
-                if app.workflow_step == WorkflowStep::Verify {
-                    app.workflow_step = WorkflowStep::Suggestions;
-                    app.verify_state = ui::VerifyState::default();
-                }
+                app.workflow_step = WorkflowStep::Suggestions;
+                app.verify_state = ui::VerifyState::default();
                 app.show_toast(&format!("Preview error: {}", truncate(&e, 80)));
             }
             BackgroundMessage::DirectFixApplied {
@@ -459,6 +484,7 @@ pub fn drain_messages(
                         new_content: new_content.clone(),
                     })
                     .collect();
+                app.clear_apply_confirm();
                 app.start_review(review_files);
 
                 // Trigger verification in background (all files)
@@ -503,11 +529,9 @@ pub fn drain_messages(
             }
             BackgroundMessage::DirectFixError(e) => {
                 app.loading = LoadingState::None;
-                // Reset workflow if we were in Verify step
-                if app.workflow_step == WorkflowStep::Verify {
-                    app.workflow_step = WorkflowStep::Suggestions;
-                    app.verify_state = ui::VerifyState::default();
-                }
+                app.workflow_step = WorkflowStep::Suggestions;
+                app.verify_state = ui::VerifyState::default();
+                app.clear_apply_confirm();
                 app.show_toast(&format!("Apply failed: {}", truncate(&e, 80)));
             }
             BackgroundMessage::ShipProgress(step) => {

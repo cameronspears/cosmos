@@ -449,9 +449,6 @@ fn render_suggestions_panel(frame: &mut Frame, area: Rect, app: &App) {
             WorkflowStep::Suggestions => {
                 render_suggestions_content(&mut lines, app, is_active, visible_height, inner_width);
             }
-            WorkflowStep::Verify => {
-                render_verify_content(&mut lines, app, visible_height, inner_width);
-            }
             WorkflowStep::Review => {
                 render_review_content(&mut lines, app, visible_height, inner_width);
             }
@@ -487,7 +484,6 @@ fn render_workflow_title(current: WorkflowStep, ask_cosmos_active: bool) -> Stri
 
     let steps = [
         (WorkflowStep::Suggestions, Theme::WORKFLOW_SUGGESTIONS),
-        (WorkflowStep::Verify, Theme::WORKFLOW_VERIFY),
         (WorkflowStep::Review, Theme::WORKFLOW_REVIEW),
         (WorkflowStep::Ship, Theme::WORKFLOW_SHIP),
     ];
@@ -615,6 +611,24 @@ fn render_suggestions_content<'a>(
                     Style::default().fg(Theme::GREY_500),
                 ),
                 Span::styled("       │", Style::default().fg(Theme::GREY_700)),
+            ]));
+        } else if app.suggestion_refinement_in_progress {
+            lines.push(Line::from(vec![
+                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
+                Span::styled("       ↻ ", Style::default().fg(Theme::ACCENT)),
+                Span::styled("Refining suggestions", Style::default().fg(Theme::GREY_300)),
+                Span::styled("      │", Style::default().fg(Theme::GREY_700)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
+                Span::styled(
+                    format!(
+                        "         {} provisional suggestions in review",
+                        app.suggestion_provisional_count
+                    ),
+                    Style::default().fg(Theme::GREY_500),
+                ),
+                Span::styled(" │", Style::default().fg(Theme::GREY_700)),
             ]));
         } else if has_ai {
             lines.push(Line::from(vec![
@@ -860,6 +874,31 @@ fn render_suggestion_diagnostics<'a>(lines: &mut Vec<Line<'a>>, app: &App, inner
             )]));
         }
 
+        let attempts_line = format!(
+            "Gate: {} · attempt {}/{} · cost ${:.4} · {}ms",
+            if diag.gate_passed { "passed" } else { "missed" },
+            diag.attempt_index.max(1),
+            diag.attempt_count.max(1),
+            diag.attempt_cost_usd,
+            diag.attempt_ms
+        );
+        for line in wrap_text(&attempts_line, text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::GREY_500),
+            )]));
+        }
+
+        if !diag.gate_fail_reasons.is_empty() {
+            let fail_reasons = format!("Gate reasons: {}", diag.gate_fail_reasons.join("; "));
+            for line in wrap_text(&fail_reasons, text_width) {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{indent}{line}"),
+                    Style::default().fg(Theme::YELLOW),
+                )]));
+            }
+        }
+
         let tool_names = if diag.tool_names.is_empty() {
             "none".to_string()
         } else {
@@ -1011,296 +1050,6 @@ fn render_suggestion_diagnostics<'a>(lines: &mut Vec<Line<'a>>, app: &App, inner
                 )]));
             }
         }
-    }
-}
-
-/// Render the Verify step content
-fn render_verify_content<'a>(
-    lines: &mut Vec<Line<'a>>,
-    app: &App,
-    visible_height: usize,
-    inner_width: usize,
-) {
-    let state = &app.verify_state;
-
-    if state.loading || app.loading == LoadingState::GeneratingFix {
-        let spinner = SPINNER_FRAMES[app.loading_frame % SPINNER_FRAMES.len()];
-        let message = if app.loading == LoadingState::GeneratingFix {
-            "Applying fix..."
-        } else {
-            "Verifying issue..."
-        };
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("    ", Style::default()),
-            Span::styled(format!("{} ", spinner), Style::default().fg(Theme::WHITE)),
-            Span::styled(message, Style::default().fg(Theme::GREY_300)),
-        ]));
-        return;
-    }
-
-    // Build all scrollable content first
-    let mut content: Vec<Line<'a>> = Vec::new();
-    let text_width = inner_width.saturating_sub(6);
-
-    // Show preview content (non-technical, user-friendly)
-    if let Some(preview) = &state.preview {
-        // Friendly title header (no file names)
-        content.push(Line::from(vec![Span::styled(
-            format!("  {}", preview.friendly_title),
-            Style::default()
-                .fg(Theme::WHITE)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        content.push(Line::from(""));
-
-        // Problem summary (behavior-focused)
-        for line in wrap_text(&preview.problem_summary, text_width) {
-            content.push(Line::from(vec![Span::styled(
-                format!("  {}", line),
-                Style::default().fg(Theme::GREY_200),
-            )]));
-        }
-        content.push(Line::from(""));
-
-        // Separator
-        content.push(Line::from(vec![Span::styled(
-            "  ─────────────────────────────────",
-            Style::default().fg(Theme::GREY_700),
-        )]));
-        content.push(Line::from(""));
-
-        // Simple verification status (no verbose explanation)
-        let (status_icon, status_text, status_color) = match preview.verification_state {
-            crate::suggest::VerificationState::Verified => ("✓", "Confirmed", Theme::GREEN),
-            crate::suggest::VerificationState::Contradicted => {
-                ("✗", "Contradicted", Theme::BADGE_BUG)
-            }
-            crate::suggest::VerificationState::InsufficientEvidence => {
-                ("?", "Needs More Evidence", Theme::YELLOW)
-            }
-            crate::suggest::VerificationState::Unverified => ("?", "Unverified", Theme::GREY_500),
-        };
-        content.push(Line::from(vec![
-            Span::styled(
-                format!("  {} ", status_icon),
-                Style::default().fg(status_color),
-            ),
-            Span::styled(status_text, Style::default().fg(status_color)),
-        ]));
-        content.push(Line::from(""));
-
-        // The fix (outcome-focused)
-        content.push(Line::from(vec![Span::styled(
-            "  The fix:",
-            Style::default().fg(Theme::GREY_400),
-        )]));
-        for line in wrap_text(&preview.outcome, text_width) {
-            content.push(Line::from(vec![Span::styled(
-                format!("  {}", line),
-                Style::default().fg(Theme::GREY_200),
-            )]));
-        }
-        content.push(Line::from(""));
-
-        // Show multi-file indicator if this affects multiple files
-        if state.is_multi_file() {
-            content.push(Line::from(vec![
-                Span::styled("  Files affected:", Style::default().fg(Theme::GREY_400)),
-                Span::styled(
-                    format!(" {}", state.file_count()),
-                    Style::default().fg(Theme::ACCENT),
-                ),
-            ]));
-            // List all affected files
-            if let Some(primary) = &state.file_path {
-                let file_name = primary
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("file");
-                content.push(Line::from(vec![Span::styled(
-                    format!("    · {}", file_name),
-                    Style::default().fg(Theme::GREY_300),
-                )]));
-            }
-            for additional in &state.additional_files {
-                let file_name = additional
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("file");
-                content.push(Line::from(vec![Span::styled(
-                    format!("    · {}", file_name),
-                    Style::default().fg(Theme::GREY_300),
-                )]));
-            }
-            content.push(Line::from(""));
-        }
-
-        // Technical details section (toggleable)
-        if state.show_technical_details {
-            content.push(Line::from(vec![Span::styled(
-                "  ─────────────────────────────────",
-                Style::default().fg(Theme::GREY_700),
-            )]));
-            content.push(Line::from(vec![Span::styled(
-                "  Technical Details",
-                Style::default()
-                    .fg(Theme::GREY_300)
-                    .add_modifier(Modifier::BOLD),
-            )]));
-            content.push(Line::from(""));
-
-            // Verification note
-            if !preview.verification_note.is_empty() {
-                content.push(Line::from(vec![Span::styled(
-                    "  Verification:",
-                    Style::default().fg(Theme::GREY_400),
-                )]));
-                for line in wrap_text(&preview.verification_note, text_width) {
-                    content.push(Line::from(vec![Span::styled(
-                        format!("  {}", line),
-                        Style::default().fg(Theme::GREY_300),
-                    )]));
-                }
-                content.push(Line::from(""));
-            }
-
-            // Evidence snippet with line number
-            if let Some(snippet) = &preview.evidence_snippet {
-                content.push(Line::from(vec![
-                    Span::styled("  Evidence", Style::default().fg(Theme::GREY_400)),
-                    if let Some(line_num) = preview.evidence_line {
-                        Span::styled(
-                            format!(" (line {})", line_num),
-                            Style::default().fg(Theme::GREY_500),
-                        )
-                    } else {
-                        Span::styled("", Style::default())
-                    },
-                    Span::styled(":", Style::default().fg(Theme::GREY_400)),
-                ]));
-                // Show the code snippet in a monospace style
-                for line in snippet.lines().take(8) {
-                    let truncated = if line.len() > text_width.saturating_sub(4) {
-                        format!("{}...", &line[..text_width.saturating_sub(7)])
-                    } else {
-                        line.to_string()
-                    };
-                    content.push(Line::from(vec![Span::styled(
-                        format!("    {}", truncated),
-                        Style::default().fg(Theme::GREY_400),
-                    )]));
-                }
-                content.push(Line::from(""));
-            }
-
-            // Implementation description
-            if !preview.description.is_empty() {
-                content.push(Line::from(vec![Span::styled(
-                    "  Implementation:",
-                    Style::default().fg(Theme::GREY_400),
-                )]));
-                for line in wrap_text(&preview.description, text_width) {
-                    content.push(Line::from(vec![Span::styled(
-                        format!("  {}", line),
-                        Style::default().fg(Theme::GREY_300),
-                    )]));
-                }
-                content.push(Line::from(""));
-            }
-
-            // Affected areas
-            if !preview.affected_areas.is_empty() {
-                content.push(Line::from(vec![Span::styled(
-                    "  Affected areas:",
-                    Style::default().fg(Theme::GREY_400),
-                )]));
-                for area in &preview.affected_areas {
-                    content.push(Line::from(vec![Span::styled(
-                        format!("    · {}", area),
-                        Style::default().fg(Theme::GREY_300),
-                    )]));
-                }
-                content.push(Line::from(""));
-            }
-
-            // Scope indicator
-            content.push(Line::from(vec![
-                Span::styled("  Scope: ", Style::default().fg(Theme::GREY_400)),
-                Span::styled(
-                    preview.scope.label(),
-                    Style::default().fg(match preview.scope {
-                        crate::suggest::llm::FixScope::Small => Theme::GREEN,
-                        crate::suggest::llm::FixScope::Medium => Theme::BADGE_PERF,
-                        crate::suggest::llm::FixScope::Large => Theme::BADGE_BUG,
-                    }),
-                ),
-            ]));
-            content.push(Line::from(""));
-        } else {
-            // Hint to show technical details
-            content.push(Line::from(vec![Span::styled(
-                "  Press 'd' for technical details",
-                Style::default().fg(Theme::GREY_600),
-            )]));
-            content.push(Line::from(""));
-        }
-    } else {
-        // Fallback when no preview yet - show technical summary
-        let file_name = state
-            .file_path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
-
-        content.push(Line::from(vec![Span::styled(
-            format!("  {}", file_name),
-            Style::default()
-                .fg(Theme::WHITE)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        content.push(Line::from(""));
-
-        for line in wrap_text(&state.summary, text_width) {
-            content.push(Line::from(vec![Span::styled(
-                format!("  {}", line),
-                Style::default().fg(Theme::GREY_200),
-            )]));
-        }
-        content.push(Line::from(""));
-    }
-
-    // Use full visible height for scrollable content
-    let scrollable_height = visible_height.saturating_sub(2); // Leave room for scroll indicator
-    let total_content = content.len();
-    let scroll = state.scroll.min(total_content.saturating_sub(1));
-
-    // Apply scroll and take visible lines
-    for line in content.into_iter().skip(scroll).take(scrollable_height) {
-        lines.push(line);
-    }
-
-    // Scroll indicator if needed
-    if total_content > scrollable_height {
-        // Pad to bottom
-        while lines.len() < scrollable_height {
-            lines.push(Line::from(""));
-        }
-        lines.push(Line::from(vec![
-            Span::styled(
-                "  ─────────────────────────────────",
-                Style::default().fg(Theme::GREY_700),
-            ),
-            Span::styled(
-                format!(
-                    " ↕ {}/{} ",
-                    scroll + 1,
-                    total_content.saturating_sub(scrollable_height) + 1
-                ),
-                Style::default().fg(Theme::GREY_500),
-            ),
-        ]));
     }
 }
 

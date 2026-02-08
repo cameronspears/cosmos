@@ -38,8 +38,8 @@ cargo run --bin cosmos-lab -- validate \
   --gate-window 10 \
   --gate-min-displayed-validity 0.95 \
   --gate-min-final-count 10 \
-  --gate-max-suggest-ms 30000 \
-  --gate-max-suggest-cost-usd 0.01 \
+  --gate-max-suggest-ms 26000 \
+  --gate-max-suggest-cost-usd 0.016 \
   --gate-source both
 ```
 
@@ -86,10 +86,30 @@ cargo run --bin cosmos-lab -- reliability \
   --gate-window 10 \
   --gate-min-displayed-validity 0.95 \
   --gate-min-final-count 10 \
-  --gate-max-suggest-ms 30000 \
-  --gate-max-suggest-cost-usd 0.01 \
+  --gate-max-suggest-ms 26000 \
+  --gate-max-suggest-cost-usd 0.016 \
   --gate-source both
 ```
+
+## Production Runtime Contract
+
+The real app (`cosmos <repo>`) uses the shared gated suggestion orchestrator and
+does not rely on a separate pre-apply verify stage.
+
+- Display contract:
+  - validated-only suggestions
+  - `pending_count == 0`
+  - target count `10..=15`
+  - target displayed validity `1.0`
+- Budget contract:
+  - suggest + refine cost target `< $0.015`
+  - end-to-end suggestion budget `< 35s`
+- Retry/fallback contract:
+  - up to 2 hidden attempts
+  - stop early on pass
+  - on miss, show best validated set with gate-failure reasons (best-effort warning)
+- Rewrite contract:
+  - overclaiming impact language is conservatively rewritten and revalidated once before final rejection.
 
 ## When To Use Which Mode
 
@@ -107,6 +127,10 @@ cargo run --bin cosmos-lab -- reliability \
 - Primary pre-verify quality metric is `displayed_valid_ratio`.
 - Gate on count/speed/cost too: `final_count`, `suggest_total_ms`, and `suggest_total_cost_usd`.
 - Final refined output should keep `pending_count == 0` (no pending backfill).
+- Refinement uses a two-stage count policy: hard target `10`, stretch target `15` only when budget permits.
+- Validation includes a bounded transport retry lane and tracks `validation_transport_retry_count` plus `validation_transport_recovered_count`.
+- Regeneration stops early when validation budget is exhausted (`regen_stopped_validation_budget=true`) to avoid low-value extra spend.
+- Overclaim rejects are rewritten to conservative grounded language and revalidated once before final rejection.
 
 ## ETHOS-Aligned Run Summary Template
 

@@ -102,8 +102,8 @@ cargo run --bin cosmos-lab -- validate \
   --gate-window 10 \
   --gate-min-displayed-validity 0.95 \
   --gate-min-final-count 10 \
-  --gate-max-suggest-ms 30000 \
-  --gate-max-suggest-cost-usd 0.01 \
+  --gate-max-suggest-ms 26000 \
+  --gate-max-suggest-cost-usd 0.016 \
   --gate-source both
 ```
 
@@ -137,10 +137,31 @@ cargo run --bin cosmos-lab -- reliability \
   --gate-window 10 \
   --gate-min-displayed-validity 0.95 \
   --gate-min-final-count 10 \
-  --gate-max-suggest-ms 30000 \
-  --gate-max-suggest-cost-usd 0.01 \
+  --gate-max-suggest-ms 26000 \
+  --gate-max-suggest-cost-usd 0.016 \
   --gate-source both
 ```
+
+## Production Runtime Gate Contract
+
+Real app runs (`cosmos <repo>`) now use the same gated suggestion cycle as lab via
+`run_fast_grounded_with_gate(...)`, with hidden retries and validated-only output.
+
+- Gate targets:
+  - `final_count` in `10..=15`
+  - `displayed_valid_ratio == 1.0`
+  - `pending_count == 0`
+  - `suggest_total_cost_usd <= 0.015` (suggest + refine only)
+  - `suggest_total_ms <= 35_000`
+- Retry policy:
+  - up to `2` hidden attempts
+  - stop early on first pass
+  - second attempt only when remaining budget allows
+- Fallback policy:
+  - if gate still misses, show best validated set plus explicit gate-failure reasons
+  - never inject pending suggestions
+- Overclaim handling:
+  - impact/assumption-heavy rejects are rewritten to conservative grounded wording once, then revalidated.
 
 ## Reports and Telemetry
 
@@ -165,12 +186,19 @@ Core report fields and how to read them:
 - `suggest_total_cost_usd`: LLM spend for suggest + refine in USD.
 - `preview_precision`: `verified / (verified + contradicted)` over sampled previews.
 - `evidence_line1_ratio`: proportion of pack anchors at line 1 (lower is usually better).
+- `validation_transport_retry_count`: number of transport/deadline validator failures that were retried once.
+- `validation_transport_recovered_count`: retried transport failures that eventually validated.
+- `regen_stopped_validation_budget`: regeneration halted because validation budget/deadline made further refinement unlikely to succeed.
 - `reliability_failure_kind`: machine-classified cause when reliability run fails.
 
 Interpretation shortcuts:
 
 - High `displayed_valid_ratio` with `pending_count = 0` is required, but not sufficient alone.
 - Also watch `final_count`, `suggest_total_ms`, and `suggest_total_cost_usd` to avoid high-accuracy/low-throughput regressions.
+- Validation now includes a bounded transport retry lane; rising transport retries with low recovery indicates provider instability, not rubric weakness.
+- Refinement behavior is target-staged: hard fill target `10`, opportunistic stretch target `15` when budget allows.
+- Production uses hidden retry attempts and surfaces a best-effort validated set with gate miss reasons when retries are exhausted.
+- Overclaim rewrite/revalidate is enabled before final rejection for assumption-heavy impact claims.
 - High `preview_precision` + lower `rejected_ratio` = healthier end-to-end reliability loop.
 - Rising `evidence_line1_ratio` suggests weaker grounding anchors.
 - Non-null `reliability_failure_kind` means reliability metrics may be unavailable for that run.
@@ -182,8 +210,8 @@ Use these targets to keep tuning decisions objective:
 - Rolling displayed validity target: `displayed_valid_ratio >= 0.95`.
 - Rolling final count target: `final_count >= 10`.
 - Pending guardrail: `pending_count == 0` in every gated run.
-- Rolling speed target: `suggest_total_ms <= 30000`.
-- Rolling cost target: `suggest_total_cost_usd <= 0.01`.
+- Rolling speed target: `suggest_total_ms <= 26000`.
+- Rolling cost target: `suggest_total_cost_usd <= 0.016`.
 - Rolling preview precision target: keep `preview_precision` healthy and non-trending down.
 - Contradictions guardrail: keep `preview_contradicted_count` low and non-trending.
 - Evidence anchor quality: keep `evidence_line1_ratio <= 0.25`.

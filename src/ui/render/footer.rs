@@ -359,15 +359,12 @@ fn get_primary_buttons(app: &App) -> Vec<FooterButton> {
         }
         ActivePanel::Suggestions => match app.workflow_step {
             WorkflowStep::Suggestions => {
-                vec![primary_button("↵", "verify")]
-            }
-            WorkflowStep::Verify => {
-                if app.verify_state.loading || app.loading == LoadingState::GeneratingFix {
+                if app.suggestion_refinement_in_progress
+                    || app.loading == LoadingState::GeneratingFix
+                {
                     vec![]
-                } else if app.verify_state.preview.is_some() {
-                    vec![primary_button("↵", "apply")]
                 } else {
-                    vec![]
+                    vec![primary_button("↵", "apply")]
                 }
             }
             WorkflowStep::Review => {
@@ -393,24 +390,11 @@ fn get_secondary_buttons(app: &App) -> Vec<FooterButton> {
     match app.active_panel {
         ActivePanel::Project => vec![],
         ActivePanel::Suggestions => match app.workflow_step {
-            WorkflowStep::Suggestions => vec![],
-            WorkflowStep::Verify => {
-                if app.verify_state.loading || app.loading == LoadingState::GeneratingFix {
-                    vec![hint_button("Esc", "cancel")]
-                } else if app.verify_state.preview.is_some() {
-                    vec![
-                        hint_button(
-                            "d",
-                            if app.verify_state.show_technical_details {
-                                "hide"
-                            } else {
-                                "details"
-                            },
-                        ),
-                        secondary_button("Esc", "back"),
-                    ]
+            WorkflowStep::Suggestions => {
+                if app.armed_suggestion_id.is_some() {
+                    vec![secondary_button("Esc", "cancel")]
                 } else {
-                    vec![secondary_button("Esc", "back")]
+                    vec![]
                 }
             }
             WorkflowStep::Review => {

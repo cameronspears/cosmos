@@ -1098,6 +1098,32 @@ impl Cache {
         }
     }
 
+    /// Aggregate recent contradicted verify outcomes by evidence id.
+    ///
+    /// Returns a map keyed by `SuggestionEvidenceRef.snippet_id` with the number of
+    /// recent contradicted verify outcomes tied to that evidence id.
+    pub fn recent_contradicted_evidence_counts(
+        &self,
+        window_rows: usize,
+    ) -> anyhow::Result<HashMap<usize, usize>> {
+        if window_rows == 0 {
+            return Ok(HashMap::new());
+        }
+        let records = self.load_recent_suggestion_quality(window_rows)?;
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        for record in records {
+            if record.validation_outcome != "verify_result"
+                || record.user_verify_outcome.as_deref() != Some("contradicted")
+            {
+                continue;
+            }
+            for evidence_id in record.evidence_ids {
+                *counts.entry(evidence_id).or_insert(0) += 1;
+            }
+        }
+        Ok(counts)
+    }
+
     /// Clear selected cache files only
     pub fn clear_selective(&self, options: &[ResetOption]) -> anyhow::Result<Vec<String>> {
         let _lock = self.lock(true)?;

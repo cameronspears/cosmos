@@ -150,12 +150,11 @@ pub enum ShipStep {
     Done,       // PR created successfully
 }
 
-/// Main workflow steps for the right panel: Suggestions → Verify → Review → Ship
+/// Main workflow steps for the right panel: Suggestions → Review → Ship
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkflowStep {
     #[default]
     Suggestions, // Browse and select suggestions
-    Verify, // Verify the fix, apply it
     Review, // Review applied changes, fix issues
     Ship,   // Commit, push, create PR
 }
@@ -164,9 +163,8 @@ impl WorkflowStep {
     pub fn index(&self) -> usize {
         match self {
             WorkflowStep::Suggestions => 0,
-            WorkflowStep::Verify => 1,
-            WorkflowStep::Review => 2,
-            WorkflowStep::Ship => 3,
+            WorkflowStep::Review => 1,
+            WorkflowStep::Ship => 2,
         }
     }
 }

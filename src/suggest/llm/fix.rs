@@ -823,6 +823,48 @@ impl FixScope {
     }
 }
 
+/// Build a lightweight fix plan from an already-validated suggestion.
+///
+/// This is used by the real-app runtime when the legacy pre-apply Verify stage
+/// is bypassed. The plan preserves suggestion grounding and feeds fix generation.
+pub fn build_fix_preview_from_validated_suggestion(suggestion: &Suggestion) -> FixPreview {
+    let affected_areas = if suggestion.additional_files.is_empty() {
+        vec![suggestion.file.display().to_string()]
+    } else {
+        suggestion
+            .affected_files()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect()
+    };
+    let description = suggestion
+        .detail
+        .clone()
+        .unwrap_or_else(|| suggestion.summary.clone());
+    let outcome = suggestion
+        .detail
+        .as_deref()
+        .and_then(|detail| detail.lines().next())
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .unwrap_or_else(|| suggestion.summary.clone());
+
+    FixPreview {
+        verified: true,
+        verification_state: crate::suggest::VerificationState::Verified,
+        friendly_title: suggestion.kind.label().to_string(),
+        problem_summary: suggestion.summary.clone(),
+        outcome,
+        verification_note: "Using pre-validated suggestion evidence.".to_string(),
+        evidence_snippet: suggestion.evidence.clone(),
+        evidence_line: suggestion.line.map(|line| line as u32),
+        description,
+        affected_areas,
+        scope: FixScope::Medium,
+        modifier: None,
+    }
+}
+
 /// JSON Schema for FixPreview - used for structured output on final agentic response
 /// This ensures the LLM returns valid, parseable JSON matching our expected format
 pub(crate) fn fix_preview_schema() -> serde_json::Value {
