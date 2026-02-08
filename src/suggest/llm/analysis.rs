@@ -61,12 +61,15 @@ const VALIDATOR_RETRY_TIMEOUT_MS: u64 = 3_200;
 const VALIDATOR_BATCH_MAX_TOKENS: u32 = 320;
 const VALIDATOR_BATCH_TIMEOUT_BUFFER_MS: u64 = 1_600;
 const VALIDATION_RETRY_MAX_PER_SUGGESTION: usize = 1;
+const VALIDATION_RETRY_MIN_REMAINING_BUDGET_MS: u64 = 4_000;
 const VALIDATION_RUN_DEADLINE_MS: u64 = 22_000;
 const VALIDATION_MIN_REMAINING_BUDGET_MS: u64 = 2_500;
 const OVERCLAIM_REWRITE_MAX_TOKENS: u32 = 70;
 const OVERCLAIM_REWRITE_TIMEOUT_MS: u64 = 2_000;
 const OVERCLAIM_REVALIDATE_MAX_TOKENS: u32 = 70;
 const OVERCLAIM_REVALIDATE_TIMEOUT_MS: u64 = 2_000;
+const STRETCH_PHASE_MAX_COST_USD: f64 = 0.012;
+const STRETCH_PHASE_MIN_REMAINING_VALIDATION_MS: u64 = 6_000;
 const SUMMARY_MIN_WORDS: usize = 5;
 const SUMMARY_MIN_CHARS: usize = 24;
 
@@ -856,7 +859,43 @@ fn build_validation_evidence_block(suggestion: &Suggestion) -> String {
 fn parse_validation_state(
     validation: &str,
 ) -> (SuggestionValidationState, Option<ValidationRejectClass>) {
-    match validation {
+    let normalized = validation
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_");
+
+    if normalized.contains("contradict")
+        || normalized.contains("unsupported")
+        || normalized.contains("not_supported")
+        || normalized.contains("not_valid")
+        || normalized.contains("assumption")
+    {
+        return (
+            SuggestionValidationState::Rejected,
+            Some(ValidationRejectClass::Contradicted),
+        );
+    }
+
+    if normalized.contains("insufficient")
+        || normalized.contains("not_enough_evidence")
+        || normalized.contains("insufficient_evidence")
+        || normalized.contains("unclear")
+    {
+        return (
+            SuggestionValidationState::Rejected,
+            Some(ValidationRejectClass::InsufficientEvidence),
+        );
+    }
+
+    if matches!(
+        normalized.as_str(),
+        "validated" | "valid" | "supported" | "support" | "supported_by_evidence"
+    ) || normalized.contains("validated")
+    {
+        return (SuggestionValidationState::Validated, None);
+    }
+
+    match normalized.as_str() {
         "validated" => (SuggestionValidationState::Validated, None),
         "contradicted" => (
             SuggestionValidationState::Rejected,
@@ -871,6 +910,81 @@ fn parse_validation_state(
             Some(ValidationRejectClass::Other),
         ),
     }
+}
+
+fn reconcile_validation_from_reason(
+    state: SuggestionValidationState,
+    reject_class: Option<ValidationRejectClass>,
+    reason: &str,
+) -> (SuggestionValidationState, Option<ValidationRejectClass>) {
+    if !(state == SuggestionValidationState::Rejected
+        && matches!(reject_class, Some(ValidationRejectClass::Other)))
+    {
+        return (state, reject_class);
+    }
+
+    let lower = reason.to_ascii_lowercase();
+    let has_negative_marker = [
+        "not support",
+        "does not support",
+        "cannot support",
+        "insufficient",
+        "contradict",
+        "beyond evidence",
+        "assumption",
+        "deadline exceeded",
+        "validation failed",
+        "missing batch result",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+
+    if !has_negative_marker
+        && [
+            "evidence shows",
+            "evidence contains",
+            "supports",
+            "supported",
+            "confirm",
+            "directly shown",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return (SuggestionValidationState::Validated, None);
+    }
+
+    if [
+        "insufficient",
+        "not enough evidence",
+        "cannot verify",
+        "unclear from evidence",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return (
+            SuggestionValidationState::Rejected,
+            Some(ValidationRejectClass::InsufficientEvidence),
+        );
+    }
+
+    if [
+        "contradict",
+        "beyond evidence",
+        "assumption",
+        "not supported",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return (
+            SuggestionValidationState::Rejected,
+            Some(ValidationRejectClass::Contradicted),
+        );
+    }
+
+    (state, reject_class)
 }
 
 fn extract_evidence_id(text: &str) -> Option<usize> {
@@ -1013,9 +1127,17 @@ fn is_low_information_summary(summary: &str) -> bool {
         return true;
     }
     let lower = trimmed.to_ascii_lowercase();
+    let normalized_lower = lower.trim_end_matches(['.', '!', '?']);
+    let has_vague_hidden_errors = normalized_lower.ends_with("hidden errors")
+        || normalized_lower.starts_with("hidden errors")
+        || normalized_lower.contains("hidden errors when")
+        || normalized_lower.contains(", hidden errors")
+        || normalized_lower.contains(" hidden errors,");
     lower == "when users"
         || lower == "when someone"
         || lower == "when a user"
+        || lower.starts_with("when ")
+        || has_vague_hidden_errors
         || lower.ends_with(" may")
         || lower.ends_with(" can")
         || lower.ends_with(" should")
@@ -1037,20 +1159,100 @@ fn sentence_like_fragment(text: &str) -> Option<String> {
     None
 }
 
-fn normalize_grounded_summary(summary: &str, detail: &str, evidence_line: usize) -> String {
+fn first_sentence_only(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    for (idx, ch) in trimmed.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            return trimmed[..=idx].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn strip_formulaic_impact_clause(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(idx) = lower.find("this matters because") {
+        return trimmed[..idx].trim().to_string();
+    }
+    trimmed.to_string()
+}
+
+fn capitalize_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+fn lowercase_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_lowercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+fn rewrite_when_lead_to_plain_sentence(summary: &str) -> String {
+    let trimmed = summary.trim();
+    if !trimmed.to_ascii_lowercase().starts_with("when ") {
+        return trimmed.to_string();
+    }
+
+    let Some(comma_idx) = trimmed.find(',') else {
+        return trimmed.to_string();
+    };
+
+    let condition = trimmed[5..comma_idx]
+        .trim()
+        .trim_end_matches(['.', '!', '?']);
+    let outcome = trimmed[comma_idx + 1..]
+        .trim()
+        .trim_start_matches("then ")
+        .trim()
+        .trim_end_matches(['.', '!', '?']);
+
+    if condition.is_empty() || outcome.is_empty() {
+        return trimmed.to_string();
+    }
+
+    let outcome = capitalize_first(outcome);
+    let condition = lowercase_first(condition);
+    format!("{outcome} when {condition}.")
+}
+
+fn normalize_grounded_summary(summary: &str, detail: &str, _evidence_line: usize) -> String {
     let mut normalized = scrub_user_summary(summary);
+    normalized = strip_formulaic_impact_clause(&normalized);
+    normalized = first_sentence_only(&normalized);
+    normalized = rewrite_when_lead_to_plain_sentence(&normalized);
+
     if is_low_information_summary(&normalized) {
         if let Some(from_detail) = sentence_like_fragment(detail) {
-            normalized = from_detail;
+            let mut detail_sentence = strip_formulaic_impact_clause(&from_detail);
+            detail_sentence = first_sentence_only(&detail_sentence);
+            normalized = rewrite_when_lead_to_plain_sentence(&detail_sentence);
         }
     }
     if is_low_information_summary(&normalized) {
-        normalized = format!(
-            "Behavior near line {} likely has a user-facing reliability issue",
-            evidence_line
-        );
+        normalized =
+            "A user-facing reliability issue can cause visible broken behavior in this flow"
+                .to_string();
     }
-    truncate_str(normalized.trim(), 120).to_string()
+    let mut display = normalized.trim().to_string();
+    if !display.ends_with('.') && !display.ends_with('!') && !display.ends_with('?') {
+        display.push('.');
+    }
+    display
 }
 
 fn normalize_grounded_detail(detail: &str, summary: &str) -> String {
@@ -1363,9 +1565,10 @@ fn should_retry_transport_rejection(
     attempts: usize,
     validation_deadline: std::time::Instant,
 ) -> bool {
+    let remaining_budget_ms = remaining_validation_budget_ms(validation_deadline);
     matches!(class, ValidationRejectClass::Transport)
         && attempts < VALIDATION_RETRY_MAX_PER_SUGGESTION
-        && std::time::Instant::now() < validation_deadline
+        && remaining_budget_ms >= VALIDATION_RETRY_MIN_REMAINING_BUDGET_MS
 }
 
 fn build_remaining_pack_for_regeneration(
@@ -1648,6 +1851,8 @@ Return JSON:
 
     let normalized = response.data.validation.trim().to_lowercase();
     let (state, reject_class) = parse_validation_state(normalized.as_str());
+    let (state, reject_class) =
+        reconcile_validation_from_reason(state, reject_class, &response.data.reason);
 
     Ok((state, response.data.reason, response.usage, reject_class))
 }
@@ -1691,13 +1896,24 @@ Return JSON:
 
     let mut rewritten = suggestion.clone();
     let rewritten_summary = scrub_user_summary(response.data.summary.trim());
-    if !rewritten_summary.is_empty() {
-        rewritten.summary = truncate_str(&rewritten_summary, 120).to_string();
-    }
+    let summary_seed = if rewritten_summary.is_empty() {
+        suggestion.summary.clone()
+    } else {
+        rewritten_summary
+    };
     let rewritten_detail = response.data.detail.trim().to_string();
-    if !rewritten_detail.is_empty() {
-        rewritten.detail = Some(truncate_str(&rewritten_detail, 600).to_string());
-    }
+    let detail_seed = if rewritten_detail.is_empty() {
+        suggestion.detail.as_deref().unwrap_or("").to_string()
+    } else {
+        rewritten_detail
+    };
+    let normalized_detail = normalize_grounded_detail(&detail_seed, &summary_seed);
+    rewritten.summary = normalize_grounded_summary(
+        &summary_seed,
+        &normalized_detail,
+        suggestion.line.unwrap_or_default(),
+    );
+    rewritten.detail = Some(normalized_detail);
     Ok((rewritten, response.usage))
 }
 
@@ -1784,6 +2000,7 @@ fn map_batch_validation_response(
             truncate_str(item.reason.trim(), 180).to_string()
         };
         let (state, reject_class) = parse_validation_state(normalized.as_str());
+        let (state, reject_class) = reconcile_validation_from_reason(state, reject_class, &reason);
         decisions[item.local_index] = Some((state, reason, reject_class));
     }
 
@@ -2143,6 +2360,109 @@ fn prevalidation_rejection_reason(
     None
 }
 
+fn snippet_contains_empty_catch(snippet: &str) -> bool {
+    let mut code_lines = Vec::new();
+    for line in snippet.lines() {
+        let code = if let Some((_, rest)) = line.split_once('|') {
+            rest
+        } else {
+            line
+        };
+        code_lines.push(code.trim().to_string());
+    }
+
+    for idx in 0..code_lines.len() {
+        let line = code_lines[idx].to_ascii_lowercase();
+        if line.contains("catch {}") || line.contains("catch{}") {
+            return true;
+        }
+        if !line.contains("catch") || !line.contains('{') {
+            continue;
+        }
+        let after_brace = line
+            .split_once('{')
+            .map(|(_, rest)| rest.trim())
+            .unwrap_or("");
+        if !after_brace.is_empty() && after_brace != "}" {
+            continue;
+        }
+
+        let mut next_idx = idx + 1;
+        while next_idx < code_lines.len() {
+            let next = code_lines[next_idx].trim();
+            if next.is_empty() || next.starts_with("//") {
+                next_idx += 1;
+                continue;
+            }
+            if next == "}" {
+                return true;
+            }
+            break;
+        }
+    }
+
+    false
+}
+
+fn has_silent_error_language(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "silent",
+        "silently",
+        "ignored",
+        "swallow",
+        "not logged",
+        "without logging",
+        "hidden error",
+        "not captured",
+        "not reported",
+        "go unnoticed",
+        "suppressed errors",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn has_high_speculation_impact_language(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "revenue",
+        "profit",
+        "spam",
+        "phishing",
+        "chargeback",
+        "lawsuit",
+        "financial loss",
+        "support tickets",
+        "support requests",
+        "customer churn",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn deterministic_auto_validation_reason(suggestion: &Suggestion) -> Option<String> {
+    let snippet = suggestion.evidence.as_deref()?;
+    if !snippet_contains_empty_catch(snippet) {
+        return None;
+    }
+
+    let summary = suggestion.summary.as_str();
+    let detail = suggestion.detail.as_deref().unwrap_or("");
+    let combined = format!("{} {}", summary, detail);
+    if !has_silent_error_language(&combined) {
+        return None;
+    }
+    if has_high_speculation_impact_language(summary) {
+        return None;
+    }
+
+    Some(
+        "Deterministic validation: snippet shows an empty catch block and summary describes silent error handling."
+            .to_string(),
+    )
+}
+
 fn accept_validated_suggestion(
     cache: &crate::cache::Cache,
     run_id: &str,
@@ -2239,6 +2559,20 @@ async fn validate_batch_suggestions(
                     &suggestion,
                     "rejected",
                     Some(reason),
+                );
+                continue;
+            }
+
+            if let Some(reason) = deterministic_auto_validation_reason(&suggestion) {
+                let _ = accept_validated_suggestion(
+                    cache,
+                    run_id,
+                    suggestion,
+                    reason,
+                    validated,
+                    used_evidence_ids,
+                    rejected_count,
+                    rejection_stats,
                 );
                 continue;
             }
@@ -2837,6 +3171,15 @@ pub async fn refine_grounded_suggestions(
         if phase_target == hard_target {
             hard_phase_attempts += 1;
         } else {
+            let current_cost = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+            if current_cost >= STRETCH_PHASE_MAX_COST_USD {
+                notes.push("stretch_skipped_cost_budget".to_string());
+                break;
+            }
+            if remaining_validation_budget < STRETCH_PHASE_MIN_REMAINING_VALIDATION_MS {
+                notes.push("stretch_skipped_validation_budget".to_string());
+                break;
+            }
             stretch_phase_attempts += 1;
         }
 
@@ -3839,7 +4182,10 @@ mod grounded_parser_tests {
 
     #[test]
     fn should_retry_transport_rejection_allows_single_retry_with_time_remaining() {
-        let future_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let future_deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(VALIDATION_RETRY_MIN_REMAINING_BUDGET_MS + 200);
+        let near_deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(VALIDATION_RETRY_MIN_REMAINING_BUDGET_MS - 100);
         let past_deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
         assert!(should_retry_transport_rejection(
             ValidationRejectClass::Transport,
@@ -3860,6 +4206,11 @@ mod grounded_parser_tests {
             ValidationRejectClass::Transport,
             0,
             past_deadline
+        ));
+        assert!(!should_retry_transport_rejection(
+            ValidationRejectClass::Transport,
+            0,
+            near_deadline
         ));
     }
 
@@ -4140,6 +4491,103 @@ mod grounded_parser_tests {
     }
 
     #[test]
+    fn normalize_grounded_summary_rewrites_when_template_to_plain_sentence() {
+        let summary = normalize_grounded_summary(
+            "When the page hides, CLS errors are ignored, so layout-shift problems may go unnoticed. This matters because undetected CLS bugs can degrade user experience.",
+            "CLS metric updates can fail silently during page hide events.",
+            42,
+        );
+        let lower = summary.to_ascii_lowercase();
+        assert!(!lower.starts_with("when "));
+        assert!(!lower.contains("this matters because"));
+        assert!(lower.contains("when the page hides"));
+    }
+
+    #[test]
+    fn normalize_grounded_summary_replaces_vague_hidden_errors_phrase() {
+        let summary = normalize_grounded_summary(
+            "When the page experiences layout shifts, hidden errors.",
+            "Layout-shift metric collection errors are swallowed, so the CLS metric is never reported to analytics.",
+            42,
+        );
+        let lower = summary.to_ascii_lowercase();
+        assert!(!lower.contains("hidden errors"));
+        assert!(lower.contains("cls metric"));
+    }
+
+    #[test]
+    fn normalize_grounded_summary_discourages_when_openers_without_comma() {
+        let summary = normalize_grounded_summary(
+            "When users save settings they may lose data",
+            "Saving settings can silently fail, so people think their changes were saved when they were not.",
+            42,
+        );
+        let lower = summary.to_ascii_lowercase();
+        assert!(!lower.starts_with("when "));
+        assert!(lower.contains("saving settings"));
+    }
+
+    #[test]
+    fn deterministic_auto_validation_accepts_empty_catch_with_silent_error_language() {
+        let suggestion = test_suggestion("Errors are silently ignored in this flow.")
+            .with_detail("A catch block is empty, so failures are not logged.".to_string())
+            .with_evidence(
+                " 10| try {\n 11|   runTask();\n 12| } catch (error) {\n 13| }\n".to_string(),
+            )
+            .with_evidence_refs(vec![SuggestionEvidenceRef {
+                snippet_id: 7,
+                file: PathBuf::from("src/a.ts"),
+                line: 12,
+            }]);
+
+        let reason = deterministic_auto_validation_reason(&suggestion);
+        assert!(reason.is_some());
+    }
+
+    #[test]
+    fn deterministic_auto_validation_rejects_non_empty_catch() {
+        let suggestion = test_suggestion("Errors are silently ignored in this flow.")
+            .with_detail("A catch block is empty, so failures are not logged.".to_string())
+            .with_evidence(
+                " 10| try {\n 11|   runTask();\n 12| } catch (error) {\n 13|   console.error(error);\n 14| }\n".to_string(),
+            )
+            .with_evidence_refs(vec![SuggestionEvidenceRef {
+                snippet_id: 7,
+                file: PathBuf::from("src/a.ts"),
+                line: 12,
+            }]);
+
+        let reason = deterministic_auto_validation_reason(&suggestion);
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn parse_validation_state_accepts_common_synonyms() {
+        let (state, class) = parse_validation_state("supported_by_evidence");
+        assert_eq!(state, SuggestionValidationState::Validated);
+        assert!(class.is_none());
+
+        let (state, class) = parse_validation_state("insufficient evidence");
+        assert_eq!(state, SuggestionValidationState::Rejected);
+        assert_eq!(class, Some(ValidationRejectClass::InsufficientEvidence));
+
+        let (state, class) = parse_validation_state("not supported");
+        assert_eq!(state, SuggestionValidationState::Rejected);
+        assert_eq!(class, Some(ValidationRejectClass::Contradicted));
+    }
+
+    #[test]
+    fn reconcile_validation_from_reason_recovers_supported_other_label() {
+        let (state, class) = reconcile_validation_from_reason(
+            SuggestionValidationState::Rejected,
+            Some(ValidationRejectClass::Other),
+            "Evidence contains an empty catch block, confirming this suggestion is supported.",
+        );
+        assert_eq!(state, SuggestionValidationState::Validated);
+        assert!(class.is_none());
+    }
+
+    #[test]
     fn should_retry_after_gate_miss_skips_cost_only_misses() {
         let config = SuggestionQualityGateConfig::default();
         let gate = SuggestionGateSnapshot {
@@ -4157,6 +4605,18 @@ mod grounded_parser_tests {
             config.max_suggest_cost_usd * 0.95,
             GATE_RETRY_MIN_REMAINING_BUDGET_MS + 1
         ));
+    }
+
+    #[test]
+    fn choose_regeneration_phase_target_returns_stretch_after_hard_is_met() {
+        let selected = choose_regeneration_phase_target(
+            FAST_GROUNDED_VALIDATED_HARD_TARGET,
+            FAST_GROUNDED_VALIDATED_HARD_TARGET,
+            FAST_GROUNDED_VALIDATED_STRETCH_TARGET,
+            REFINEMENT_HARD_PHASE_MAX_ATTEMPTS,
+            0,
+        );
+        assert_eq!(selected, Some(FAST_GROUNDED_VALIDATED_STRETCH_TARGET));
     }
 }
 

@@ -54,10 +54,13 @@ WRITE GREAT SUGGESTIONS:
 - `summary` must answer two things:
   1) What goes wrong for the person using the product.
   2) Why that matters in real life (lost sign-ins, failed saves, slower app, crashes, trust/support cost).
-- Preferred structure (2 short sentences):
-  "When someone <user action>, <visible bad outcome>."
-  "This matters because <real-world impact>."
+- Preferred structure: one direct sentence in plain English.
+- Start with the concrete failure/outcome, then add impact.
+  - Good: "Checkout confirmation emails can fail silently, leaving people unsure their order succeeded."
+  - Good: "The app can miss layout-shift metrics, so teams lose visibility into jittery page behavior."
+- Avoid formulaic templates like "When someone ..." and "This matters because ...".
 - Mention concrete product moments (like sign-in, upload, save, checkout), not vague wording.
+- Avoid vague wording like "hidden errors", "issues happen", or "things break"; name exactly what fails.
 - Avoid unexplained jargon in `summary`. If evidence is technical, translate it:
   - token -> sign-in key
   - cached data -> temporarily saved info
@@ -68,7 +71,7 @@ WRITE GREAT SUGGESTIONS:
   - the words "evidence", "snippet", or "EVIDENCE"
   - backticks or code formatting
 - `summary` should be understandable on first read.
-- Keep `summary` to 1-2 sentences.
+- Keep `summary` to one sentence when possible (max two only if needed for clarity).
 - `summary` must be complete (at least 8 words). Never output dangling fragments like "When users".
 - `detail` is internal technical context for verification/fixing. It may mention files/functions.
 - For both `summary` and `detail`, keep claims local to what the snippet proves.
@@ -111,8 +114,9 @@ mod prompt_tests {
             "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require plain-English summaries"
         );
         assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("This matters because"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should require user-impact framing"
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM
+                .contains("Avoid formulaic templates like \"When someone ...\""),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should explicitly discourage template phrasing"
         );
         assert!(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("non-technical"),

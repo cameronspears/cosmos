@@ -716,9 +716,9 @@ fn render_suggestions_content<'a>(
         };
 
         let (confidence_label, confidence_style) = match suggestion.confidence {
-            Confidence::High => ("high", Style::default().fg(Theme::GREEN)),
-            Confidence::Medium => ("med", Style::default().fg(Theme::YELLOW)),
-            Confidence::Low => ("low", Style::default().fg(Theme::GREY_500)),
+            Confidence::High => ("verified", Style::default().fg(Theme::GREEN)),
+            Confidence::Medium => ("likely", Style::default().fg(Theme::YELLOW)),
+            Confidence::Low => ("uncertain", Style::default().fg(Theme::GREY_500)),
         };
         let confidence_prefix = format!(" [{}]", confidence_label);
 
