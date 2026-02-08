@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.7.0](https://github.com/cameronspears/cosmos/compare/v0.6.1...v0.7.0) (2026-02-08)
+
+
+### Features
+
+* **agentic:** implement agentic codebase analysis for improved suggestions ([32c96e6](https://github.com/cameronspears/cosmos/commit/32c96e638f14d16a641488e670b06fa6bb646e6a))
+* **cache:** implement question answer caching and improve suggestion caching validation ([315a9a2](https://github.com/cameronspears/cosmos/commit/315a9a27d554d66601bdbfa8053fa08fe61fae49))
+* **config:** add user tracking identifier and enhance API request structure ([de43d82](https://github.com/cameronspears/cosmos/commit/de43d82916baa85d04006cbafb627da830dd1f0e))
+* **dependencies:** add rayon and crossbeam libraries for improved parallel processing ([0e8ca14](https://github.com/cameronspears/cosmos/commit/0e8ca14f3c1e70be63c720f50c433d97e08abfc9))
+* **llm:** add reasoning configuration to ChatRequest and model support ([af2bde2](https://github.com/cameronspears/cosmos/commit/af2bde25c4e66a63b922f3664cd57f9f75f5c8fd))
+* **llm:** add support for Anthropic prompt caching in LLM calls ([8d58c9a](https://github.com/cameronspears/cosmos/commit/8d58c9acbed260789c415230ad7bf1a8694cc5e2))
+* **llm:** add tool choice and parallel tool call options to ChatRequest ([341f759](https://github.com/cameronspears/cosmos/commit/341f759a816beb9bbebf8720c1310ce6c8b5b59c))
+* **llm:** enhance ChatRequest with plugin support and provider configuration ([44b79ff](https://github.com/cameronspears/cosmos/commit/44b79ff2cafd27bc160b77f7d14e78912e5b6e2a))
+* **llm:** enhance keyring functionality and response handling ([5f678b3](https://github.com/cameronspears/cosmos/commit/5f678b3cf743d01deeb31c6d7c4e7ad17acb6f2b))
+* **llm:** enhance suggestion generation with continuation logic ([581c444](https://github.com/cameronspears/cosmos/commit/581c444d2571a746587563427be77bb1c3fd195c))
+* **llm:** improve suggestion deduplication and response handling ([4ce2583](https://github.com/cameronspears/cosmos/commit/4ce258340761a951502318e3c96f69f31fe9bf81))
+* **llm:** integrate reasoning configuration and enhance tool definitions ([d5e63a4](https://github.com/cameronspears/cosmos/commit/d5e63a4a1ae0966c0c9df00d38e8f08f135018f2))
+* **render:** update loading state handling in suggestions rendering ([aba0847](https://github.com/cameronspears/cosmos/commit/aba0847227d1e53c6c71d66338c4a207303c84b1))
+* **security:** enhance validation and sanitization across git operations and API interactions ([6c4872d](https://github.com/cameronspears/cosmos/commit/6c4872d83f995ae93e0b25020bdec23f2baccfde))
+* **suggest:** clarify summary and detail definitions for user impact ([ad9deb3](https://github.com/cameronspears/cosmos/commit/ad9deb38fba712befd36f5bd28568e76b08b4fb3))
+* **suggest:** enhance suggestion diagnostics and integrate confidence levels ([0d1bf88](https://github.com/cameronspears/cosmos/commit/0d1bf886843ec15aad5b1586a7745359569876f4))
+* **suggest:** implement fast grounded suggestions and enhance suggestion diagnostics ([6a21923](https://github.com/cameronspears/cosmos/commit/6a2192357ba971b94aaaab84b945318bd93be0fe))
+* **suggest:** refine suggestion sorting and analysis prompt for balanced context ([26dbdad](https://github.com/cameronspears/cosmos/commit/26dbdad9450aac85e783d253d3ed4fcf0878671f))
+* **wallet:** implement wallet balance tracking and refresh mechanism ([731e98e](https://github.com/cameronspears/cosmos/commit/731e98ebdb80dc7dd4d10d50e5d0e3a5f9278f15))
+
+
+### Bug Fixes
+
+* add validation to clamp percent_x and percent_y to the 0-100 range in centered_rect to prevent underflow panics when values exceed 100. ([54e0eb4](https://github.com/cameronspears/cosmos/commit/54e0eb47f70c8f115c94c66375869ed32ab4c11e))
+* **cache:** wire up question cache cleanup on load ([63cf7ac](https://github.com/cameronspears/cosmos/commit/63cf7aca6893b88e5656d0b4aab06b776aa4f4ff))
+* **git_ops:** enhance branch name validation in tests to ensure non-empty and valid git references ([f4e22c5](https://github.com/cameronspears/cosmos/commit/f4e22c558b1f7bbf4db9528044d18ce367d02f34))
+* **llm:** update reasoning effort and model identifiers for accuracy ([2da2cd4](https://github.com/cameronspears/cosmos/commit/2da2cd41823f7c310f4264ac40f023fa8d4dac69))
+* **tests:** add missing newline at end of file in analysis.rs to comply with formatting standards ([cbbd976](https://github.com/cameronspears/cosmos/commit/cbbd97689c2586c2d1286de5550fd5827214300d))
+* **ui:** reset review fixing state on error to prevent stuck UI ([2a1b150](https://github.com/cameronspears/cosmos/commit/2a1b150574ddc4d1bafe996766f42bd122c49c0f))
+
 ## [0.6.1](https://github.com/cameronspears/cosmos/compare/v0.6.0...v0.6.1) (2026-01-26)
 
 
