@@ -31,6 +31,8 @@ const MEMORY_FILE: &str = "memory.json";
 const GLOSSARY_FILE: &str = "glossary.json";
 const GROUPING_AI_CACHE_FILE: &str = "grouping_ai.json";
 const PIPELINE_METRICS_FILE: &str = "pipeline_metrics.jsonl";
+const SUGGESTION_QUALITY_FILE: &str = "suggestion_quality.jsonl";
+const SELF_ITERATION_RUNS_FILE: &str = "self_iteration_runs.jsonl";
 const CACHE_LOCK_TIMEOUT_SECS: u64 = 5;
 const CACHE_LOCK_RETRY_MS: u64 = 50;
 
@@ -53,6 +55,8 @@ pub enum ResetOption {
     QuestionCache,
     /// Clear pipeline_metrics.jsonl - latency/cost telemetry rows
     PipelineMetrics,
+    /// Clear suggestion_quality.jsonl - per-suggestion validation telemetry
+    SuggestionQuality,
 }
 
 impl ResetOption {
@@ -67,6 +71,7 @@ impl ResetOption {
             ResetOption::GroupingAi => "Grouping AI",
             ResetOption::QuestionCache => "Question Cache",
             ResetOption::PipelineMetrics => "Pipeline Metrics",
+            ResetOption::SuggestionQuality => "Suggestion Quality",
         }
     }
 
@@ -81,6 +86,7 @@ impl ResetOption {
             ResetOption::GroupingAi => "rebuild AI grouping",
             ResetOption::QuestionCache => "clear saved Q&A",
             ResetOption::PipelineMetrics => "clear latency/cost logs",
+            ResetOption::SuggestionQuality => "clear validation telemetry",
         }
     }
 
@@ -95,6 +101,7 @@ impl ResetOption {
             ResetOption::GroupingAi,
             ResetOption::QuestionCache,
             ResetOption::PipelineMetrics,
+            ResetOption::SuggestionQuality,
         ]
     }
 
@@ -413,6 +420,90 @@ pub struct PipelineMetricRecord {
     pub cost: f64,
     pub gate: String,
     pub passed: bool,
+}
+
+/// Per-suggestion telemetry row written as JSONL to `.cosmos/suggestion_quality.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuggestionQualityRecord {
+    pub timestamp: DateTime<Utc>,
+    /// Correlates all suggestions produced in one generation/refinement cycle.
+    pub run_id: String,
+    pub suggestion_id: String,
+    pub evidence_ids: Vec<usize>,
+    /// One of: pending, validated, rejected.
+    pub validation_outcome: String,
+    /// Optional detail from validator (if available).
+    pub validation_reason: Option<String>,
+    /// One of: verified, contradicted, insufficient_evidence (set later by user verify).
+    pub user_verify_outcome: Option<String>,
+}
+
+/// Command result row for self-iteration validation runs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SelfIterationCommandOutcome {
+    pub name: String,
+    pub command: String,
+    pub cwd: PathBuf,
+    pub duration_ms: u64,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Aggregated suggestion quality metrics from sandbox self-iteration runs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SelfIterationSuggestionMetrics {
+    #[serde(default)]
+    pub trials: usize,
+    #[serde(default)]
+    pub provisional_count: usize,
+    #[serde(default)]
+    pub validated_count: usize,
+    #[serde(default)]
+    pub rejected_count: usize,
+    #[serde(default)]
+    pub validated_ratio: f64,
+    #[serde(default)]
+    pub rejected_ratio: f64,
+    #[serde(default)]
+    pub preview_sampled: usize,
+    #[serde(default)]
+    pub preview_verified_count: usize,
+    #[serde(default)]
+    pub preview_contradicted_count: usize,
+    #[serde(default)]
+    pub preview_insufficient_count: usize,
+    #[serde(default)]
+    pub preview_error_count: usize,
+    #[serde(default)]
+    pub preview_precision: Option<f64>,
+    #[serde(default)]
+    pub evidence_line1_ratio: f64,
+    #[serde(default)]
+    pub evidence_source_mix: HashMap<String, usize>,
+}
+
+/// High-level record for one `cosmos-lab` run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfIterationRunRecord {
+    pub timestamp: DateTime<Utc>,
+    pub run_id: String,
+    pub mode: String,
+    pub cosmos_repo: PathBuf,
+    pub target_repo: PathBuf,
+    pub passed: bool,
+    #[serde(default)]
+    pub command_outcomes: Vec<SelfIterationCommandOutcome>,
+    #[serde(default)]
+    pub reliability_metrics: Option<SelfIterationSuggestionMetrics>,
+    #[serde(default)]
+    pub report_path: Option<PathBuf>,
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 impl GroupingAiCache {
@@ -899,6 +990,102 @@ impl Cache {
         Ok(())
     }
 
+    /// Append a per-suggestion quality record (JSONL).
+    pub fn append_suggestion_quality(
+        &self,
+        record: &SuggestionQualityRecord,
+    ) -> anyhow::Result<()> {
+        let _lock = self.lock(true)?;
+        let path = self.cache_dir.join(SUGGESTION_QUALITY_FILE);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let row = serde_json::to_string(record)?;
+        use std::io::Write;
+        writeln!(file, "{}", row)?;
+        Ok(())
+    }
+
+    /// Append one self-iteration run record (JSONL).
+    pub fn append_self_iteration_run(&self, record: &SelfIterationRunRecord) -> anyhow::Result<()> {
+        let _lock = self.lock(true)?;
+        let path = self.cache_dir.join(SELF_ITERATION_RUNS_FILE);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let row = serde_json::to_string(record)?;
+        use std::io::Write;
+        writeln!(file, "{}", row)?;
+        Ok(())
+    }
+
+    /// Load up to `limit` latest suggestion-quality records (newest last).
+    pub fn load_recent_suggestion_quality(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SuggestionQualityRecord>> {
+        let path = self.cache_dir.join(SUGGESTION_QUALITY_FILE);
+        if !path.exists() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let _lock = self.lock(false)?;
+        let content = fs::read_to_string(&path)?;
+        let mut records: Vec<SuggestionQualityRecord> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<SuggestionQualityRecord>(line).ok())
+            .collect();
+        if records.len() > limit {
+            let split = records.len() - limit;
+            records.drain(0..split);
+        }
+        Ok(records)
+    }
+
+    /// Load up to `limit` latest self-iteration run records (newest last).
+    pub fn load_recent_self_iteration_runs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SelfIterationRunRecord>> {
+        let path = self.cache_dir.join(SELF_ITERATION_RUNS_FILE);
+        if !path.exists() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let _lock = self.lock(false)?;
+        let content = fs::read_to_string(&path)?;
+        let mut records: Vec<SelfIterationRunRecord> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<SelfIterationRunRecord>(line).ok())
+            .collect();
+        if records.len() > limit {
+            let split = records.len() - limit;
+            records.drain(0..split);
+        }
+        Ok(records)
+    }
+
+    /// Compute rolling verify precision from suggestion-quality telemetry.
+    ///
+    /// Precision = verified / (verified + contradicted)
+    pub fn rolling_verify_precision(&self, window: usize) -> Option<f64> {
+        let records = self
+            .load_recent_suggestion_quality(window.saturating_mul(3))
+            .ok()?;
+        let mut verified = 0usize;
+        let mut contradicted = 0usize;
+        for record in records.iter().rev() {
+            match record.user_verify_outcome.as_deref() {
+                Some("verified") => verified += 1,
+                Some("contradicted") => contradicted += 1,
+                _ => {}
+            }
+            if verified + contradicted >= window {
+                break;
+            }
+        }
+        let total = verified + contradicted;
+        if total == 0 {
+            None
+        } else {
+            Some(verified as f64 / total as f64)
+        }
+    }
+
     /// Clear selected cache files only
     pub fn clear_selective(&self, options: &[ResetOption]) -> anyhow::Result<Vec<String>> {
         let _lock = self.lock(true)?;
@@ -914,6 +1101,7 @@ impl Cache {
                 ResetOption::GroupingAi => vec![GROUPING_AI_CACHE_FILE],
                 ResetOption::QuestionCache => vec![QUESTION_CACHE_FILE],
                 ResetOption::PipelineMetrics => vec![PIPELINE_METRICS_FILE],
+                ResetOption::SuggestionQuality => vec![SUGGESTION_QUALITY_FILE],
             };
 
             for file in files_to_remove {
@@ -1146,6 +1334,7 @@ fn write_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1231,8 +1420,10 @@ mod tests {
         let options = ResetOption::all();
         assert!(options.contains(&ResetOption::QuestionCache));
         assert!(options.contains(&ResetOption::PipelineMetrics));
+        assert!(options.contains(&ResetOption::SuggestionQuality));
         assert!(!ResetOption::defaults().contains(&ResetOption::QuestionCache));
         assert!(!ResetOption::defaults().contains(&ResetOption::PipelineMetrics));
+        assert!(!ResetOption::defaults().contains(&ResetOption::SuggestionQuality));
     }
 
     #[test]
@@ -1276,18 +1467,135 @@ mod tests {
             passed: true,
         };
         cache.append_pipeline_metric(&metric).unwrap();
+        let quality = SuggestionQualityRecord {
+            timestamp: Utc::now(),
+            run_id: "run-1".to_string(),
+            suggestion_id: "suggestion-1".to_string(),
+            evidence_ids: vec![1, 2],
+            validation_outcome: "validated".to_string(),
+            validation_reason: Some("Looks good".to_string()),
+            user_verify_outcome: None,
+        };
+        cache.append_suggestion_quality(&quality).unwrap();
 
         let cache_dir = root.join(CACHE_DIR);
         assert!(cache_dir.join(QUESTION_CACHE_FILE).exists());
         assert!(cache_dir.join(PIPELINE_METRICS_FILE).exists());
+        assert!(cache_dir.join(SUGGESTION_QUALITY_FILE).exists());
 
         cache
-            .clear_selective(&[ResetOption::QuestionCache, ResetOption::PipelineMetrics])
+            .clear_selective(&[
+                ResetOption::QuestionCache,
+                ResetOption::PipelineMetrics,
+                ResetOption::SuggestionQuality,
+            ])
             .unwrap();
 
         assert!(!cache_dir.join(QUESTION_CACHE_FILE).exists());
         assert!(!cache_dir.join(PIPELINE_METRICS_FILE).exists());
+        assert!(!cache_dir.join(SUGGESTION_QUALITY_FILE).exists());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn suggestion_quality_deserializes_without_optional_fields() {
+        let row = serde_json::json!({
+            "timestamp": Utc::now(),
+            "run_id": "run-1",
+            "suggestion_id": "sid-1",
+            "evidence_ids": [0],
+            "validation_outcome": "pending"
+        });
+        let parsed: SuggestionQualityRecord = serde_json::from_value(row).unwrap();
+        assert_eq!(parsed.validation_reason, None);
+        assert_eq!(parsed.user_verify_outcome, None);
+    }
+
+    #[test]
+    fn self_iteration_record_round_trip_and_load_recent() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_self_iteration_test_{}", nanos));
+        fs::create_dir_all(&root).unwrap();
+
+        // Make this a git repo so ensure_dir can write to .git/info/exclude.
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .expect("git init should run");
+
+        let cache = Cache::new(&root);
+        let record = SelfIterationRunRecord {
+            timestamp: Utc::now(),
+            run_id: "run-abc".to_string(),
+            mode: "fast".to_string(),
+            cosmos_repo: root.clone(),
+            target_repo: root.clone(),
+            passed: true,
+            command_outcomes: vec![SelfIterationCommandOutcome {
+                name: "cargo test".to_string(),
+                command: "cargo test --locked".to_string(),
+                cwd: root.clone(),
+                duration_ms: 1000,
+                success: true,
+                exit_code: Some(0),
+                timed_out: false,
+                stdout_tail: "ok".to_string(),
+                stderr_tail: String::new(),
+                note: None,
+            }],
+            reliability_metrics: Some(SelfIterationSuggestionMetrics {
+                trials: 1,
+                provisional_count: 8,
+                validated_count: 7,
+                rejected_count: 1,
+                validated_ratio: 0.875,
+                rejected_ratio: 0.125,
+                preview_sampled: 4,
+                preview_verified_count: 3,
+                preview_contradicted_count: 1,
+                preview_insufficient_count: 0,
+                preview_error_count: 0,
+                preview_precision: Some(0.75),
+                evidence_line1_ratio: 0.2,
+                evidence_source_mix: HashMap::from([
+                    ("pattern".to_string(), 12usize),
+                    ("hotspot".to_string(), 7usize),
+                    ("core".to_string(), 6usize),
+                ]),
+            }),
+            report_path: None,
+            notes: vec!["note".to_string()],
+        };
+        cache.append_self_iteration_run(&record).unwrap();
+
+        let loaded = cache.load_recent_self_iteration_runs(10).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].run_id, "run-abc");
+        assert!(loaded[0].reliability_metrics.is_some());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn self_iteration_record_deserializes_without_optional_fields() {
+        let row = serde_json::json!({
+            "timestamp": Utc::now(),
+            "run_id": "run-legacy",
+            "mode": "fast",
+            "cosmos_repo": ".",
+            "target_repo": ".",
+            "passed": true
+        });
+        let parsed: SelfIterationRunRecord = serde_json::from_value(row).unwrap();
+        assert!(parsed.command_outcomes.is_empty());
+        assert!(parsed.reliability_metrics.is_none());
+        assert!(parsed.notes.is_empty());
+        assert!(parsed.report_path.is_none());
     }
 }

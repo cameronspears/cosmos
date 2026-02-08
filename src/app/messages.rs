@@ -13,6 +13,12 @@ pub enum BackgroundMessage {
         diagnostics: suggest::llm::SuggestionDiagnostics,
         duration_ms: u64,
     },
+    SuggestionsRefined {
+        suggestions: Vec<suggest::Suggestion>,
+        usage: Option<suggest::llm::Usage>,
+        diagnostics: suggest::llm::SuggestionDiagnostics,
+        duration_ms: u64,
+    },
     SuggestionsError(String),
     SummariesReady {
         summaries: HashMap<PathBuf, String>,

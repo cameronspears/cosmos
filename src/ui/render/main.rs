@@ -846,6 +846,20 @@ fn render_suggestion_diagnostics<'a>(lines: &mut Vec<Line<'a>>, app: &App, inner
     }
 
     if let Some(diag) = diagnostics {
+        let refinement_line = if app.suggestion_refinement_in_progress {
+            "Refinement: in progress"
+        } else if diag.refinement_complete {
+            "Refinement: complete"
+        } else {
+            "Refinement: pending"
+        };
+        for line in wrap_text(refinement_line, text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::GREY_400),
+            )]));
+        }
+
         let tool_names = if diag.tool_names.is_empty() {
             "none".to_string()
         } else {
@@ -904,6 +918,34 @@ fn render_suggestion_diagnostics<'a>(lines: &mut Vec<Line<'a>>, app: &App, inner
             )]));
         }
 
+        let validation = format!(
+            "Validation: provisional {} · validated {} · rejected {} · regen attempts {}",
+            diag.provisional_count,
+            diag.validated_count,
+            diag.rejected_count,
+            diag.regeneration_attempts
+        );
+        for line in wrap_text(&validation, text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::GREY_500),
+            )]));
+        }
+
+        let pack_mix = format!(
+            "Evidence pack: patterns {} · hotspots {} · core {} · line1 {:.0}%",
+            diag.pack_pattern_count,
+            diag.pack_hotspot_count,
+            diag.pack_core_count,
+            diag.pack_line1_ratio * 100.0
+        );
+        for line in wrap_text(&pack_mix, text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::GREY_500),
+            )]));
+        }
+
         if diag.batch_verify_attempted > 0 {
             let batch_verify = format!(
                 "Batch verify: attempted {} · confirmed {} · not found {} · errors {}",
@@ -945,6 +987,19 @@ fn render_suggestion_diagnostics<'a>(lines: &mut Vec<Line<'a>>, app: &App, inner
                 format!("{indent}{line}"),
                 Style::default().fg(Theme::GREY_500),
             )]));
+        }
+
+        if let Some(precision) = app.rolling_verify_precision {
+            let precision_line = format!(
+                "Rolling verify precision (last 50): {:.0}%",
+                precision * 100.0
+            );
+            for line in wrap_text(&precision_line, text_width) {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{indent}{line}"),
+                    Style::default().fg(Theme::GREY_400),
+                )]));
+            }
         }
 
         if diag.final_count == 0 && !diag.response_preview.is_empty() {

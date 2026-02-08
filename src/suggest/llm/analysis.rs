@@ -6,11 +6,13 @@ use super::models::{Model, Usage};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{ASK_QUESTION_SYSTEM, FAST_GROUNDED_SUGGESTIONS_SYSTEM};
 use crate::context::WorkContext;
-use crate::index::{CodebaseIndex, PatternSeverity, SymbolKind};
-use crate::suggest::{Suggestion, SuggestionEvidenceRef};
+use crate::index::{CodebaseIndex, PatternKind, PatternReliability, PatternSeverity, SymbolKind};
+use crate::suggest::{Suggestion, SuggestionEvidenceRef, SuggestionValidationState};
+use chrono::Utc;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  THRESHOLDS AND CONSTANTS
@@ -25,6 +27,11 @@ const FAST_EVIDENCE_SNIPPET_LINES_BEFORE: usize = 8;
 const FAST_EVIDENCE_SNIPPET_LINES_AFTER: usize = 12;
 const FAST_GROUNDED_TARGET_MIN: usize = 6;
 const FAST_GROUNDED_TARGET_MAX: usize = 8;
+const FAST_EVIDENCE_SOURCE_PATTERN_MAX: usize = 12;
+const FAST_EVIDENCE_SOURCE_HOTSPOT_MAX: usize = 8;
+const FAST_EVIDENCE_SOURCE_CORE_MAX: usize = 8;
+const FAST_EVIDENCE_KIND_GOD_MODULE_MAX: usize = 4;
+const REFINEMENT_MAX_ATTEMPTS: usize = 2;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ADAPTIVE CONTEXT LIMITS
@@ -136,6 +143,7 @@ QUESTION:
 
 #[derive(Debug, Clone)]
 pub struct SuggestionDiagnostics {
+    pub run_id: String,
     pub model: String,
     pub iterations: usize,
     pub tool_calls: usize,
@@ -165,6 +173,15 @@ pub struct SuggestionDiagnostics {
     pub response_chars: usize,
     pub response_preview: String,
     pub evidence_pack_ms: u64,
+    pub pack_pattern_count: usize,
+    pub pack_hotspot_count: usize,
+    pub pack_core_count: usize,
+    pub pack_line1_ratio: f64,
+    pub provisional_count: usize,
+    pub validated_count: usize,
+    pub rejected_count: usize,
+    pub regeneration_attempts: usize,
+    pub refinement_complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +191,31 @@ struct EvidenceItem {
     line: usize, // 1-based
     snippet: String,
     why_interesting: String,
+    source: EvidenceSource,
+    pattern_kind: Option<PatternKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EvidenceSource {
+    Pattern,
+    Hotspot,
+    Core,
+}
+
+#[derive(Debug, Clone)]
+struct EvidenceCandidate {
+    score: f64,
+    source_priority: usize,
+    severity: PatternSeverity,
+    item: EvidenceItem,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EvidencePackStats {
+    pattern_count: usize,
+    hotspot_count: usize,
+    core_count: usize,
+    line1_ratio: f64,
 }
 
 fn normalize_repo_relative(repo_root: &Path, path: &Path) -> Option<PathBuf> {
@@ -211,43 +253,110 @@ fn read_snippet_around_line(
     Some(snippet)
 }
 
+fn severity_score(severity: PatternSeverity) -> f64 {
+    match severity {
+        PatternSeverity::High => 3.0,
+        PatternSeverity::Medium => 2.0,
+        PatternSeverity::Low => 1.0,
+        PatternSeverity::Info => 0.5,
+    }
+}
+
+fn reliability_score(reliability: PatternReliability) -> f64 {
+    match reliability {
+        PatternReliability::High => 0.55,
+        PatternReliability::Medium => 0.3,
+        PatternReliability::Low => 0.1,
+    }
+}
+
+fn source_priority(source: EvidenceSource) -> usize {
+    match source {
+        EvidenceSource::Pattern => 3,
+        EvidenceSource::Hotspot => 2,
+        EvidenceSource::Core => 1,
+    }
+}
+
+fn source_limit(source: EvidenceSource) -> usize {
+    match source {
+        EvidenceSource::Pattern => FAST_EVIDENCE_SOURCE_PATTERN_MAX,
+        EvidenceSource::Hotspot => FAST_EVIDENCE_SOURCE_HOTSPOT_MAX,
+        EvidenceSource::Core => FAST_EVIDENCE_SOURCE_CORE_MAX,
+    }
+}
+
+fn best_function_anchor(file: &crate::index::FileIndex) -> usize {
+    file.symbols
+        .iter()
+        .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
+        .max_by(|a, b| {
+            a.complexity
+                .partial_cmp(&b.complexity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|s| s.line)
+        .unwrap_or(1)
+}
+
 fn build_evidence_pack(
     repo_root: &Path,
     index: &CodebaseIndex,
     context: &WorkContext,
-) -> Vec<EvidenceItem> {
+) -> (Vec<EvidenceItem>, EvidencePackStats) {
     let changed: HashSet<PathBuf> = context.all_changed_files().into_iter().cloned().collect();
-    let mut candidates: Vec<(f64, EvidenceItem)> = Vec::new();
+    let mut candidates: Vec<EvidenceCandidate> = Vec::new();
 
-    // Patterns (high signal)
+    // Patterns (high-signal, deterministic ranking with reliability weighting)
     for file in index.files.values() {
         for p in &file.patterns {
             let Some(rel_file) = normalize_repo_relative(repo_root, &p.file) else {
                 continue;
             };
-            let severity_score = match p.kind.severity() {
-                PatternSeverity::High => 3.0,
-                PatternSeverity::Medium => 2.0,
-                PatternSeverity::Low => 1.0,
-                PatternSeverity::Info => 0.5,
+            let reliability = p.reliability;
+            let severity = p.kind.severity();
+            let pattern_bonus = match p.kind {
+                PatternKind::MissingErrorHandling => 0.4,
+                PatternKind::PotentialResourceLeak => 0.35,
+                PatternKind::GodModule => -0.35,
+                PatternKind::TodoMarker => -0.2,
+                _ => 0.0,
             };
             let changed_boost = if changed.contains(&rel_file) {
                 0.2
             } else {
                 0.0
             };
-            let score = severity_score + changed_boost;
-            if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, p.line) {
-                candidates.push((
+            let score = severity_score(severity)
+                + reliability_score(reliability)
+                + changed_boost
+                + pattern_bonus;
+
+            let anchor = if p.kind == PatternKind::GodModule {
+                index
+                    .files
+                    .get(&rel_file)
+                    .map(best_function_anchor)
+                    .unwrap_or_else(|| p.line.max(1))
+            } else {
+                p.line.max(1)
+            };
+
+            if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
+                candidates.push(EvidenceCandidate {
                     score,
-                    EvidenceItem {
+                    source_priority: source_priority(EvidenceSource::Pattern),
+                    severity,
+                    item: EvidenceItem {
                         id: 0,
                         file: rel_file,
-                        line: p.line.max(1),
+                        line: anchor,
                         snippet,
                         why_interesting: format!("Detected {:?}: {}", p.kind, p.description),
+                        source: EvidenceSource::Pattern,
+                        pattern_kind: Some(p.kind),
                     },
-                ));
+                });
             }
         }
     }
@@ -258,50 +367,58 @@ fn build_evidence_pack(
         b.complexity
             .partial_cmp(&a.complexity)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.loc.cmp(&a.loc))
+            .then_with(|| a.path.cmp(&b.path))
     });
     for f in hotspot_files
         .iter()
         .filter(|f| f.complexity > HIGH_COMPLEXITY_THRESHOLD || f.loc > GOD_MODULE_LOC_THRESHOLD)
-        .take(6)
+        .take(10)
     {
         let Some(rel_file) = normalize_repo_relative(repo_root, &f.path) else {
             continue;
         };
-        let anchor = f
-            .symbols
-            .iter()
-            .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
-            .max_by(|a, b| {
-                a.complexity
-                    .partial_cmp(&b.complexity)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|s| s.line)
-            .unwrap_or(1);
+        let anchor = best_function_anchor(f).max(1);
         if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
-            candidates.push((
-                2.0 + (f.complexity / 50.0).min(1.0),
-                EvidenceItem {
+            let changed_boost = if changed.contains(&rel_file) {
+                0.2
+            } else {
+                0.0
+            };
+            let score = 2.1 + (f.complexity / 60.0).min(1.0) + changed_boost;
+            candidates.push(EvidenceCandidate {
+                score,
+                source_priority: source_priority(EvidenceSource::Hotspot),
+                severity: PatternSeverity::High,
+                item: EvidenceItem {
                     id: 0,
                     file: rel_file,
-                    line: anchor.max(1),
+                    line: anchor,
                     snippet,
                     why_interesting: format!(
                         "Hotspot file (complexity {:.1}, {} LOC)",
                         f.complexity, f.loc
                     ),
+                    source: EvidenceSource::Hotspot,
+                    pattern_kind: None,
                 },
-            ));
+            });
         }
     }
 
     // Core files (fan-in)
     let mut core_files: Vec<_> = index.files.values().collect();
-    core_files.sort_by(|a, b| b.summary.used_by.len().cmp(&a.summary.used_by.len()));
+    core_files.sort_by(|a, b| {
+        b.summary
+            .used_by
+            .len()
+            .cmp(&a.summary.used_by.len())
+            .then_with(|| a.path.cmp(&b.path))
+    });
     for f in core_files
         .iter()
         .filter(|f| f.summary.used_by.len() >= 3)
-        .take(6)
+        .take(10)
     {
         let Some(rel_file) = normalize_repo_relative(repo_root, &f.path) else {
             continue;
@@ -318,9 +435,17 @@ fn build_evidence_pack(
             .map(|s| s.line)
             .unwrap_or(1);
         if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
-            candidates.push((
-                1.5 + (f.summary.used_by.len() as f64 / 20.0).min(1.0),
-                EvidenceItem {
+            let changed_boost = if changed.contains(&rel_file) {
+                0.15
+            } else {
+                0.0
+            };
+            let score = 1.7 + (f.summary.used_by.len() as f64 / 25.0).min(1.0) + changed_boost;
+            candidates.push(EvidenceCandidate {
+                score,
+                source_priority: source_priority(EvidenceSource::Core),
+                severity: PatternSeverity::Medium,
+                item: EvidenceItem {
                     id: 0,
                     file: rel_file,
                     line: anchor.max(1),
@@ -329,26 +454,97 @@ fn build_evidence_pack(
                         "Core file used by {} other files",
                         f.summary.used_by.len()
                     ),
+                    source: EvidenceSource::Core,
+                    pattern_kind: None,
                 },
-            ));
+            });
         }
     }
 
-    // Rank and dedupe by (file,line)
-    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Deterministic ranking:
+    // score, source priority, severity, then file path + line.
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.source_priority.cmp(&a.source_priority))
+            .then_with(|| b.severity.cmp(&a.severity))
+            .then_with(|| a.item.file.cmp(&b.item.file))
+            .then_with(|| a.item.line.cmp(&b.item.line))
+    });
+
     let mut seen: HashSet<(PathBuf, usize)> = HashSet::new();
     let mut out: Vec<EvidenceItem> = Vec::new();
-    for (_score, mut item) in candidates {
-        let key = (item.file.clone(), item.line);
-        if seen.insert(key) {
-            item.id = out.len();
-            out.push(item);
+    let mut source_counts: HashMap<EvidenceSource, usize> = HashMap::new();
+    let mut god_module_count = 0usize;
+
+    for candidate in &candidates {
+        let key = (candidate.item.file.clone(), candidate.item.line);
+        if seen.contains(&key) {
+            continue;
         }
+        if source_counts
+            .get(&candidate.item.source)
+            .copied()
+            .unwrap_or(0)
+            >= source_limit(candidate.item.source)
+        {
+            continue;
+        }
+        if candidate.item.pattern_kind == Some(PatternKind::GodModule)
+            && god_module_count >= FAST_EVIDENCE_KIND_GOD_MODULE_MAX
+        {
+            continue;
+        }
+        if candidate.item.pattern_kind == Some(PatternKind::GodModule) {
+            god_module_count += 1;
+        }
+        *source_counts.entry(candidate.item.source).or_insert(0) += 1;
+        seen.insert(key);
+        out.push(candidate.item.clone());
         if out.len() >= FAST_EVIDENCE_PACK_MAX_ITEMS {
             break;
         }
     }
-    out
+
+    // Second pass: if quotas were too restrictive, fill remaining slots.
+    if out.len() < FAST_EVIDENCE_PACK_MAX_ITEMS {
+        for candidate in &candidates {
+            let key = (candidate.item.file.clone(), candidate.item.line);
+            if out.len() >= FAST_EVIDENCE_PACK_MAX_ITEMS || seen.contains(&key) {
+                continue;
+            }
+            if candidate.item.pattern_kind == Some(PatternKind::GodModule)
+                && god_module_count >= FAST_EVIDENCE_KIND_GOD_MODULE_MAX
+            {
+                continue;
+            }
+            if candidate.item.pattern_kind == Some(PatternKind::GodModule) {
+                god_module_count += 1;
+            }
+            seen.insert(key);
+            out.push(candidate.item.clone());
+        }
+    }
+
+    for (id, item) in out.iter_mut().enumerate() {
+        item.id = id;
+    }
+
+    let mut stats = EvidencePackStats::default();
+    let line1 = out.iter().filter(|i| i.line == 1).count();
+    for item in &out {
+        match item.source {
+            EvidenceSource::Pattern => stats.pattern_count += 1,
+            EvidenceSource::Hotspot => stats.hotspot_count += 1,
+            EvidenceSource::Core => stats.core_count += 1,
+        }
+    }
+    if !out.is_empty() {
+        stats.line1_ratio = line1 as f64 / out.len() as f64;
+    }
+
+    (out, stats)
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -397,6 +593,29 @@ enum FastGroundedEvidenceRefJson {
     String(String),
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SuggestionValidationJson {
+    #[serde(default)]
+    validation: String,
+    #[serde(default)]
+    reason: String,
+}
+
+fn suggestion_validation_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "validation": {
+                "type": "string",
+                "enum": ["validated", "contradicted", "insufficient_evidence"]
+            },
+            "reason": { "type": "string" }
+        },
+        "required": ["validation", "reason"],
+        "additionalProperties": false
+    })
+}
+
 fn extract_evidence_id(text: &str) -> Option<usize> {
     // Accept common variants:
     // - "EVIDENCE 12"
@@ -442,65 +661,284 @@ fn dedupe_and_cap_grounded_suggestions(mapped: Vec<(usize, Suggestion)>) -> Vec<
     unique
 }
 
-pub async fn analyze_codebase_fast_grounded(
-    repo_root: &Path,
-    index: &CodebaseIndex,
-    context: &WorkContext,
-    repo_memory: Option<String>,
-    summaries: Option<&HashMap<PathBuf, String>>,
-) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
-    let overall_start = std::time::Instant::now();
-    let pack_start = std::time::Instant::now();
-    let pack = build_evidence_pack(repo_root, index, context);
-    let evidence_pack_ms = pack_start.elapsed().as_millis() as u64;
+fn scrub_user_summary(summary: &str) -> String {
+    // Extra safety: even if the model slips, ensure the user-facing title
+    // doesn't contain file paths / line numbers / evidence markers.
+    let mut s = summary.to_string();
 
-    if pack.len() < 12 {
-        return Err(anyhow::anyhow!(
-            "Not enough grounded evidence items found to generate suggestions. Try again after indexing completes."
-        ));
+    // Remove explicit evidence markers.
+    let re_evidence = Regex::new(r"(?i)\b(evidence\s*id|evidence)\s*[:=]?\s*\d*\b")
+        .unwrap_or_else(|_| Regex::new("$^").unwrap());
+    s = re_evidence.replace_all(&s, "").to_string();
+
+    // Remove "(path:123)" style suffixes.
+    let re_path_line =
+        Regex::new(r"\s*\(([^)]*/[^)]*?):\d+\)").unwrap_or_else(|_| Regex::new("$^").unwrap());
+    s = re_path_line.replace_all(&s, "").to_string();
+
+    // Remove bare path-like tokens ("src/foo.rs", "foo.tsx", etc).
+    let re_path_token =
+        Regex::new(r"(?i)\b[\w./-]+\.(rs|tsx|ts|jsx|js|py|go|java|kt|cs|cpp|c|h)\b")
+            .unwrap_or_else(|_| Regex::new("$^").unwrap());
+    s = re_path_token.replace_all(&s, "").to_string();
+
+    // Collapse whitespace after removals.
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn collect_valid_evidence_refs(
+    suggestion: &FastGroundedSuggestionJson,
+    pack: &[EvidenceItem],
+) -> Vec<SuggestionEvidenceRef> {
+    fn push_evidence_id(
+        evidence_id: usize,
+        pack: &[EvidenceItem],
+        seen: &mut HashSet<usize>,
+        refs: &mut Vec<SuggestionEvidenceRef>,
+    ) {
+        if seen.insert(evidence_id) {
+            if let Some(item) = pack.get(evidence_id) {
+                refs.push(SuggestionEvidenceRef {
+                    snippet_id: item.id,
+                    file: item.file.clone(),
+                    line: item.line,
+                });
+            }
+        }
     }
 
-    let memory_section =
-        format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
-    let format_user = |items: &[EvidenceItem], count_hint: &str| -> String {
-        let mut user = String::new();
-        if !memory_section.trim().is_empty() {
-            user.push_str(&memory_section);
-            user.push_str("\n\n");
-        }
-        if let Some(summaries) = summaries {
-            user.push_str("FILE SUMMARIES (grounding context):\n");
-            for item in items {
-                if let Some(summary) = summaries.get(&item.file) {
-                    user.push_str(&format!(
-                        "- {}: {}\n",
-                        item.file.display(),
-                        truncate_str(summary, 180)
-                    ));
-                } else if let Some(file_index) = index.files.get(&item.file) {
-                    user.push_str(&format!(
-                        "- {}: {}\n",
-                        item.file.display(),
-                        truncate_str(&file_index.summary.purpose, 180)
-                    ));
+    let mut refs = Vec::new();
+    let mut seen = HashSet::new();
+
+    let resolve_by_file_line = |file: &str, line: Option<usize>| -> Option<usize> {
+        let normalized = file.replace('\\', "/");
+        let target_line = line.unwrap_or(0);
+
+        // First try exact path match with nearest line.
+        let mut best_exact: Option<(usize, usize)> = None; // (distance, id)
+        for item in pack {
+            let item_path = item.file.to_string_lossy().replace('\\', "/");
+            if item_path == normalized || normalized.ends_with(&item_path) {
+                let distance = if target_line > 0 {
+                    item.line.abs_diff(target_line)
+                } else {
+                    0
+                };
+                match best_exact {
+                    Some((best_dist, _)) if distance >= best_dist => {}
+                    _ => best_exact = Some((distance, item.id)),
                 }
             }
-            user.push('\n');
         }
-        user.push_str(count_hint);
-        user.push_str("\n\nEVIDENCE PACK (internal grounding only):\n");
-        for item in items {
-            user.push_str(&format!(
-                "EVIDENCE {id}:\nSignal: {why}\nSNIPPET:\n{snippet}\n\n",
-                id = item.id,
-                why = item.why_interesting,
-                snippet = item.snippet
-            ));
+        if let Some((_, id)) = best_exact {
+            return Some(id);
         }
-        user
+
+        // Fallback to basename match if unique.
+        let file_name = std::path::Path::new(&normalized)
+            .file_name()
+            .and_then(|n| n.to_str())?;
+        let mut matched: Option<usize> = None;
+        for item in pack {
+            let candidate = item.file.file_name().and_then(|n| n.to_str());
+            if candidate == Some(file_name) {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(item.id);
+            }
+        }
+        matched
     };
 
-    let schema = serde_json::json!({
+    let infer_id_from_text = |text: &str| -> Option<usize> {
+        let text_norm = text.to_lowercase();
+        for item in pack {
+            let item_path = item
+                .file
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_lowercase();
+            if text_norm.contains(&item_path) {
+                return Some(item.id);
+            }
+        }
+        None
+    };
+
+    let parse_ref_id = |reference: &FastGroundedEvidenceRefJson| -> Option<usize> {
+        match reference {
+            FastGroundedEvidenceRefJson::Object {
+                evidence_id,
+                snippet_id,
+                file,
+                line,
+            } => (*evidence_id)
+                .or(*snippet_id)
+                .or_else(|| file.as_deref().and_then(|f| resolve_by_file_line(f, *line))),
+            FastGroundedEvidenceRefJson::Integer(id) => Some(*id),
+            FastGroundedEvidenceRefJson::String(raw) => raw
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .or_else(|| extract_evidence_id(raw))
+                .or_else(|| infer_id_from_text(raw)),
+        }
+    };
+
+    for r in &suggestion.evidence_refs {
+        if let Some(id) = parse_ref_id(r) {
+            push_evidence_id(id, pack, &mut seen, &mut refs);
+        }
+    }
+
+    // Backward compatibility: older suggestion shape used top-level `evidence_id`.
+    if refs.is_empty() {
+        if let Some(id) = suggestion.evidence_id {
+            push_evidence_id(id, pack, &mut seen, &mut refs);
+        }
+    }
+
+    if refs.is_empty() {
+        if let Some(id) = suggestion.snippet_id {
+            push_evidence_id(id, pack, &mut seen, &mut refs);
+        }
+    }
+
+    if refs.is_empty() {
+        if let Some(id) = suggestion
+            .file
+            .as_deref()
+            .and_then(|f| resolve_by_file_line(f, suggestion.line))
+        {
+            push_evidence_id(id, pack, &mut seen, &mut refs);
+        }
+    }
+
+    // Last-chance compatibility: extract explicit evidence markers from text.
+    if refs.is_empty() {
+        if let Some(id) = suggestion
+            .evidence_id
+            .or(suggestion.snippet_id)
+            .or_else(|| extract_evidence_id(&suggestion.summary))
+            .or_else(|| extract_evidence_id(&suggestion.detail))
+            .or_else(|| infer_id_from_text(&suggestion.summary))
+            .or_else(|| infer_id_from_text(&suggestion.detail))
+        {
+            push_evidence_id(id, pack, &mut seen, &mut refs);
+        }
+    }
+
+    refs
+}
+
+fn convert_raw_suggestion(
+    s: FastGroundedSuggestionJson,
+    pack: &[EvidenceItem],
+) -> Option<(usize, Suggestion)> {
+    let evidence_refs = collect_valid_evidence_refs(&s, pack);
+    let evidence_id = evidence_refs.first().map(|r| r.snippet_id)?;
+    let item = pack.get(evidence_id)?;
+
+    let kind = match s.kind.to_lowercase().as_str() {
+        "bugfix" => crate::suggest::SuggestionKind::BugFix,
+        "optimization" => crate::suggest::SuggestionKind::Optimization,
+        "refactoring" => crate::suggest::SuggestionKind::Refactoring,
+        "security" => crate::suggest::SuggestionKind::BugFix,
+        "reliability" => crate::suggest::SuggestionKind::Quality,
+        _ => crate::suggest::SuggestionKind::Improvement,
+    };
+    let priority = match s.priority.to_lowercase().as_str() {
+        "high" => crate::suggest::Priority::High,
+        "low" => crate::suggest::Priority::Low,
+        _ => crate::suggest::Priority::Medium,
+    };
+    let confidence = match s.confidence.to_lowercase().as_str() {
+        "high" => crate::suggest::Confidence::High,
+        _ => crate::suggest::Confidence::Medium,
+    };
+
+    let mut summary = scrub_user_summary(&s.summary);
+    if summary.trim().is_empty() {
+        summary = scrub_user_summary(
+            s.detail
+                .lines()
+                .next()
+                .unwrap_or("Potential improvement found.")
+                .trim(),
+        );
+        summary = truncate_str(&summary, 120).to_string();
+    }
+
+    let suggestion = Suggestion::new(
+        kind,
+        priority,
+        item.file.clone(),
+        summary,
+        crate::suggest::SuggestionSource::LlmDeep,
+    )
+    .with_confidence(confidence)
+    .with_line(item.line)
+    .with_detail(s.detail)
+    .with_evidence(item.snippet.clone())
+    .with_evidence_refs(evidence_refs)
+    .with_validation_state(SuggestionValidationState::Pending);
+
+    Some((evidence_id, suggestion))
+}
+
+fn map_raw_items_to_grounded(
+    raw_items: Vec<FastGroundedSuggestionJson>,
+    pack: &[EvidenceItem],
+) -> (Vec<(usize, Suggestion)>, usize) {
+    let mut mapped: Vec<(usize, Suggestion)> = Vec::new();
+    let mut missing_or_invalid = 0usize;
+    for s in raw_items {
+        if let Some(converted) = convert_raw_suggestion(s, pack) {
+            mapped.push(converted);
+        } else {
+            missing_or_invalid += 1;
+        }
+    }
+    (mapped, missing_or_invalid)
+}
+
+fn ensure_target_suggestion_count(
+    mut validated: Vec<Suggestion>,
+    mut provisional_pool: Vec<Suggestion>,
+    cache: Option<&crate::cache::Cache>,
+    run_id: Option<&str>,
+) -> Vec<Suggestion> {
+    if validated.len() < FAST_GROUNDED_TARGET_MIN {
+        for mut suggestion in provisional_pool.drain(..) {
+            if validated.len() >= FAST_GROUNDED_TARGET_MIN {
+                break;
+            }
+            if validated
+                .iter()
+                .any(|existing| existing.id == suggestion.id)
+            {
+                continue;
+            }
+            suggestion.validation_state = SuggestionValidationState::Pending;
+            if let (Some(cache), Some(run_id)) = (cache, run_id) {
+                append_suggestion_quality_record(
+                    cache,
+                    run_id,
+                    &suggestion,
+                    "pending",
+                    Some("Kept to satisfy minimum count after bounded refinement".to_string()),
+                );
+            }
+            validated.push(suggestion);
+        }
+    }
+    validated.truncate(FAST_GROUNDED_TARGET_MAX);
+    validated
+}
+
+fn grounded_suggestion_schema(pack_len: usize) -> serde_json::Value {
+    serde_json::json!({
         "type": "object",
         "properties": {
             "suggestions": {
@@ -513,7 +951,7 @@ pub async fn analyze_codebase_fast_grounded(
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "evidence_id": { "type": "integer", "minimum": 0, "maximum": pack.len().saturating_sub(1) }
+                                    "evidence_id": { "type": "integer", "minimum": 0, "maximum": pack_len.saturating_sub(1) }
                                 },
                                 "required": ["evidence_id"],
                                 "additionalProperties": false
@@ -536,7 +974,238 @@ pub async fn analyze_codebase_fast_grounded(
         },
         "required": ["suggestions"],
         "additionalProperties": false
-    });
+    })
+}
+
+fn format_grounded_user_prompt(
+    memory_section: &str,
+    index: &CodebaseIndex,
+    summaries: Option<&HashMap<PathBuf, String>>,
+    items: &[EvidenceItem],
+    count_hint: &str,
+) -> String {
+    let mut user = String::new();
+    if !memory_section.trim().is_empty() {
+        user.push_str(memory_section);
+        user.push_str("\n\n");
+    }
+    if let Some(summaries) = summaries {
+        user.push_str("FILE SUMMARIES (grounding context):\n");
+        for item in items {
+            if let Some(summary) = summaries.get(&item.file) {
+                user.push_str(&format!(
+                    "- {}: {}\n",
+                    item.file.display(),
+                    truncate_str(summary, 180)
+                ));
+            } else if let Some(file_index) = index.files.get(&item.file) {
+                user.push_str(&format!(
+                    "- {}: {}\n",
+                    item.file.display(),
+                    truncate_str(&file_index.summary.purpose, 180)
+                ));
+            }
+        }
+        user.push('\n');
+    }
+    user.push_str(count_hint);
+    user.push_str("\n\nEVIDENCE PACK (internal grounding only):\n");
+    for item in items {
+        user.push_str(&format!(
+            "EVIDENCE {id}:\nSignal: {why}\nSNIPPET:\n{snippet}\n\n",
+            id = item.id,
+            why = item.why_interesting,
+            snippet = item.snippet
+        ));
+    }
+    user
+}
+
+async fn validate_suggestion_with_model(
+    suggestion: &Suggestion,
+    memory_section: &str,
+) -> anyhow::Result<(SuggestionValidationState, String, Option<Usage>)> {
+    let mut evidence_block = String::new();
+    for (idx, reference) in suggestion.evidence_refs.iter().take(3).enumerate() {
+        evidence_block.push_str(&format!(
+            "Evidence {}: {}:{} (id={})\n",
+            idx + 1,
+            reference.file.display(),
+            reference.line,
+            reference.snippet_id
+        ));
+    }
+    if let Some(snippet) = &suggestion.evidence {
+        evidence_block.push_str("\nPRIMARY SNIPPET:\n");
+        evidence_block.push_str(snippet);
+        evidence_block.push('\n');
+    }
+
+    let system = r#"You are a strict code suggestion validator.
+Use ONLY the provided suggestion and evidence snippets.
+
+Return JSON:
+{
+  "validation": "validated|contradicted|insufficient_evidence",
+  "reason": "one short sentence"
+}"#;
+
+    let user = format!(
+        "{}\n\nSUGGESTION SUMMARY:\n{}\n\nTECHNICAL DETAIL:\n{}\n\nEVIDENCE:\n{}\n\nDecide whether the suggestion is supported by the evidence only.",
+        memory_section,
+        suggestion.summary,
+        suggestion.detail.as_deref().unwrap_or(""),
+        evidence_block
+    );
+
+    let response = call_llm_structured::<SuggestionValidationJson>(
+        system,
+        &user,
+        Model::Balanced,
+        "suggestion_validation",
+        suggestion_validation_schema(),
+    )
+    .await?;
+
+    let state = match response.data.validation.trim().to_lowercase().as_str() {
+        "validated" => SuggestionValidationState::Validated,
+        "contradicted" | "insufficient_evidence" => SuggestionValidationState::Rejected,
+        _ => SuggestionValidationState::Rejected,
+    };
+
+    Ok((state, response.data.reason, response.usage))
+}
+
+fn append_suggestion_quality_record(
+    cache: &crate::cache::Cache,
+    run_id: &str,
+    suggestion: &Suggestion,
+    outcome: &str,
+    reason: Option<String>,
+) {
+    let record = crate::cache::SuggestionQualityRecord {
+        timestamp: Utc::now(),
+        run_id: run_id.to_string(),
+        suggestion_id: suggestion.id.to_string(),
+        evidence_ids: suggestion
+            .evidence_refs
+            .iter()
+            .map(|r| r.snippet_id)
+            .collect::<Vec<_>>(),
+        validation_outcome: outcome.to_string(),
+        validation_reason: reason,
+        user_verify_outcome: None,
+    };
+    let _ = cache.append_suggestion_quality(&record);
+}
+
+async fn validate_batch_suggestions(
+    batch: Vec<Suggestion>,
+    memory_section: &str,
+    cache: &crate::cache::Cache,
+    run_id: &str,
+    validated: &mut Vec<Suggestion>,
+    rejected_count: &mut usize,
+    used_evidence_ids: &mut HashSet<usize>,
+) -> Option<Usage> {
+    let mut usage: Option<Usage> = None;
+    for mut suggestion in batch {
+        let (state, reason, call_usage) =
+            match validate_suggestion_with_model(&suggestion, memory_section).await {
+                Ok(result) => result,
+                Err(err) => (
+                    SuggestionValidationState::Rejected,
+                    format!("Validation failed: {}", truncate_str(&err.to_string(), 120)),
+                    None,
+                ),
+            };
+        usage = merge_usage(usage, call_usage);
+
+        let primary_evidence = suggestion.evidence_refs.first().map(|r| r.snippet_id);
+        match state {
+            SuggestionValidationState::Validated => {
+                if let Some(eid) = primary_evidence {
+                    if used_evidence_ids.insert(eid) {
+                        suggestion.validation_state = SuggestionValidationState::Validated;
+                        append_suggestion_quality_record(
+                            cache,
+                            run_id,
+                            &suggestion,
+                            "validated",
+                            Some(reason),
+                        );
+                        validated.push(suggestion);
+                    } else {
+                        *rejected_count += 1;
+                        suggestion.validation_state = SuggestionValidationState::Rejected;
+                        append_suggestion_quality_record(
+                            cache,
+                            run_id,
+                            &suggestion,
+                            "rejected",
+                            Some("Duplicate evidence_id after validation".to_string()),
+                        );
+                    }
+                } else {
+                    *rejected_count += 1;
+                    suggestion.validation_state = SuggestionValidationState::Rejected;
+                    append_suggestion_quality_record(
+                        cache,
+                        run_id,
+                        &suggestion,
+                        "rejected",
+                        Some("Missing evidence refs after validation".to_string()),
+                    );
+                }
+            }
+            SuggestionValidationState::Rejected => {
+                *rejected_count += 1;
+                suggestion.validation_state = SuggestionValidationState::Rejected;
+                let outcome = if reason.to_lowercase().contains("insufficient") {
+                    "insufficient_evidence"
+                } else {
+                    "rejected"
+                };
+                append_suggestion_quality_record(cache, run_id, &suggestion, outcome, Some(reason));
+            }
+            SuggestionValidationState::Pending => {
+                *rejected_count += 1;
+                suggestion.validation_state = SuggestionValidationState::Rejected;
+                append_suggestion_quality_record(
+                    cache,
+                    run_id,
+                    &suggestion,
+                    "rejected",
+                    Some("Validator returned pending".to_string()),
+                );
+            }
+        }
+    }
+    usage
+}
+
+pub async fn analyze_codebase_fast_grounded(
+    repo_root: &Path,
+    index: &CodebaseIndex,
+    context: &WorkContext,
+    repo_memory: Option<String>,
+    summaries: Option<&HashMap<PathBuf, String>>,
+) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
+    let run_id = Uuid::new_v4().to_string();
+    let overall_start = std::time::Instant::now();
+    let pack_start = std::time::Instant::now();
+    let (pack, pack_stats) = build_evidence_pack(repo_root, index, context);
+    let evidence_pack_ms = pack_start.elapsed().as_millis() as u64;
+
+    if pack.len() < 12 {
+        return Err(anyhow::anyhow!(
+            "Not enough grounded evidence items found to generate suggestions. Try again after indexing completes."
+        ));
+    }
+
+    let memory_section =
+        format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
+    let schema = grounded_suggestion_schema(pack.len());
 
     // Two sharded calls in parallel to reduce tail latency and improve chance of
     // reaching 6-8 usable suggestions under provider quirks.
@@ -545,8 +1214,20 @@ pub async fn analyze_codebase_fast_grounded(
 
     let shard_timeout_ms: u64 = 6_800;
     let shard_max_tokens: u32 = 420;
-    let user_left = format_user(left, "For this request, return 3 to 4 suggestions.");
-    let user_right = format_user(right, "For this request, return 3 to 4 suggestions.");
+    let user_left = format_grounded_user_prompt(
+        &memory_section,
+        index,
+        summaries,
+        left,
+        "For this request, return 3 to 4 suggestions.",
+    );
+    let user_right = format_grounded_user_prompt(
+        &memory_section,
+        index,
+        summaries,
+        right,
+        "For this request, return 3 to 4 suggestions.",
+    );
 
     let llm_start = std::time::Instant::now();
     let (resp_a, resp_b) = tokio::join!(
@@ -593,10 +1274,13 @@ pub async fn analyze_codebase_fast_grounded(
             let extra_start = std::time::Instant::now();
             if let Ok(r) = call_llm_structured_with_provider::<FastGroundedResponseJson>(
                 FAST_GROUNDED_SUGGESTIONS_SYSTEM,
-                    &format_user(
-                        &pack,
-                        "Return 6 to 8 suggestions. Prefer diverse evidence refs and avoid reusing the same evidence_id unless necessary.",
-                    ),
+                &format_grounded_user_prompt(
+                    &memory_section,
+                    index,
+                    summaries,
+                    &pack,
+                    "Return 6 to 8 suggestions. Prefer diverse evidence refs and avoid reusing the same evidence_id unless necessary.",
+                ),
                 Model::Speed,
                 "fast_grounded_suggestions",
                 schema.clone(),
@@ -618,7 +1302,10 @@ pub async fn analyze_codebase_fast_grounded(
         let rescue_start = std::time::Instant::now();
         if let Ok(r) = call_llm_structured::<FastGroundedResponseJson>(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM,
-            &format_user(
+            &format_grounded_user_prompt(
+                &memory_section,
+                index,
+                summaries,
                 &pack,
                 "Return 6 to 8 suggestions and include evidence refs for each suggestion.",
             ),
@@ -634,238 +1321,8 @@ pub async fn analyze_codebase_fast_grounded(
         }
     }
 
-    fn collect_valid_evidence_refs(
-        suggestion: &FastGroundedSuggestionJson,
-        pack: &[EvidenceItem],
-    ) -> Vec<SuggestionEvidenceRef> {
-        fn push_evidence_id(
-            evidence_id: usize,
-            pack: &[EvidenceItem],
-            seen: &mut HashSet<usize>,
-            refs: &mut Vec<SuggestionEvidenceRef>,
-        ) {
-            if seen.insert(evidence_id) {
-                if let Some(item) = pack.get(evidence_id) {
-                    refs.push(SuggestionEvidenceRef {
-                        snippet_id: item.id,
-                        file: item.file.clone(),
-                        line: item.line,
-                    });
-                }
-            }
-        }
-
-        let mut refs = Vec::new();
-        let mut seen = HashSet::new();
-
-        let resolve_by_file_line = |file: &str, line: Option<usize>| -> Option<usize> {
-            let normalized = file.replace('\\', "/");
-            let target_line = line.unwrap_or(0);
-
-            // First try exact path match with nearest line.
-            let mut best_exact: Option<(usize, usize)> = None; // (distance, id)
-            for item in pack {
-                let item_path = item.file.to_string_lossy().replace('\\', "/");
-                if item_path == normalized || normalized.ends_with(&item_path) {
-                    let distance = if target_line > 0 {
-                        item.line.abs_diff(target_line)
-                    } else {
-                        0
-                    };
-                    match best_exact {
-                        Some((best_dist, _)) if distance >= best_dist => {}
-                        _ => best_exact = Some((distance, item.id)),
-                    }
-                }
-            }
-            if let Some((_, id)) = best_exact {
-                return Some(id);
-            }
-
-            // Fallback to basename match if unique.
-            let file_name = std::path::Path::new(&normalized)
-                .file_name()
-                .and_then(|n| n.to_str())?;
-            let mut matched: Option<usize> = None;
-            for item in pack {
-                let candidate = item.file.file_name().and_then(|n| n.to_str());
-                if candidate == Some(file_name) {
-                    if matched.is_some() {
-                        return None;
-                    }
-                    matched = Some(item.id);
-                }
-            }
-            matched
-        };
-
-        let infer_id_from_text = |text: &str| -> Option<usize> {
-            let text_norm = text.to_lowercase();
-            for item in pack {
-                let item_path = item
-                    .file
-                    .to_string_lossy()
-                    .replace('\\', "/")
-                    .to_lowercase();
-                if text_norm.contains(&item_path) {
-                    return Some(item.id);
-                }
-            }
-            None
-        };
-
-        let parse_ref_id = |reference: &FastGroundedEvidenceRefJson| -> Option<usize> {
-            match reference {
-                FastGroundedEvidenceRefJson::Object {
-                    evidence_id,
-                    snippet_id,
-                    file,
-                    line,
-                } => (*evidence_id)
-                    .or(*snippet_id)
-                    .or_else(|| file.as_deref().and_then(|f| resolve_by_file_line(f, *line))),
-                FastGroundedEvidenceRefJson::Integer(id) => Some(*id),
-                FastGroundedEvidenceRefJson::String(raw) => raw
-                    .trim()
-                    .parse::<usize>()
-                    .ok()
-                    .or_else(|| extract_evidence_id(raw))
-                    .or_else(|| infer_id_from_text(raw)),
-            }
-        };
-
-        for r in &suggestion.evidence_refs {
-            if let Some(id) = parse_ref_id(r) {
-                push_evidence_id(id, pack, &mut seen, &mut refs);
-            }
-        }
-
-        // Backward compatibility: older suggestion shape used top-level `evidence_id`.
-        if refs.is_empty() {
-            if let Some(id) = suggestion.evidence_id {
-                push_evidence_id(id, pack, &mut seen, &mut refs);
-            }
-        }
-
-        if refs.is_empty() {
-            if let Some(id) = suggestion.snippet_id {
-                push_evidence_id(id, pack, &mut seen, &mut refs);
-            }
-        }
-
-        if refs.is_empty() {
-            if let Some(id) = suggestion
-                .file
-                .as_deref()
-                .and_then(|f| resolve_by_file_line(f, suggestion.line))
-            {
-                push_evidence_id(id, pack, &mut seen, &mut refs);
-            }
-        }
-
-        // Last-chance compatibility: extract explicit evidence markers from text.
-        if refs.is_empty() {
-            if let Some(id) = suggestion
-                .evidence_id
-                .or(suggestion.snippet_id)
-                .or_else(|| extract_evidence_id(&suggestion.summary))
-                .or_else(|| extract_evidence_id(&suggestion.detail))
-                .or_else(|| infer_id_from_text(&suggestion.summary))
-                .or_else(|| infer_id_from_text(&suggestion.detail))
-            {
-                push_evidence_id(id, pack, &mut seen, &mut refs);
-            }
-        }
-
-        refs
-    }
-
     let raw_count = raw_items.len();
-    let mut mapped: Vec<(usize, Suggestion)> = Vec::new();
-    let mut missing_or_invalid = 0usize;
-
-    fn scrub_user_summary(summary: &str) -> String {
-        // Extra safety: even if the model slips, ensure the user-facing title
-        // doesn't contain file paths / line numbers / evidence markers.
-        let mut s = summary.to_string();
-
-        // Remove explicit evidence markers.
-        let re_evidence = Regex::new(r"(?i)\b(evidence\s*id|evidence)\s*[:=]?\s*\d*\b")
-            .unwrap_or_else(|_| Regex::new("$^").unwrap());
-        s = re_evidence.replace_all(&s, "").to_string();
-
-        // Remove "(path:123)" style suffixes.
-        let re_path_line =
-            Regex::new(r"\s*\(([^)]*/[^)]*?):\d+\)").unwrap_or_else(|_| Regex::new("$^").unwrap());
-        s = re_path_line.replace_all(&s, "").to_string();
-
-        // Remove bare path-like tokens ("src/foo.rs", "foo.tsx", etc).
-        let re_path_token =
-            Regex::new(r"(?i)\b[\w./-]+\.(rs|tsx|ts|jsx|js|py|go|java|kt|cs|cpp|c|h)\b")
-                .unwrap_or_else(|_| Regex::new("$^").unwrap());
-        s = re_path_token.replace_all(&s, "").to_string();
-
-        // Collapse whitespace after removals.
-        s.split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-
-    for s in raw_items {
-        let evidence_refs = collect_valid_evidence_refs(&s, &pack);
-        let evidence_id = evidence_refs.first().map(|r| r.snippet_id);
-        let Some(evidence_id) = evidence_id else {
-            missing_or_invalid += 1;
-            continue;
-        };
-        let Some(item) = pack.get(evidence_id) else {
-            missing_or_invalid += 1;
-            continue;
-        };
-        let kind = match s.kind.to_lowercase().as_str() {
-            "bugfix" => crate::suggest::SuggestionKind::BugFix,
-            "optimization" => crate::suggest::SuggestionKind::Optimization,
-            "refactoring" => crate::suggest::SuggestionKind::Refactoring,
-            "security" => crate::suggest::SuggestionKind::BugFix,
-            "reliability" => crate::suggest::SuggestionKind::Quality,
-            _ => crate::suggest::SuggestionKind::Improvement,
-        };
-        let priority = match s.priority.to_lowercase().as_str() {
-            "high" => crate::suggest::Priority::High,
-            "low" => crate::suggest::Priority::Low,
-            _ => crate::suggest::Priority::Medium,
-        };
-        let confidence = match s.confidence.to_lowercase().as_str() {
-            "high" => crate::suggest::Confidence::High,
-            _ => crate::suggest::Confidence::Medium,
-        };
-
-        let mut summary = scrub_user_summary(&s.summary);
-        if summary.trim().is_empty() {
-            // Provider didn't follow schema; recover a minimally useful summary.
-            summary = scrub_user_summary(
-                s.detail
-                    .lines()
-                    .next()
-                    .unwrap_or("Potential improvement found.")
-                    .trim(),
-            );
-            summary = truncate_str(&summary, 120).to_string();
-        }
-
-        let suggestion = Suggestion::new(
-            kind,
-            priority,
-            item.file.clone(),
-            summary,
-            crate::suggest::SuggestionSource::LlmDeep,
-        )
-        .with_confidence(confidence)
-        .with_line(item.line)
-        .with_detail(s.detail)
-        .with_evidence(item.snippet.clone())
-        .with_evidence_refs(evidence_refs);
-
-        mapped.push((evidence_id, suggestion));
-    }
+    let (mapped, missing_or_invalid) = map_raw_items_to_grounded(raw_items, &pack);
 
     if mapped.is_empty() {
         return Err(anyhow::anyhow!(
@@ -876,6 +1333,7 @@ pub async fn analyze_codebase_fast_grounded(
     let suggestions = dedupe_and_cap_grounded_suggestions(mapped);
 
     let diagnostics = SuggestionDiagnostics {
+        run_id,
         model: Model::Speed.id().to_string(),
         iterations: 1,
         tool_calls: 0,
@@ -905,16 +1363,168 @@ pub async fn analyze_codebase_fast_grounded(
         response_chars: 0,
         response_preview: String::new(),
         evidence_pack_ms,
+        pack_pattern_count: pack_stats.pattern_count,
+        pack_hotspot_count: pack_stats.hotspot_count,
+        pack_core_count: pack_stats.core_count,
+        pack_line1_ratio: pack_stats.line1_ratio,
+        provisional_count: suggestions.len(),
+        validated_count: 0,
+        rejected_count: 0,
+        regeneration_attempts: 0,
+        refinement_complete: false,
     };
 
     Ok((suggestions, usage, diagnostics))
 }
 
+pub async fn refine_grounded_suggestions(
+    repo_root: &Path,
+    index: &CodebaseIndex,
+    context: &WorkContext,
+    repo_memory: Option<String>,
+    summaries: Option<&HashMap<PathBuf, String>>,
+    provisional: Vec<Suggestion>,
+    mut diagnostics: SuggestionDiagnostics,
+) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
+    if provisional.is_empty() {
+        diagnostics.refinement_complete = true;
+        diagnostics.provisional_count = 0;
+        diagnostics.validated_count = 0;
+        diagnostics.rejected_count = 0;
+        diagnostics.final_count = 0;
+        return Ok((Vec::new(), None, diagnostics));
+    }
+
+    let memory_section =
+        format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
+    let cache = crate::cache::Cache::new(repo_root);
+    let refine_start = std::time::Instant::now();
+    let mut usage: Option<Usage> = None;
+    let mut rejected_count = 0usize;
+    let mut regeneration_attempts = 0usize;
+    let mut used_evidence_ids: HashSet<usize> = HashSet::new();
+    let mut validated: Vec<Suggestion> = Vec::new();
+    let provisional_pool = provisional.clone();
+
+    let batch_usage = validate_batch_suggestions(
+        provisional.clone(),
+        &memory_section,
+        &cache,
+        &diagnostics.run_id,
+        &mut validated,
+        &mut rejected_count,
+        &mut used_evidence_ids,
+    )
+    .await;
+    usage = merge_usage(usage, batch_usage);
+
+    let (pack, pack_stats) = build_evidence_pack(repo_root, index, context);
+    while validated.len() < FAST_GROUNDED_TARGET_MIN
+        && regeneration_attempts < REFINEMENT_MAX_ATTEMPTS
+    {
+        regeneration_attempts += 1;
+        let remaining_pack: Vec<EvidenceItem> = pack
+            .iter()
+            .filter(|item| !used_evidence_ids.contains(&item.id))
+            .cloned()
+            .collect();
+        if remaining_pack.len() < 4 {
+            break;
+        }
+
+        let needed = FAST_GROUNDED_TARGET_MIN.saturating_sub(validated.len());
+        let schema = grounded_suggestion_schema(remaining_pack.len());
+        let user = format_grounded_user_prompt(
+            &memory_section,
+            index,
+            summaries,
+            &remaining_pack,
+            &format!(
+                "Return {} to {} suggestions. Avoid reusing evidence ids and prioritize high-confidence issues.",
+                needed,
+                (needed + 1).min(FAST_GROUNDED_TARGET_MAX)
+            ),
+        );
+
+        let regen_response = call_llm_structured_with_provider::<FastGroundedResponseJson>(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM,
+            &user,
+            Model::Speed,
+            "fast_grounded_regeneration",
+            schema,
+            super::client::provider_cerebras_fp16(),
+            360,
+            6_800,
+        )
+        .await;
+
+        let Ok(rebuilt) = regen_response else {
+            break;
+        };
+        usage = merge_usage(usage, rebuilt.usage);
+        let (mapped, _missing_or_invalid) =
+            map_raw_items_to_grounded(rebuilt.data.suggestions, &remaining_pack);
+        let regenerated = mapped.into_iter().map(|(_, s)| s).collect::<Vec<_>>();
+        if regenerated.is_empty() {
+            break;
+        }
+
+        let batch_usage = validate_batch_suggestions(
+            regenerated,
+            &memory_section,
+            &cache,
+            &diagnostics.run_id,
+            &mut validated,
+            &mut rejected_count,
+            &mut used_evidence_ids,
+        )
+        .await;
+        usage = merge_usage(usage, batch_usage);
+    }
+
+    let validated = ensure_target_suggestion_count(
+        validated,
+        provisional_pool,
+        Some(&cache),
+        Some(&diagnostics.run_id),
+    );
+    let refinement_ms = refine_start.elapsed().as_millis() as u64;
+    diagnostics.batch_verify_ms = refinement_ms;
+    diagnostics.llm_ms += refinement_ms;
+    diagnostics.pack_pattern_count = pack_stats.pattern_count;
+    diagnostics.pack_hotspot_count = pack_stats.hotspot_count;
+    diagnostics.pack_core_count = pack_stats.core_count;
+    diagnostics.pack_line1_ratio = pack_stats.line1_ratio;
+    diagnostics.provisional_count = provisional.len();
+    diagnostics.validated_count = validated
+        .iter()
+        .filter(|s| s.validation_state == SuggestionValidationState::Validated)
+        .count();
+    diagnostics.rejected_count = rejected_count;
+    diagnostics.regeneration_attempts = regeneration_attempts;
+    diagnostics.refinement_complete = true;
+    diagnostics.final_count = validated.len();
+    diagnostics.deduped_count = validated.len();
+    diagnostics.parse_strategy = "fast_grounded_refined".to_string();
+
+    Ok((validated, usage, diagnostics))
+}
+
 #[cfg(test)]
 mod grounded_parser_tests {
     use super::*;
+    use crate::context::WorkContext;
+    use crate::index::{
+        CodebaseIndex, FileIndex, FileSummary, Language, Pattern, PatternKind, PatternReliability,
+        Symbol, SymbolKind, Visibility,
+    };
     use crate::suggest::{Priority, SuggestionKind, SuggestionSource};
+    use chrono::Utc;
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_suggestion(summary: &str) -> Suggestion {
         Suggestion::new(
@@ -924,6 +1534,74 @@ mod grounded_parser_tests {
             summary.to_string(),
             SuggestionSource::LlmDeep,
         )
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_analysis_test_{}_{}", label, nanos));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_fixture_file(root: &Path, rel: &str, lines: usize) {
+        let full = root.join(rel);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut content = String::new();
+        for i in 1..=lines.max(8) {
+            content.push_str(&format!("fn line_{}() {{}}\n", i));
+        }
+        fs::write(full, content).unwrap();
+    }
+
+    fn mk_file_index(
+        rel: &str,
+        loc: usize,
+        complexity: f64,
+        patterns: Vec<Pattern>,
+        symbols: Vec<Symbol>,
+        used_by: usize,
+    ) -> (PathBuf, FileIndex) {
+        let path = PathBuf::from(rel);
+        let index = FileIndex {
+            path: path.clone(),
+            language: Language::Rust,
+            loc,
+            content_hash: format!("hash-{}", rel),
+            symbols,
+            dependencies: Vec::new(),
+            patterns,
+            complexity,
+            last_modified: Utc::now(),
+            summary: FileSummary {
+                purpose: "test file".to_string(),
+                exports: Vec::new(),
+                used_by: (0..used_by)
+                    .map(|i| PathBuf::from(format!("src/dep_{}.rs", i)))
+                    .collect(),
+                depends_on: Vec::new(),
+            },
+            layer: None,
+            feature: None,
+        };
+        (path, index)
+    }
+
+    fn empty_context(root: &Path) -> WorkContext {
+        WorkContext {
+            branch: "test".to_string(),
+            uncommitted_files: Vec::new(),
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 0,
+            repo_root: root.to_path_buf(),
+        }
     }
 
     #[test]
@@ -1033,6 +1711,174 @@ mod grounded_parser_tests {
         let result = dedupe_and_cap_grounded_suggestions(mapped);
 
         assert_eq!(result.len(), FAST_GROUNDED_TARGET_MAX);
+    }
+
+    #[test]
+    fn build_evidence_pack_is_deterministic_with_tie_breakers() {
+        let root = temp_root("deterministic");
+        write_fixture_file(&root, "src/a.rs", 80);
+        write_fixture_file(&root, "src/b.rs", 80);
+        write_fixture_file(&root, "src/c.rs", 80);
+
+        let mut files = HashMap::new();
+        for rel in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+            let pattern = Pattern {
+                kind: PatternKind::MissingErrorHandling,
+                file: PathBuf::from(rel),
+                line: 12,
+                description: "Unchecked unwrap".to_string(),
+                reliability: PatternReliability::High,
+            };
+            let symbol = Symbol {
+                name: "handle".to_string(),
+                kind: SymbolKind::Function,
+                file: PathBuf::from(rel),
+                line: 12,
+                end_line: 30,
+                complexity: 12.0,
+                visibility: Visibility::Public,
+            };
+            let (path, index) = mk_file_index(rel, 120, 30.0, vec![pattern], vec![symbol], 3);
+            files.insert(path, index);
+        }
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files,
+            index_errors: Vec::new(),
+            git_head: None,
+        };
+        let context = empty_context(&root);
+
+        let (pack_a, _) = build_evidence_pack(&root, &index, &context);
+        let (pack_b, _) = build_evidence_pack(&root, &index, &context);
+
+        let ids_a: Vec<_> = pack_a.iter().map(|i| (i.file.clone(), i.line)).collect();
+        let ids_b: Vec<_> = pack_b.iter().map(|i| (i.file.clone(), i.line)).collect();
+        assert_eq!(ids_a, ids_b);
+
+        let first_paths: Vec<_> = pack_a
+            .iter()
+            .take(3)
+            .map(|i| i.file.display().to_string())
+            .collect();
+        assert!(first_paths.windows(2).all(|w| w[0] <= w[1]));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_evidence_pack_enforces_source_and_godmodule_quotas() {
+        let root = temp_root("quotas");
+        let mut files = HashMap::new();
+
+        for i in 0..24 {
+            let rel = format!("src/f{}.rs", i);
+            write_fixture_file(&root, &rel, 120);
+            let pattern = Pattern {
+                kind: PatternKind::GodModule,
+                file: PathBuf::from(&rel),
+                line: 1,
+                description: "Large module".to_string(),
+                reliability: PatternReliability::Low,
+            };
+            let symbol = Symbol {
+                name: format!("work_{}", i),
+                kind: SymbolKind::Function,
+                file: PathBuf::from(&rel),
+                line: 40,
+                end_line: 70,
+                complexity: 20.0 + i as f64,
+                visibility: Visibility::Public,
+            };
+            let (path, index) =
+                mk_file_index(&rel, 900, 40.0 + i as f64, vec![pattern], vec![symbol], 4);
+            files.insert(path, index);
+        }
+
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files,
+            index_errors: Vec::new(),
+            git_head: None,
+        };
+        let context = empty_context(&root);
+        let (pack, stats) = build_evidence_pack(&root, &index, &context);
+
+        let godmodule_count = pack
+            .iter()
+            .filter(|item| item.pattern_kind == Some(PatternKind::GodModule))
+            .count();
+        assert!(stats.pattern_count <= FAST_EVIDENCE_SOURCE_PATTERN_MAX);
+        assert!(godmodule_count <= FAST_EVIDENCE_KIND_GOD_MODULE_MAX);
+        assert!(pack.len() <= FAST_EVIDENCE_PACK_MAX_ITEMS);
+        assert!(stats.line1_ratio <= 0.5);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn godmodule_anchor_prefers_complex_function_line_not_line1() {
+        let root = temp_root("godmodule_anchor");
+        let rel = "src/module.rs";
+        write_fixture_file(&root, rel, 140);
+
+        let pattern = Pattern {
+            kind: PatternKind::GodModule,
+            file: PathBuf::from(rel),
+            line: 1,
+            description: "File has many lines".to_string(),
+            reliability: PatternReliability::Low,
+        };
+        let symbol = Symbol {
+            name: "critical_path".to_string(),
+            kind: SymbolKind::Function,
+            file: PathBuf::from(rel),
+            line: 72,
+            end_line: 110,
+            complexity: 88.0,
+            visibility: Visibility::Public,
+        };
+        let (path, index_file) = mk_file_index(rel, 300, 10.0, vec![pattern], vec![symbol], 0);
+        let mut files = HashMap::new();
+        files.insert(path, index_file);
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files,
+            index_errors: Vec::new(),
+            git_head: None,
+        };
+        let context = empty_context(&root);
+        let (pack, _) = build_evidence_pack(&root, &index, &context);
+
+        let godmodule_item = pack
+            .iter()
+            .find(|item| item.pattern_kind == Some(PatternKind::GodModule))
+            .expect("expected godmodule evidence item");
+        assert_eq!(godmodule_item.line, 72);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_target_count_backfills_with_pending_until_minimum() {
+        let mut validated = Vec::new();
+        validated.push(
+            test_suggestion("v1").with_validation_state(SuggestionValidationState::Validated),
+        );
+        validated.push(
+            test_suggestion("v2").with_validation_state(SuggestionValidationState::Validated),
+        );
+
+        let provisional = (0..8)
+            .map(|i| test_suggestion(&format!("p{}", i)))
+            .collect::<Vec<_>>();
+
+        let out = ensure_target_suggestion_count(validated, provisional, None, None);
+        assert!(out.len() >= FAST_GROUNDED_TARGET_MIN);
+        assert!(out.len() <= FAST_GROUNDED_TARGET_MAX);
+        assert!(out
+            .iter()
+            .any(|s| s.validation_state == SuggestionValidationState::Pending));
     }
 }
 

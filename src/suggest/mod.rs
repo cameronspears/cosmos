@@ -96,6 +96,16 @@ pub enum VerificationState {
     InsufficientEvidence,
 }
 
+/// Validation lifecycle state for suggestion quality refinement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SuggestionValidationState {
+    #[default]
+    Pending,
+    Validated,
+    Rejected,
+}
+
 /// A concrete evidence reference backing a suggestion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuggestionEvidenceRef {
@@ -133,6 +143,9 @@ pub struct Suggestion {
     /// Explicit verification contract state.
     #[serde(default)]
     pub verification_state: VerificationState,
+    /// Suggestion validation state used by two-stage refinement.
+    #[serde(default)]
+    pub validation_state: SuggestionValidationState,
     pub source: SuggestionSource,
     pub created_at: DateTime<Utc>,
     /// Whether the user has dismissed this suggestion
@@ -162,6 +175,7 @@ impl Suggestion {
             evidence: None,
             evidence_refs: Vec::new(),
             verification_state: VerificationState::Unverified,
+            validation_state: SuggestionValidationState::Pending,
             source,
             created_at: Utc::now(),
             dismissed: false,
@@ -191,6 +205,11 @@ impl Suggestion {
 
     pub fn with_evidence_refs(mut self, evidence_refs: Vec<SuggestionEvidenceRef>) -> Self {
         self.evidence_refs = evidence_refs;
+        self
+    }
+
+    pub fn with_validation_state(mut self, validation_state: SuggestionValidationState) -> Self {
+        self.validation_state = validation_state;
         self
     }
 
@@ -255,6 +274,16 @@ impl SuggestionEngine {
     /// Add a suggestion from LLM
     pub fn add_llm_suggestion(&mut self, suggestion: Suggestion) {
         self.suggestions.push(suggestion);
+        self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
+    }
+
+    /// Replace provisional LLM suggestions with refined suggestions.
+    ///
+    /// Keeps non-LLM suggestions and already-applied suggestions intact.
+    pub fn replace_llm_suggestions(&mut self, mut suggestions: Vec<Suggestion>) {
+        self.suggestions
+            .retain(|s| s.source != SuggestionSource::LlmDeep || s.applied);
+        self.suggestions.append(&mut suggestions);
         self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
     }
 
@@ -367,12 +396,14 @@ mod tests {
             map.remove("evidence");
             map.remove("evidence_refs");
             map.remove("verification_state");
+            map.remove("validation_state");
         }
 
         let round: Suggestion = serde_json::from_value(value).unwrap();
         assert!(round.evidence.is_none());
         assert!(round.evidence_refs.is_empty());
         assert_eq!(round.verification_state, VerificationState::Unverified);
+        assert_eq!(round.validation_state, SuggestionValidationState::Pending);
     }
 
     #[test]

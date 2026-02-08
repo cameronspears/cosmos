@@ -55,6 +55,8 @@ pub async fn run_tui(
     app.glossary = cache_manager.load_glossary().unwrap_or_default();
     // Load cached question answers
     app.question_cache = cache_manager.load_question_cache().unwrap_or_default();
+    // Load rolling verify precision from per-suggestion quality telemetry.
+    app.rolling_verify_precision = cache_manager.rolling_verify_precision(50);
 
     // Check for unsaved work and show startup overlay if needed
     if let Ok(status) = git_ops::current_status(&repo_path) {
@@ -431,6 +433,7 @@ pub async fn run_tui(
                 } else {
                     Some(repo_memory_context)
                 };
+                let mem_for_refine = mem.clone();
                 // Fast grounded suggestions: one LLM call, no tools, strict latency budget.
                 // Agentic deep scan remains available elsewhere but should not block the user.
                 match suggest::llm::analyze_codebase_fast_grounded(
@@ -443,6 +446,8 @@ pub async fn run_tui(
                 .await
                 {
                     Ok((suggestions, usage, diagnostics)) => {
+                        let provisional = suggestions.clone();
+                        let diagnostics_for_refine = diagnostics.clone();
                         let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                             suggestions,
                             usage,
@@ -450,6 +455,27 @@ pub async fn run_tui(
                             diagnostics,
                             duration_ms: stage_start.elapsed().as_millis() as u64,
                         });
+
+                        let refine_start = std::time::Instant::now();
+                        if let Ok((refined, refine_usage, refined_diag)) =
+                            suggest::llm::refine_grounded_suggestions(
+                                &repo_root,
+                                &index_clone,
+                                &context_clone,
+                                mem_for_refine,
+                                Some(&summaries_for_suggestions),
+                                provisional,
+                                diagnostics_for_refine,
+                            )
+                            .await
+                        {
+                            let _ = tx_suggestions.send(BackgroundMessage::SuggestionsRefined {
+                                suggestions: refined,
+                                usage: refine_usage,
+                                diagnostics: refined_diag,
+                                duration_ms: refine_start.elapsed().as_millis() as u64,
+                            });
+                        }
                     }
                     Err(e) => {
                         let _ =

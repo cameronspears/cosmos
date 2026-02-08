@@ -149,6 +149,18 @@ pub struct App {
     pub last_suggestion_diagnostics: Option<crate::suggest::llm::SuggestionDiagnostics>,
     /// Last suggestion error message (full, untruncated)
     pub last_suggestion_error: Option<String>,
+    /// Whether background refinement is still validating/regenerating suggestions.
+    pub suggestion_refinement_in_progress: bool,
+    /// Number of provisional suggestions from fast pass.
+    pub suggestion_provisional_count: usize,
+    /// Number of validated suggestions after refinement.
+    pub suggestion_validated_count: usize,
+    /// Number of rejected suggestions from refinement.
+    pub suggestion_rejected_count: usize,
+    /// Run identifier for the latest suggestion generation cycle.
+    pub current_suggestion_run_id: Option<String>,
+    /// Rolling precision from recent verify outcomes.
+    pub rolling_verify_precision: Option<f64>,
 
     // Flag: generate suggestions once summaries complete (used at init and after reset)
     pub pending_suggestions_on_init: bool,
@@ -236,6 +248,12 @@ impl App {
             git_refresh_error_at: None,
             last_suggestion_diagnostics: None,
             last_suggestion_error: None,
+            suggestion_refinement_in_progress: false,
+            suggestion_provisional_count: 0,
+            suggestion_validated_count: 0,
+            suggestion_rejected_count: 0,
+            current_suggestion_run_id: None,
+            rolling_verify_precision: None,
             update_available: None,
             update_progress: None,
             budget_warned_soft: false,

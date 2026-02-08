@@ -12,6 +12,7 @@ pub mod github;
 pub mod grouping;
 pub mod index;
 pub mod keyring;
+pub mod lab;
 pub mod onboarding;
 pub mod suggest;
 pub mod ui;

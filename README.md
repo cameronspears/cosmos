@@ -246,6 +246,27 @@ cosmos --version
 
 ---
 
+## Maintainer Workflow
+
+For sandboxed self-iteration and reliability validation, use `cosmos-lab`:
+
+```bash
+# Fast loop (tests + type checks + reliability sample)
+cargo run --bin cosmos-lab -- validate --mode fast
+
+# Full loop (adds perf/build/lint baseline-delta)
+cargo run --bin cosmos-lab -- validate --mode full
+
+# Reliability trials only
+cargo run --bin cosmos-lab -- reliability --trials 3
+```
+
+Recommended cadence: run fast validation each iteration, run full validation every 3 successful fast loops (or before major merges), and run reliability trials when tuning suggestion quality.
+
+Quick commands and safety guarantees are documented in [`docs/self-iteration.md`](docs/self-iteration.md). The comprehensive maintainer runbook (metrics, troubleshooting, and ETHOS-aligned loop) is in [`docs/reliability-loop.md`](docs/reliability-loop.md).
+
+---
+
 ## How Cosmos Works Under the Hood
 
 ### Indexing

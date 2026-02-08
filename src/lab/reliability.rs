@@ -1,0 +1,439 @@
+use crate::cache::SelfIterationSuggestionMetrics;
+use crate::context::WorkContext;
+use crate::index::CodebaseIndex;
+use crate::suggest::llm::{
+    analyze_codebase_fast_grounded, generate_fix_preview_agentic, refine_grounded_suggestions,
+};
+use crate::suggest::{Suggestion, SuggestionValidationState, VerificationState};
+use anyhow::anyhow;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReliabilityDiagnosticsSummary {
+    pub run_id: String,
+    pub model: String,
+    pub provisional_count: usize,
+    pub final_count: usize,
+    pub validated_count: usize,
+    pub rejected_count: usize,
+    pub regeneration_attempts: usize,
+    pub evidence_pack_line1_ratio: f64,
+    pub evidence_source_mix: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReliabilityTrialResult {
+    pub target_repo: PathBuf,
+    pub metrics: SelfIterationSuggestionMetrics,
+    pub diagnostics: ReliabilityDiagnosticsSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReliabilityRunResult {
+    pub target_repo: PathBuf,
+    pub trial_count: usize,
+    pub aggregated: SelfIterationSuggestionMetrics,
+    pub trials: Vec<ReliabilityTrialResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReliabilityFailureKind {
+    IndexEmpty,
+    InsufficientEvidencePack,
+    LlmUnavailable,
+    Other,
+}
+
+impl ReliabilityFailureKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReliabilityFailureKind::IndexEmpty => "IndexEmpty",
+            ReliabilityFailureKind::InsufficientEvidencePack => "InsufficientEvidencePack",
+            ReliabilityFailureKind::LlmUnavailable => "LlmUnavailable",
+            ReliabilityFailureKind::Other => "Other",
+        }
+    }
+}
+
+pub fn classify_reliability_error(error: &anyhow::Error) -> ReliabilityFailureKind {
+    classify_reliability_error_message(&error.to_string())
+}
+
+fn classify_reliability_error_message(message: &str) -> ReliabilityFailureKind {
+    let lower = message.to_ascii_lowercase();
+
+    if lower.contains("codebase index is empty")
+        || lower.contains("index is empty")
+        || lower.contains("file_count == 0")
+        || lower.contains("file_count=0")
+    {
+        return ReliabilityFailureKind::IndexEmpty;
+    }
+
+    if lower.contains("not enough grounded evidence items found")
+        || lower.contains("insufficient evidence pack")
+    {
+        return ReliabilityFailureKind::InsufficientEvidencePack;
+    }
+
+    if lower.contains("no api key configured")
+        || lower.contains("invalid api key")
+        || lower.contains("openrouter")
+        || lower.contains("rate limited")
+        || lower.contains("rate limit")
+        || lower.contains("timed out")
+        || lower.contains("could not connect")
+        || lower.contains("network")
+        || lower.contains("authentication")
+        || lower.contains("service may be temporarily unavailable")
+        || lower.contains("api returned empty response")
+    {
+        return ReliabilityFailureKind::LlmUnavailable;
+    }
+
+    ReliabilityFailureKind::Other
+}
+
+pub async fn run_trial(
+    repo_root: &Path,
+    verify_sample: usize,
+) -> anyhow::Result<ReliabilityTrialResult> {
+    let repo_root = repo_root
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("Failed to resolve repo '{}': {}", repo_root.display(), e))?;
+    let index = CodebaseIndex::new(&repo_root)?;
+    let stats = index.stats();
+    if stats.file_count == 0 {
+        let root_name = repo_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<unknown>");
+        return Err(anyhow!(
+            "Reliability preflight failed: codebase index is empty for '{}'. Root directory name '{}' may have matched an ignore rule (for example 'target'), or the repository has no supported source files.",
+            repo_root.display(),
+            root_name
+        ));
+    }
+    let context = WorkContext::load(&repo_root)?;
+    let cache = crate::cache::Cache::new(&repo_root);
+
+    let summaries = cache.load_llm_summaries_cache().map(|summaries_cache| {
+        summaries_cache
+            .summaries
+            .into_iter()
+            .map(|(path, entry)| (path, entry.summary))
+            .collect::<HashMap<PathBuf, String>>()
+    });
+
+    let (provisional, _usage_a, diagnostics) =
+        analyze_codebase_fast_grounded(&repo_root, &index, &context, None, summaries.as_ref())
+            .await?;
+    let (refined, _usage_b, diagnostics) = refine_grounded_suggestions(
+        &repo_root,
+        &index,
+        &context,
+        None,
+        summaries.as_ref(),
+        provisional.clone(),
+        diagnostics,
+    )
+    .await?;
+
+    let validated_suggestions: Vec<Suggestion> = refined
+        .iter()
+        .filter(|s| s.validation_state == SuggestionValidationState::Validated)
+        .cloned()
+        .collect();
+    let preview_sample_count = verify_sample.min(validated_suggestions.len());
+
+    let mut preview_verified_count = 0usize;
+    let mut preview_contradicted_count = 0usize;
+    let mut preview_insufficient_count = 0usize;
+    let mut preview_error_count = 0usize;
+    for suggestion in validated_suggestions.iter().take(preview_sample_count) {
+        match generate_fix_preview_agentic(&repo_root, suggestion, None, None).await {
+            Ok((preview, _usage)) => match preview.verification_state {
+                VerificationState::Verified => preview_verified_count += 1,
+                VerificationState::Contradicted => preview_contradicted_count += 1,
+                VerificationState::InsufficientEvidence => preview_insufficient_count += 1,
+                VerificationState::Unverified => preview_error_count += 1,
+            },
+            Err(_) => {
+                preview_error_count += 1;
+            }
+        }
+    }
+
+    let provisional_count = diagnostics.provisional_count.max(provisional.len());
+    let validated_count = diagnostics.validated_count.max(validated_suggestions.len());
+    let rejected_count = diagnostics.rejected_count;
+    let validated_ratio = ratio(validated_count, provisional_count);
+    let rejected_ratio = ratio(rejected_count, provisional_count);
+
+    let preview_precision_denominator = preview_verified_count + preview_contradicted_count;
+    let preview_precision = if preview_precision_denominator == 0 {
+        None
+    } else {
+        Some(preview_verified_count as f64 / preview_precision_denominator as f64)
+    };
+
+    let mut source_mix = HashMap::new();
+    source_mix.insert("pattern".to_string(), diagnostics.pack_pattern_count);
+    source_mix.insert("hotspot".to_string(), diagnostics.pack_hotspot_count);
+    source_mix.insert("core".to_string(), diagnostics.pack_core_count);
+
+    let metrics = SelfIterationSuggestionMetrics {
+        trials: 1,
+        provisional_count,
+        validated_count,
+        rejected_count,
+        validated_ratio,
+        rejected_ratio,
+        preview_sampled: preview_sample_count,
+        preview_verified_count,
+        preview_contradicted_count,
+        preview_insufficient_count,
+        preview_error_count,
+        preview_precision,
+        evidence_line1_ratio: diagnostics.pack_line1_ratio,
+        evidence_source_mix: source_mix.clone(),
+    };
+
+    let diagnostics_summary = ReliabilityDiagnosticsSummary {
+        run_id: diagnostics.run_id,
+        model: diagnostics.model,
+        provisional_count: diagnostics.provisional_count,
+        final_count: diagnostics.final_count,
+        validated_count: diagnostics.validated_count,
+        rejected_count: diagnostics.rejected_count,
+        regeneration_attempts: diagnostics.regeneration_attempts,
+        evidence_pack_line1_ratio: diagnostics.pack_line1_ratio,
+        evidence_source_mix: source_mix,
+    };
+
+    Ok(ReliabilityTrialResult {
+        target_repo: repo_root,
+        metrics,
+        diagnostics: diagnostics_summary,
+    })
+}
+
+pub async fn run_trials(
+    repo_root: &Path,
+    trial_count: usize,
+    verify_sample: usize,
+) -> anyhow::Result<ReliabilityRunResult> {
+    let trial_count = trial_count.max(1);
+    let mut trials = Vec::with_capacity(trial_count);
+    for _ in 0..trial_count {
+        let trial = run_trial(repo_root, verify_sample).await?;
+        trials.push(trial);
+    }
+
+    let aggregated = aggregate_trial_metrics(
+        &trials
+            .iter()
+            .map(|trial| trial.metrics.clone())
+            .collect::<Vec<_>>(),
+    );
+
+    Ok(ReliabilityRunResult {
+        target_repo: repo_root.to_path_buf(),
+        trial_count,
+        aggregated,
+        trials,
+    })
+}
+
+pub fn aggregate_trial_metrics(
+    metrics: &[SelfIterationSuggestionMetrics],
+) -> SelfIterationSuggestionMetrics {
+    if metrics.is_empty() {
+        return SelfIterationSuggestionMetrics::default();
+    }
+
+    let mut aggregated = SelfIterationSuggestionMetrics::default();
+    aggregated.trials = metrics.len();
+
+    let mut weighted_line1_numerator = 0.0f64;
+    let mut weighted_line1_denominator = 0usize;
+    let mut mix_totals: HashMap<String, usize> = HashMap::new();
+
+    for metric in metrics {
+        aggregated.provisional_count += metric.provisional_count;
+        aggregated.validated_count += metric.validated_count;
+        aggregated.rejected_count += metric.rejected_count;
+        aggregated.preview_sampled += metric.preview_sampled;
+        aggregated.preview_verified_count += metric.preview_verified_count;
+        aggregated.preview_contradicted_count += metric.preview_contradicted_count;
+        aggregated.preview_insufficient_count += metric.preview_insufficient_count;
+        aggregated.preview_error_count += metric.preview_error_count;
+
+        let weight = metric.provisional_count.max(1);
+        weighted_line1_numerator += metric.evidence_line1_ratio * weight as f64;
+        weighted_line1_denominator += weight;
+
+        for (source, count) in &metric.evidence_source_mix {
+            *mix_totals.entry(source.clone()).or_insert(0) += *count;
+        }
+    }
+
+    aggregated.validated_ratio = ratio(aggregated.validated_count, aggregated.provisional_count);
+    aggregated.rejected_ratio = ratio(aggregated.rejected_count, aggregated.provisional_count);
+
+    let precision_denom = aggregated.preview_verified_count + aggregated.preview_contradicted_count;
+    aggregated.preview_precision = if precision_denom == 0 {
+        None
+    } else {
+        Some(aggregated.preview_verified_count as f64 / precision_denom as f64)
+    };
+
+    if weighted_line1_denominator > 0 {
+        aggregated.evidence_line1_ratio =
+            weighted_line1_numerator / weighted_line1_denominator as f64;
+    }
+    aggregated.evidence_source_mix = mix_totals;
+
+    aggregated
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_metrics_computes_validated_and_rejected_ratios() {
+        let metrics = vec![
+            SelfIterationSuggestionMetrics {
+                trials: 1,
+                provisional_count: 10,
+                validated_count: 7,
+                rejected_count: 3,
+                preview_sampled: 5,
+                preview_verified_count: 4,
+                preview_contradicted_count: 1,
+                preview_insufficient_count: 0,
+                preview_error_count: 0,
+                preview_precision: Some(0.8),
+                evidence_line1_ratio: 0.2,
+                evidence_source_mix: HashMap::from([
+                    ("pattern".to_string(), 10usize),
+                    ("hotspot".to_string(), 8usize),
+                    ("core".to_string(), 7usize),
+                ]),
+                validated_ratio: 0.7,
+                rejected_ratio: 0.3,
+            },
+            SelfIterationSuggestionMetrics {
+                trials: 1,
+                provisional_count: 5,
+                validated_count: 4,
+                rejected_count: 1,
+                preview_sampled: 4,
+                preview_verified_count: 2,
+                preview_contradicted_count: 2,
+                preview_insufficient_count: 0,
+                preview_error_count: 0,
+                preview_precision: Some(0.5),
+                evidence_line1_ratio: 0.4,
+                evidence_source_mix: HashMap::from([
+                    ("pattern".to_string(), 5usize),
+                    ("hotspot".to_string(), 4usize),
+                    ("core".to_string(), 3usize),
+                ]),
+                validated_ratio: 0.8,
+                rejected_ratio: 0.2,
+            },
+        ];
+
+        let aggregate = aggregate_trial_metrics(&metrics);
+        assert_eq!(aggregate.trials, 2);
+        assert_eq!(aggregate.provisional_count, 15);
+        assert_eq!(aggregate.validated_count, 11);
+        assert_eq!(aggregate.rejected_count, 4);
+        assert!((aggregate.validated_ratio - (11.0 / 15.0)).abs() < f64::EPSILON);
+        assert!((aggregate.rejected_ratio - (4.0 / 15.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn aggregate_metrics_computes_preview_precision() {
+        let metrics = vec![
+            SelfIterationSuggestionMetrics {
+                preview_verified_count: 3,
+                preview_contradicted_count: 1,
+                ..SelfIterationSuggestionMetrics::default()
+            },
+            SelfIterationSuggestionMetrics {
+                preview_verified_count: 1,
+                preview_contradicted_count: 2,
+                ..SelfIterationSuggestionMetrics::default()
+            },
+        ];
+
+        let aggregate = aggregate_trial_metrics(&metrics);
+        assert_eq!(aggregate.preview_verified_count, 4);
+        assert_eq!(aggregate.preview_contradicted_count, 3);
+        assert!(aggregate.preview_precision.is_some());
+        assert!((aggregate.preview_precision.unwrap() - (4.0 / 7.0)).abs() < 0.000001);
+    }
+
+    #[test]
+    fn aggregate_metrics_empty_input_returns_default() {
+        let aggregate = aggregate_trial_metrics(&[]);
+        assert_eq!(aggregate.trials, 0);
+        assert_eq!(aggregate.provisional_count, 0);
+        assert_eq!(aggregate.validated_count, 0);
+        assert_eq!(aggregate.rejected_count, 0);
+        assert_eq!(aggregate.preview_precision, None);
+    }
+
+    #[test]
+    fn classify_failure_kind_index_empty() {
+        let error = anyhow::anyhow!(
+            "Reliability preflight failed: codebase index is empty for '/tmp/target'. Root directory name 'target' may have matched an ignore rule."
+        );
+        assert_eq!(
+            classify_reliability_error(&error),
+            ReliabilityFailureKind::IndexEmpty
+        );
+    }
+
+    #[test]
+    fn classify_failure_kind_insufficient_evidence_pack() {
+        let error = anyhow::anyhow!(
+            "Not enough grounded evidence items found to generate suggestions. Try again after indexing completes."
+        );
+        assert_eq!(
+            classify_reliability_error(&error),
+            ReliabilityFailureKind::InsufficientEvidencePack
+        );
+    }
+
+    #[test]
+    fn classify_failure_kind_llm_unavailable() {
+        let error = anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.");
+        assert_eq!(
+            classify_reliability_error(&error),
+            ReliabilityFailureKind::LlmUnavailable
+        );
+    }
+
+    #[test]
+    fn classify_failure_kind_other() {
+        let error = anyhow::anyhow!("Unexpected failure while reading cache telemetry");
+        assert_eq!(
+            classify_reliability_error(&error),
+            ReliabilityFailureKind::Other
+        );
+    }
+}

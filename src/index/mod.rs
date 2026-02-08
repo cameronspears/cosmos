@@ -115,6 +115,8 @@ pub struct Pattern {
     pub file: PathBuf,
     pub line: usize,
     pub description: String,
+    #[serde(default)]
+    pub reliability: PatternReliability,
 }
 
 /// A file that was skipped during indexing (with a reason)
@@ -138,6 +140,8 @@ pub enum PatternKind {
     DuplicatePattern,
     /// Missing error handling
     MissingErrorHandling,
+    /// Potential resource leak or unbounded resource retention
+    PotentialResourceLeak,
     /// Unused import
     UnusedImport,
     /// TODO/FIXME marker
@@ -153,10 +157,34 @@ impl PatternKind {
             PatternKind::GodModule => PatternSeverity::High,
             PatternKind::DuplicatePattern => PatternSeverity::Medium,
             PatternKind::MissingErrorHandling => PatternSeverity::High,
+            PatternKind::PotentialResourceLeak => PatternSeverity::High,
             PatternKind::UnusedImport => PatternSeverity::Low,
             PatternKind::TodoMarker => PatternSeverity::Info,
         }
     }
+
+    pub fn reliability(&self) -> PatternReliability {
+        match self {
+            PatternKind::MissingErrorHandling => PatternReliability::High,
+            PatternKind::PotentialResourceLeak => PatternReliability::Medium,
+            PatternKind::LongFunction => PatternReliability::Medium,
+            PatternKind::DeepNesting => PatternReliability::Medium,
+            PatternKind::ManyParameters => PatternReliability::Low,
+            PatternKind::GodModule => PatternReliability::Low,
+            PatternKind::DuplicatePattern => PatternReliability::Low,
+            PatternKind::UnusedImport => PatternReliability::Low,
+            PatternKind::TodoMarker => PatternReliability::Low,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternReliability {
+    Low,
+    #[default]
+    Medium,
+    High,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -709,7 +737,9 @@ impl CodebaseIndex {
         // Phase 1: Collect all file paths (single-threaded, fast)
         let file_entries: Vec<_> = WalkDir::new(root)
             .into_iter()
-            .filter_entry(|e| !is_ignored(e.path()))
+            // Never prune traversal at depth 0 (the scan root itself), even if its
+            // basename matches an ignored directory name like "target".
+            .filter_entry(|e| e.depth() == 0 || !is_ignored(e.path()))
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_file())
             .filter_map(|entry| {
@@ -807,6 +837,7 @@ impl CodebaseIndex {
                     file: path.to_path_buf(),
                     line: sym.line,
                     description: format!("{} is {} lines", sym.name, sym.line_count()),
+                    reliability: PatternKind::LongFunction.reliability(),
                 });
             }
         }
@@ -818,6 +849,7 @@ impl CodebaseIndex {
                 file: path.to_path_buf(),
                 line: 1,
                 description: format!("File has {} lines", analysis.loc),
+                reliability: PatternKind::GodModule.reliability(),
             });
         }
 
@@ -828,6 +860,27 @@ impl CodebaseIndex {
                 file: path.to_path_buf(),
                 line: line_num,
                 description,
+                reliability: PatternKind::TodoMarker.reliability(),
+            });
+        }
+
+        for (line_num, description) in analysis.missing_error_patterns {
+            patterns.push(Pattern {
+                kind: PatternKind::MissingErrorHandling,
+                file: path.to_path_buf(),
+                line: line_num,
+                description,
+                reliability: PatternKind::MissingErrorHandling.reliability(),
+            });
+        }
+
+        for (line_num, description) in analysis.resource_leak_patterns {
+            patterns.push(Pattern {
+                kind: PatternKind::PotentialResourceLeak,
+                file: path.to_path_buf(),
+                line: line_num,
+                description,
+                reliability: PatternKind::PotentialResourceLeak.reliability(),
             });
         }
 
@@ -999,6 +1052,8 @@ struct ContentAnalysis {
     loc: usize,
     complexity: f64,
     todo_patterns: Vec<(usize, String)>, // (line_number, description)
+    missing_error_patterns: Vec<(usize, String)>,
+    resource_leak_patterns: Vec<(usize, String)>,
 }
 
 /// Analyze content in a single pass: count lines, calculate complexity, find TODOs
@@ -1006,6 +1061,8 @@ fn analyze_content_single_pass(content: &str) -> ContentAnalysis {
     let mut loc = 0;
     let mut complexity = 1.0; // Base complexity
     let mut todo_patterns = Vec::new();
+    let mut missing_error_patterns = Vec::new();
+    let mut resource_leak_patterns = Vec::new();
 
     // Decision point keywords for complexity
     let decision_keywords = [
@@ -1022,6 +1079,29 @@ fn analyze_content_single_pass(content: &str) -> ContentAnalysis {
             todo_patterns.push((i + 1, line.trim().to_string()));
         }
 
+        let trimmed = line.trim();
+        if trimmed.contains(".unwrap()") || trimmed.contains(".expect(") {
+            missing_error_patterns.push((
+                i + 1,
+                "Unchecked unwrap/expect can panic instead of handling failure".to_string(),
+            ));
+        }
+        if trimmed.contains("catch") && trimmed.contains("{}") {
+            missing_error_patterns.push((
+                i + 1,
+                "Empty catch block swallows errors without handling".to_string(),
+            ));
+        }
+        if trimmed.contains("Err(_) => {}") || trimmed.contains("Err(_e) => {}") {
+            missing_error_patterns.push((i + 1, "Empty error branch ignores failures".to_string()));
+        }
+        if trimmed.contains("std::mem::forget(") || trimmed.contains("Box::leak(") {
+            resource_leak_patterns.push((
+                i + 1,
+                "Potential resource leak keeps memory/resources alive indefinitely".to_string(),
+            ));
+        }
+
         // Count complexity decision points in this line
         for keyword in &decision_keywords {
             complexity += line.matches(keyword).count() as f64;
@@ -1032,6 +1112,8 @@ fn analyze_content_single_pass(content: &str) -> ContentAnalysis {
         loc,
         complexity,
         todo_patterns,
+        missing_error_patterns,
+        resource_leak_patterns,
     }
 }
 
@@ -1161,5 +1243,25 @@ mod tests {
         assert_eq!(resolved, Some(PathBuf::from("src/foo.rs")));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_scan_does_not_ignore_root_named_target() {
+        let mut parent = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        parent.push(format!("cosmos_index_root_target_{}", nanos));
+
+        let root = parent.join("target");
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let index = CodebaseIndex::new(&root).unwrap();
+        assert!(index.stats().file_count > 0);
+
+        let _ = fs::remove_dir_all(&parent);
     }
 }

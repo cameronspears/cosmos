@@ -1,6 +1,6 @@
 use super::agentic::{call_llm_agentic, schema_to_response_format};
 use super::client::{call_llm_structured_cached, StructuredResponse};
-use super::models::{Model, Usage};
+use super::models::{merge_usage, Model, Usage};
 use super::parse::{truncate_content, truncate_content_around_line};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{fix_content_system, multi_file_fix_system, FIX_PREVIEW_AGENTIC_SYSTEM};
@@ -930,6 +930,69 @@ fn parse_verification_state(
     }
 }
 
+fn fix_preview_from_json(parsed: FixPreviewJson, modifier: Option<&str>) -> FixPreview {
+    let verification_state = parse_verification_state(&parsed.verification_state, parsed.verified);
+    let scope = match parsed.scope.as_str() {
+        "small" => FixScope::Small,
+        "large" => FixScope::Large,
+        _ => FixScope::Medium,
+    };
+
+    FixPreview {
+        verified: verification_state == crate::suggest::VerificationState::Verified,
+        verification_state,
+        friendly_title: if parsed.friendly_title.is_empty() {
+            "Issue".to_string()
+        } else {
+            parsed.friendly_title
+        },
+        problem_summary: if parsed.problem_summary.is_empty() {
+            "An issue was found that needs attention.".to_string()
+        } else {
+            parsed.problem_summary
+        },
+        outcome: if parsed.outcome.is_empty() {
+            "This will be fixed.".to_string()
+        } else {
+            parsed.outcome
+        },
+        verification_note: if parsed.verification_note.is_empty() {
+            if parsed.verified {
+                "Issue verified".to_string()
+            } else {
+                "Issue not found".to_string()
+            }
+        } else {
+            parsed.verification_note
+        },
+        evidence_snippet: parsed.evidence_snippet.filter(|s| !s.trim().is_empty()),
+        evidence_line: parsed.evidence_line,
+        description: if parsed.description.is_empty() {
+            "Fix the identified issue".to_string()
+        } else {
+            parsed.description
+        },
+        affected_areas: parsed.affected_areas,
+        scope,
+        modifier: modifier.map(String::from),
+    }
+}
+
+fn preview_target_line_for_suggestion(suggestion: &Suggestion, line_count: usize) -> usize {
+    let line_count = line_count.max(1);
+    let fallback_line = suggestion.line.unwrap_or(1).max(1).min(line_count);
+    let evidence_line = suggestion
+        .evidence_refs
+        .iter()
+        .filter(|r| r.file == suggestion.file)
+        .map(|r| r.line)
+        .min_by_key(|line| line.abs_diff(fallback_line));
+    evidence_line
+        .unwrap_or(fallback_line)
+        .max(1)
+        .min(line_count)
+}
+
 /// Generate a preview using lean hybrid verification.
 ///
 /// Strategy:
@@ -955,30 +1018,55 @@ pub async fn generate_fix_preview_agentic(
     // Pre-read the relevant file content (we know exactly where to look)
     let file_path = repo_root.join(&suggestion.file);
     let file_content = std::fs::read_to_string(&file_path).unwrap_or_default();
-
-    // Extract ~80 lines around the suggestion line for better context
-    let target_line = suggestion.line.unwrap_or(1);
     let lines: Vec<&str> = file_content.lines().collect();
-    let start = target_line.saturating_sub(30).max(0);
-    let end = (target_line + 50).min(lines.len());
+    let target_line = preview_target_line_for_suggestion(suggestion, lines.len());
 
-    let code_section: String = lines
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(end - start)
-        .map(|(i, line)| format!("{:4}| {}", i + 1, line))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let render_excerpt = |line: usize, before: usize, after: usize| -> (usize, usize, String) {
+        if lines.is_empty() {
+            return (1, 1, String::new());
+        }
+        let start = line.saturating_sub(before).max(1);
+        let end = (line + after).min(lines.len());
+        let snippet = lines
+            .iter()
+            .enumerate()
+            .skip(start - 1)
+            .take(end - start + 1)
+            .map(|(i, line)| format!("{:4}| {}", i + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (start, end, snippet)
+    };
 
-    // Build a focused prompt with the code already included
-    let user = format!(
-        r#"ISSUE TO VERIFY:
+    let evidence_context = {
+        let mut block = String::new();
+        for (idx, reference) in suggestion.evidence_refs.iter().take(3).enumerate() {
+            block.push_str(&format!(
+                "- Evidence {}: {}:{} (id={})\n",
+                idx + 1,
+                reference.file.display(),
+                reference.line,
+                reference.snippet_id
+            ));
+        }
+        if let Some(snippet) = suggestion.evidence.as_deref() {
+            block.push_str("\nPrimary evidence snippet:\n");
+            block.push_str(snippet);
+        }
+        block
+    };
+
+    let build_user_prompt = |start: usize, end: usize, code_section: &str, fallback: bool| {
+        format!(
+            r#"ISSUE TO VERIFY:
 File: {}
 Line: ~{}
 Summary: {}
 {}
 {}{}
+
+EVIDENCE REFERENCES:
+{}
 
 CODE (lines {}-{}):
 {}
@@ -988,19 +1076,29 @@ VERIFY:
 2. If you need more context:
    • grep -n 'pattern' {} → find related code
    • sed -n 'X,Yp' {} → read specific lines
-3. Return JSON immediately (minimize tool calls)"#,
-        suggestion.file.display(),
-        target_line,
-        suggestion.summary,
-        suggestion.detail.as_deref().unwrap_or(""),
-        memory_section,
-        modifier_text,
-        start + 1,
-        end,
-        code_section,
-        suggestion.file.display(),
-        suggestion.file.display(),
-    );
+3. Return JSON immediately (minimize tool calls).{}"#,
+            suggestion.file.display(),
+            target_line,
+            suggestion.summary,
+            suggestion.detail.as_deref().unwrap_or(""),
+            memory_section,
+            modifier_text,
+            evidence_context,
+            start,
+            end,
+            code_section,
+            suggestion.file.display(),
+            suggestion.file.display(),
+            if fallback {
+                " If uncertain, prefer insufficient_evidence over contradicted."
+            } else {
+                ""
+            }
+        )
+    };
+
+    let (start, end, code_section) = render_excerpt(target_line, 30, 50);
+    let user = build_user_prompt(start, end, &code_section, false);
 
     // Use structured output to guarantee valid JSON response
     let response_format = schema_to_response_format("fix_preview", fix_preview_schema());
@@ -1014,7 +1112,7 @@ VERIFY:
         repo_root,
         false,
         3, // max iterations - verification has code upfront
-        Some(response_format),
+        Some(response_format.clone()),
     )
     .await?;
 
@@ -1027,55 +1125,34 @@ VERIFY:
         )
     })?;
 
-    // Convert parsed JSON to FixPreview
-    let verification_state = parse_verification_state(&parsed.verification_state, parsed.verified);
-    let scope = match parsed.scope.as_str() {
-        "small" => FixScope::Small,
-        "large" => FixScope::Large,
-        _ => FixScope::Medium,
-    };
+    let mut preview = fix_preview_from_json(parsed, modifier);
+    let mut usage = response.usage;
 
-    Ok((
-        FixPreview {
-            verified: verification_state == crate::suggest::VerificationState::Verified,
-            verification_state,
-            friendly_title: if parsed.friendly_title.is_empty() {
-                "Issue".to_string()
-            } else {
-                parsed.friendly_title
-            },
-            problem_summary: if parsed.problem_summary.is_empty() {
-                "An issue was found that needs attention.".to_string()
-            } else {
-                parsed.problem_summary
-            },
-            outcome: if parsed.outcome.is_empty() {
-                "This will be fixed.".to_string()
-            } else {
-                parsed.outcome
-            },
-            verification_note: if parsed.verification_note.is_empty() {
-                if parsed.verified {
-                    "Issue verified".to_string()
-                } else {
-                    "Issue not found".to_string()
-                }
-            } else {
-                parsed.verification_note
-            },
-            evidence_snippet: parsed.evidence_snippet.filter(|s| !s.trim().is_empty()),
-            evidence_line: parsed.evidence_line,
-            description: if parsed.description.is_empty() {
-                "Fix the identified issue".to_string()
-            } else {
-                parsed.description
-            },
-            affected_areas: parsed.affected_areas,
-            scope,
-            modifier: modifier.map(String::from),
-        },
-        response.usage,
-    ))
+    if preview.verification_state == crate::suggest::VerificationState::Contradicted {
+        // One bounded fallback pass with broader context to reduce false contradictions.
+        let (fallback_start, fallback_end, fallback_code) = render_excerpt(target_line, 120, 160);
+        let fallback_user = build_user_prompt(fallback_start, fallback_end, &fallback_code, true);
+        if let Ok(fallback_response) = call_llm_agentic(
+            FIX_PREVIEW_AGENTIC_SYSTEM,
+            &fallback_user,
+            Model::Balanced,
+            repo_root,
+            false,
+            4,
+            Some(response_format.clone()),
+        )
+        .await
+        {
+            usage = merge_usage(usage, fallback_response.usage);
+            if let Ok(parsed_fallback) =
+                serde_json::from_str::<FixPreviewJson>(&fallback_response.content)
+            {
+                preview = fix_preview_from_json(parsed_fallback, modifier);
+            }
+        }
+    }
+
+    Ok((preview, usage))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1342,7 +1419,7 @@ fn is_stopword(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::suggest::{Priority, SuggestionKind, SuggestionSource};
+    use crate::suggest::{Priority, SuggestionEvidenceRef, SuggestionKind, SuggestionSource};
     use std::path::{Path, PathBuf};
 
     fn sample_preview(evidence_line: Option<u32>) -> FixPreview {
@@ -1457,6 +1534,27 @@ mod tests {
 
         let line = choose_preview_anchor_line(&lines, Some(2), &hint_tokens);
         assert_eq!(line, 2);
+    }
+
+    #[test]
+    fn test_preview_target_line_prefers_same_file_evidence_ref() {
+        let mut suggestion = sample_suggestion(PathBuf::from("src/lib.rs"));
+        suggestion.line = Some(12);
+        suggestion.evidence_refs = vec![
+            SuggestionEvidenceRef {
+                snippet_id: 1,
+                file: PathBuf::from("src/other.rs"),
+                line: 80,
+            },
+            SuggestionEvidenceRef {
+                snippet_id: 2,
+                file: PathBuf::from("src/lib.rs"),
+                line: 45,
+            },
+        ];
+
+        let target = preview_target_line_for_suggestion(&suggestion, 120);
+        assert_eq!(target, 45);
     }
 
     #[test]

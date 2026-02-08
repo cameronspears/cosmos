@@ -371,6 +371,13 @@ pub fn commit(repo_path: &Path, message: &str) -> Result<String> {
 
 /// Push current branch to remote (shells out to git)
 pub fn push_branch(repo_path: &Path, branch: &str) -> Result<String> {
+    if push_disabled_by_env() {
+        return Err(anyhow::anyhow!(
+            "Push blocked: sandbox mode is active (COSMOS_DISABLE_PUSH=1). \
+             Disable sandbox mode before pushing."
+        ));
+    }
+
     let repo = Repository::open(repo_path)?;
     ensure_local_branch(&repo, branch)?;
     let remote = resolve_push_remote(&repo, branch).unwrap_or_else(|_| "origin".to_string());
@@ -431,6 +438,18 @@ pub fn push_branch(repo_path: &Path, branch: &str) -> Result<String> {
 }
 
 const GIT_PUSH_TIMEOUT_SECS: u64 = 180;
+
+fn push_disabled_by_env() -> bool {
+    std::env::var("COSMOS_DISABLE_PUSH")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
 
 fn run_git_push(
     repo_path: &Path,
@@ -791,6 +810,9 @@ pub fn open_url(url: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::env;
+    use std::sync::Mutex;
+
+    static PUSH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // ========================================================================
     // Git Status Tests
@@ -982,6 +1004,20 @@ mod tests {
             .target()
             .unwrap();
         assert_eq!(created_head, feature_head);
+    }
+
+    #[test]
+    fn test_push_branch_blocked_when_sandbox_flag_is_set() {
+        let _guard = PUSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("COSMOS_DISABLE_PUSH", "1");
+
+        let result = push_branch(Path::new("/this/path/does/not/matter"), "main");
+        assert!(result.is_err());
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("Push blocked"));
+        assert!(message.contains("COSMOS_DISABLE_PUSH=1"));
+
+        std::env::remove_var("COSMOS_DISABLE_PUSH");
     }
 
     // ========================================================================

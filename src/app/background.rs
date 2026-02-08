@@ -42,6 +42,7 @@ pub fn drain_messages(
                 diagnostics,
                 duration_ms,
             } => {
+                let run_id = diagnostics.run_id.clone();
                 let count = suggestions.len();
                 for s in suggestions {
                     app.suggestions.add_llm_suggestion(s);
@@ -65,6 +66,11 @@ pub fn drain_messages(
                 app.active_model = Some(model);
                 app.last_suggestion_diagnostics = Some(diagnostics);
                 app.last_suggestion_error = None;
+                app.suggestion_refinement_in_progress = true;
+                app.suggestion_provisional_count = count;
+                app.suggestion_validated_count = 0;
+                app.suggestion_rejected_count = 0;
+                app.current_suggestion_run_id = Some(run_id);
                 record_pipeline_metric(
                     app,
                     "suggest",
@@ -75,6 +81,46 @@ pub fn drain_messages(
                     true,
                 );
             }
+            BackgroundMessage::SuggestionsRefined {
+                suggestions,
+                usage,
+                diagnostics,
+                duration_ms,
+            } => {
+                let run_id = diagnostics.run_id.clone();
+                let validated_count = suggestions
+                    .iter()
+                    .filter(|s| {
+                        s.validation_state == crate::suggest::SuggestionValidationState::Validated
+                    })
+                    .count();
+                let count = suggestions.len();
+                app.suggestions.replace_llm_suggestions(suggestions);
+                app.suggestions.sort_with_context(&app.context);
+
+                let (tokens, cost) = track_usage(app, usage.as_ref(), ctx);
+                record_pipeline_metric(
+                    app,
+                    "suggest_refine",
+                    duration_ms,
+                    tokens,
+                    cost,
+                    "suggestions_refined",
+                    true,
+                );
+
+                app.last_suggestion_diagnostics = Some(diagnostics.clone());
+                app.last_suggestion_error = None;
+                app.suggestion_refinement_in_progress = false;
+                app.suggestion_provisional_count = diagnostics.provisional_count;
+                app.suggestion_validated_count = validated_count;
+                app.suggestion_rejected_count = diagnostics.rejected_count;
+                app.current_suggestion_run_id = Some(run_id);
+                app.show_toast(&format!(
+                    "{} suggestions refined · {} validated",
+                    count, validated_count
+                ));
+            }
             BackgroundMessage::SuggestionsError(e) => {
                 // If summaries are still generating, switch to that loading state
                 if app.needs_summary_generation && app.summary_progress.is_some() {
@@ -84,6 +130,7 @@ pub fn drain_messages(
                 }
                 app.show_toast(&format!("Suggestions error: {}", truncate(&e, 80)));
                 app.last_suggestion_error = Some(e);
+                app.suggestion_refinement_in_progress = false;
             }
             BackgroundMessage::SummariesReady {
                 summaries,
@@ -156,6 +203,7 @@ pub fn drain_messages(
                             } else {
                                 Some(repo_memory_context)
                             };
+                            let mem_for_refine = mem.clone();
                             // Fast grounded suggestions: one LLM call, no tools, strict latency budget.
                             match suggest::llm::analyze_codebase_fast_grounded(
                                 &repo_root,
@@ -167,6 +215,8 @@ pub fn drain_messages(
                             .await
                             {
                                 Ok((suggestions, usage, diagnostics)) => {
+                                    let provisional = suggestions.clone();
+                                    let diagnostics_for_refine = diagnostics.clone();
                                     let _ =
                                         tx_suggestions.send(BackgroundMessage::SuggestionsReady {
                                             suggestions,
@@ -175,6 +225,30 @@ pub fn drain_messages(
                                             diagnostics,
                                             duration_ms: stage_start.elapsed().as_millis() as u64,
                                         });
+
+                                    let refine_start = std::time::Instant::now();
+                                    if let Ok((refined, refine_usage, refined_diag)) =
+                                        suggest::llm::refine_grounded_suggestions(
+                                            &repo_root,
+                                            &index_clone,
+                                            &context_clone,
+                                            mem_for_refine,
+                                            Some(&summaries_for_suggestions),
+                                            provisional,
+                                            diagnostics_for_refine,
+                                        )
+                                        .await
+                                    {
+                                        let _ = tx_suggestions.send(
+                                            BackgroundMessage::SuggestionsRefined {
+                                                suggestions: refined,
+                                                usage: refine_usage,
+                                                diagnostics: refined_diag,
+                                                duration_ms: refine_start.elapsed().as_millis()
+                                                    as u64,
+                                            },
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     let _ = tx_suggestions
@@ -283,6 +357,36 @@ pub fn drain_messages(
                     gate,
                     preview.verification_state == crate::suggest::VerificationState::Verified,
                 );
+                if let (Some(run_id), Some(suggestion_id)) = (
+                    app.current_suggestion_run_id.clone(),
+                    app.verify_state.suggestion_id,
+                ) {
+                    let evidence_ids = app
+                        .suggestions
+                        .suggestions
+                        .iter()
+                        .find(|s| s.id == suggestion_id)
+                        .map(|s| {
+                            s.evidence_refs
+                                .iter()
+                                .map(|r| r.snippet_id)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let quality = cache::SuggestionQualityRecord {
+                        timestamp: Utc::now(),
+                        run_id,
+                        suggestion_id: suggestion_id.to_string(),
+                        evidence_ids,
+                        validation_outcome: "verify_result".to_string(),
+                        validation_reason: None,
+                        user_verify_outcome: Some(gate.to_string()),
+                    };
+                    let cache = cache::Cache::new(&app.repo_path);
+                    let _ = cache.append_suggestion_quality(&quality);
+                }
+                let cache = cache::Cache::new(&app.repo_path);
+                app.rolling_verify_precision = cache.rolling_verify_precision(50);
                 // Set the preview in the Verify workflow step
                 app.set_verify_preview(preview, file_hashes);
             }
@@ -732,6 +836,7 @@ fn record_pipeline_metric(
     match stage {
         "summary" => metric.summary_ms = Some(duration_ms),
         "suggest" => metric.suggest_ms = Some(duration_ms),
+        "suggest_refine" => metric.suggest_ms = Some(duration_ms),
         "verify" => metric.verify_ms = Some(duration_ms),
         "apply" => metric.apply_ms = Some(duration_ms),
         "review" => metric.review_ms = Some(duration_ms),
