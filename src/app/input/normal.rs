@@ -456,6 +456,12 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                         // Handle based on workflow step
                         match app.workflow_step {
                             WorkflowStep::Suggestions => {
+                                if app.suggestion_refinement_in_progress {
+                                    app.show_toast(
+                                        "Suggestions are still refining. Wait for refined results before verifying.",
+                                    );
+                                    return Ok(());
+                                }
                                 // Start verify step with selected suggestion
                                 let suggestion = app.selected_suggestion().cloned();
                                 if let Some(suggestion) = suggestion {
@@ -1176,6 +1182,13 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::WorkContext;
+    use crate::index::CodebaseIndex;
+    use crate::suggest::SuggestionEngine;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     // ========================================================================
     // ApplyError User Message Tests
@@ -1292,5 +1305,56 @@ mod tests {
         let err = ApplyError::DirtyWorkingTree;
         let cloned = err.clone();
         assert_eq!(err.user_message(), cloned.user_message());
+    }
+
+    #[test]
+    fn enter_is_blocked_while_suggestion_refinement_in_progress() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_normal_mode_test_{}", nanos));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files: HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: Some("deadbeef".to_string()),
+        };
+        let suggestions = SuggestionEngine::new(index.clone());
+        let context = WorkContext {
+            branch: "main".to_string(),
+            uncommitted_files: Vec::new(),
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 0,
+            repo_root: root.clone(),
+        };
+        let mut app = App::new(index.clone(), suggestions, context);
+        app.active_panel = ActivePanel::Suggestions;
+        app.workflow_step = WorkflowStep::Suggestions;
+        app.suggestion_refinement_in_progress = true;
+
+        let (tx, _rx) = mpsc::channel();
+        let ctx = crate::app::RuntimeContext {
+            index: &index,
+            repo_path: &root,
+            tx: &tx,
+        };
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_normal_mode(&mut app, key, &ctx).unwrap();
+
+        let toast = app
+            .toast
+            .as_ref()
+            .map(|t| t.message.clone())
+            .unwrap_or_default();
+        assert!(toast.contains("still refining"));
+        assert_eq!(app.workflow_step, WorkflowStep::Suggestions);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

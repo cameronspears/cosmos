@@ -434,8 +434,8 @@ pub async fn run_tui(
                     Some(repo_memory_context)
                 };
                 let mem_for_refine = mem.clone();
-                // Fast grounded suggestions: one LLM call, no tools, strict latency budget.
-                // Agentic deep scan remains available elsewhere but should not block the user.
+                // Fast grounded suggestions: provisional output only.
+                // Actionable suggestions are emitted in SuggestionsRefined after validation.
                 match suggest::llm::analyze_codebase_fast_grounded(
                     &repo_root,
                     &index_clone,

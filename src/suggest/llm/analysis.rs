@@ -9,6 +9,7 @@ use crate::context::WorkContext;
 use crate::index::{CodebaseIndex, PatternKind, PatternReliability, PatternSeverity, SymbolKind};
 use crate::suggest::{Suggestion, SuggestionEvidenceRef, SuggestionValidationState};
 use chrono::Utc;
+use futures::future::join_all;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,16 +23,23 @@ use crate::index::GOD_MODULE_LOC_THRESHOLD;
 
 /// Complexity threshold above which a file is considered a "hotspot"
 const HIGH_COMPLEXITY_THRESHOLD: f64 = 20.0;
-const FAST_EVIDENCE_PACK_MAX_ITEMS: usize = 25;
+const FAST_EVIDENCE_PACK_MAX_ITEMS: usize = 48;
 const FAST_EVIDENCE_SNIPPET_LINES_BEFORE: usize = 8;
 const FAST_EVIDENCE_SNIPPET_LINES_AFTER: usize = 12;
-const FAST_GROUNDED_TARGET_MIN: usize = 6;
-const FAST_GROUNDED_TARGET_MAX: usize = 8;
+const FAST_GROUNDED_FINAL_TARGET_MIN: usize = 10;
+const FAST_GROUNDED_FINAL_TARGET_MAX: usize = 15;
+const FAST_GROUNDED_VALIDATED_SOFT_FLOOR: usize = 10;
+const FAST_GROUNDED_PROVISIONAL_TARGET_MIN: usize = 22;
+const FAST_GROUNDED_PROVISIONAL_TARGET_MAX: usize = 30;
 const FAST_EVIDENCE_SOURCE_PATTERN_MAX: usize = 12;
 const FAST_EVIDENCE_SOURCE_HOTSPOT_MAX: usize = 8;
 const FAST_EVIDENCE_SOURCE_CORE_MAX: usize = 8;
 const FAST_EVIDENCE_KIND_GOD_MODULE_MAX: usize = 4;
-const REFINEMENT_MAX_ATTEMPTS: usize = 2;
+const REFINEMENT_MAX_ATTEMPTS: usize = 4;
+const GENERATION_TOPUP_MAX_CALLS: usize = 2;
+const GENERATION_TOPUP_TIMEOUT_MS: u64 = 5_500;
+const SUGGEST_BALANCED_BUDGET_MS: u64 = 35_000;
+const VALIDATION_CONCURRENCY: usize = 6;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ADAPTIVE CONTEXT LIMITS
@@ -178,10 +186,15 @@ pub struct SuggestionDiagnostics {
     pub pack_core_count: usize,
     pub pack_line1_ratio: f64,
     pub provisional_count: usize,
+    pub generation_waves: usize,
+    pub generation_topup_calls: usize,
+    pub generation_mapped_count: usize,
     pub validated_count: usize,
     pub rejected_count: usize,
+    pub rejected_evidence_skipped_count: usize,
     pub regeneration_attempts: usize,
     pub refinement_complete: bool,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -649,7 +662,67 @@ fn extract_evidence_id(text: &str) -> Option<usize> {
     None
 }
 
-fn dedupe_and_cap_grounded_suggestions(mapped: Vec<(usize, Suggestion)>) -> Vec<Suggestion> {
+fn pack_item_by_id(pack: &[EvidenceItem], id: usize) -> Option<&EvidenceItem> {
+    pack.iter().find(|item| item.id == id)
+}
+
+fn renumber_pack(items: &[EvidenceItem]) -> (Vec<EvidenceItem>, HashMap<usize, usize>) {
+    let mut local_pack = Vec::with_capacity(items.len());
+    let mut local_to_original = HashMap::with_capacity(items.len());
+
+    for (local_id, item) in items.iter().enumerate() {
+        local_to_original.insert(local_id, item.id);
+        let mut cloned = item.clone();
+        cloned.id = local_id;
+        local_pack.push(cloned);
+    }
+
+    (local_pack, local_to_original)
+}
+
+fn remap_suggestion_to_original_ids(
+    suggestion: &mut Suggestion,
+    local_to_original: &HashMap<usize, usize>,
+    full_pack: &[EvidenceItem],
+) -> bool {
+    let mut remapped_refs = Vec::new();
+    let mut seen = HashSet::new();
+    for reference in &suggestion.evidence_refs {
+        let Some(original_id) = local_to_original.get(&reference.snippet_id).copied() else {
+            continue;
+        };
+        if !seen.insert(original_id) {
+            continue;
+        }
+        let Some(item) = pack_item_by_id(full_pack, original_id) else {
+            continue;
+        };
+        remapped_refs.push(SuggestionEvidenceRef {
+            snippet_id: item.id,
+            file: item.file.clone(),
+            line: item.line,
+        });
+    }
+
+    if remapped_refs.is_empty() {
+        return false;
+    }
+
+    suggestion.evidence_refs = remapped_refs;
+    if let Some(primary) = suggestion.evidence_refs.first() {
+        if let Some(item) = pack_item_by_id(full_pack, primary.snippet_id) {
+            suggestion.file = item.file.clone();
+            suggestion.line = Some(item.line);
+            suggestion.evidence = Some(item.snippet.clone());
+        }
+    }
+    true
+}
+
+fn dedupe_and_cap_grounded_suggestions(
+    mapped: Vec<(usize, Suggestion)>,
+    cap: usize,
+) -> Vec<Suggestion> {
     let mut seen_ids: HashSet<usize> = HashSet::new();
     let mut unique = Vec::new();
     for (evidence_id, suggestion) in mapped {
@@ -657,7 +730,7 @@ fn dedupe_and_cap_grounded_suggestions(mapped: Vec<(usize, Suggestion)>) -> Vec<
             unique.push(suggestion);
         }
     }
-    unique.truncate(FAST_GROUNDED_TARGET_MAX);
+    unique.truncate(cap);
     unique
 }
 
@@ -697,7 +770,7 @@ fn collect_valid_evidence_refs(
         refs: &mut Vec<SuggestionEvidenceRef>,
     ) {
         if seen.insert(evidence_id) {
-            if let Some(item) = pack.get(evidence_id) {
+            if let Some(item) = pack_item_by_id(pack, evidence_id) {
                 refs.push(SuggestionEvidenceRef {
                     snippet_id: item.id,
                     file: item.file.clone(),
@@ -838,7 +911,7 @@ fn convert_raw_suggestion(
 ) -> Option<(usize, Suggestion)> {
     let evidence_refs = collect_valid_evidence_refs(&s, pack);
     let evidence_id = evidence_refs.first().map(|r| r.snippet_id)?;
-    let item = pack.get(evidence_id)?;
+    let item = pack_item_by_id(pack, evidence_id)?;
 
     let kind = match s.kind.to_lowercase().as_str() {
         "bugfix" => crate::suggest::SuggestionKind::BugFix,
@@ -903,37 +976,72 @@ fn map_raw_items_to_grounded(
     (mapped, missing_or_invalid)
 }
 
-fn ensure_target_suggestion_count(
-    mut validated: Vec<Suggestion>,
-    mut provisional_pool: Vec<Suggestion>,
-    cache: Option<&crate::cache::Cache>,
-    run_id: Option<&str>,
-) -> Vec<Suggestion> {
-    if validated.len() < FAST_GROUNDED_TARGET_MIN {
-        for mut suggestion in provisional_pool.drain(..) {
-            if validated.len() >= FAST_GROUNDED_TARGET_MIN {
-                break;
-            }
-            if validated
-                .iter()
-                .any(|existing| existing.id == suggestion.id)
-            {
-                continue;
-            }
-            suggestion.validation_state = SuggestionValidationState::Pending;
-            if let (Some(cache), Some(run_id)) = (cache, run_id) {
-                append_suggestion_quality_record(
-                    cache,
-                    run_id,
-                    &suggestion,
-                    "pending",
-                    Some("Kept to satisfy minimum count after bounded refinement".to_string()),
-                );
-            }
-            validated.push(suggestion);
+fn should_run_mapping_rescue(raw_count: usize, mapped_count: usize) -> bool {
+    raw_count > 0 && mapped_count == 0
+}
+
+fn grounded_mapped_count(mapped: &[(usize, Suggestion)]) -> usize {
+    mapped
+        .iter()
+        .map(|(evidence_id, _)| *evidence_id)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn should_run_generation_topup(mapped_count: usize, topup_calls: usize) -> bool {
+    mapped_count < FAST_GROUNDED_PROVISIONAL_TARGET_MIN && topup_calls < GENERATION_TOPUP_MAX_CALLS
+}
+
+fn generation_topup_request_count(deficit: usize) -> usize {
+    deficit.saturating_add(4).clamp(4, 12)
+}
+
+fn regeneration_needed(validated_count: usize) -> usize {
+    FAST_GROUNDED_VALIDATED_SOFT_FLOOR.saturating_sub(validated_count)
+}
+
+fn regeneration_request_bounds(needed: usize) -> (usize, usize) {
+    let min_requested = needed.saturating_mul(2).clamp(4, 12);
+    let max_requested = needed.saturating_mul(3).clamp(4, 12).max(min_requested);
+    (min_requested, max_requested)
+}
+
+fn build_remaining_pack_for_regeneration(
+    pack: &[EvidenceItem],
+    used_evidence_ids: &HashSet<usize>,
+    rejected_evidence_ids: &HashSet<usize>,
+    allow_rejected_relaxation: bool,
+) -> (Vec<EvidenceItem>, bool, Vec<usize>) {
+    let mut strict = Vec::new();
+    let mut skipped_rejected_ids = Vec::new();
+
+    for item in pack {
+        if used_evidence_ids.contains(&item.id) {
+            continue;
         }
+        if rejected_evidence_ids.contains(&item.id) {
+            skipped_rejected_ids.push(item.id);
+            continue;
+        }
+        strict.push(item.clone());
     }
-    validated.truncate(FAST_GROUNDED_TARGET_MAX);
+
+    if strict.len() >= 4 || !allow_rejected_relaxation {
+        return (strict, false, skipped_rejected_ids);
+    }
+
+    let relaxed = pack
+        .iter()
+        .filter(|item| !used_evidence_ids.contains(&item.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    (relaxed, true, Vec::new())
+}
+
+fn finalize_validated_suggestions(mut validated: Vec<Suggestion>) -> Vec<Suggestion> {
+    // Defensive filter: refinement should only surface validated suggestions.
+    validated.retain(|s| s.validation_state == SuggestionValidationState::Validated);
+    validated.truncate(FAST_GROUNDED_FINAL_TARGET_MAX);
     validated
 }
 
@@ -956,7 +1064,8 @@ fn grounded_suggestion_schema(pack_len: usize) -> serde_json::Value {
                                 "required": ["evidence_id"],
                                 "additionalProperties": false
                             },
-                            "minItems": 1
+                            "minItems": 1,
+                            "maxItems": 1
                         },
                         "kind": {
                             "type": "string",
@@ -1041,8 +1150,14 @@ async fn validate_suggestion_with_model(
         evidence_block.push('\n');
     }
 
-    let system = r#"You are a strict code suggestion validator.
+    let system = r#"You are a strict evidence-grounded suggestion validator.
 Use ONLY the provided suggestion and evidence snippets.
+
+Validation rubric:
+- Mark `validated` only if the suggestion's claim is directly supported by evidence.
+- If the suggestion makes assumptions beyond the snippets (UI behavior, user state, rollback needs, business impact), mark `contradicted`.
+- If evidence hints at an issue but cannot safely support the stated claim, mark `insufficient_evidence`.
+- Do not infer unstated behavior.
 
 Return JSON:
 {
@@ -1061,7 +1176,7 @@ Return JSON:
     let response = call_llm_structured::<SuggestionValidationJson>(
         system,
         &user,
-        Model::Balanced,
+        Model::Speed,
         "suggestion_validation",
         suggestion_validation_schema(),
     )
@@ -1099,6 +1214,18 @@ fn append_suggestion_quality_record(
     let _ = cache.append_suggestion_quality(&record);
 }
 
+type ValidationOutcome = (
+    usize,
+    Suggestion,
+    SuggestionValidationState,
+    String,
+    Option<Usage>,
+);
+
+fn sort_validation_outcomes(outcomes: &mut [ValidationOutcome]) {
+    outcomes.sort_by_key(|(idx, _, _, _, _)| *idx);
+}
+
 async fn validate_batch_suggestions(
     batch: Vec<Suggestion>,
     memory_section: &str,
@@ -1107,34 +1234,67 @@ async fn validate_batch_suggestions(
     validated: &mut Vec<Suggestion>,
     rejected_count: &mut usize,
     used_evidence_ids: &mut HashSet<usize>,
+    rejected_evidence_ids: &mut HashSet<usize>,
 ) -> Option<Usage> {
     let mut usage: Option<Usage> = None;
-    for mut suggestion in batch {
-        let (state, reason, call_usage) =
-            match validate_suggestion_with_model(&suggestion, memory_section).await {
-                Ok(result) => result,
-                Err(err) => (
-                    SuggestionValidationState::Rejected,
-                    format!("Validation failed: {}", truncate_str(&err.to_string(), 120)),
-                    None,
-                ),
-            };
-        usage = merge_usage(usage, call_usage);
+    let mut queue: Vec<(usize, Suggestion)> = batch.into_iter().enumerate().collect();
+    let memory_section_owned = memory_section.to_string();
+    while !queue.is_empty() {
+        if validated.len() >= FAST_GROUNDED_FINAL_TARGET_MAX {
+            break;
+        }
+        let chunk_size = VALIDATION_CONCURRENCY.min(queue.len());
+        let chunk: Vec<(usize, Suggestion)> = queue.drain(..chunk_size).collect();
+        let mut outcomes: Vec<ValidationOutcome> =
+            join_all(chunk.into_iter().map(|(idx, suggestion)| {
+                let memory_section = memory_section_owned.clone();
+                async move {
+                    let (state, reason, call_usage) =
+                        match validate_suggestion_with_model(&suggestion, &memory_section).await {
+                            Ok(result) => result,
+                            Err(err) => (
+                                SuggestionValidationState::Rejected,
+                                format!(
+                                    "Validation failed: {}",
+                                    truncate_str(&err.to_string(), 120)
+                                ),
+                                None,
+                            ),
+                        };
+                    (idx, suggestion, state, reason, call_usage)
+                }
+            }))
+            .await;
+        sort_validation_outcomes(&mut outcomes);
 
-        let primary_evidence = suggestion.evidence_refs.first().map(|r| r.snippet_id);
-        match state {
-            SuggestionValidationState::Validated => {
-                if let Some(eid) = primary_evidence {
-                    if used_evidence_ids.insert(eid) {
-                        suggestion.validation_state = SuggestionValidationState::Validated;
-                        append_suggestion_quality_record(
-                            cache,
-                            run_id,
-                            &suggestion,
-                            "validated",
-                            Some(reason),
-                        );
-                        validated.push(suggestion);
+        for (_idx, mut suggestion, state, reason, call_usage) in outcomes {
+            usage = merge_usage(usage, call_usage);
+            let primary_evidence = suggestion.evidence_refs.first().map(|r| r.snippet_id);
+            match state {
+                SuggestionValidationState::Validated => {
+                    if let Some(eid) = primary_evidence {
+                        if used_evidence_ids.insert(eid) {
+                            suggestion.validation_state = SuggestionValidationState::Validated;
+                            append_suggestion_quality_record(
+                                cache,
+                                run_id,
+                                &suggestion,
+                                "validated",
+                                Some(reason),
+                            );
+                            validated.push(suggestion);
+                        } else {
+                            *rejected_count += 1;
+                            rejected_evidence_ids.insert(eid);
+                            suggestion.validation_state = SuggestionValidationState::Rejected;
+                            append_suggestion_quality_record(
+                                cache,
+                                run_id,
+                                &suggestion,
+                                "rejected",
+                                Some("Duplicate evidence_id after validation".to_string()),
+                            );
+                        }
                     } else {
                         *rejected_count += 1;
                         suggestion.validation_state = SuggestionValidationState::Rejected;
@@ -1143,41 +1303,47 @@ async fn validate_batch_suggestions(
                             run_id,
                             &suggestion,
                             "rejected",
-                            Some("Duplicate evidence_id after validation".to_string()),
+                            Some("Missing evidence refs after validation".to_string()),
                         );
                     }
-                } else {
+                }
+                SuggestionValidationState::Rejected => {
                     *rejected_count += 1;
+                    if let Some(eid) = primary_evidence {
+                        rejected_evidence_ids.insert(eid);
+                    }
+                    suggestion.validation_state = SuggestionValidationState::Rejected;
+                    let outcome = if reason.to_lowercase().contains("insufficient") {
+                        "insufficient_evidence"
+                    } else {
+                        "rejected"
+                    };
+                    append_suggestion_quality_record(
+                        cache,
+                        run_id,
+                        &suggestion,
+                        outcome,
+                        Some(reason),
+                    );
+                }
+                SuggestionValidationState::Pending => {
+                    *rejected_count += 1;
+                    if let Some(eid) = primary_evidence {
+                        rejected_evidence_ids.insert(eid);
+                    }
                     suggestion.validation_state = SuggestionValidationState::Rejected;
                     append_suggestion_quality_record(
                         cache,
                         run_id,
                         &suggestion,
                         "rejected",
-                        Some("Missing evidence refs after validation".to_string()),
+                        Some("Validator returned pending".to_string()),
                     );
                 }
             }
-            SuggestionValidationState::Rejected => {
-                *rejected_count += 1;
-                suggestion.validation_state = SuggestionValidationState::Rejected;
-                let outcome = if reason.to_lowercase().contains("insufficient") {
-                    "insufficient_evidence"
-                } else {
-                    "rejected"
-                };
-                append_suggestion_quality_record(cache, run_id, &suggestion, outcome, Some(reason));
-            }
-            SuggestionValidationState::Pending => {
-                *rejected_count += 1;
-                suggestion.validation_state = SuggestionValidationState::Rejected;
-                append_suggestion_quality_record(
-                    cache,
-                    run_id,
-                    &suggestion,
-                    "rejected",
-                    Some("Validator returned pending".to_string()),
-                );
+
+            if validated.len() >= FAST_GROUNDED_FINAL_TARGET_MAX {
+                break;
             }
         }
     }
@@ -1207,98 +1373,61 @@ pub async fn analyze_codebase_fast_grounded(
         format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
     let schema = grounded_suggestion_schema(pack.len());
 
-    // Two sharded calls in parallel to reduce tail latency and improve chance of
-    // reaching 6-8 usable suggestions under provider quirks.
-    let mid = pack.len() / 2;
-    let (left, right) = pack.split_at(mid);
-
+    // Four sharded calls in parallel to push provisional throughput while keeping
+    // each completion short and focused.
+    let shard_count = 4usize;
+    let shard_size = (pack.len() + shard_count - 1) / shard_count;
     let shard_timeout_ms: u64 = 6_800;
     let shard_max_tokens: u32 = 420;
-    let user_left = format_grounded_user_prompt(
-        &memory_section,
-        index,
-        summaries,
-        left,
-        "For this request, return 3 to 4 suggestions.",
-    );
-    let user_right = format_grounded_user_prompt(
-        &memory_section,
-        index,
-        summaries,
-        right,
-        "For this request, return 3 to 4 suggestions.",
-    );
+    let shard_prompts: Vec<String> = pack
+        .chunks(shard_size.max(1))
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| {
+            format_grounded_user_prompt(
+                &memory_section,
+                index,
+                summaries,
+                chunk,
+                "For this request, return 4 to 5 suggestions.",
+            )
+        })
+        .collect();
 
     let llm_start = std::time::Instant::now();
-    let (resp_a, resp_b) = tokio::join!(
-        call_llm_structured_with_provider::<FastGroundedResponseJson>(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM,
-            &user_left,
-            Model::Speed,
-            "fast_grounded_suggestions",
-            schema.clone(),
-            super::client::provider_cerebras_fp16(),
-            shard_max_tokens,
-            shard_timeout_ms,
-        ),
-        call_llm_structured_with_provider::<FastGroundedResponseJson>(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM,
-            &user_right,
-            Model::Speed,
-            "fast_grounded_suggestions",
-            schema.clone(),
-            super::client::provider_cerebras_fp16(),
-            shard_max_tokens,
-            shard_timeout_ms,
-        ),
-    );
+    let shard_responses = join_all(shard_prompts.into_iter().map(|user| {
+        let shard_schema = schema.clone();
+        async move {
+            call_llm_structured_with_provider::<FastGroundedResponseJson>(
+                FAST_GROUNDED_SUGGESTIONS_SYSTEM,
+                &user,
+                Model::Speed,
+                "fast_grounded_suggestions",
+                shard_schema,
+                super::client::provider_cerebras_fp16(),
+                shard_max_tokens,
+                shard_timeout_ms,
+            )
+            .await
+        }
+    }))
+    .await;
     let mut llm_ms = llm_start.elapsed().as_millis() as u64;
 
     let mut usage = None;
     let mut raw_items: Vec<FastGroundedSuggestionJson> = Vec::new();
-    if let Ok(r) = resp_a {
-        usage = merge_usage(usage, r.usage);
-        raw_items.extend(r.data.suggestions);
-    }
-    if let Ok(r) = resp_b {
-        usage = merge_usage(usage, r.usage);
-        raw_items.extend(r.data.suggestions);
-    }
-
-    // If we still don't have enough material, try one more fast call with the remaining budget.
-    if raw_items.len() < FAST_GROUNDED_TARGET_MIN {
-        let total_budget_ms: u64 = 10_000;
-        let elapsed = overall_start.elapsed().as_millis() as u64;
-        let remaining = total_budget_ms.saturating_sub(elapsed).saturating_sub(250);
-        if remaining >= 900 {
-            let extra_start = std::time::Instant::now();
-            if let Ok(r) = call_llm_structured_with_provider::<FastGroundedResponseJson>(
-                FAST_GROUNDED_SUGGESTIONS_SYSTEM,
-                &format_grounded_user_prompt(
-                    &memory_section,
-                    index,
-                    summaries,
-                    &pack,
-                    "Return 6 to 8 suggestions. Prefer diverse evidence refs and avoid reusing the same evidence_id unless necessary.",
-                ),
-                Model::Speed,
-                "fast_grounded_suggestions",
-                schema.clone(),
-                super::client::provider_cerebras_fp16(),
-                380,
-                remaining,
-            )
-            .await
-            {
-                llm_ms += extra_start.elapsed().as_millis() as u64;
-                usage = merge_usage(usage, r.usage);
-                raw_items.extend(r.data.suggestions);
-            }
+    for response in shard_responses {
+        if let Ok(r) = response {
+            usage = merge_usage(usage, r.usage);
+            raw_items.extend(r.data.suggestions);
         }
     }
+
+    let mut generation_waves = 1usize;
+    let mut generation_topup_calls = 0usize;
     // Provider resilience: if the pinned provider yields no shard output, retry once with
     // normal provider routing before we declare failure.
     if raw_items.is_empty() {
+        generation_waves += 1;
         let rescue_start = std::time::Instant::now();
         if let Ok(r) = call_llm_structured::<FastGroundedResponseJson>(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM,
@@ -1307,7 +1436,10 @@ pub async fn analyze_codebase_fast_grounded(
                 index,
                 summaries,
                 &pack,
-                "Return 6 to 8 suggestions and include evidence refs for each suggestion.",
+                &format!(
+                    "Return {} to {} suggestions and include evidence refs for each suggestion.",
+                    FAST_GROUNDED_FINAL_TARGET_MIN, FAST_GROUNDED_FINAL_TARGET_MAX
+                ),
             ),
             Model::Speed,
             "fast_grounded_suggestions_rescue",
@@ -1321,8 +1453,86 @@ pub async fn analyze_codebase_fast_grounded(
         }
     }
 
-    let raw_count = raw_items.len();
-    let (mapped, missing_or_invalid) = map_raw_items_to_grounded(raw_items, &pack);
+    let mut raw_count = raw_items.len();
+    let (mut mapped, mut missing_or_invalid) = map_raw_items_to_grounded(raw_items, &pack);
+    let mut generation_mapped_count = grounded_mapped_count(&mapped);
+
+    while should_run_generation_topup(generation_mapped_count, generation_topup_calls) {
+        if overall_start.elapsed().as_millis() as u64 >= SUGGEST_BALANCED_BUDGET_MS {
+            break;
+        }
+
+        let deficit = FAST_GROUNDED_PROVISIONAL_TARGET_MIN.saturating_sub(generation_mapped_count);
+        let request_count = generation_topup_request_count(deficit);
+        generation_topup_calls += 1;
+        generation_waves += 1;
+
+        let extra_start = std::time::Instant::now();
+        if let Ok(r) = call_llm_structured_with_provider::<FastGroundedResponseJson>(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM,
+            &format_grounded_user_prompt(
+                &memory_section,
+                index,
+                summaries,
+                &pack,
+                &format!(
+                    "Return {} suggestions. Prefer diverse evidence refs and avoid reusing the same evidence_id unless necessary.",
+                    request_count
+                ),
+            ),
+            Model::Speed,
+            "fast_grounded_suggestions_topup",
+            schema.clone(),
+            super::client::provider_cerebras_fp16(),
+            420,
+            GENERATION_TOPUP_TIMEOUT_MS,
+        )
+        .await
+        {
+            llm_ms += extra_start.elapsed().as_millis() as u64;
+            usage = merge_usage(usage, r.usage);
+            raw_count += r.data.suggestions.len();
+            let (topup_mapped, topup_missing_or_invalid) =
+                map_raw_items_to_grounded(r.data.suggestions, &pack);
+            mapped.extend(topup_mapped);
+            missing_or_invalid += topup_missing_or_invalid;
+            generation_mapped_count = grounded_mapped_count(&mapped);
+        }
+    }
+
+    // If generation returned content but nothing mapped, retry once with a strict full-pack call.
+    if should_run_mapping_rescue(raw_count, generation_mapped_count) {
+        generation_waves += 1;
+        let rescue_start = std::time::Instant::now();
+        if let Ok(r) = call_llm_structured::<FastGroundedResponseJson>(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM,
+            &format_grounded_user_prompt(
+                &memory_section,
+                index,
+                summaries,
+                &pack,
+                &format!(
+                    "Return {} to {} suggestions. Every suggestion must include exactly one evidence reference.",
+                    FAST_GROUNDED_FINAL_TARGET_MIN,
+                    FAST_GROUNDED_FINAL_TARGET_MAX
+                ),
+            ),
+            Model::Speed,
+            "fast_grounded_mapping_rescue",
+            schema,
+        )
+        .await
+        {
+            llm_ms += rescue_start.elapsed().as_millis() as u64;
+            usage = merge_usage(usage, r.usage);
+            raw_count += r.data.suggestions.len();
+            let (rescue_mapped, rescue_missing_or_invalid) =
+                map_raw_items_to_grounded(r.data.suggestions, &pack);
+            mapped.extend(rescue_mapped);
+            missing_or_invalid += rescue_missing_or_invalid;
+            generation_mapped_count = grounded_mapped_count(&mapped);
+        }
+    }
 
     if mapped.is_empty() {
         return Err(anyhow::anyhow!(
@@ -1330,7 +1540,8 @@ pub async fn analyze_codebase_fast_grounded(
         ));
     }
 
-    let suggestions = dedupe_and_cap_grounded_suggestions(mapped);
+    let suggestions =
+        dedupe_and_cap_grounded_suggestions(mapped, FAST_GROUNDED_PROVISIONAL_TARGET_MAX);
 
     let diagnostics = SuggestionDiagnostics {
         run_id,
@@ -1368,10 +1579,15 @@ pub async fn analyze_codebase_fast_grounded(
         pack_core_count: pack_stats.core_count,
         pack_line1_ratio: pack_stats.line1_ratio,
         provisional_count: suggestions.len(),
+        generation_waves,
+        generation_topup_calls,
+        generation_mapped_count,
         validated_count: 0,
         rejected_count: 0,
+        rejected_evidence_skipped_count: 0,
         regeneration_attempts: 0,
         refinement_complete: false,
+        notes: Vec::new(),
     };
 
     Ok((suggestions, usage, diagnostics))
@@ -1392,6 +1608,7 @@ pub async fn refine_grounded_suggestions(
         diagnostics.validated_count = 0;
         diagnostics.rejected_count = 0;
         diagnostics.final_count = 0;
+        diagnostics.notes = Vec::new();
         return Ok((Vec::new(), None, diagnostics));
     }
 
@@ -1403,8 +1620,11 @@ pub async fn refine_grounded_suggestions(
     let mut rejected_count = 0usize;
     let mut regeneration_attempts = 0usize;
     let mut used_evidence_ids: HashSet<usize> = HashSet::new();
+    let mut rejected_evidence_ids: HashSet<usize> = HashSet::new();
+    let mut rejected_evidence_skipped_ids: HashSet<usize> = HashSet::new();
+    let mut relaxed_rejected_filter_used = false;
     let mut validated: Vec<Suggestion> = Vec::new();
-    let provisional_pool = provisional.clone();
+    let mut notes = diagnostics.notes.clone();
 
     let batch_usage = validate_batch_suggestions(
         provisional.clone(),
@@ -1414,35 +1634,54 @@ pub async fn refine_grounded_suggestions(
         &mut validated,
         &mut rejected_count,
         &mut used_evidence_ids,
+        &mut rejected_evidence_ids,
     )
     .await;
     usage = merge_usage(usage, batch_usage);
 
     let (pack, pack_stats) = build_evidence_pack(repo_root, index, context);
-    while validated.len() < FAST_GROUNDED_TARGET_MIN
+    while validated.len() < FAST_GROUNDED_VALIDATED_SOFT_FLOOR
         && regeneration_attempts < REFINEMENT_MAX_ATTEMPTS
     {
-        regeneration_attempts += 1;
-        let remaining_pack: Vec<EvidenceItem> = pack
-            .iter()
-            .filter(|item| !used_evidence_ids.contains(&item.id))
-            .cloned()
-            .collect();
-        if remaining_pack.len() < 4 {
+        if refine_start.elapsed().as_millis() as u64 >= SUGGEST_BALANCED_BUDGET_MS {
+            notes.push("regeneration_budget_reached".to_string());
             break;
         }
 
-        let needed = FAST_GROUNDED_TARGET_MIN.saturating_sub(validated.len());
-        let schema = grounded_suggestion_schema(remaining_pack.len());
+        regeneration_attempts += 1;
+
+        let (remaining_pack_original, used_relaxed_filter, skipped_rejected_ids) =
+            build_remaining_pack_for_regeneration(
+                &pack,
+                &used_evidence_ids,
+                &rejected_evidence_ids,
+                !relaxed_rejected_filter_used,
+            );
+        if used_relaxed_filter {
+            relaxed_rejected_filter_used = true;
+        } else {
+            rejected_evidence_skipped_ids.extend(skipped_rejected_ids);
+        }
+
+        if remaining_pack_original.len() < 4 {
+            break;
+        }
+        let (remaining_pack_local, local_to_original) = renumber_pack(&remaining_pack_original);
+
+        let needed = regeneration_needed(validated.len());
+        if needed == 0 {
+            break;
+        }
+        let (request_min, request_max) = regeneration_request_bounds(needed);
+        let schema = grounded_suggestion_schema(remaining_pack_local.len());
         let user = format_grounded_user_prompt(
             &memory_section,
             index,
             summaries,
-            &remaining_pack,
+            &remaining_pack_local,
             &format!(
                 "Return {} to {} suggestions. Avoid reusing evidence ids and prioritize high-confidence issues.",
-                needed,
-                (needed + 1).min(FAST_GROUNDED_TARGET_MAX)
+                request_min, request_max
             ),
         );
 
@@ -1459,14 +1698,19 @@ pub async fn refine_grounded_suggestions(
         .await;
 
         let Ok(rebuilt) = regen_response else {
-            break;
+            continue;
         };
         usage = merge_usage(usage, rebuilt.usage);
         let (mapped, _missing_or_invalid) =
-            map_raw_items_to_grounded(rebuilt.data.suggestions, &remaining_pack);
-        let regenerated = mapped.into_iter().map(|(_, s)| s).collect::<Vec<_>>();
+            map_raw_items_to_grounded(rebuilt.data.suggestions, &remaining_pack_local);
+        let mut regenerated = Vec::new();
+        for (_local_id, mut suggestion) in mapped {
+            if remap_suggestion_to_original_ids(&mut suggestion, &local_to_original, &pack) {
+                regenerated.push(suggestion);
+            }
+        }
         if regenerated.is_empty() {
-            break;
+            continue;
         }
 
         let batch_usage = validate_batch_suggestions(
@@ -1477,17 +1721,13 @@ pub async fn refine_grounded_suggestions(
             &mut validated,
             &mut rejected_count,
             &mut used_evidence_ids,
+            &mut rejected_evidence_ids,
         )
         .await;
         usage = merge_usage(usage, batch_usage);
     }
 
-    let validated = ensure_target_suggestion_count(
-        validated,
-        provisional_pool,
-        Some(&cache),
-        Some(&diagnostics.run_id),
-    );
+    let validated = finalize_validated_suggestions(validated);
     let refinement_ms = refine_start.elapsed().as_millis() as u64;
     diagnostics.batch_verify_ms = refinement_ms;
     diagnostics.llm_ms += refinement_ms;
@@ -1501,11 +1741,16 @@ pub async fn refine_grounded_suggestions(
         .filter(|s| s.validation_state == SuggestionValidationState::Validated)
         .count();
     diagnostics.rejected_count = rejected_count;
+    diagnostics.rejected_evidence_skipped_count = rejected_evidence_skipped_ids.len();
     diagnostics.regeneration_attempts = regeneration_attempts;
     diagnostics.refinement_complete = true;
     diagnostics.final_count = validated.len();
     diagnostics.deduped_count = validated.len();
     diagnostics.parse_strategy = "fast_grounded_refined".to_string();
+    diagnostics.notes = notes;
+    if validated.len() < FAST_GROUNDED_VALIDATED_SOFT_FLOOR {
+        diagnostics.notes.push("count_below_soft_floor".to_string());
+    }
 
     Ok((validated, usage, diagnostics))
 }
@@ -1521,7 +1766,7 @@ mod grounded_parser_tests {
     use crate::suggest::{Priority, SuggestionKind, SuggestionSource};
     use chrono::Utc;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1534,6 +1779,18 @@ mod grounded_parser_tests {
             summary.to_string(),
             SuggestionSource::LlmDeep,
         )
+    }
+
+    fn test_evidence_item(id: usize) -> EvidenceItem {
+        EvidenceItem {
+            id,
+            file: PathBuf::from(format!("src/file_{}.rs", id)),
+            line: id + 1,
+            snippet: format!("{}| let value = {};", id + 1, id),
+            why_interesting: "test".to_string(),
+            source: EvidenceSource::Pattern,
+            pattern_kind: None,
+        }
     }
 
     fn temp_root(label: &str) -> PathBuf {
@@ -1697,20 +1954,22 @@ mod grounded_parser_tests {
             (2, test_suggestion("b-duplicate")),
         ];
 
-        let result = dedupe_and_cap_grounded_suggestions(mapped);
+        let result =
+            dedupe_and_cap_grounded_suggestions(mapped, FAST_GROUNDED_PROVISIONAL_TARGET_MAX);
 
         assert_eq!(result.len(), 2);
     }
 
     #[test]
-    fn grounded_finalizer_caps_results_at_eight() {
-        let mapped: Vec<(usize, Suggestion)> = (0..12)
+    fn grounded_finalizer_caps_results_at_provisional_target_max() {
+        let mapped: Vec<(usize, Suggestion)> = (0..40)
             .map(|i| (i, test_suggestion(&format!("item-{}", i))))
             .collect();
 
-        let result = dedupe_and_cap_grounded_suggestions(mapped);
+        let result =
+            dedupe_and_cap_grounded_suggestions(mapped, FAST_GROUNDED_PROVISIONAL_TARGET_MAX);
 
-        assert_eq!(result.len(), FAST_GROUNDED_TARGET_MAX);
+        assert_eq!(result.len(), FAST_GROUNDED_PROVISIONAL_TARGET_MAX);
     }
 
     #[test]
@@ -1860,25 +2119,198 @@ mod grounded_parser_tests {
     }
 
     #[test]
-    fn ensure_target_count_backfills_with_pending_until_minimum() {
-        let mut validated = Vec::new();
-        validated.push(
-            test_suggestion("v1").with_validation_state(SuggestionValidationState::Validated),
-        );
-        validated.push(
-            test_suggestion("v2").with_validation_state(SuggestionValidationState::Validated),
-        );
+    fn regeneration_needed_uses_soft_floor_ten() {
+        assert_eq!(regeneration_needed(0), 10);
+        assert_eq!(regeneration_needed(1), 9);
+        assert_eq!(regeneration_needed(9), 1);
+        assert_eq!(regeneration_needed(10), 0);
+        assert_eq!(regeneration_needed(14), 0);
+    }
 
-        let provisional = (0..8)
-            .map(|i| test_suggestion(&format!("p{}", i)))
+    #[test]
+    fn finalize_validated_suggestions_drops_pending_and_caps_at_final_target_max() {
+        let mut input = (0..24)
+            .map(|i| {
+                test_suggestion(&format!("v{}", i))
+                    .with_validation_state(SuggestionValidationState::Validated)
+            })
             .collect::<Vec<_>>();
+        input.push(
+            test_suggestion("pending").with_validation_state(SuggestionValidationState::Pending),
+        );
 
-        let out = ensure_target_suggestion_count(validated, provisional, None, None);
-        assert!(out.len() >= FAST_GROUNDED_TARGET_MIN);
-        assert!(out.len() <= FAST_GROUNDED_TARGET_MAX);
+        let out = finalize_validated_suggestions(input);
+        assert_eq!(out.len(), FAST_GROUNDED_FINAL_TARGET_MAX);
         assert!(out
             .iter()
-            .any(|s| s.validation_state == SuggestionValidationState::Pending));
+            .all(|s| s.validation_state == SuggestionValidationState::Validated));
+    }
+
+    #[test]
+    fn should_run_mapping_rescue_only_when_raw_exists_and_mapped_is_empty() {
+        assert!(should_run_mapping_rescue(3, 0));
+        assert!(!should_run_mapping_rescue(0, 0));
+        assert!(!should_run_mapping_rescue(3, 1));
+    }
+
+    #[test]
+    fn generation_topup_decision_is_based_on_mapped_count_and_call_budget() {
+        let raw_count = FAST_GROUNDED_PROVISIONAL_TARGET_MIN + 12;
+        assert!(raw_count > FAST_GROUNDED_PROVISIONAL_TARGET_MIN);
+        assert!(should_run_generation_topup(
+            FAST_GROUNDED_PROVISIONAL_TARGET_MIN - 1,
+            0
+        ));
+        assert!(!should_run_generation_topup(
+            FAST_GROUNDED_PROVISIONAL_TARGET_MIN,
+            0
+        ));
+        assert!(!should_run_generation_topup(0, GENERATION_TOPUP_MAX_CALLS));
+    }
+
+    #[test]
+    fn generation_topup_request_count_uses_deficit_plus_padding_with_cap() {
+        assert_eq!(generation_topup_request_count(1), 5);
+        assert_eq!(generation_topup_request_count(6), 10);
+        assert_eq!(generation_topup_request_count(20), 12);
+    }
+
+    #[test]
+    fn regeneration_request_bounds_scale_and_clamp_to_range() {
+        assert_eq!(regeneration_request_bounds(1), (4, 4));
+        assert_eq!(regeneration_request_bounds(2), (4, 6));
+        assert_eq!(regeneration_request_bounds(4), (8, 12));
+        assert_eq!(regeneration_request_bounds(10), (12, 12));
+    }
+
+    #[test]
+    fn build_remaining_pack_excludes_rejected_evidence_when_strict_pack_is_large_enough() {
+        let pack = (0..8).map(test_evidence_item).collect::<Vec<_>>();
+        let used = HashSet::from([0usize]);
+        let rejected = HashSet::from([1usize, 2usize]);
+
+        let (remaining, used_relaxed_filter, skipped_rejected_ids) =
+            build_remaining_pack_for_regeneration(&pack, &used, &rejected, false);
+
+        assert!(!used_relaxed_filter);
+        let remaining_ids = remaining.iter().map(|item| item.id).collect::<Vec<_>>();
+        assert_eq!(remaining_ids, vec![3, 4, 5, 6, 7]);
+        assert_eq!(skipped_rejected_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn build_remaining_pack_relaxes_rejected_filter_once_when_strict_pack_is_too_small() {
+        let pack = (0..8).map(test_evidence_item).collect::<Vec<_>>();
+        let used = HashSet::from([0usize, 6usize, 7usize]);
+        let rejected = HashSet::from([1usize, 2usize, 3usize]);
+
+        let (remaining, used_relaxed_filter, skipped_rejected_ids) =
+            build_remaining_pack_for_regeneration(&pack, &used, &rejected, true);
+
+        assert!(used_relaxed_filter);
+        let remaining_ids = remaining.iter().map(|item| item.id).collect::<Vec<_>>();
+        assert_eq!(remaining_ids, vec![1, 2, 3, 4, 5]);
+        assert!(skipped_rejected_ids.is_empty());
+    }
+
+    #[test]
+    fn sort_validation_outcomes_restores_input_order_for_parallel_results() {
+        let mut outcomes: Vec<ValidationOutcome> = vec![
+            (
+                2,
+                test_suggestion("c"),
+                SuggestionValidationState::Validated,
+                "ok".to_string(),
+                None,
+            ),
+            (
+                0,
+                test_suggestion("a"),
+                SuggestionValidationState::Validated,
+                "ok".to_string(),
+                None,
+            ),
+            (
+                1,
+                test_suggestion("b"),
+                SuggestionValidationState::Rejected,
+                "no".to_string(),
+                None,
+            ),
+        ];
+        sort_validation_outcomes(&mut outcomes);
+        let summaries = outcomes
+            .iter()
+            .map(|(_, suggestion, _, _, _)| suggestion.summary.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(summaries, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn remap_suggestion_to_original_ids_handles_non_contiguous_ids() {
+        let full_pack = vec![
+            EvidenceItem {
+                id: 10,
+                file: PathBuf::from("src/a.rs"),
+                line: 7,
+                snippet: "7| let a = 1;".to_string(),
+                why_interesting: "pattern".to_string(),
+                source: EvidenceSource::Pattern,
+                pattern_kind: Some(PatternKind::MissingErrorHandling),
+            },
+            EvidenceItem {
+                id: 42,
+                file: PathBuf::from("src/b.rs"),
+                line: 11,
+                snippet: "11| let b = 2;".to_string(),
+                why_interesting: "hotspot".to_string(),
+                source: EvidenceSource::Hotspot,
+                pattern_kind: None,
+            },
+        ];
+        let (local_pack, local_to_original) = renumber_pack(&full_pack);
+        assert_eq!(local_pack[0].id, 0);
+        assert_eq!(local_pack[1].id, 1);
+
+        let mut suggestion = test_suggestion("local-id")
+            .with_line(local_pack[1].line)
+            .with_evidence(local_pack[1].snippet.clone())
+            .with_evidence_refs(vec![SuggestionEvidenceRef {
+                snippet_id: 1,
+                file: local_pack[1].file.clone(),
+                line: local_pack[1].line,
+            }]);
+
+        assert!(remap_suggestion_to_original_ids(
+            &mut suggestion,
+            &local_to_original,
+            &full_pack
+        ));
+        assert_eq!(suggestion.evidence_refs[0].snippet_id, 42);
+        assert_eq!(suggestion.file, PathBuf::from("src/b.rs"));
+        assert_eq!(suggestion.line, Some(11));
+    }
+
+    #[test]
+    fn finalize_validated_suggestions_drops_pending_without_backfill() {
+        let out = finalize_validated_suggestions(vec![
+            test_suggestion("v1").with_validation_state(SuggestionValidationState::Validated),
+            test_suggestion("pending").with_validation_state(SuggestionValidationState::Pending),
+            test_suggestion("v2").with_validation_state(SuggestionValidationState::Validated),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(out
+            .iter()
+            .all(|s| s.validation_state == SuggestionValidationState::Validated));
+    }
+
+    #[test]
+    fn grounded_schema_enforces_single_evidence_ref() {
+        let schema = grounded_suggestion_schema(10);
+        let evidence_refs =
+            &schema["properties"]["suggestions"]["items"]["properties"]["evidence_refs"];
+        assert_eq!(evidence_refs["minItems"], 1);
+        assert_eq!(evidence_refs["maxItems"], 1);
     }
 }
 

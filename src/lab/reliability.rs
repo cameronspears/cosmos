@@ -1,6 +1,7 @@
 use crate::cache::SelfIterationSuggestionMetrics;
 use crate::context::WorkContext;
 use crate::index::CodebaseIndex;
+use crate::suggest::llm::models::merge_usage;
 use crate::suggest::llm::{
     analyze_codebase_fast_grounded, generate_fix_preview_agentic, refine_grounded_suggestions,
 };
@@ -100,6 +101,7 @@ pub async fn run_trial(
     repo_root: &Path,
     verify_sample: usize,
 ) -> anyhow::Result<ReliabilityTrialResult> {
+    let suggest_start = std::time::Instant::now();
     let repo_root = repo_root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("Failed to resolve repo '{}': {}", repo_root.display(), e))?;
@@ -127,10 +129,10 @@ pub async fn run_trial(
             .collect::<HashMap<PathBuf, String>>()
     });
 
-    let (provisional, _usage_a, diagnostics) =
+    let (provisional, usage_a, diagnostics) =
         analyze_codebase_fast_grounded(&repo_root, &index, &context, None, summaries.as_ref())
             .await?;
-    let (refined, _usage_b, diagnostics) = refine_grounded_suggestions(
+    let (refined, usage_b, diagnostics) = refine_grounded_suggestions(
         &repo_root,
         &index,
         &context,
@@ -140,6 +142,8 @@ pub async fn run_trial(
         diagnostics,
     )
     .await?;
+    let total_usage = merge_usage(usage_a, usage_b);
+    let suggest_total_ms = suggest_start.elapsed().as_millis() as u64;
 
     let validated_suggestions: Vec<Suggestion> = refined
         .iter()
@@ -168,7 +172,13 @@ pub async fn run_trial(
 
     let provisional_count = diagnostics.provisional_count.max(provisional.len());
     let validated_count = diagnostics.validated_count.max(validated_suggestions.len());
+    let final_count = diagnostics
+        .final_count
+        .max(refined.len())
+        .max(validated_count);
+    let pending_count = final_count.saturating_sub(validated_count);
     let rejected_count = diagnostics.rejected_count;
+    let displayed_valid_ratio = ratio(validated_count, final_count);
     let validated_ratio = ratio(validated_count, provisional_count);
     let rejected_ratio = ratio(rejected_count, provisional_count);
 
@@ -187,8 +197,11 @@ pub async fn run_trial(
     let metrics = SelfIterationSuggestionMetrics {
         trials: 1,
         provisional_count,
+        final_count,
         validated_count,
+        pending_count,
         rejected_count,
+        displayed_valid_ratio,
         validated_ratio,
         rejected_ratio,
         preview_sampled: preview_sample_count,
@@ -199,6 +212,9 @@ pub async fn run_trial(
         preview_precision,
         evidence_line1_ratio: diagnostics.pack_line1_ratio,
         evidence_source_mix: source_mix.clone(),
+        suggest_total_tokens: total_usage.as_ref().map(|u| u.total_tokens).unwrap_or(0),
+        suggest_total_cost_usd: total_usage.as_ref().map(|u| u.cost()).unwrap_or(0.0),
+        suggest_total_ms,
     };
 
     let diagnostics_summary = ReliabilityDiagnosticsSummary {
@@ -263,13 +279,18 @@ pub fn aggregate_trial_metrics(
 
     for metric in metrics {
         aggregated.provisional_count += metric.provisional_count;
+        aggregated.final_count += metric.final_count;
         aggregated.validated_count += metric.validated_count;
+        aggregated.pending_count += metric.pending_count;
         aggregated.rejected_count += metric.rejected_count;
         aggregated.preview_sampled += metric.preview_sampled;
         aggregated.preview_verified_count += metric.preview_verified_count;
         aggregated.preview_contradicted_count += metric.preview_contradicted_count;
         aggregated.preview_insufficient_count += metric.preview_insufficient_count;
         aggregated.preview_error_count += metric.preview_error_count;
+        aggregated.suggest_total_tokens += metric.suggest_total_tokens;
+        aggregated.suggest_total_cost_usd += metric.suggest_total_cost_usd;
+        aggregated.suggest_total_ms += metric.suggest_total_ms;
 
         let weight = metric.provisional_count.max(1);
         weighted_line1_numerator += metric.evidence_line1_ratio * weight as f64;
@@ -280,6 +301,7 @@ pub fn aggregate_trial_metrics(
         }
     }
 
+    aggregated.displayed_valid_ratio = ratio(aggregated.validated_count, aggregated.final_count);
     aggregated.validated_ratio = ratio(aggregated.validated_count, aggregated.provisional_count);
     aggregated.rejected_ratio = ratio(aggregated.rejected_count, aggregated.provisional_count);
 
@@ -317,8 +339,11 @@ mod tests {
             SelfIterationSuggestionMetrics {
                 trials: 1,
                 provisional_count: 10,
+                final_count: 8,
                 validated_count: 7,
+                pending_count: 1,
                 rejected_count: 3,
+                displayed_valid_ratio: 0.875,
                 preview_sampled: 5,
                 preview_verified_count: 4,
                 preview_contradicted_count: 1,
@@ -331,14 +356,20 @@ mod tests {
                     ("hotspot".to_string(), 8usize),
                     ("core".to_string(), 7usize),
                 ]),
+                suggest_total_tokens: 2000,
+                suggest_total_cost_usd: 0.002,
+                suggest_total_ms: 1200,
                 validated_ratio: 0.7,
                 rejected_ratio: 0.3,
             },
             SelfIterationSuggestionMetrics {
                 trials: 1,
                 provisional_count: 5,
+                final_count: 4,
                 validated_count: 4,
+                pending_count: 0,
                 rejected_count: 1,
+                displayed_valid_ratio: 1.0,
                 preview_sampled: 4,
                 preview_verified_count: 2,
                 preview_contradicted_count: 2,
@@ -351,6 +382,9 @@ mod tests {
                     ("hotspot".to_string(), 4usize),
                     ("core".to_string(), 3usize),
                 ]),
+                suggest_total_tokens: 1500,
+                suggest_total_cost_usd: 0.0015,
+                suggest_total_ms: 900,
                 validated_ratio: 0.8,
                 rejected_ratio: 0.2,
             },
@@ -359,10 +393,16 @@ mod tests {
         let aggregate = aggregate_trial_metrics(&metrics);
         assert_eq!(aggregate.trials, 2);
         assert_eq!(aggregate.provisional_count, 15);
+        assert_eq!(aggregate.final_count, 12);
         assert_eq!(aggregate.validated_count, 11);
+        assert_eq!(aggregate.pending_count, 1);
         assert_eq!(aggregate.rejected_count, 4);
+        assert!((aggregate.displayed_valid_ratio - (11.0 / 12.0)).abs() < f64::EPSILON);
         assert!((aggregate.validated_ratio - (11.0 / 15.0)).abs() < f64::EPSILON);
         assert!((aggregate.rejected_ratio - (4.0 / 15.0)).abs() < f64::EPSILON);
+        assert_eq!(aggregate.suggest_total_tokens, 3500);
+        assert!((aggregate.suggest_total_cost_usd - 0.0035).abs() < f64::EPSILON);
+        assert_eq!(aggregate.suggest_total_ms, 2100);
     }
 
     #[test]

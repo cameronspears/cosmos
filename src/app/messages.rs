@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 /// Messages from background tasks to the main UI thread
 pub enum BackgroundMessage {
+    /// Provisional grounded suggestions from fast pass (not yet actionable).
     SuggestionsReady {
         suggestions: Vec<suggest::Suggestion>,
         usage: Option<suggest::llm::Usage>,
@@ -13,6 +14,7 @@ pub enum BackgroundMessage {
         diagnostics: suggest::llm::SuggestionDiagnostics,
         duration_ms: u64,
     },
+    /// Refined suggestions after validation/regeneration (actionable list).
     SuggestionsRefined {
         suggestions: Vec<suggest::Suggestion>,
         usage: Option<suggest::llm::Usage>,

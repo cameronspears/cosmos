@@ -26,6 +26,23 @@ cargo run --bin cosmos-lab -- validate \
   --verify-sample 4
 ```
 
+Optional rolling quality gate:
+
+```bash
+cargo run --bin cosmos-lab -- validate \
+  --cosmos-repo /Users/cam/WebstormProjects/cosmos \
+  --target-repo /Users/cam/WebstormProjects/gielinor-gains \
+  --mode fast \
+  --verify-sample 4 \
+  --enforce-quality-gate \
+  --gate-window 10 \
+  --gate-min-displayed-validity 0.95 \
+  --gate-min-final-count 10 \
+  --gate-max-suggest-ms 30000 \
+  --gate-max-suggest-cost-usd 0.01 \
+  --gate-source both
+```
+
 Runs:
 - Cosmos: `cargo test --locked`
 - Target: `pnpm test:once`, `pnpm type-check`
@@ -58,6 +75,22 @@ cargo run --bin cosmos-lab -- reliability \
   --verify-sample 4
 ```
 
+Optional rolling quality gate:
+
+```bash
+cargo run --bin cosmos-lab -- reliability \
+  --target-repo /Users/cam/WebstormProjects/gielinor-gains \
+  --trials 3 \
+  --verify-sample 4 \
+  --enforce-quality-gate \
+  --gate-window 10 \
+  --gate-min-displayed-validity 0.95 \
+  --gate-min-final-count 10 \
+  --gate-max-suggest-ms 30000 \
+  --gate-max-suggest-cost-usd 0.01 \
+  --gate-source both
+```
+
 ## When To Use Which Mode
 
 | Mode | Use when | Key output |
@@ -71,6 +104,9 @@ cargo run --bin cosmos-lab -- reliability \
 - JSON report files are written to `.cosmos/lab/` by default.
 - Run telemetry is appended to `.cosmos/self_iteration_runs.jsonl`.
 - Suggestion validation telemetry remains in `.cosmos/suggestion_quality.jsonl`.
+- Primary pre-verify quality metric is `displayed_valid_ratio`.
+- Gate on count/speed/cost too: `final_count`, `suggest_total_ms`, and `suggest_total_cost_usd`.
+- Final refined output should keep `pending_count == 0` (no pending backfill).
 
 ## ETHOS-Aligned Run Summary Template
 

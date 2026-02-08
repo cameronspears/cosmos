@@ -462,9 +462,15 @@ pub struct SelfIterationSuggestionMetrics {
     #[serde(default)]
     pub provisional_count: usize,
     #[serde(default)]
+    pub final_count: usize,
+    #[serde(default)]
     pub validated_count: usize,
     #[serde(default)]
+    pub pending_count: usize,
+    #[serde(default)]
     pub rejected_count: usize,
+    #[serde(default)]
+    pub displayed_valid_ratio: f64,
     #[serde(default)]
     pub validated_ratio: f64,
     #[serde(default)]
@@ -485,6 +491,12 @@ pub struct SelfIterationSuggestionMetrics {
     pub evidence_line1_ratio: f64,
     #[serde(default)]
     pub evidence_source_mix: HashMap<String, usize>,
+    #[serde(default)]
+    pub suggest_total_tokens: u32,
+    #[serde(default)]
+    pub suggest_total_cost_usd: f64,
+    #[serde(default)]
+    pub suggest_total_ms: u64,
 }
 
 /// High-level record for one `cosmos-lab` run.
@@ -1552,8 +1564,11 @@ mod tests {
             reliability_metrics: Some(SelfIterationSuggestionMetrics {
                 trials: 1,
                 provisional_count: 8,
+                final_count: 8,
                 validated_count: 7,
+                pending_count: 0,
                 rejected_count: 1,
+                displayed_valid_ratio: 0.875,
                 validated_ratio: 0.875,
                 rejected_ratio: 0.125,
                 preview_sampled: 4,
@@ -1568,6 +1583,9 @@ mod tests {
                     ("hotspot".to_string(), 7usize),
                     ("core".to_string(), 6usize),
                 ]),
+                suggest_total_tokens: 2000,
+                suggest_total_cost_usd: 0.002,
+                suggest_total_ms: 1500,
             }),
             report_path: None,
             notes: vec!["note".to_string()],

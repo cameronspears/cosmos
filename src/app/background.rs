@@ -44,12 +44,6 @@ pub fn drain_messages(
             } => {
                 let run_id = diagnostics.run_id.clone();
                 let count = suggestions.len();
-                for s in suggestions {
-                    app.suggestions.add_llm_suggestion(s);
-                }
-
-                // Diff-first ordering: changed files and their blast radius float to the top.
-                app.suggestions.sort_with_context(&app.context);
 
                 let (tokens, cost) = track_usage(app, usage.as_ref(), ctx);
 
@@ -61,8 +55,11 @@ pub fn drain_messages(
                     app.loading = LoadingState::None;
                 }
 
-                // More prominent toast for suggestions
-                app.show_toast(&format!("{} suggestions ready ({})", count, &model));
+                // Provisional stage only: don't surface actionable suggestions yet.
+                app.show_toast(&format!(
+                    "Refining {} provisional suggestions ({})",
+                    count, &model
+                ));
                 app.active_model = Some(model);
                 app.last_suggestion_diagnostics = Some(diagnostics);
                 app.last_suggestion_error = None;
@@ -204,7 +201,8 @@ pub fn drain_messages(
                                 Some(repo_memory_context)
                             };
                             let mem_for_refine = mem.clone();
-                            // Fast grounded suggestions: one LLM call, no tools, strict latency budget.
+                            // Fast grounded suggestions: provisional output only.
+                            // Actionable suggestions are emitted after refinement.
                             match suggest::llm::analyze_codebase_fast_grounded(
                                 &repo_root,
                                 &index_clone,

@@ -47,6 +47,20 @@ struct ValidateArgs {
     output: Option<PathBuf>,
     #[arg(long)]
     keep_sandboxes: bool,
+    #[arg(long)]
+    enforce_quality_gate: bool,
+    #[arg(long, default_value_t = 10)]
+    gate_window: usize,
+    #[arg(long, default_value_t = 0.95)]
+    gate_min_displayed_validity: f64,
+    #[arg(long, default_value_t = 10)]
+    gate_min_final_count: usize,
+    #[arg(long, default_value_t = 30_000)]
+    gate_max_suggest_ms: u64,
+    #[arg(long, default_value_t = 0.01)]
+    gate_max_suggest_cost_usd: f64,
+    #[arg(long, value_enum, default_value_t = GateSource::Both)]
+    gate_source: GateSource,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -64,6 +78,31 @@ impl ValidateMode {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum GateSource {
+    Both,
+    Validate,
+    Reliability,
+}
+
+impl GateSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            GateSource::Both => "both",
+            GateSource::Validate => "validate",
+            GateSource::Reliability => "reliability",
+        }
+    }
+
+    fn includes_mode(&self, mode: &str) -> bool {
+        match self {
+            GateSource::Both => mode.starts_with("validate_") || mode == "reliability",
+            GateSource::Validate => mode.starts_with("validate_"),
+            GateSource::Reliability => mode == "reliability",
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 struct ReliabilityArgs {
     #[arg(long, default_value = DEFAULT_TARGET_REPO)]
@@ -74,6 +113,20 @@ struct ReliabilityArgs {
     verify_sample: usize,
     #[arg(long)]
     output: Option<PathBuf>,
+    #[arg(long)]
+    enforce_quality_gate: bool,
+    #[arg(long, default_value_t = 10)]
+    gate_window: usize,
+    #[arg(long, default_value_t = 0.95)]
+    gate_min_displayed_validity: f64,
+    #[arg(long, default_value_t = 10)]
+    gate_min_final_count: usize,
+    #[arg(long, default_value_t = 30_000)]
+    gate_max_suggest_ms: u64,
+    #[arg(long, default_value_t = 0.01)]
+    gate_max_suggest_cost_usd: f64,
+    #[arg(long, value_enum, default_value_t = GateSource::Both)]
+    gate_source: GateSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +140,24 @@ struct LintBaselineFile {
     captured_at: DateTime<Utc>,
     command: String,
     counts: LintCounts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QualityGateResult {
+    source: String,
+    window: usize,
+    min_displayed_validity: f64,
+    min_final_count: usize,
+    max_suggest_ms: u64,
+    max_suggest_cost_usd: f64,
+    evaluated_runs: usize,
+    rolling_displayed_validity: Option<f64>,
+    rolling_final_count: Option<f64>,
+    rolling_suggest_ms: Option<f64>,
+    rolling_suggest_cost_usd: Option<f64>,
+    pending_violations: usize,
+    warmup: bool,
+    passed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +177,8 @@ struct ValidateReport {
     reliability_diagnostics: Option<ReliabilityDiagnosticsSummary>,
     #[serde(default)]
     reliability_failure_kind: Option<String>,
+    #[serde(default)]
+    quality_gate: Option<QualityGateResult>,
     passed: bool,
     notes: Vec<String>,
 }
@@ -123,6 +196,8 @@ struct ReliabilityReport {
     trial_results: Vec<ReliabilityTrialResult>,
     #[serde(default)]
     reliability_failure_kind: Option<String>,
+    #[serde(default)]
+    quality_gate: Option<QualityGateResult>,
     passed: bool,
     notes: Vec<String>,
 }
@@ -254,6 +329,63 @@ async fn run_validate(args: ValidateArgs) -> Result<()> {
 
     let mut passed =
         outcomes.iter().all(|outcome| outcome.success) && reliability_metrics.is_some();
+    let mode_key = format!("validate_{}", args.mode.as_str());
+    let cache = Cache::new(&cosmos_repo);
+    let quality_gate = if args.enforce_quality_gate {
+        let gate = evaluate_quality_gate(
+            &cache,
+            args.gate_source,
+            args.gate_window,
+            args.gate_min_displayed_validity,
+            args.gate_min_final_count,
+            args.gate_max_suggest_ms,
+            args.gate_max_suggest_cost_usd,
+            &mode_key,
+            reliability_metrics.as_ref(),
+        )?;
+        if gate.warmup {
+            notes.push(format!(
+                "quality_gate_warmup: source={} runs={} window={} min_displayed_validity={:.2} min_final_count={} max_suggest_ms={} max_suggest_cost_usd={:.4}",
+                gate.source,
+                gate.evaluated_runs,
+                gate.window,
+                gate.min_displayed_validity,
+                gate.min_final_count,
+                gate.max_suggest_ms,
+                gate.max_suggest_cost_usd
+            ));
+        } else if gate.passed {
+            notes.push(format!(
+                "quality_gate_pass: source={} displayed_validity={:.3} final_count={:.2} suggest_ms={:.2} suggest_cost_usd={:.5} window={}",
+                gate.source,
+                gate.rolling_displayed_validity.unwrap_or(0.0),
+                gate.rolling_final_count.unwrap_or(0.0),
+                gate.rolling_suggest_ms.unwrap_or(0.0),
+                gate.rolling_suggest_cost_usd.unwrap_or(0.0),
+                gate.window
+            ));
+        } else {
+            passed = false;
+            notes.push(format!(
+                "quality_gate_fail: source={} displayed_validity={:.3}/{:.2} final_count={:.2}/{} suggest_ms={:.2}/{} suggest_cost_usd={:.5}/{:.5} pending_violations={} window={}",
+                gate.source,
+                gate.rolling_displayed_validity.unwrap_or(0.0),
+                gate.min_displayed_validity,
+                gate.rolling_final_count.unwrap_or(0.0),
+                gate.min_final_count,
+                gate.rolling_suggest_ms.unwrap_or(0.0),
+                gate.max_suggest_ms,
+                gate.rolling_suggest_cost_usd.unwrap_or(0.0),
+                gate.max_suggest_cost_usd,
+                gate.pending_violations,
+                gate.window
+            ));
+        }
+        Some(gate)
+    } else {
+        None
+    };
+
     if args.keep_sandboxes {
         notes.push(format!(
             "Keeping sandboxes for debugging: '{}' and '{}'",
@@ -286,6 +418,7 @@ async fn run_validate(args: ValidateArgs) -> Result<()> {
         reliability_metrics: reliability_metrics.clone(),
         reliability_diagnostics,
         reliability_failure_kind,
+        quality_gate: quality_gate.clone(),
         passed,
         notes: notes.clone(),
     };
@@ -299,11 +432,10 @@ async fn run_validate(args: ValidateArgs) -> Result<()> {
     );
     write_report_json(&output_path, &report)?;
 
-    let cache = Cache::new(&cosmos_repo);
     let telemetry = SelfIterationRunRecord {
         timestamp: Utc::now(),
         run_id: run_id.clone(),
-        mode: format!("validate_{}", args.mode.as_str()),
+        mode: mode_key,
         cosmos_repo: cosmos_repo.clone(),
         target_repo: target_repo.clone(),
         passed,
@@ -332,6 +464,7 @@ async fn run_reliability(args: ReliabilityArgs) -> Result<()> {
     let target_sandbox = SandboxSession::create(&target_repo, &run_id, "target-repo", true)?;
     let mut notes = Vec::new();
     let mut reliability_failure_kind = None;
+    let cache = Cache::new(&cosmos_repo);
 
     let (aggregated_metrics, trial_results, mut passed) = if fake_reliability_enabled() {
         let mut trials = Vec::new();
@@ -362,6 +495,61 @@ async fn run_reliability(args: ReliabilityArgs) -> Result<()> {
         }
     };
 
+    let quality_gate = if args.enforce_quality_gate {
+        let gate = evaluate_quality_gate(
+            &cache,
+            args.gate_source,
+            args.gate_window,
+            args.gate_min_displayed_validity,
+            args.gate_min_final_count,
+            args.gate_max_suggest_ms,
+            args.gate_max_suggest_cost_usd,
+            "reliability",
+            aggregated_metrics.as_ref(),
+        )?;
+        if gate.warmup {
+            notes.push(format!(
+                "quality_gate_warmup: source={} runs={} window={} min_displayed_validity={:.2} min_final_count={} max_suggest_ms={} max_suggest_cost_usd={:.4}",
+                gate.source,
+                gate.evaluated_runs,
+                gate.window,
+                gate.min_displayed_validity,
+                gate.min_final_count,
+                gate.max_suggest_ms,
+                gate.max_suggest_cost_usd
+            ));
+        } else if gate.passed {
+            notes.push(format!(
+                "quality_gate_pass: source={} displayed_validity={:.3} final_count={:.2} suggest_ms={:.2} suggest_cost_usd={:.5} window={}",
+                gate.source,
+                gate.rolling_displayed_validity.unwrap_or(0.0),
+                gate.rolling_final_count.unwrap_or(0.0),
+                gate.rolling_suggest_ms.unwrap_or(0.0),
+                gate.rolling_suggest_cost_usd.unwrap_or(0.0),
+                gate.window
+            ));
+        } else {
+            passed = false;
+            notes.push(format!(
+                "quality_gate_fail: source={} displayed_validity={:.3}/{:.2} final_count={:.2}/{} suggest_ms={:.2}/{} suggest_cost_usd={:.5}/{:.5} pending_violations={} window={}",
+                gate.source,
+                gate.rolling_displayed_validity.unwrap_or(0.0),
+                gate.min_displayed_validity,
+                gate.rolling_final_count.unwrap_or(0.0),
+                gate.min_final_count,
+                gate.rolling_suggest_ms.unwrap_or(0.0),
+                gate.max_suggest_ms,
+                gate.rolling_suggest_cost_usd.unwrap_or(0.0),
+                gate.max_suggest_cost_usd,
+                gate.pending_violations,
+                gate.window
+            ));
+        }
+        Some(gate)
+    } else {
+        None
+    };
+
     if let Err(error) = target_sandbox.cleanup() {
         passed = false;
         notes.push(format!("Failed to cleanup target sandbox: {}", error));
@@ -378,6 +566,7 @@ async fn run_reliability(args: ReliabilityArgs) -> Result<()> {
         aggregated_metrics: aggregated_metrics.clone(),
         trial_results: trial_results.clone(),
         reliability_failure_kind,
+        quality_gate: quality_gate.clone(),
         passed,
         notes: notes.clone(),
     };
@@ -391,7 +580,6 @@ async fn run_reliability(args: ReliabilityArgs) -> Result<()> {
     );
     write_report_json(&output_path, &report)?;
 
-    let cache = Cache::new(&cosmos_repo);
     let telemetry = SelfIterationRunRecord {
         timestamp: Utc::now(),
         run_id: run_id.clone(),
@@ -517,6 +705,217 @@ fn parse_lint_counts(outcome: &SelfIterationCommandOutcome) -> Option<LintCounts
     None
 }
 
+fn metric_displayed_valid_ratio(metrics: &SelfIterationSuggestionMetrics) -> f64 {
+    if metrics.final_count > 0 {
+        ratio(metrics.validated_count, metrics.final_count)
+    } else if metrics.displayed_valid_ratio > 0.0 {
+        metrics.displayed_valid_ratio
+    } else {
+        metrics.validated_ratio
+    }
+}
+
+fn metric_pending_count(metrics: &SelfIterationSuggestionMetrics) -> usize {
+    if metrics.final_count > 0 || metrics.pending_count > 0 {
+        metrics
+            .pending_count
+            .max(metrics.final_count.saturating_sub(metrics.validated_count))
+    } else {
+        0
+    }
+}
+
+fn metric_final_count(metrics: &SelfIterationSuggestionMetrics) -> usize {
+    if metrics.final_count > 0 {
+        metrics.final_count
+    } else {
+        metrics.validated_count + metric_pending_count(metrics)
+    }
+}
+
+fn metric_suggest_ms(metrics: &SelfIterationSuggestionMetrics) -> u64 {
+    metrics.suggest_total_ms
+}
+
+fn metric_suggest_cost_usd(metrics: &SelfIterationSuggestionMetrics) -> f64 {
+    metrics.suggest_total_cost_usd
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GateCandidate {
+    displayed_validity: f64,
+    final_count: usize,
+    pending_count: usize,
+    suggest_ms: Option<u64>,
+    suggest_cost_usd: Option<f64>,
+}
+
+fn gate_candidate_from_metrics(metrics: &SelfIterationSuggestionMetrics) -> GateCandidate {
+    GateCandidate {
+        displayed_validity: metric_displayed_valid_ratio(metrics),
+        final_count: metric_final_count(metrics),
+        pending_count: metric_pending_count(metrics),
+        suggest_ms: {
+            let ms = metric_suggest_ms(metrics);
+            if ms == 0 {
+                None
+            } else {
+                Some(ms)
+            }
+        },
+        suggest_cost_usd: {
+            let cost = metric_suggest_cost_usd(metrics);
+            if cost <= 0.0 {
+                None
+            } else {
+                Some(cost)
+            }
+        },
+    }
+}
+
+fn evaluate_quality_gate(
+    cache: &Cache,
+    source: GateSource,
+    window: usize,
+    min_displayed_validity: f64,
+    min_final_count: usize,
+    max_suggest_ms: u64,
+    max_suggest_cost_usd: f64,
+    current_mode: &str,
+    current_metrics: Option<&SelfIterationSuggestionMetrics>,
+) -> Result<QualityGateResult> {
+    let window = window.max(1);
+    let mut candidates: Vec<GateCandidate> = cache
+        .load_recent_self_iteration_runs(2_000)?
+        .into_iter()
+        .filter(|record| source.includes_mode(&record.mode))
+        .filter_map(|record| {
+            record
+                .reliability_metrics
+                .map(|metrics| gate_candidate_from_metrics(&metrics))
+        })
+        .collect();
+
+    if source.includes_mode(current_mode) {
+        if let Some(metrics) = current_metrics {
+            candidates.push(gate_candidate_from_metrics(metrics));
+        }
+    }
+
+    if candidates.len() > window {
+        let split = candidates.len() - window;
+        candidates.drain(0..split);
+    }
+
+    let evaluated_runs = candidates.len();
+    let rolling_displayed_validity = if evaluated_runs == 0 {
+        None
+    } else {
+        Some(
+            candidates
+                .iter()
+                .map(|candidate| candidate.displayed_validity)
+                .sum::<f64>()
+                / evaluated_runs as f64,
+        )
+    };
+    let rolling_final_count = if evaluated_runs == 0 {
+        None
+    } else {
+        Some(
+            candidates
+                .iter()
+                .map(|candidate| candidate.final_count as f64)
+                .sum::<f64>()
+                / evaluated_runs as f64,
+        )
+    };
+    let rolling_suggest_ms = if evaluated_runs == 0 {
+        None
+    } else {
+        let values = candidates
+            .iter()
+            .filter_map(|candidate| candidate.suggest_ms.map(|value| value as f64))
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().sum::<f64>() / values.len() as f64)
+        }
+    };
+    let rolling_suggest_cost_usd = if evaluated_runs == 0 {
+        None
+    } else {
+        let values = candidates
+            .iter()
+            .filter_map(|candidate| candidate.suggest_cost_usd)
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().sum::<f64>() / values.len() as f64)
+        }
+    };
+    let pending_violations = candidates
+        .iter()
+        .filter(|candidate| candidate.pending_count > 0)
+        .count();
+
+    if evaluated_runs < window {
+        return Ok(QualityGateResult {
+            source: source.as_str().to_string(),
+            window,
+            min_displayed_validity,
+            min_final_count,
+            max_suggest_ms,
+            max_suggest_cost_usd,
+            evaluated_runs,
+            rolling_displayed_validity,
+            rolling_final_count,
+            rolling_suggest_ms,
+            rolling_suggest_cost_usd,
+            pending_violations,
+            warmup: true,
+            passed: true,
+        });
+    }
+
+    let passed = rolling_displayed_validity.unwrap_or(0.0) >= min_displayed_validity
+        && rolling_final_count.unwrap_or(0.0) >= min_final_count as f64
+        && rolling_suggest_ms
+            .map(|value| value <= max_suggest_ms as f64)
+            .unwrap_or(false)
+        && rolling_suggest_cost_usd
+            .map(|value| value <= max_suggest_cost_usd)
+            .unwrap_or(false)
+        && pending_violations == 0usize;
+    Ok(QualityGateResult {
+        source: source.as_str().to_string(),
+        window,
+        min_displayed_validity,
+        min_final_count,
+        max_suggest_ms,
+        max_suggest_cost_usd,
+        evaluated_runs,
+        rolling_displayed_validity,
+        rolling_final_count,
+        rolling_suggest_ms,
+        rolling_suggest_cost_usd,
+        pending_violations,
+        warmup: false,
+        passed,
+    })
+}
+
 fn prepare_target_workspace(
     sandbox_repo: &Path,
     env: &[(String, String)],
@@ -563,8 +962,11 @@ fn fake_trial_result(target_repo: &Path, verify_sample: usize) -> ReliabilityTri
     let metrics = SelfIterationSuggestionMetrics {
         trials: 1,
         provisional_count: 8,
+        final_count: 8,
         validated_count: 7,
+        pending_count: 0,
         rejected_count: 1,
+        displayed_valid_ratio: 0.875,
         validated_ratio: 0.875,
         rejected_ratio: 0.125,
         preview_sampled,
@@ -577,6 +979,9 @@ fn fake_trial_result(target_repo: &Path, verify_sample: usize) -> ReliabilityTri
         ),
         evidence_line1_ratio: 0.2,
         evidence_source_mix: source_mix.clone(),
+        suggest_total_tokens: 2400,
+        suggest_total_cost_usd: 0.0012,
+        suggest_total_ms: 3200,
     };
     let diagnostics = ReliabilityDiagnosticsSummary {
         run_id: "fake-run".to_string(),
@@ -605,6 +1010,70 @@ mod tests {
     use tempfile::tempdir;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn gate_metric_with_limits(
+        displayed_valid_ratio: f64,
+        final_count: usize,
+        pending_count: usize,
+        suggest_ms: u64,
+        suggest_cost_usd: f64,
+    ) -> SelfIterationSuggestionMetrics {
+        let final_count = final_count.max(1);
+        let validated_count = (displayed_valid_ratio * final_count as f64).round() as usize;
+        let implied_pending = final_count.saturating_sub(validated_count);
+        let pending_count = pending_count.max(implied_pending);
+        SelfIterationSuggestionMetrics {
+            trials: 1,
+            provisional_count: final_count,
+            final_count,
+            validated_count,
+            pending_count,
+            rejected_count: 0,
+            displayed_valid_ratio: validated_count as f64 / final_count as f64,
+            validated_ratio: validated_count as f64 / final_count as f64,
+            rejected_ratio: 0.0,
+            preview_sampled: 0,
+            preview_verified_count: 0,
+            preview_contradicted_count: 0,
+            preview_insufficient_count: 0,
+            preview_error_count: 0,
+            preview_precision: None,
+            evidence_line1_ratio: 0.2,
+            evidence_source_mix: HashMap::new(),
+            suggest_total_tokens: 1000,
+            suggest_total_cost_usd: suggest_cost_usd,
+            suggest_total_ms: suggest_ms,
+        }
+    }
+
+    fn gate_metric(
+        displayed_valid_ratio: f64,
+        pending_count: usize,
+    ) -> SelfIterationSuggestionMetrics {
+        gate_metric_with_limits(displayed_valid_ratio, 100, pending_count, 1_000, 0.001)
+    }
+
+    fn append_run(
+        cache: &Cache,
+        mode: &str,
+        run_id: &str,
+        metrics: SelfIterationSuggestionMetrics,
+    ) {
+        cache
+            .append_self_iteration_run(&SelfIterationRunRecord {
+                timestamp: Utc::now(),
+                run_id: run_id.to_string(),
+                mode: mode.to_string(),
+                cosmos_repo: PathBuf::from("."),
+                target_repo: PathBuf::from("."),
+                passed: true,
+                command_outcomes: Vec::new(),
+                reliability_metrics: Some(metrics),
+                report_path: None,
+                notes: Vec::new(),
+            })
+            .unwrap();
+    }
 
     #[test]
     fn parse_lint_counts_reads_eslint_summary() {
@@ -641,8 +1110,11 @@ mod tests {
         let metrics = SelfIterationSuggestionMetrics {
             trials: 1,
             provisional_count: 8,
+            final_count: 8,
             validated_count: 7,
+            pending_count: 0,
             rejected_count: 1,
+            displayed_valid_ratio: 0.875,
             validated_ratio: 0.875,
             rejected_ratio: 0.125,
             preview_sampled: 4,
@@ -657,6 +1129,9 @@ mod tests {
                 ("hotspot".to_string(), 8usize),
                 ("core".to_string(), 5usize),
             ]),
+            suggest_total_tokens: 2300,
+            suggest_total_cost_usd: 0.0011,
+            suggest_total_ms: 3000,
         };
         let record = SelfIterationRunRecord {
             timestamp: Utc::now(),
@@ -692,6 +1167,7 @@ mod tests {
             reliability_metrics: None,
             reliability_diagnostics: None,
             reliability_failure_kind: Some("IndexEmpty".to_string()),
+            quality_gate: None,
             passed: false,
             notes: Vec::new(),
         };
@@ -717,6 +1193,7 @@ mod tests {
             aggregated_metrics: None,
             trial_results: Vec::new(),
             reliability_failure_kind: Some("LlmUnavailable".to_string()),
+            quality_gate: None,
             passed: false,
             notes: Vec::new(),
         };
@@ -746,6 +1223,7 @@ mod tests {
             reliability_metrics: None,
             reliability_diagnostics: None,
             reliability_failure_kind: Some("IndexEmpty".to_string()),
+            quality_gate: None,
             passed: false,
             notes: Vec::new(),
         };
@@ -758,6 +1236,189 @@ mod tests {
         };
         let without_json = serde_json::to_value(&without_kind).unwrap();
         assert!(without_json["reliability_failure_kind"].is_null());
+    }
+
+    #[test]
+    fn quality_gate_returns_warmup_when_window_not_filled() {
+        let workspace = tempdir().unwrap();
+        init_git_repo(workspace.path());
+        let cache = Cache::new(workspace.path());
+
+        append_run(&cache, "validate_fast", "r1", gate_metric(0.95, 0));
+        append_run(&cache, "reliability", "r2", gate_metric(0.96, 0));
+
+        let gate = evaluate_quality_gate(
+            &cache,
+            GateSource::Both,
+            5,
+            0.95,
+            10,
+            30_000,
+            0.01,
+            "validate_fast",
+            Some(&gate_metric(1.0, 0)),
+        )
+        .unwrap();
+        assert!(gate.warmup);
+        assert!(gate.passed);
+        assert_eq!(gate.evaluated_runs, 3);
+    }
+
+    #[test]
+    fn quality_gate_fails_when_pending_suggestions_exist() {
+        let workspace = tempdir().unwrap();
+        init_git_repo(workspace.path());
+        let cache = Cache::new(workspace.path());
+
+        for i in 0..9 {
+            append_run(
+                &cache,
+                "validate_fast",
+                &format!("run-{}", i),
+                gate_metric(1.0, 0),
+            );
+        }
+
+        let gate = evaluate_quality_gate(
+            &cache,
+            GateSource::Both,
+            10,
+            0.95,
+            10,
+            30_000,
+            0.01,
+            "validate_fast",
+            Some(&gate_metric(1.0, 1)),
+        )
+        .unwrap();
+        assert!(!gate.warmup);
+        assert!(!gate.passed);
+        assert_eq!(gate.pending_violations, 1);
+    }
+
+    #[test]
+    fn quality_gate_fails_when_rolling_final_count_is_below_threshold() {
+        let workspace = tempdir().unwrap();
+        init_git_repo(workspace.path());
+        let cache = Cache::new(workspace.path());
+
+        for i in 0..10 {
+            append_run(
+                &cache,
+                "validate_fast",
+                &format!("run-{}", i),
+                gate_metric_with_limits(1.0, 8, 0, 1_000, 0.001),
+            );
+        }
+
+        let gate = evaluate_quality_gate(
+            &cache,
+            GateSource::Both,
+            10,
+            0.95,
+            10,
+            30_000,
+            0.01,
+            "validate_fast",
+            None,
+        )
+        .unwrap();
+        assert!(!gate.warmup);
+        assert!(!gate.passed);
+        assert!(gate.rolling_final_count.unwrap_or(0.0) < 10.0);
+    }
+
+    #[test]
+    fn quality_gate_fails_when_rolling_suggest_ms_exceeds_threshold() {
+        let workspace = tempdir().unwrap();
+        init_git_repo(workspace.path());
+        let cache = Cache::new(workspace.path());
+
+        for i in 0..10 {
+            append_run(
+                &cache,
+                "validate_fast",
+                &format!("run-{}", i),
+                gate_metric_with_limits(1.0, 12, 0, 45_000, 0.001),
+            );
+        }
+
+        let gate = evaluate_quality_gate(
+            &cache,
+            GateSource::Both,
+            10,
+            0.95,
+            10,
+            30_000,
+            0.01,
+            "validate_fast",
+            None,
+        )
+        .unwrap();
+        assert!(!gate.warmup);
+        assert!(!gate.passed);
+        assert!(gate.rolling_suggest_ms.unwrap_or(0.0) > 30_000.0);
+    }
+
+    #[test]
+    fn quality_gate_fails_when_rolling_suggest_cost_exceeds_threshold() {
+        let workspace = tempdir().unwrap();
+        init_git_repo(workspace.path());
+        let cache = Cache::new(workspace.path());
+
+        for i in 0..10 {
+            append_run(
+                &cache,
+                "validate_fast",
+                &format!("run-{}", i),
+                gate_metric_with_limits(1.0, 12, 0, 1_000, 0.02),
+            );
+        }
+
+        let gate = evaluate_quality_gate(
+            &cache,
+            GateSource::Both,
+            10,
+            0.95,
+            10,
+            30_000,
+            0.01,
+            "validate_fast",
+            None,
+        )
+        .unwrap();
+        assert!(!gate.warmup);
+        assert!(!gate.passed);
+        assert!(gate.rolling_suggest_cost_usd.unwrap_or(0.0) > 0.01);
+    }
+
+    #[test]
+    fn quality_gate_filters_by_source_mode() {
+        let workspace = tempdir().unwrap();
+        init_git_repo(workspace.path());
+        let cache = Cache::new(workspace.path());
+
+        append_run(&cache, "validate_fast", "v1", gate_metric(1.0, 0));
+        append_run(&cache, "validate_full", "v2", gate_metric(1.0, 0));
+        append_run(&cache, "reliability", "r1", gate_metric(1.0, 0));
+        append_run(&cache, "reliability", "r2", gate_metric(1.0, 0));
+
+        let gate = evaluate_quality_gate(
+            &cache,
+            GateSource::Reliability,
+            2,
+            0.95,
+            10,
+            30_000,
+            0.01,
+            "validate_fast",
+            Some(&gate_metric(1.0, 0)),
+        )
+        .unwrap();
+        assert!(!gate.warmup);
+        assert!(gate.passed);
+        assert_eq!(gate.evaluated_runs, 2);
+        assert_eq!(gate.source, "reliability");
     }
 
     #[test]
@@ -811,6 +1472,13 @@ edition = "2021"
             verify_sample: 3,
             output: Some(output.clone()),
             keep_sandboxes: false,
+            enforce_quality_gate: false,
+            gate_window: 10,
+            gate_min_displayed_validity: 0.95,
+            gate_min_final_count: 10,
+            gate_max_suggest_ms: 30_000,
+            gate_max_suggest_cost_usd: 0.01,
+            gate_source: GateSource::Both,
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -859,7 +1527,7 @@ edition = "2021"
 
         let commit = Command::new("git")
             .current_dir(path)
-            .args(["commit", "-m", "init"])
+            .args(["commit", "--allow-empty", "-m", "init"])
             .output()
             .unwrap();
         assert!(commit.status.success(), "git commit failed");
