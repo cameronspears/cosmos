@@ -101,64 +101,6 @@ RULES:
 - Prefer diversity: bugs, reliability, performance, refactoring.
 - Keep claims local: only what can be confirmed from the snippet."#;
 
-#[cfg(test)]
-mod prompt_tests {
-    use super::*;
-
-    #[test]
-    fn fast_grounded_prompt_enforces_plain_english() {
-        // Guardrail: this prompt tends to drift into low-quality, code-y titles.
-        // Keep it anchored on user-facing phrasing and strict JSON-only output.
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Plain-English suggestion"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require plain-English summaries"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM
-                .contains("Avoid formulaic templates like \"When someone ...\""),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should explicitly discourage template phrasing"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("non-technical"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should target non-technical readers"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Output MUST include `evidence_refs`"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require evidence_refs for grounding"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("No tool calls"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must forbid tool calls"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM
-                .contains("Never output dangling fragments like \"When users\""),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must forbid dangling partial summaries"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM
-                .contains("Use distinct `evidence_id` values across suggestions"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must strongly prefer unique evidence ids for count stability"
-        );
-    }
-
-    #[test]
-    fn fast_grounded_prompt_targets_ten_to_fifteen() {
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Produce 10 to 15 suggestions by default"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should prefer 10-15 suggestions by default"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("one concrete claim"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should require one grounded claim per suggestion"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Reject unsupported impact claims"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should explicitly reject unsupported impact claims"
-        );
-    }
-}
-
 /// Single-file fix generation - uses EDIT_RULES and CODE_QUALITY_RULES
 pub fn fix_content_system() -> String {
     format!(
@@ -411,5 +353,63 @@ Fix ROOT CAUSE this time.
             edit_rules = EDIT_RULES,
             quality_rules = CODE_QUALITY_RULES
         )
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    #[test]
+    fn fast_grounded_prompt_enforces_plain_english() {
+        // Guardrail: this prompt tends to drift into low-quality, code-y titles.
+        // Keep it anchored on user-facing phrasing and strict JSON-only output.
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Plain-English suggestion"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require plain-English summaries"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM
+                .contains("Avoid formulaic templates like \"When someone ...\""),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should explicitly discourage template phrasing"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("non-technical"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should target non-technical readers"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Output MUST include `evidence_refs`"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require evidence_refs for grounding"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("No tool calls"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must forbid tool calls"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM
+                .contains("Never output dangling fragments like \"When users\""),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must forbid dangling partial summaries"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM
+                .contains("Use distinct `evidence_id` values across suggestions"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must strongly prefer unique evidence ids for count stability"
+        );
+    }
+
+    #[test]
+    fn fast_grounded_prompt_targets_ten_to_fifteen() {
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Produce 10 to 15 suggestions by default"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should prefer 10-15 suggestions by default"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("one concrete claim"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should require one grounded claim per suggestion"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Reject unsupported impact claims"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should explicitly reject unsupported impact claims"
+        );
     }
 }

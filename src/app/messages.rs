@@ -57,6 +57,24 @@ pub enum BackgroundMessage {
         duration_ms: u64,
     },
     PreviewError(String),
+    /// Progress updates from apply-time implementation harness.
+    ApplyHarnessProgress {
+        attempt_index: usize,
+        attempt_count: usize,
+        detail: String,
+    },
+    /// Detailed apply-harness failure payload.
+    ApplyHarnessFailed {
+        summary: String,
+        fail_reasons: Vec<String>,
+        report_path: Option<PathBuf>,
+    },
+    /// Apply succeeded, but at least one confidence-reducing condition occurred
+    /// (for example, quick checks were unavailable).
+    ApplyHarnessReducedConfidence {
+        detail: String,
+        report_path: Option<PathBuf>,
+    },
     /// Direct fix applied (Smart preset generated + applied the change)
     /// Supports both single-file and multi-file changes
     DirectFixApplied {

@@ -72,17 +72,14 @@ pub enum Priority {
 }
 
 /// Confidence level for suggestions
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub enum Confidence {
     Low,
+    #[default]
     Medium,
     High,
-}
-
-impl Default for Confidence {
-    fn default() -> Self {
-        Confidence::Medium
-    }
 }
 
 /// Verification state for a suggestion (explicit verify contract)

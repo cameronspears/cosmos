@@ -563,6 +563,46 @@ fn build_evidence_pack(
         }
     }
 
+    // Coverage fallback: some repos (or subprojects) won't trip any of our pattern/hotspot/core
+    // heuristics, but Cosmos should still be able to generate grounded suggestions by sampling
+    // representative code. Only do this when we have no other candidates at all.
+    if candidates.is_empty() {
+        let mut fallback_files: Vec<_> = index.files.values().collect();
+        fallback_files.sort_by(|a, b| {
+            b.complexity
+                .partial_cmp(&a.complexity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.loc.cmp(&a.loc))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+
+        for f in fallback_files.iter().take(FAST_EVIDENCE_PACK_MAX_ITEMS) {
+            let Some(rel_file) = normalize_repo_relative(repo_root, &f.path) else {
+                continue;
+            };
+            let anchor = best_function_anchor(f).max(1);
+            if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
+                let score =
+                    0.8 + (f.complexity / 40.0).min(1.0) + ((f.loc as f64) / 600.0).min(1.0) * 0.2;
+                candidates.push(EvidenceCandidate {
+                    score,
+                    source_priority: 0,
+                    severity: PatternSeverity::Info,
+                    item: EvidenceItem {
+                        id: 0,
+                        file: rel_file,
+                        line: anchor,
+                        snippet,
+                        why_interesting: "Coverage sample: scan this snippet for concrete issues visible in code."
+                            .to_string(),
+                        source: EvidenceSource::Hotspot,
+                        pattern_kind: None,
+                    },
+                });
+            }
+        }
+    }
+
     // Deterministic ranking:
     // score, source priority, severity, then file path + line.
     candidates.sort_by(|a, b| {
@@ -2171,9 +2211,8 @@ async fn run_validation_attempts(
             .min(per_call_timeout_ms.saturating_add(VALIDATOR_BATCH_TIMEOUT_BUFFER_MS));
         if batch_timeout_ms > 0 {
             let dynamic_tokens = VALIDATOR_MAX_TOKENS.saturating_mul(chunk.len() as u32);
-            let batch_tokens = dynamic_tokens
-                .max(VALIDATOR_MAX_TOKENS)
-                .min(VALIDATOR_BATCH_MAX_TOKENS);
+            let batch_tokens =
+                dynamic_tokens.clamp(VALIDATOR_MAX_TOKENS, VALIDATOR_BATCH_MAX_TOKENS);
             let batch_call = tokio::time::timeout(
                 std::time::Duration::from_millis(batch_timeout_ms),
                 validate_suggestions_batch_with_model_budget(
@@ -2285,6 +2324,7 @@ async fn run_validation_attempts(
     outcomes
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_rejected_validation(
     cache: &crate::cache::Cache,
     run_id: &str,
@@ -2463,6 +2503,7 @@ fn deterministic_auto_validation_reason(suggestion: &Suggestion) -> Option<Strin
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accept_validated_suggestion(
     cache: &crate::cache::Cache,
     run_id: &str,
@@ -2506,6 +2547,7 @@ fn accept_validated_suggestion(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn validate_batch_suggestions(
     batch: Vec<Suggestion>,
     memory_section: &str,
@@ -2840,15 +2882,16 @@ pub async fn analyze_codebase_fast_grounded(
     let (pack, pack_stats) = build_evidence_pack(repo_root, index, context);
     let evidence_pack_ms = pack_start.elapsed().as_millis() as u64;
 
-    if pack.len() < 12 {
+    if pack.is_empty() {
         return Err(anyhow::anyhow!(
-            "Not enough grounded evidence items found to generate suggestions. Try again after indexing completes."
+            "Not enough grounded evidence items found to generate suggestions. Cosmos couldn't extract any representative code snippets from this repo."
         ));
     }
 
     let memory_section =
         format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
     let schema = grounded_suggestion_schema(pack.len());
+    let hard_target = FAST_GROUNDED_VALIDATED_HARD_TARGET.min(pack.len());
 
     let mut llm_ms = 0u64;
     let mut usage = None;
@@ -2858,6 +2901,8 @@ pub async fn analyze_codebase_fast_grounded(
     let mut raw_items: Vec<FastGroundedSuggestionJson> = Vec::new();
 
     let primary_start = std::time::Instant::now();
+    let request_max = PRIMARY_REQUEST_MAX.min(pack.len()).max(1);
+    let request_min = PRIMARY_REQUEST_MIN.min(request_max).max(1);
     let primary_result = call_grounded_suggestions_with_fallback(
         FAST_GROUNDED_SUGGESTIONS_SYSTEM,
         &format_grounded_user_prompt(
@@ -2867,7 +2912,7 @@ pub async fn analyze_codebase_fast_grounded(
             &pack,
             &format!(
                 "For this request, return {} to {} suggestions.",
-                PRIMARY_REQUEST_MIN, PRIMARY_REQUEST_MAX
+                request_min, request_max
             ),
         ),
         "fast_grounded_suggestions_primary",
@@ -2890,12 +2935,12 @@ pub async fn analyze_codebase_fast_grounded(
     let (mut mapped, mut missing_or_invalid) = map_raw_items_to_grounded(raw_items, &pack);
     let mut generation_mapped_count = grounded_mapped_count(&mapped);
 
-    while generation_mapped_count < FAST_GROUNDED_VALIDATED_HARD_TARGET
+    while generation_mapped_count < hard_target
         && generation_topup_calls < GENERATION_TOPUP_MAX_CALLS
         && (overall_start.elapsed().as_millis() as u64) < SUGGEST_BALANCED_BUDGET_MS
     {
         let mapped_before_topup = generation_mapped_count;
-        let deficit = FAST_GROUNDED_VALIDATED_HARD_TARGET.saturating_sub(generation_mapped_count);
+        let deficit = hard_target.saturating_sub(generation_mapped_count);
         let request_count = generation_topup_request_count(deficit);
         let used_ids = mapped
             .iter()
@@ -3112,8 +3157,6 @@ pub async fn refine_grounded_suggestions(
     let mut relaxed_rejected_filter_used = false;
     let mut validated: Vec<Suggestion> = Vec::new();
     let mut notes = diagnostics.notes.clone();
-    let hard_target = FAST_GROUNDED_VALIDATED_HARD_TARGET.min(FAST_GROUNDED_FINAL_TARGET_MAX);
-    let stretch_target = FAST_GROUNDED_VALIDATED_STRETCH_TARGET.min(FAST_GROUNDED_FINAL_TARGET_MAX);
     let mut hard_phase_attempts = 0usize;
     let mut stretch_phase_attempts = 0usize;
     let mut regen_stopped_validation_budget = false;
@@ -3139,6 +3182,12 @@ pub async fn refine_grounded_suggestions(
     usage = merge_usage(usage, batch_usage);
 
     let (pack, pack_stats) = build_evidence_pack(repo_root, index, context);
+    let hard_target = FAST_GROUNDED_VALIDATED_HARD_TARGET
+        .min(pack.len())
+        .min(FAST_GROUNDED_FINAL_TARGET_MAX);
+    let stretch_target = FAST_GROUNDED_VALIDATED_STRETCH_TARGET
+        .min(pack.len())
+        .min(FAST_GROUNDED_FINAL_TARGET_MAX);
     while validated.len() < stretch_target {
         let remaining_validation_budget = remaining_validation_budget_ms(validation_deadline);
         if should_stop_regeneration_for_validation_budget(
@@ -3392,14 +3441,14 @@ fn gate_snapshot_is_better(
         candidate.passed as u8,
         candidate.displayed_valid_ratio,
         candidate.final_count,
-        -(candidate.suggest_total_cost_usd as f64),
+        -candidate.suggest_total_cost_usd,
         -(candidate.suggest_total_ms as f64),
     );
     let curr_key = (
         current.passed as u8,
         current.displayed_valid_ratio,
         current.final_count,
-        -(current.suggest_total_cost_usd as f64),
+        -current.suggest_total_cost_usd,
         -(current.suggest_total_ms as f64),
     );
     cand_key > curr_key

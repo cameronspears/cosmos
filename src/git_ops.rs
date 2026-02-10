@@ -20,6 +20,12 @@ pub struct GitStatus {
     pub behind: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCreateOutcome {
+    pub branch_name: String,
+    pub created_new: bool,
+}
+
 /// Get the current git status
 pub fn current_status(repo_path: &Path) -> Result<GitStatus> {
     let repo = Repository::open(repo_path)?;
@@ -124,11 +130,20 @@ pub fn create_fix_branch_from_main(repo_path: &Path, branch_name: &str) -> Resul
         &main_commit,
         &format!("main branch '{}'", main_branch_name),
     )
+    .map(|outcome| outcome.branch_name)
 }
 
 /// Create a new branch from the current checkout/HEAD and check it out.
 /// Used when the user chooses to continue from their current branch context.
 pub fn create_fix_branch_from_current(repo_path: &Path, branch_name: &str) -> Result<String> {
+    create_fix_branch_from_current_with_outcome(repo_path, branch_name)
+        .map(|outcome| outcome.branch_name)
+}
+
+pub fn create_fix_branch_from_current_with_outcome(
+    repo_path: &Path,
+    branch_name: &str,
+) -> Result<BranchCreateOutcome> {
     let repo = Repository::open(repo_path)?;
     let head = repo
         .head()
@@ -153,7 +168,7 @@ fn create_fix_branch_from_base_commit(
     branch_name: &str,
     base_commit: &git2::Commit<'_>,
     base_label: &str,
-) -> Result<String> {
+) -> Result<BranchCreateOutcome> {
     // Check if branch already exists (avoid deleting user work)
     let mut final_name = branch_name.to_string();
     if let Ok(existing) = repo.find_branch(branch_name, git2::BranchType::Local) {
@@ -164,7 +179,10 @@ fn create_fix_branch_from_base_commit(
         if existing_commit.id() == base_commit.id() {
             // Branch already points at desired base; just reuse it.
             checkout_branch(repo_path, branch_name)?;
-            return Ok(branch_name.to_string());
+            return Ok(BranchCreateOutcome {
+                branch_name: branch_name.to_string(),
+                created_new: false,
+            });
         }
 
         final_name = unique_branch_name(repo, branch_name)?;
@@ -178,9 +196,30 @@ fn create_fix_branch_from_base_commit(
         ))?;
 
     // Checkout the new branch
-    checkout_branch(repo_path, &final_name)?;
+    if let Err(error) = checkout_branch(repo_path, &final_name) {
+        // Best-effort cleanup so branch creation is transactional.
+        let cleanup_failed = repo
+            .find_branch(&final_name, git2::BranchType::Local)
+            .and_then(|mut b| b.delete())
+            .is_err();
+        if cleanup_failed {
+            return Err(anyhow::anyhow!(
+                "Failed to checkout newly created branch '{}' ({}). Cleanup also failed; you may need to delete the branch manually.",
+                final_name,
+                error
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "Failed to checkout newly created branch '{}': {}",
+            final_name,
+            error
+        ));
+    }
 
-    Ok(final_name)
+    Ok(BranchCreateOutcome {
+        branch_name: final_name,
+        created_new: true,
+    })
 }
 
 fn unique_branch_name(repo: &Repository, base: &str) -> Result<String> {
@@ -197,6 +236,35 @@ fn unique_branch_name(repo: &Repository, base: &str) -> Result<String> {
         "Failed to find available branch name for '{}'",
         base
     ))
+}
+
+/// Delete a local branch with safety checks.
+pub fn delete_local_branch_safe(repo_path: &Path, branch_name: &str) -> Result<()> {
+    let repo = Repository::open(repo_path)?;
+    let head = repo.head().context("Failed to get HEAD")?;
+    let current = head.shorthand().unwrap_or_default();
+    if current == branch_name {
+        return Err(anyhow::anyhow!(
+            "Refusing to delete currently checked out branch '{}'",
+            branch_name
+        ));
+    }
+
+    let mut branch = repo
+        .find_branch(branch_name, git2::BranchType::Local)
+        .context(format!("Local branch '{}' not found", branch_name))?;
+
+    if branch.upstream().is_ok() {
+        return Err(anyhow::anyhow!(
+            "Refusing to delete branch '{}' with upstream tracking",
+            branch_name
+        ));
+    }
+
+    branch
+        .delete()
+        .context(format!("Failed to delete local branch '{}'", branch_name))?;
+    Ok(())
 }
 
 /// Generate a branch name from a suggestion summary
@@ -1007,6 +1075,101 @@ mod tests {
     }
 
     #[test]
+    fn test_create_fix_branch_from_current_with_outcome_marks_created_new() {
+        let (_temp_dir, repo_path) = create_temp_repo();
+        let outcome = create_fix_branch_from_current_with_outcome(&repo_path, "fix/new-outcome")
+            .expect("branch should be created");
+        assert_eq!(outcome.branch_name, "fix/new-outcome");
+        assert!(outcome.created_new);
+    }
+
+    #[test]
+    fn test_create_fix_branch_from_main_cleans_up_on_checkout_failure() {
+        let (_temp_dir, repo_path) = create_temp_repo();
+        let repo = Repository::open(&repo_path).unwrap();
+
+        // Add a tracked file on the default branch.
+        std::fs::write(repo_path.join("conflict.txt"), "tracked").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("conflict.txt")).unwrap();
+        index.write().unwrap();
+        let sig = Signature::now("Test User", "test@example.com").unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "Add tracked conflict file",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+
+        // Create a branch where the file is removed so we can later create it as untracked.
+        let main_branch = get_main_branch_name(&repo_path).unwrap();
+        let main_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature/without-conflict", &main_commit, false)
+            .unwrap();
+        checkout_branch(&repo_path, "feature/without-conflict").unwrap();
+
+        std::fs::remove_file(repo_path.join("conflict.txt")).unwrap();
+        let repo = Repository::open(&repo_path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("conflict.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "Remove conflict file",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+
+        // Create an untracked file that would be overwritten by checkout from main.
+        std::fs::write(repo_path.join("conflict.txt"), "untracked").unwrap();
+        let status = current_status(&repo_path).unwrap();
+        assert!(status.untracked.iter().any(|p| p == "conflict.txt"));
+
+        let branch_name = "fix/from-main";
+        let err = create_fix_branch_from_main(&repo_path, branch_name).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Failed to checkout newly created branch"));
+
+        // Ensure the failed attempt didn't leave the new branch behind.
+        let repo = Repository::open(&repo_path).unwrap();
+        assert!(repo
+            .find_branch(branch_name, git2::BranchType::Local)
+            .is_err());
+
+        // Ensure we did not delete or corrupt the main branch reference.
+        assert!(repo
+            .find_branch(&main_branch, git2::BranchType::Local)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_delete_local_branch_safe_deletes_non_tracking_branch() {
+        let (_temp_dir, repo_path) = create_temp_repo();
+        let source_branch = get_current_branch(&repo_path).unwrap();
+        create_fix_branch_from_current(&repo_path, "fix/delete-me").unwrap();
+        checkout_branch(&repo_path, &source_branch).unwrap();
+        let deleted = delete_local_branch_safe(&repo_path, "fix/delete-me");
+        assert!(deleted.is_ok());
+        let repo = Repository::open(&repo_path).unwrap();
+        assert!(repo
+            .find_branch("fix/delete-me", git2::BranchType::Local)
+            .is_err());
+    }
+
+    #[test]
     fn test_push_branch_blocked_when_sandbox_flag_is_set() {
         let _guard = PUSH_ENV_LOCK.lock().unwrap();
         std::env::set_var("COSMOS_DISABLE_PUSH", "1");
@@ -1045,9 +1208,8 @@ mod tests {
         );
 
         // Restore original state
-        match orig {
-            Some(val) => std::env::set_var("GITHUB_TOKEN", val),
-            None => {}
+        if let Some(val) = orig {
+            std::env::set_var("GITHUB_TOKEN", val);
         }
     }
 

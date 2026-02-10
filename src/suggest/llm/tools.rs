@@ -660,11 +660,10 @@ fn execute_shell(root: &Path, args_json: &str) -> String {
 
     // Check for dangerous shell metacharacters that could bypass the allowlist
     if contains_dangerous_chars(command) {
-        return format!(
-            "Command blocked: contains shell metacharacters that could bypass security. \
+        return "Command blocked: contains shell metacharacters that could bypass security. \
              Avoid using: backticks, $, ;, &, or newlines. \
              Use pipes (|) for chaining allowed commands."
-        );
+            .to_string();
     }
 
     // Split by pipe and validate each command in the pipeline

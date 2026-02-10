@@ -4,6 +4,7 @@ use crate::app::RuntimeContext;
 use crate::git_ops;
 use crate::suggest;
 use crate::suggest::llm::FixPreview;
+use crate::suggest::llm::{ImplementationAppliedFile, ImplementationFinalizationStatus};
 use crate::suggest::Suggestion;
 use crate::ui::{ActivePanel, App, LoadingState, Overlay, ShipStep, WorkflowStep};
 use crate::util::{hash_bytes, resolve_repo_path_allow_new};
@@ -92,7 +93,6 @@ pub struct ApplyContext {
     pub preview: FixPreview,
     pub suggestion: Suggestion,
     pub suggestion_id: Uuid,
-    pub file_path: PathBuf,
     pub repo_path: PathBuf,
     pub repo_memory_context: String,
 }
@@ -147,7 +147,6 @@ fn validate_apply_fix(app: &App) -> std::result::Result<ApplyContext, ApplyError
     let preview = suggest::llm::build_fix_preview_from_validated_suggestion(&suggestion);
     Ok(ApplyContext {
         preview,
-        file_path: suggestion.file.clone(),
         suggestion_id: suggestion.id,
         suggestion,
         repo_path: app.repo_path.clone(),
@@ -329,6 +328,199 @@ fn start_review_fix_for_selected_findings(app: &mut App, ctx: &RuntimeContext) {
     });
 }
 
+#[derive(Debug)]
+struct ApplyFinalizationFailure {
+    message: String,
+    status: ImplementationFinalizationStatus,
+    mutation_on_failure: bool,
+}
+
+fn has_repo_mutations(repo_path: &std::path::Path) -> bool {
+    git_ops::current_status(repo_path)
+        .map(|status| !(status.staged.is_empty() && status.modified.is_empty()))
+        .unwrap_or(true)
+}
+
+fn finalize_harness_result_on_branch(
+    repo_path: &std::path::Path,
+    source_branch: &str,
+    suggestion: &Suggestion,
+    files: &[ImplementationAppliedFile],
+) -> std::result::Result<(String, Vec<(PathBuf, String)>), ApplyFinalizationFailure> {
+    let status = match git_ops::current_status(repo_path) {
+        Ok(status) => status,
+        Err(error) => {
+            return Err(ApplyFinalizationFailure {
+                message: format!(
+                    "Finalization stopped because git status could not be read: {}",
+                    error
+                ),
+                status: ImplementationFinalizationStatus::FailedBeforeFinalize,
+                mutation_on_failure: true,
+            });
+        }
+    };
+
+    if !source_branch.is_empty() && source_branch != "unknown" && status.branch != source_branch {
+        return Err(ApplyFinalizationFailure {
+            message: format!(
+                "Finalization stopped because the active branch changed from '{}' to '{}' while apply was running.",
+                source_branch, status.branch
+            ),
+            status: ImplementationFinalizationStatus::FailedBeforeFinalize,
+            mutation_on_failure: false,
+        });
+    }
+
+    if !(status.staged.is_empty() && status.modified.is_empty()) {
+        return Err(ApplyFinalizationFailure {
+            message: "Finalization stopped because repository state changed while preparing apply."
+                .to_string(),
+            status: ImplementationFinalizationStatus::FailedBeforeFinalize,
+            mutation_on_failure: true,
+        });
+    }
+
+    let branch_name =
+        git_ops::generate_fix_branch_name(&suggestion.id.to_string(), &suggestion.summary);
+    let branch_outcome =
+        match git_ops::create_fix_branch_from_current_with_outcome(repo_path, &branch_name) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Err(ApplyFinalizationFailure {
+                    message: format!("Could not create fix branch: {}", error),
+                    status: ImplementationFinalizationStatus::FailedBeforeFinalize,
+                    mutation_on_failure: false,
+                });
+            }
+        };
+
+    let mut touched_files = Vec::new();
+    let mut final_file_changes = Vec::new();
+    for file in files {
+        let resolved = match resolve_repo_path_allow_new(repo_path, &file.path) {
+            Ok(path) => path,
+            Err(error) => {
+                let rollback_detail = rollback_finalization(
+                    repo_path,
+                    source_branch,
+                    &branch_outcome.branch_name,
+                    branch_outcome.created_new,
+                    &touched_files,
+                );
+                return Err(ApplyFinalizationFailure {
+                    message: format!(
+                        "Finalization failed due to unsafe file path {}: {} ({})",
+                        file.path.display(),
+                        error,
+                        rollback_detail
+                    ),
+                    status: ImplementationFinalizationStatus::RolledBack,
+                    mutation_on_failure: has_repo_mutations(repo_path),
+                });
+            }
+        };
+
+        if let Some(parent) = resolved.absolute.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                let rollback_detail = rollback_finalization(
+                    repo_path,
+                    source_branch,
+                    &branch_outcome.branch_name,
+                    branch_outcome.created_new,
+                    &touched_files,
+                );
+                return Err(ApplyFinalizationFailure {
+                    message: format!(
+                        "Finalization failed while preparing {}: {} ({})",
+                        file.path.display(),
+                        error,
+                        rollback_detail
+                    ),
+                    status: ImplementationFinalizationStatus::RolledBack,
+                    mutation_on_failure: has_repo_mutations(repo_path),
+                });
+            }
+        }
+
+        touched_files.push(resolved.relative.clone());
+
+        if let Err(error) = std::fs::write(&resolved.absolute, &file.content) {
+            let rollback_detail = rollback_finalization(
+                repo_path,
+                source_branch,
+                &branch_outcome.branch_name,
+                branch_outcome.created_new,
+                &touched_files,
+            );
+            return Err(ApplyFinalizationFailure {
+                message: format!(
+                    "Finalization failed while writing {}: {} ({})",
+                    file.path.display(),
+                    error,
+                    rollback_detail
+                ),
+                status: ImplementationFinalizationStatus::RolledBack,
+                mutation_on_failure: has_repo_mutations(repo_path),
+            });
+        }
+
+        if let Err(error) = git_ops::stage_file(repo_path, &resolved.relative.to_string_lossy()) {
+            let rollback_detail = rollback_finalization(
+                repo_path,
+                source_branch,
+                &branch_outcome.branch_name,
+                branch_outcome.created_new,
+                &touched_files,
+            );
+            return Err(ApplyFinalizationFailure {
+                message: format!(
+                    "Finalization failed while staging {}: {} ({})",
+                    file.path.display(),
+                    error,
+                    rollback_detail
+                ),
+                status: ImplementationFinalizationStatus::RolledBack,
+                mutation_on_failure: has_repo_mutations(repo_path),
+            });
+        }
+
+        final_file_changes.push((file.path.clone(), file.summary.clone()));
+    }
+
+    Ok((branch_outcome.branch_name, final_file_changes))
+}
+
+fn rollback_finalization(
+    repo_path: &std::path::Path,
+    source_branch: &str,
+    created_branch: &str,
+    created_new_branch: bool,
+    touched_files: &[PathBuf],
+) -> String {
+    let mut rollback_errors = Vec::new();
+
+    for path in touched_files {
+        if let Err(error) = git_ops::restore_file(repo_path, path) {
+            rollback_errors.push(format!("restore {}: {}", path.display(), error));
+        }
+    }
+    if let Err(error) = git_ops::checkout_branch(repo_path, source_branch) {
+        rollback_errors.push(format!("checkout {}: {}", source_branch, error));
+    }
+    if created_new_branch {
+        if let Err(error) = git_ops::delete_local_branch_safe(repo_path, created_branch) {
+            rollback_errors.push(format!("delete branch {}: {}", created_branch, error));
+        }
+    }
+
+    if rollback_errors.is_empty() {
+        "rollback completed successfully".to_string()
+    } else {
+        format!("rollback had issues: {}", rollback_errors.join("; "))
+    }
+}
+
 fn start_apply_for_context(app: &mut App, ctx: &RuntimeContext, apply_ctx: ApplyContext) {
     app.loading = LoadingState::GeneratingFix;
     app.clear_apply_confirm();
@@ -338,7 +530,6 @@ fn start_apply_for_context(app: &mut App, ctx: &RuntimeContext, apply_ctx: Apply
     let preview = apply_ctx.preview;
     let suggestion = apply_ctx.suggestion;
     let sid = apply_ctx.suggestion_id;
-    let fp = apply_ctx.file_path;
     let repo_memory_context = apply_ctx.repo_memory_context;
 
     background::spawn_background(ctx.tx.clone(), "apply_fix", async move {
@@ -347,190 +538,80 @@ fn start_apply_for_context(app: &mut App, ctx: &RuntimeContext, apply_ctx: Apply
             .map(|s| s.branch)
             .unwrap_or_else(|_| "unknown".to_string());
 
-        // Create branch from current checkout/HEAD
-        let branch_name =
-            git_ops::generate_fix_branch_name(&suggestion.id.to_string(), &suggestion.summary);
-
-        let created_branch = match git_ops::create_fix_branch_from_current(&repo_path, &branch_name)
-        {
-            Ok(name) => name,
-            Err(e) => {
-                let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
-                    "Failed to create fix branch: {}",
-                    e
-                )));
-                return;
-            }
-        };
-
         let mem = if repo_memory_context.trim().is_empty() {
             None
         } else {
             Some(repo_memory_context)
         };
 
-        // Check if this is a multi-file suggestion
-        if suggestion.is_multi_file() {
-            // Multi-file fix
-            let all_files = suggestion.affected_files();
+        let config = suggest::llm::ImplementationHarnessConfig::interactive_strict();
+        let _ = tx_apply.send(BackgroundMessage::ApplyHarnessProgress {
+            attempt_index: 1,
+            attempt_count: config.max_attempts,
+            detail: "starting strict implementation harness".to_string(),
+        });
+        let tx_progress = tx_apply.clone();
 
-            // Read all file contents
-            let mut file_inputs: Vec<suggest::llm::FileInput> = Vec::new();
-            for file_path in &all_files {
-                let resolved = match resolve_repo_path_allow_new(&repo_path, file_path) {
-                    Ok(resolved) => resolved,
-                    Err(e) => {
-                        let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
-                            "Unsafe path {}: {}",
-                            file_path.display(),
-                            e
-                        )));
-                        return;
-                    }
+        match suggest::llm::implement_validated_suggestion_with_harness_with_progress(
+            &repo_path,
+            &suggestion,
+            &preview,
+            mem,
+            config,
+            |attempt_index, attempt_count, diagnostics| {
+                let detail = if diagnostics.passed {
+                    "attempt passed all gates".to_string()
+                } else if diagnostics.fail_reasons.is_empty() {
+                    "attempt completed".to_string()
+                } else {
+                    format!(
+                        "{} gate miss(es): {}",
+                        diagnostics.fail_reasons.len(),
+                        diagnostics
+                            .fail_reasons
+                            .iter()
+                            .take(2)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )
                 };
-                let is_new = !resolved.absolute.exists();
-                let content = match std::fs::read_to_string(&resolved.absolute) {
-                    Ok(content) => content,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                    Err(e) => {
-                        let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
-                            "Failed to read {}: {}",
-                            file_path.display(),
-                            e
-                        )));
-                        return;
-                    }
-                };
-                file_inputs.push(suggest::llm::FileInput {
-                    path: resolved.relative,
-                    content,
-                    is_new,
+                let _ = tx_progress.send(BackgroundMessage::ApplyHarnessProgress {
+                    attempt_index,
+                    attempt_count,
+                    detail,
                 });
-            }
-
-            // Generate multi-file fix
-            match suggest::llm::generate_multi_file_fix(&file_inputs, &suggestion, &preview, mem)
-                .await
-            {
-                Ok(multi_fix) => {
-                    // Apply all edits
-                    let mut file_changes: Vec<(PathBuf, String)> = Vec::new();
-                    for file_edit in &multi_fix.file_edits {
-                        let resolved =
-                            match resolve_repo_path_allow_new(&repo_path, &file_edit.path) {
-                                Ok(resolved) => resolved,
-                                Err(e) => {
-                                    let _ = tx_apply.send(BackgroundMessage::DirectFixError(
-                                        format!("Unsafe path {}: {}", file_edit.path.display(), e),
-                                    ));
-                                    return;
-                                }
-                            };
-                        let full_path = resolved.absolute;
-
-                        if let Some(parent) = full_path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-
-                        // Write file
-                        if let Err(e) = std::fs::write(&full_path, &file_edit.new_content) {
-                            let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
-                                "Failed to write {}: {}",
-                                file_edit.path.display(),
-                                e
-                            )));
-                            return;
-                        }
-
-                        // Stage file
-                        let rel_path_str = resolved.relative.to_string_lossy().to_string();
-                        let _ = git_ops::stage_file(&repo_path, &rel_path_str);
-
-                        // Track changes
-                        let diff = if file_edit.modified_areas.is_empty() {
-                            "Modified".to_string()
-                        } else {
-                            format!("Modified: {}", file_edit.modified_areas.join(", "))
-                        };
-                        file_changes.push((resolved.relative, diff));
-                    }
-
-                    let _ = tx_apply.send(BackgroundMessage::DirectFixApplied {
-                        suggestion_id: sid,
-                        file_changes,
-                        description: multi_fix.description,
-                        usage: multi_fix.usage,
-                        branch_name: created_branch,
-                        source_branch: source_branch.clone(),
-                        friendly_title: preview.friendly_title.clone(),
-                        problem_summary: preview.problem_summary.clone(),
-                        outcome: preview.outcome.clone(),
-                        duration_ms: stage_start.elapsed().as_millis() as u64,
-                    });
-                }
-                Err(e) => {
-                    let _ = tx_apply.send(BackgroundMessage::DirectFixError(e.to_string()));
-                }
-            }
-        } else {
-            // Single-file fix (existing behavior)
-            let resolved = match resolve_repo_path_allow_new(&repo_path, &fp) {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
-                        "Unsafe path {}: {}",
-                        fp.display(),
-                        e
-                    )));
-                    return;
-                }
-            };
-            let full_path = resolved.absolute;
-            let is_new_file = !full_path.exists();
-
-            let current_content = if is_new_file {
-                String::new()
-            } else {
-                match std::fs::read_to_string(&full_path) {
-                    Ok(content) => content,
-                    Err(e) => {
-                        let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
-                            "Failed to read file {}: {}",
-                            fp.display(),
-                            e
-                        )));
-                        return;
-                    }
-                }
-            };
-
-            match suggest::llm::generate_fix_content(
-                &fp,
-                &current_content,
-                &suggestion,
-                &preview,
-                mem,
-                is_new_file,
-            )
-            .await
-            {
-                Ok(applied_fix) => {
-                    if let Some(parent) = full_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    match std::fs::write(&full_path, &applied_fix.new_content) {
-                        Ok(_) => {
-                            let rel_path_str = resolved.relative.to_string_lossy().to_string();
-                            let _ = git_ops::stage_file(&repo_path, &rel_path_str);
-
-                            let diff =
-                                format!("Modified: {}", applied_fix.modified_areas.join(", "));
-
+            },
+        )
+        .await
+        {
+            Ok(mut result) => {
+                if result.diagnostics.passed {
+                    match finalize_harness_result_on_branch(
+                        &repo_path,
+                        &source_branch,
+                        &suggestion,
+                        &result.file_changes,
+                    ) {
+                        Ok((created_branch, file_changes)) => {
+                            let _ = suggest::llm::record_harness_finalization_outcome(
+                                &repo_path,
+                                &mut result.diagnostics,
+                                ImplementationFinalizationStatus::Applied,
+                                Some("Applied passing harness result on fix branch".to_string()),
+                                Some(false),
+                            );
+                            if result.diagnostics.reduced_confidence {
+                                let _ = tx_apply.send(BackgroundMessage::ApplyHarnessReducedConfidence {
+                                    detail: "Quick checks were unavailable, so Cosmos could not automatically run your project checks. Treat this apply as lower confidence and consider running your tests before shipping.".to_string(),
+                                    report_path: result.diagnostics.report_path.clone(),
+                                });
+                            }
                             let _ = tx_apply.send(BackgroundMessage::DirectFixApplied {
                                 suggestion_id: sid,
-                                file_changes: vec![(resolved.relative, diff)],
-                                description: applied_fix.description,
-                                usage: applied_fix.usage,
+                                file_changes,
+                                description: result.description,
+                                usage: result.usage,
                                 branch_name: created_branch,
                                 source_branch: source_branch.clone(),
                                 friendly_title: preview.friendly_title.clone(),
@@ -539,22 +620,54 @@ fn start_apply_for_context(app: &mut App, ctx: &RuntimeContext, apply_ctx: Apply
                                 duration_ms: stage_start.elapsed().as_millis() as u64,
                             });
                         }
-                        Err(e) => {
-                            // Rollback via git restore
-                            let _ = git_ops::restore_file(&repo_path, &fp);
-                            let _ = tx_apply.send(BackgroundMessage::DirectFixError(format!(
-                                "Failed to write fix: {}",
-                                e
-                            )));
+                        Err(finalize_error) => {
+                            let _ = suggest::llm::record_harness_finalization_outcome(
+                                &repo_path,
+                                &mut result.diagnostics,
+                                finalize_error.status,
+                                Some(finalize_error.message.clone()),
+                                Some(finalize_error.mutation_on_failure),
+                            );
+                            let _ = tx_apply.send(BackgroundMessage::ApplyHarnessFailed {
+                                summary:
+                                    "Harness found a safe fix but finalization could not complete."
+                                        .to_string(),
+                                fail_reasons: vec![finalize_error.message],
+                                report_path: result.diagnostics.report_path.clone(),
+                            });
                         }
                     }
+                } else {
+                    let _ = suggest::llm::record_harness_finalization_outcome(
+                        &repo_path,
+                        &mut result.diagnostics,
+                        ImplementationFinalizationStatus::FailedBeforeFinalize,
+                        Some("Harness did not produce a passing attempt".to_string()),
+                        Some(false),
+                    );
+                    let _ = tx_apply.send(BackgroundMessage::ApplyHarnessFailed {
+                        summary: result.description,
+                        fail_reasons: result.diagnostics.fail_reasons,
+                        report_path: result.diagnostics.report_path.clone(),
+                    });
                 }
-                Err(e) => {
-                    let _ = tx_apply.send(BackgroundMessage::DirectFixError(e.to_string()));
-                }
+            }
+            Err(e) => {
+                let _ = tx_apply.send(BackgroundMessage::DirectFixError(e.to_string()));
             }
         }
     });
+}
+
+fn llm_available_for_apply() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
+    {
+        suggest::llm::is_available()
+    }
 }
 
 /// Handle key events in normal mode (no special input active)
@@ -646,29 +759,26 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                 }
                                 let suggestion = app.selected_suggestion().cloned();
                                 if let Some(suggestion) = suggestion {
-                                    if !suggest::llm::is_available() {
+                                    if !llm_available_for_apply() {
                                         app.show_toast("Run: cosmos --setup");
-                                    } else {
-                                        if app.armed_suggestion_id != Some(suggestion.id) {
-                                            match snapshot_suggestion_file_hashes(app, &suggestion)
-                                            {
-                                                Ok(hashes) => {
-                                                    app.arm_apply_confirm(suggestion.id, hashes);
-                                                    app.show_toast(
-                                                        "Press Enter again to apply this validated suggestion.",
-                                                    );
-                                                }
-                                                Err(e) => app.show_toast(&e.user_message()),
+                                    } else if app.armed_suggestion_id != Some(suggestion.id) {
+                                        match snapshot_suggestion_file_hashes(app, &suggestion) {
+                                            Ok(hashes) => {
+                                                app.arm_apply_confirm(suggestion.id, hashes);
+                                                app.show_toast(
+                                                    "Press Enter again to apply this validated suggestion.",
+                                                );
                                             }
-                                        } else {
-                                            match validate_apply_fix(app) {
-                                                Ok(apply_ctx) => {
-                                                    start_apply_for_context(app, ctx, apply_ctx);
-                                                }
-                                                Err(e) => {
-                                                    app.clear_apply_confirm();
-                                                    app.show_toast(&e.user_message());
-                                                }
+                                            Err(e) => app.show_toast(&e.user_message()),
+                                        }
+                                    } else {
+                                        match validate_apply_fix(app) {
+                                            Ok(apply_ctx) => {
+                                                start_apply_for_context(app, ctx, apply_ctx);
+                                            }
+                                            Err(e) => {
+                                                app.clear_apply_confirm();
+                                                app.show_toast(&e.user_message());
                                             }
                                         }
                                     }
@@ -878,9 +988,11 @@ mod tests {
     use crate::index::CodebaseIndex;
     use crate::suggest::SuggestionEngine;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use git2::{Repository, Signature};
     use std::collections::HashMap;
     use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
 
     // ========================================================================
     // ApplyError User Message Tests
@@ -1340,5 +1452,154 @@ mod tests {
 
         std::env::remove_var("OPENROUTER_API_KEY");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn init_temp_git_repo_with_file() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path().to_path_buf();
+        let repo = Repository::init(&repo_path).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test User").unwrap();
+        config.set_str("user.email", "test@example.com").unwrap();
+
+        std::fs::create_dir_all(repo_path.join("src")).unwrap();
+        std::fs::write(repo_path.join("src/lib.rs"), "fn demo() {}\n").unwrap();
+
+        let sig = Signature::now("Test User", "test@example.com").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("src/lib.rs")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+            .unwrap();
+        (dir, repo_path)
+    }
+
+    #[test]
+    fn finalization_refuses_if_branch_changed_during_apply() {
+        let (_dir, repo_path) = init_temp_git_repo_with_file();
+        let source_branch = git_ops::current_status(&repo_path).unwrap().branch;
+
+        let repo = Repository::open(&repo_path).unwrap();
+        let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature/other", &head_commit, false).unwrap();
+        git_ops::checkout_branch(&repo_path, "feature/other").unwrap();
+
+        let suggestion = crate::suggest::Suggestion::new(
+            crate::suggest::SuggestionKind::Improvement,
+            crate::suggest::Priority::High,
+            PathBuf::from("src/lib.rs"),
+            "Improve demo".to_string(),
+            crate::suggest::SuggestionSource::LlmDeep,
+        );
+        let branch_name =
+            git_ops::generate_fix_branch_name(&suggestion.id.to_string(), &suggestion.summary);
+
+        let result = finalize_harness_result_on_branch(
+            &repo_path,
+            &source_branch,
+            &suggestion,
+            &[ImplementationAppliedFile {
+                path: PathBuf::from("src/lib.rs"),
+                summary: "Modified".to_string(),
+                content: "fn demo() { println!(\"x\"); }\n".to_string(),
+            }],
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.status,
+            ImplementationFinalizationStatus::FailedBeforeFinalize
+        );
+        assert!(err.message.contains("active branch changed"));
+
+        // Ensure finalization did not create/switch to a fix branch.
+        let status = git_ops::current_status(&repo_path).unwrap();
+        assert_eq!(status.branch, "feature/other");
+        assert!(Repository::open(&repo_path)
+            .unwrap()
+            .find_branch(&branch_name, git2::BranchType::Local)
+            .is_err());
+    }
+
+    #[test]
+    fn finalization_rolls_back_on_unsafe_path_and_deletes_branch() {
+        let (_dir, repo_path) = init_temp_git_repo_with_file();
+        let source_branch = git_ops::current_status(&repo_path).unwrap().branch;
+
+        let suggestion = crate::suggest::Suggestion::new(
+            crate::suggest::SuggestionKind::Improvement,
+            crate::suggest::Priority::High,
+            PathBuf::from("src/lib.rs"),
+            "Improve demo".to_string(),
+            crate::suggest::SuggestionSource::LlmDeep,
+        );
+        let branch_name =
+            git_ops::generate_fix_branch_name(&suggestion.id.to_string(), &suggestion.summary);
+
+        let result = finalize_harness_result_on_branch(
+            &repo_path,
+            &source_branch,
+            &suggestion,
+            &[ImplementationAppliedFile {
+                path: PathBuf::from("../evil"),
+                summary: "Nope".to_string(),
+                content: "bad".to_string(),
+            }],
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status, ImplementationFinalizationStatus::RolledBack);
+        assert!(!err.mutation_on_failure);
+
+        // After rollback, we should be back on the source branch with a clean working tree.
+        let status = git_ops::current_status(&repo_path).unwrap();
+        assert_eq!(status.branch, source_branch);
+        assert!(status.staged.is_empty());
+        assert!(status.modified.is_empty());
+
+        // Branch should be cleaned up.
+        let repo = Repository::open(&repo_path).unwrap();
+        assert!(repo
+            .find_branch(&branch_name, git2::BranchType::Local)
+            .is_err());
+    }
+
+    #[test]
+    fn finalization_success_stages_only_payload_files() {
+        let (_dir, repo_path) = init_temp_git_repo_with_file();
+        let source_branch = git_ops::current_status(&repo_path).unwrap().branch;
+
+        let suggestion = crate::suggest::Suggestion::new(
+            crate::suggest::SuggestionKind::Improvement,
+            crate::suggest::Priority::High,
+            PathBuf::from("src/lib.rs"),
+            "Improve demo".to_string(),
+            crate::suggest::SuggestionSource::LlmDeep,
+        );
+
+        let (branch, changes) = finalize_harness_result_on_branch(
+            &repo_path,
+            &source_branch,
+            &suggestion,
+            &[ImplementationAppliedFile {
+                path: PathBuf::from("src/lib.rs"),
+                summary: "Modified: demo".to_string(),
+                content: "fn demo() { println!(\"x\"); }\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        // Should have created/switch to a fix branch and stage only the approved file.
+        assert_eq!(git_ops::current_status(&repo_path).unwrap().branch, branch);
+        let status = git_ops::current_status(&repo_path).unwrap();
+        assert_eq!(status.staged, vec!["src/lib.rs".to_string()]);
+        assert!(status.modified.is_empty());
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, PathBuf::from("src/lib.rs"));
+
+        let content = std::fs::read_to_string(repo_path.join("src/lib.rs")).unwrap();
+        assert!(content.contains("println!"));
     }
 }

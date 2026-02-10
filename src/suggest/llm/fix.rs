@@ -31,6 +31,7 @@ pub struct AppliedFix {
 // Modern models handle 100k+ tokens easily; these limits only kick in for unusually large files.
 const MAX_FIX_EXCERPT_CHARS: usize = 60000;
 const MAX_MULTI_FILE_EXCERPT_CHARS: usize = 120000;
+const MAX_EDIT_REPAIR_ATTEMPTS: usize = 3;
 
 struct PromptContent {
     content: String,
@@ -209,6 +210,59 @@ fn is_context_limit_error(message: &str) -> bool {
     has_context && has_limit
 }
 
+fn is_retryable_edit_apply_error(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("old_string")
+        && (msg.contains("not found")
+            || msg.contains("matches")
+            || msg.contains("must be unique")
+            || msg.contains("empty for non-empty"))
+}
+
+fn searched_for_fragment(message: &str) -> Option<String> {
+    let idx = message.find("Searched for:")?;
+    Some(message[idx..].trim().to_string())
+}
+
+pub(crate) fn format_edit_apply_repair_guidance(message: &str, code_block_label: &str) -> String {
+    let msg = message.to_ascii_lowercase();
+    let mut bullets: Vec<&str> = Vec::new();
+
+    if msg.contains("matches") || msg.contains("must be unique") {
+        bullets.push("Your `old_string` was too generic and matched multiple places.");
+        bullets.push("Pick a larger anchor: include 3-10 surrounding lines and at least one unique identifier (function name, component name, string literal, or nearby props).");
+        bullets
+            .push("Avoid anchors like `</div>`, `</motion.div>`, `{}` blocks, or single braces.");
+        bullets.push("If you need to change multiple occurrences, return multiple edits with different unique `old_string` values.");
+    } else if msg.contains("not found") {
+        bullets.push("Your `old_string` does not exist verbatim in the code block.");
+        bullets.push("Copy/paste the exact text from the code block, including indentation and line endings.");
+        bullets.push("Do not use placeholders, summaries, or ellipses. The match must be exact.");
+    } else if msg.contains("empty for non-empty") {
+        bullets.push("Do not use an empty `old_string` when the file already has content.");
+        bullets.push("Choose an exact anchor from the code block that appears exactly once.");
+    } else {
+        bullets.push("Fix your `old_string` values so they match verbatim text from the code block exactly once.");
+    }
+
+    let searched_for = searched_for_fragment(message);
+    let searched_for = searched_for
+        .as_deref()
+        .map(|frag| format!("\nPrevious attempt detail:\n{}", frag))
+        .unwrap_or_default();
+
+    let bullet_text = bullets
+        .into_iter()
+        .map(|b| format!("- {}", b))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "\n\nIMPORTANT: Your previous edits could not be applied safely.\nError:\n{}\n\nWhen regenerating edits, use the {} and follow these rules:\n{}\n{}",
+        message, code_block_label, bullet_text, searched_for
+    )
+}
+
 /// A single search/replace edit operation
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct EditOp {
@@ -302,14 +356,14 @@ where
 
 /// Generate the actual fixed code content based on a human-language plan.
 /// Uses a search/replace approach for precise, validated edits.
-/// This is Phase 2 of the two-phase fix flow - Smart preset generates the actual changes
-pub async fn generate_fix_content(
+pub async fn generate_fix_content_with_model(
     path: &Path,
     content: &str,
     suggestion: &Suggestion,
     plan: &FixPreview,
     repo_memory: Option<String>,
     is_new_file: bool,
+    model: Model,
 ) -> anyhow::Result<AppliedFix> {
     let plan_text = format!(
         "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
@@ -359,45 +413,90 @@ pub async fn generate_fix_content(
         &prompt_content.content,
     );
 
-    // Use structured output to guarantee valid JSON - eliminates parse failures
-    let response: StructuredResponse<FixResponse> = call_llm_structured_with_fallback(
-        &fix_content_system(),
-        &user_full,
-        &user_excerpt,
+    let mut combined_usage: Option<Usage> = None;
+    let mut last_apply_err: Option<String> = None;
+
+    for attempt in 1..=MAX_EDIT_REPAIR_ATTEMPTS.max(1) {
+        let (user_full_attempt, user_excerpt_attempt) = if let Some(ref err) = last_apply_err {
+            let guidance = format_edit_apply_repair_guidance(err, "CURRENT CODE block");
+            (
+                format!("{}{}", user_full, guidance),
+                format!("{}{}", user_excerpt, guidance),
+            )
+        } else {
+            (user_full.clone(), user_excerpt.clone())
+        };
+
+        let response: StructuredResponse<FixResponse> = call_llm_structured_with_fallback(
+            &fix_content_system(),
+            &user_full_attempt,
+            &user_excerpt_attempt,
+            model,
+            "fix_response",
+            fix_response_schema(),
+        )
+        .await?;
+        combined_usage = merge_usage(combined_usage, response.usage.clone());
+
+        let description = response
+            .data
+            .description
+            .unwrap_or_else(|| "Applied the requested fix".to_string());
+        let modified_areas = response.data.modified_areas;
+        let edits = response.data.edits;
+
+        if edits.is_empty() {
+            return Err(anyhow::anyhow!("No edits provided in response"));
+        }
+
+        match apply_edits_with_context(content, &edits, "file") {
+            Ok(new_content) => {
+                let new_content = normalize_generated_content(content, new_content, is_new_file);
+                if new_content.trim().is_empty() {
+                    return Err(anyhow::anyhow!("Generated content is empty"));
+                }
+                return Ok(AppliedFix {
+                    description,
+                    new_content,
+                    modified_areas,
+                    usage: combined_usage,
+                });
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if attempt < MAX_EDIT_REPAIR_ATTEMPTS.max(1)
+                    && is_retryable_edit_apply_error(&message)
+                {
+                    last_apply_err = Some(message);
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("Failed to generate applyable edits"))
+}
+
+/// Generate fixed code content using the default high-capability model.
+pub async fn generate_fix_content(
+    path: &Path,
+    content: &str,
+    suggestion: &Suggestion,
+    plan: &FixPreview,
+    repo_memory: Option<String>,
+    is_new_file: bool,
+) -> anyhow::Result<AppliedFix> {
+    generate_fix_content_with_model(
+        path,
+        content,
+        suggestion,
+        plan,
+        repo_memory,
+        is_new_file,
         Model::Smart,
-        "fix_response",
-        fix_response_schema(),
     )
-    .await?;
-
-    let description = response
-        .data
-        .description
-        .unwrap_or_else(|| "Applied the requested fix".to_string());
-    let modified_areas = response.data.modified_areas;
-    let edits = response.data.edits;
-
-    if edits.is_empty() {
-        return Err(anyhow::anyhow!("No edits provided in response"));
-    }
-
-    // Apply edits sequentially with validation
-    let new_content = apply_edits_with_context(content, &edits, "file")?;
-
-    // Preserve whitespace and match trailing newline to original
-    let new_content = normalize_generated_content(content, new_content, is_new_file);
-
-    // Validate the new content isn't empty
-    if new_content.trim().is_empty() {
-        return Err(anyhow::anyhow!("Generated content is empty"));
-    }
-
-    Ok(AppliedFix {
-        description,
-        new_content,
-        modified_areas,
-        usage: response.usage,
-    })
+    .await
 }
 
 /// Truncate a string for error messages (UTF-8 safe)
@@ -431,31 +530,96 @@ pub(crate) fn apply_edits_with_context(
             ));
         }
 
-        let matches: Vec<_> = new_content.match_indices(&edit.old_string).collect();
-
-        if matches.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Edit {}: old_string not found in {}. The LLM may have made an error.\nSearched for: {:?}",
-                i + 1,
-                context_label,
-                truncate_for_error(&edit.old_string)
-            ));
+        match find_unique_match_range(&new_content, &edit.old_string) {
+            MatchRange::One { start, end } => {
+                new_content.replace_range(start..end, &edit.new_string);
+                continue;
+            }
+            MatchRange::Many(count) => {
+                return Err(anyhow::anyhow!(
+                    "Edit {}: old_string matches {} times in {} (must be unique). Need more context.\nSearched for: {:?}",
+                    i + 1,
+                    count,
+                    context_label,
+                    truncate_for_error(&edit.old_string)
+                ));
+            }
+            MatchRange::None => {}
         }
 
-        if matches.len() > 1 {
-            return Err(anyhow::anyhow!(
-                "Edit {}: old_string matches {} times in {} (must be unique). Need more context.\nSearched for: {:?}",
-                i + 1,
-                matches.len(),
-                context_label,
-                truncate_for_error(&edit.old_string)
-            ));
+        // Normalize line endings when the file is CRLF but the model emitted LF.
+        if edit.old_string.contains('\n') && new_content.contains("\r\n") {
+            let crlf_old = edit.old_string.replace('\n', "\r\n");
+            match find_unique_match_range(&new_content, &crlf_old) {
+                MatchRange::One { start, end } => {
+                    let replacement = edit.new_string.replace('\n', "\r\n");
+                    new_content.replace_range(start..end, &replacement);
+                    continue;
+                }
+                MatchRange::Many(count) => {
+                    return Err(anyhow::anyhow!(
+                        "Edit {}: normalized old_string matches {} times in {} (must be unique).\nSearched for: {:?}",
+                        i + 1,
+                        count,
+                        context_label,
+                        truncate_for_error(&edit.old_string)
+                    ));
+                }
+                MatchRange::None => {}
+            }
         }
 
-        new_content = new_content.replacen(&edit.old_string, &edit.new_string, 1);
+        // Tolerate boundary whitespace mismatches if a unique trimmed anchor exists.
+        let trimmed_old = edit.old_string.trim();
+        if !trimmed_old.is_empty() && trimmed_old != edit.old_string {
+            match find_unique_match_range(&new_content, trimmed_old) {
+                MatchRange::One { start, end } => {
+                    new_content.replace_range(start..end, &edit.new_string);
+                    continue;
+                }
+                MatchRange::Many(count) => {
+                    return Err(anyhow::anyhow!(
+                        "Edit {}: trimmed old_string matches {} times in {} (must be unique).\nSearched for: {:?}",
+                        i + 1,
+                        count,
+                        context_label,
+                        truncate_for_error(&edit.old_string)
+                    ));
+                }
+                MatchRange::None => {}
+            }
+        }
+
+        return Err(anyhow::anyhow!(
+            "Edit {}: old_string not found in {}. The LLM may have made an error.\nSearched for: {:?}",
+            i + 1,
+            context_label,
+            truncate_for_error(&edit.old_string)
+        ));
     }
 
     Ok(new_content)
+}
+
+enum MatchRange {
+    None,
+    One { start: usize, end: usize },
+    Many(usize),
+}
+
+fn find_unique_match_range(content: &str, needle: &str) -> MatchRange {
+    let matches = content.match_indices(needle).collect::<Vec<_>>();
+    match matches.len() {
+        0 => MatchRange::None,
+        1 => {
+            let (start, matched) = matches[0];
+            MatchRange::One {
+                start,
+                end: start + matched.len(),
+            }
+        }
+        n => MatchRange::Many(n),
+    }
 }
 
 pub(crate) fn normalize_generated_content(
@@ -594,11 +758,12 @@ fn multi_file_fix_response_schema() -> serde_json::Value {
 /// - Renaming a function and updating all callers
 /// - Extracting shared code and updating imports
 /// - Interface changes that affect multiple files
-pub async fn generate_multi_file_fix(
+pub async fn generate_multi_file_fix_with_model(
     files: &[FileInput],
     suggestion: &Suggestion,
     plan: &FixPreview,
     repo_memory: Option<String>,
+    model: Model,
 ) -> anyhow::Result<MultiFileAppliedFix> {
     if files.is_empty() {
         return Err(anyhow::anyhow!("No files provided for multi-file fix"));
@@ -683,66 +848,110 @@ pub async fn generate_multi_file_fix(
         &files_section_excerpt,
     );
 
-    // Use structured output to guarantee valid JSON - eliminates parse failures
-    let response: StructuredResponse<MultiFileFixResponse> = call_llm_structured_with_fallback(
-        &multi_file_fix_system(),
-        &user_full,
-        &user_excerpt,
-        Model::Smart,
-        "multi_file_fix_response",
-        multi_file_fix_response_schema(),
-    )
-    .await?;
+    let mut combined_usage: Option<Usage> = None;
+    let mut last_apply_err: Option<String> = None;
 
-    let description = response
-        .data
-        .description
-        .unwrap_or_else(|| "Applied the requested multi-file fix".to_string());
-    let file_edits_json = response.data.file_edits;
-
-    if file_edits_json.is_empty() {
-        return Err(anyhow::anyhow!("No file edits provided in response"));
-    }
-
-    // Apply edits to each file
-    let mut file_edits = Vec::new();
-
-    for file_edit_json in file_edits_json {
-        let file_path = PathBuf::from(&file_edit_json.file);
-        let Some(file_input) = files.iter().find(|f| f.path == file_path) else {
-            return Err(anyhow::anyhow!(
-                "Multi-file fix references missing file: {}",
-                file_path.display()
-            ));
+    for attempt in 1..=MAX_EDIT_REPAIR_ATTEMPTS.max(1) {
+        let (user_full_attempt, user_excerpt_attempt) = if let Some(ref err) = last_apply_err {
+            let guidance = format_edit_apply_repair_guidance(err, "FILES TO MODIFY code blocks");
+            (
+                format!("{}{}", user_full, guidance),
+                format!("{}{}", user_excerpt, guidance),
+            )
+        } else {
+            (user_full.clone(), user_excerpt.clone())
         };
-        let new_content = file_input.content.clone();
 
-        let mut modified_areas = Vec::new();
-        for edit in &file_edit_json.edits {
-            if let Some(area) = extract_modified_area(&edit.old_string) {
-                modified_areas.push(area);
-            }
+        let response: StructuredResponse<MultiFileFixResponse> = call_llm_structured_with_fallback(
+            &multi_file_fix_system(),
+            &user_full_attempt,
+            &user_excerpt_attempt,
+            model,
+            "multi_file_fix_response",
+            multi_file_fix_response_schema(),
+        )
+        .await?;
+        combined_usage = merge_usage(combined_usage, response.usage.clone());
+
+        let description = response
+            .data
+            .description
+            .unwrap_or_else(|| "Applied the requested multi-file fix".to_string());
+        let file_edits_json = response.data.file_edits;
+
+        if file_edits_json.is_empty() {
+            return Err(anyhow::anyhow!("No file edits provided in response"));
         }
 
-        let context = format!("file {}", file_path.display());
-        let new_content = apply_edits_with_context(&new_content, &file_edit_json.edits, &context)?;
+        let mut file_edits = Vec::new();
+        let mut apply_error: Option<anyhow::Error> = None;
 
-        // Preserve whitespace and match trailing newline to original
-        let new_content =
-            normalize_generated_content(&file_input.content, new_content, file_input.is_new);
+        for file_edit_json in file_edits_json {
+            let file_path = PathBuf::from(&file_edit_json.file);
+            let Some(file_input) = files.iter().find(|f| f.path == file_path) else {
+                return Err(anyhow::anyhow!(
+                    "Multi-file fix references missing file: {}",
+                    file_path.display()
+                ));
+            };
+            let new_content = file_input.content.clone();
 
-        file_edits.push(FileEdit {
-            path: file_path,
-            new_content,
-            modified_areas,
+            let mut modified_areas = Vec::new();
+            for edit in &file_edit_json.edits {
+                if let Some(area) = extract_modified_area(&edit.old_string) {
+                    modified_areas.push(area);
+                }
+            }
+
+            let context = format!("file {}", file_path.display());
+            let new_content =
+                match apply_edits_with_context(&new_content, &file_edit_json.edits, &context) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        apply_error = Some(err);
+                        break;
+                    }
+                };
+
+            let new_content =
+                normalize_generated_content(&file_input.content, new_content, file_input.is_new);
+            file_edits.push(FileEdit {
+                path: file_path,
+                new_content,
+                modified_areas,
+            });
+        }
+
+        if let Some(err) = apply_error {
+            let message = err.to_string();
+            if attempt < MAX_EDIT_REPAIR_ATTEMPTS.max(1) && is_retryable_edit_apply_error(&message)
+            {
+                last_apply_err = Some(message);
+                continue;
+            }
+            return Err(err);
+        }
+
+        return Ok(MultiFileAppliedFix {
+            description,
+            file_edits,
+            usage: combined_usage,
         });
     }
 
-    Ok(MultiFileAppliedFix {
-        description,
-        file_edits,
-        usage: response.usage,
-    })
+    Err(anyhow::anyhow!(
+        "Failed to generate applyable multi-file edits"
+    ))
+}
+
+/// Generate coordinated fixes across multiple files with the default model.
+pub async fn generate_multi_file_fix(
+    files: &[FileInput],
+    suggestion: &Suggestion,
+    plan: &FixPreview,
+    repo_memory: Option<String>,
+) -> anyhow::Result<MultiFileAppliedFix> {
+    generate_multi_file_fix_with_model(files, suggestion, plan, repo_memory, Model::Smart).await
 }
 
 /// Try to extract the modified function or area name from old_string
@@ -1510,6 +1719,29 @@ mod tests {
         }];
         let err = apply_edits_with_context("content", &edits, "file").unwrap_err();
         assert!(err.to_string().contains("old_string is empty"));
+    }
+
+    #[test]
+    fn test_apply_edits_uses_trimmed_fallback_unique_match() {
+        let edits = vec![EditOp {
+            old_string: "    let value = compute();\n".to_string(),
+            new_string: "    let value = compute_fast();\n".to_string(),
+        }];
+        let content = "let value = compute();\n";
+        let updated = apply_edits_with_context(content, &edits, "file").unwrap();
+        assert!(updated.contains("compute_fast"));
+    }
+
+    #[test]
+    fn test_apply_edits_handles_crlf_old_string_normalization() {
+        let edits = vec![EditOp {
+            old_string: "let a = 1;\nlet b = 2;\n".to_string(),
+            new_string: "let a = 1;\nlet b = 3;\n".to_string(),
+        }];
+        let content = "let a = 1;\r\nlet b = 2;\r\n";
+        let updated = apply_edits_with_context(content, &edits, "file").unwrap();
+        assert!(updated.contains("let b = 3;"));
+        assert!(updated.contains("\r\n"));
     }
 
     #[test]

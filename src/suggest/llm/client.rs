@@ -36,6 +36,149 @@ fn sanitize_api_response(content: &str) -> String {
     truncated.to_string()
 }
 
+fn push_unique_candidate(candidates: &mut Vec<String>, candidate: impl Into<String>) {
+    let candidate = candidate.into();
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !candidates.iter().any(|existing| existing == trimmed) {
+        candidates.push(trimmed.to_string());
+    }
+}
+
+fn strip_markdown_fences(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with("```") {
+        return None;
+    }
+    let without_open = trimmed.strip_prefix("```")?;
+    let after_header = if let Some(newline_idx) = without_open.find('\n') {
+        &without_open[newline_idx + 1..]
+    } else {
+        without_open
+    };
+    let end_idx = after_header.rfind("```")?;
+    Some(after_header[..end_idx].trim().to_string())
+}
+
+fn unwrap_outer_wrapper(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.len() < 3 {
+        return None;
+    }
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let inner_trimmed = inner.trim_start();
+        if inner_trimmed.starts_with('{') || inner_trimmed.starts_with('[') {
+            return Some(inner.trim().to_string());
+        }
+    } else if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let inner_trimmed = inner.trim_start();
+        if inner_trimmed.starts_with('[')
+            || inner_trimmed.starts_with('{')
+            || inner_trimmed.starts_with('"')
+        {
+            return Some(inner.trim().to_string());
+        }
+    }
+    None
+}
+
+fn extract_balanced_json_from(content: &str, start: usize) -> Option<String> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in content[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(content[start..end].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn extract_json_candidates(content: &str, max_candidates: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    if max_candidates == 0 {
+        return out;
+    }
+    for (idx, ch) in content.char_indices() {
+        if ch == '{' || ch == '[' {
+            if let Some(candidate) = extract_balanced_json_from(content, idx) {
+                push_unique_candidate(&mut out, candidate);
+                if out.len() >= max_candidates {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn parse_structured_content<T>(content: &str) -> anyhow::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut candidates = Vec::new();
+    push_unique_candidate(&mut candidates, content);
+    if let Some(stripped) = strip_markdown_fences(content) {
+        push_unique_candidate(&mut candidates, stripped);
+    }
+
+    // Build a few deterministic salvage candidates for mildly malformed wrappers.
+    let mut idx = 0usize;
+    while idx < candidates.len() {
+        let current = candidates[idx].clone();
+        for extracted in extract_json_candidates(&current, 4) {
+            push_unique_candidate(&mut candidates, extracted);
+        }
+        if let Some(unwrapped) = unwrap_outer_wrapper(&current) {
+            push_unique_candidate(&mut candidates, unwrapped);
+        }
+        idx += 1;
+    }
+
+    let mut last_err: Option<String> = None;
+    for candidate in candidates {
+        match serde_json::from_str::<T>(&candidate) {
+            Ok(data) => return Ok(data),
+            Err(err) => last_err = Some(err.to_string()),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Failed to parse structured response: {}\nContent: {}",
+        last_err.unwrap_or_else(|| "unknown parse error".to_string()),
+        sanitize_api_response(content)
+    ))
+}
+
 /// Get the configured OpenRouter API key, if any.
 pub(crate) fn api_key() -> Option<String> {
     let mut config = Config::load();
@@ -310,6 +453,7 @@ pub(crate) fn is_retryable_network_error(err: &reqwest::Error) -> bool {
 const RESPONSE_HEALING_PLUGIN_ID: &str = "response-healing";
 
 fn provider_config(response_format: &Option<ResponseFormat>) -> ProviderConfig {
+    // Default routing for non-Speed models.
     ProviderConfig {
         order: None,
         allow_fallbacks: true,
@@ -330,6 +474,38 @@ fn provider_config(response_format: &Option<ResponseFormat>) -> ProviderConfig {
         }),
         quantizations: None,
     }
+}
+
+const GPT_OSS_PROVIDER_ORDER: [&str; 3] = ["cerebras/fp16", "crusoe/bf16", "deepinfra/turbo"];
+
+fn provider_config_for_model(
+    model: Model,
+    response_format: &Option<ResponseFormat>,
+) -> ProviderConfig {
+    // For gpt-oss-120b we strongly prefer Cerebras fp16 (elite baseline), while
+    // still allowing a narrow, explicit fallback chain when Cerebras is unavailable.
+    if model == Model::Speed {
+        return ProviderConfig {
+            order: Some(
+                GPT_OSS_PROVIDER_ORDER
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect(),
+            ),
+            // Restrict routing to the explicit order only (Cerebras fp16 first, then
+            // explicitly-approved fallbacks). This avoids silently drifting to an
+            // unrelated provider when Cerebras is flaky.
+            allow_fallbacks: false,
+            require_parameters: response_format.as_ref().map(|_| true),
+            // With an explicit provider order, avoid secondary heuristics that could
+            // fight the "use Cerebras first" requirement.
+            preferred_max_latency: None,
+            preferred_min_throughput: None,
+            quantizations: None,
+        };
+    }
+
+    provider_config(response_format)
 }
 
 pub(crate) fn provider_cerebras_fp16() -> ProviderConfig {
@@ -536,7 +712,7 @@ pub(crate) async fn call_llm_with_usage(
 
     let stream = false;
     let plugins = response_healing_plugins(&response_format, stream);
-    let provider = provider_config(&response_format);
+    let provider = provider_config_for_model(model, &response_format);
     let reasoning = reasoning_config(model);
 
     let request = ChatRequest {
@@ -606,6 +782,7 @@ pub struct StructuredResponse<T> {
     pub usage: Option<Usage>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_llm_structured_with_provider<T>(
     system: &str,
     user: &str,
@@ -700,13 +877,7 @@ where
         ));
     }
 
-    let data: T = serde_json::from_str(&content).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse structured response: {}\nContent: {}",
-            e,
-            sanitize_api_response(&content)
-        )
-    })?;
+    let data: T = parse_structured_content(&content)?;
 
     Ok(StructuredResponse {
         data,
@@ -753,7 +924,7 @@ where
 
     let stream = false;
     let plugins = response_healing_plugins(&response_format, stream);
-    let provider = provider_config(&response_format);
+    let provider = provider_config_for_model(model, &response_format);
     let reasoning = reasoning_config(model);
 
     let request = ChatRequest {
@@ -810,13 +981,7 @@ where
         ));
     }
 
-    let data: T = serde_json::from_str(&content).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse structured response: {}\nContent: {}",
-            e,
-            sanitize_api_response(&content)
-        )
-    })?;
+    let data: T = parse_structured_content(&content)?;
 
     Ok(StructuredResponse {
         data,
@@ -862,7 +1027,7 @@ where
 
     let stream = false;
     let plugins = response_healing_plugins(&response_format, stream);
-    let provider = provider_config(&response_format);
+    let provider = provider_config_for_model(model, &response_format);
     let reasoning = reasoning_config(model);
 
     let request = ChatRequest {
@@ -920,13 +1085,7 @@ where
         ));
     }
 
-    let data: T = serde_json::from_str(&content).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse structured response: {}\nContent: {}",
-            e,
-            sanitize_api_response(&content)
-        )
-    })?;
+    let data: T = parse_structured_content(&content)?;
 
     Ok(StructuredResponse {
         data,
@@ -986,7 +1145,7 @@ where
 
     let stream = false;
     let plugins = response_healing_plugins(&response_format, stream);
-    let provider = provider_config(&response_format);
+    let provider = provider_config_for_model(model, &response_format);
     let reasoning = reasoning_config(model);
 
     // Use cached messages with cache_control on system prompt
@@ -1035,13 +1194,7 @@ where
         ));
     }
 
-    let data: T = serde_json::from_str(&content).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse structured response: {}\nContent: {}",
-            e,
-            sanitize_api_response(&content)
-        )
-    })?;
+    let data: T = parse_structured_content(&content)?;
 
     Ok(StructuredResponse {
         data,
@@ -1120,9 +1273,14 @@ pub async fn fetch_account_balance() -> anyhow::Result<f64> {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct ParseProbe {
+        description: String,
+    }
+
     #[test]
     fn test_provider_requires_parameters_only_with_response_format() {
-        let provider = provider_config(&None);
+        let provider = provider_config_for_model(Model::Balanced, &None);
         let value = serde_json::to_value(provider).unwrap();
         assert!(value.get("require_parameters").is_none());
 
@@ -1130,11 +1288,32 @@ mod tests {
             format_type: "json_object".to_string(),
             json_schema: None,
         });
-        let provider = provider_config(&response_format);
+        let provider = provider_config_for_model(Model::Balanced, &response_format);
         let value = serde_json::to_value(provider).unwrap();
         assert_eq!(
             value.get("require_parameters").and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn test_speed_model_prefers_cerebras_fp16_with_explicit_fallbacks() {
+        let provider = provider_config_for_model(Model::Speed, &None);
+        let value = serde_json::to_value(provider).unwrap();
+        let order = value
+            .get("order")
+            .and_then(|v| v.as_array())
+            .expect("expected explicit provider order for Model::Speed");
+        assert_eq!(
+            order
+                .first()
+                .and_then(|v| v.as_str())
+                .expect("expected first provider"),
+            "cerebras/fp16"
+        );
+        assert_eq!(
+            value.get("allow_fallbacks").and_then(|v| v.as_bool()),
+            Some(false)
         );
     }
 
@@ -1158,5 +1337,41 @@ mod tests {
         let reasoning = reasoning_config(Model::Speed).expect("expected reasoning config");
         let value = serde_json::to_value(reasoning).unwrap();
         assert_eq!(value.get("exclude").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn test_parse_structured_content_handles_extra_wrapper_braces() {
+        let malformed = "{\n {\"description\":\"hello\"}\n}";
+        let parsed: ParseProbe = parse_structured_content(malformed).unwrap();
+        assert_eq!(
+            parsed,
+            ParseProbe {
+                description: "hello".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_structured_content_handles_markdown_fences() {
+        let fenced = "```json\n{\"description\":\"hello\"}\n```";
+        let parsed: ParseProbe = parse_structured_content(fenced).unwrap();
+        assert_eq!(
+            parsed,
+            ParseProbe {
+                description: "hello".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_structured_content_handles_leading_garbage_before_double_object() {
+        let malformed = ".{\n{\"description\":\"hello\"}\n}";
+        let parsed: ParseProbe = parse_structured_content(malformed).unwrap();
+        assert_eq!(
+            parsed,
+            ParseProbe {
+                description: "hello".to_string()
+            }
+        );
     }
 }

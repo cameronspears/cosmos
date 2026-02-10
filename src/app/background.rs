@@ -422,6 +422,56 @@ pub fn drain_messages(
                 app.verify_state = ui::VerifyState::default();
                 app.show_toast(&format!("Preview error: {}", truncate(&e, 80)));
             }
+            BackgroundMessage::ApplyHarnessProgress {
+                attempt_index,
+                attempt_count,
+                detail,
+            } => {
+                app.loading = LoadingState::GeneratingFix;
+                app.show_toast(&format!(
+                    "Apply harness {}/{}: {}",
+                    attempt_index, attempt_count, detail
+                ));
+            }
+            BackgroundMessage::ApplyHarnessFailed {
+                summary,
+                fail_reasons,
+                report_path,
+            } => {
+                app.loading = LoadingState::None;
+                app.workflow_step = WorkflowStep::Suggestions;
+                app.verify_state = ui::VerifyState::default();
+                app.clear_apply_confirm();
+                let mut detail = summary;
+                if !fail_reasons.is_empty() {
+                    let joined = fail_reasons
+                        .iter()
+                        .take(2)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    if !joined.is_empty() {
+                        detail = format!("{} ({})", detail, joined);
+                    }
+                }
+                if let Some(path) = report_path {
+                    detail = format!("{}. See report at {}", detail, path.display());
+                }
+                app.show_toast(&format!("Apply failed: {}", truncate(&detail, 140)));
+            }
+            BackgroundMessage::ApplyHarnessReducedConfidence {
+                detail,
+                report_path,
+            } => {
+                let mut msg = detail;
+                if let Some(path) = report_path {
+                    msg = format!("{}. See report at {}", msg, path.display());
+                }
+                app.show_toast(&truncate(
+                    &format!("Applied with lower confidence: {}", msg),
+                    160,
+                ));
+            }
             BackgroundMessage::DirectFixApplied {
                 suggestion_id,
                 file_changes,
@@ -560,10 +610,7 @@ pub fn drain_messages(
             }
             BackgroundMessage::ResetComplete { options } => {
                 app.loading = LoadingState::None;
-                if options
-                    .iter()
-                    .any(|o| *o == crate::cache::ResetOption::QuestionCache)
-                {
+                if options.contains(&crate::cache::ResetOption::QuestionCache) {
                     app.question_cache = crate::cache::QuestionCache::default();
                 }
                 let labels: Vec<&str> = options.iter().map(|o| o.label()).collect();

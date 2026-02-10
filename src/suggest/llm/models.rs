@@ -22,7 +22,7 @@ const JSON_FORMAT_MODELS: [&str; 3] = [
 ];
 
 fn supports_json_format(model_id: &str) -> bool {
-    JSON_FORMAT_MODELS.iter().any(|id| *id == model_id)
+    JSON_FORMAT_MODELS.contains(&model_id)
 }
 
 impl Model {

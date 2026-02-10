@@ -1,10 +1,10 @@
 use super::agentic::{call_llm_agentic, schema_to_response_format};
-use super::client::{call_llm_structured_cached, StructuredResponse};
+use super::client::{call_llm_structured_cached, parse_structured_content, StructuredResponse};
 use super::fix::{
-    apply_edits_with_context, fix_response_schema, normalize_generated_content, AppliedFix,
-    FixResponse,
+    apply_edits_with_context, fix_response_schema, format_edit_apply_repair_guidance,
+    normalize_generated_content, AppliedFix, FixResponse,
 };
-use super::models::{Model, Usage};
+use super::models::{merge_usage, Model, Usage};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{review_fix_system_prompt, review_system_prompt};
 use serde::{Deserialize, Serialize};
@@ -217,7 +217,7 @@ pub async fn verify_changes(
     .await?;
 
     // Response is guaranteed to be valid JSON matching the schema
-    let parsed: ReviewResponseJson = serde_json::from_str(&response.content).map_err(|e| {
+    let parsed: ReviewResponseJson = parse_structured_content(&response.content).map_err(|e| {
         anyhow::anyhow!(
             "Failed to parse review response: {}. Content: {}",
             e,
@@ -228,7 +228,7 @@ pub async fn verify_changes(
     Ok(VerificationReview {
         findings: parsed.findings.into_iter().map(Into::into).collect(),
         summary: parsed.summary,
-        usage: None, // Usage is tracked in the agentic call
+        usage: response.usage,
     })
 }
 
@@ -392,6 +392,31 @@ pub async fn fix_review_findings(
     iteration: u32,
     fixed_titles: &[String],
 ) -> anyhow::Result<AppliedFix> {
+    fix_review_findings_with_model(
+        path,
+        content,
+        original_content,
+        findings,
+        repo_memory,
+        iteration,
+        fixed_titles,
+        Model::Smart,
+    )
+    .await
+}
+
+/// Fix selected review findings with an explicit model choice.
+#[allow(clippy::too_many_arguments)]
+pub async fn fix_review_findings_with_model(
+    path: &std::path::Path,
+    content: &str,
+    original_content: Option<&str>,
+    findings: &[ReviewFinding],
+    repo_memory: Option<String>,
+    iteration: u32,
+    fixed_titles: &[String],
+    model: Model,
+) -> anyhow::Result<AppliedFix> {
     if findings.is_empty() {
         return Err(anyhow::anyhow!("No findings to fix"));
     }
@@ -437,41 +462,70 @@ pub async fn fix_review_findings(
         content
     );
 
-    // Use structured output with caching - guarantees valid JSON and reduces costs
-    let response: StructuredResponse<FixResponse> = call_llm_structured_cached(
-        &system,
-        &user,
-        Model::Smart,
-        "fix_response",
-        fix_response_schema(),
-    )
-    .await?;
+    let mut combined_usage: Option<Usage> = None;
+    let mut last_apply_err: Option<String> = None;
 
-    let description = response
-        .data
-        .description
-        .unwrap_or_else(|| "Fixed review findings".to_string());
-    let modified_areas = response.data.modified_areas;
-    let edits = response.data.edits;
+    for attempt in 1..=2usize {
+        let user_attempt = if let Some(ref err) = last_apply_err {
+            format!(
+                "{}{}",
+                user,
+                format_edit_apply_repair_guidance(err, "CURRENT CODE block")
+            )
+        } else {
+            user.clone()
+        };
 
-    if edits.is_empty() {
-        return Err(anyhow::anyhow!("No edits provided in response"));
+        let response: StructuredResponse<FixResponse> = call_llm_structured_cached(
+            &system,
+            &user_attempt,
+            model,
+            "fix_response",
+            fix_response_schema(),
+        )
+        .await?;
+        combined_usage = merge_usage(combined_usage, response.usage.clone());
+
+        let description = response
+            .data
+            .description
+            .unwrap_or_else(|| "Fixed review findings".to_string());
+        let modified_areas = response.data.modified_areas;
+        let edits = response.data.edits;
+
+        if edits.is_empty() {
+            return Err(anyhow::anyhow!("No edits provided in response"));
+        }
+
+        match apply_edits_with_context(content, &edits, "file") {
+            Ok(new_content) => {
+                let new_content = normalize_generated_content(content, new_content, false);
+                if new_content.trim().is_empty() {
+                    return Err(anyhow::anyhow!("Generated content is empty"));
+                }
+                return Ok(AppliedFix {
+                    description,
+                    new_content,
+                    modified_areas,
+                    usage: combined_usage,
+                });
+            }
+            Err(err) => {
+                let message = err.to_string();
+                let msg = message.to_ascii_lowercase();
+                let retryable = msg.contains("old_string")
+                    && (msg.contains("not found")
+                        || msg.contains("matches")
+                        || msg.contains("must be unique")
+                        || msg.contains("empty for non-empty"));
+                if attempt < 2 && retryable {
+                    last_apply_err = Some(message);
+                    continue;
+                }
+                return Err(err);
+            }
+        }
     }
 
-    // Apply edits sequentially with validation
-    let new_content = apply_edits_with_context(content, &edits, "file")?;
-
-    // Preserve whitespace and match trailing newline to original
-    let new_content = normalize_generated_content(content, new_content, false);
-
-    if new_content.trim().is_empty() {
-        return Err(anyhow::anyhow!("Generated content is empty"));
-    }
-
-    Ok(AppliedFix {
-        description,
-        new_content,
-        modified_areas,
-        usage: response.usage,
-    })
+    Err(anyhow::anyhow!("Failed to apply review fix edits"))
 }

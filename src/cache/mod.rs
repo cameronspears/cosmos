@@ -33,6 +33,7 @@ const GROUPING_AI_CACHE_FILE: &str = "grouping_ai.json";
 const PIPELINE_METRICS_FILE: &str = "pipeline_metrics.jsonl";
 const SUGGESTION_QUALITY_FILE: &str = "suggestion_quality.jsonl";
 const SELF_ITERATION_RUNS_FILE: &str = "self_iteration_runs.jsonl";
+const IMPLEMENTATION_HARNESS_FILE: &str = "implementation_harness.jsonl";
 const CACHE_LOCK_TIMEOUT_SECS: u64 = 5;
 const CACHE_LOCK_RETRY_MS: u64 = 50;
 
@@ -57,6 +58,8 @@ pub enum ResetOption {
     PipelineMetrics,
     /// Clear suggestion_quality.jsonl - per-suggestion validation telemetry
     SuggestionQuality,
+    /// Clear implementation_harness.jsonl - apply harness telemetry
+    ImplementationHarness,
 }
 
 impl ResetOption {
@@ -72,6 +75,7 @@ impl ResetOption {
             ResetOption::QuestionCache => "Question Cache",
             ResetOption::PipelineMetrics => "Pipeline Metrics",
             ResetOption::SuggestionQuality => "Suggestion Quality",
+            ResetOption::ImplementationHarness => "Implementation Harness",
         }
     }
 
@@ -87,6 +91,7 @@ impl ResetOption {
             ResetOption::QuestionCache => "clear saved Q&A",
             ResetOption::PipelineMetrics => "clear latency/cost logs",
             ResetOption::SuggestionQuality => "clear validation telemetry",
+            ResetOption::ImplementationHarness => "clear apply harness telemetry",
         }
     }
 
@@ -102,6 +107,7 @@ impl ResetOption {
             ResetOption::QuestionCache,
             ResetOption::PipelineMetrics,
             ResetOption::SuggestionQuality,
+            ResetOption::ImplementationHarness,
         ]
     }
 
@@ -518,6 +524,34 @@ pub struct SelfIterationRunRecord {
     pub notes: Vec<String>,
 }
 
+/// One apply-harness execution summary row written as JSONL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementationHarnessRecord {
+    #[serde(default = "implementation_harness_schema_version_default")]
+    pub schema_version: u32,
+    pub timestamp: DateTime<Utc>,
+    pub run_id: String,
+    pub suggestion_id: String,
+    pub passed: bool,
+    pub attempt_count: usize,
+    pub total_ms: u64,
+    pub total_cost_usd: f64,
+    pub changed_file_count: usize,
+    pub quick_check_status: String,
+    #[serde(default)]
+    pub finalization_status: String,
+    #[serde(default)]
+    pub mutation_on_failure: Option<bool>,
+    #[serde(default)]
+    pub fail_reasons: Vec<String>,
+    #[serde(default)]
+    pub report_path: Option<PathBuf>,
+}
+
+fn implementation_harness_schema_version_default() -> u32 {
+    2
+}
+
 impl GroupingAiCache {
     pub fn new() -> Self {
         Self {
@@ -759,10 +793,9 @@ impl Cache {
         if git_dir.is_dir() {
             let info_exclude_path = git_dir.join("info").join("exclude");
             if let Some(parent) = info_exclude_path.parent() {
-                if fs::create_dir_all(parent).is_ok() {
-                    if append_ignore_entry(&info_exclude_path, ".cosmos/").is_ok() {
-                        return Ok(());
-                    }
+                let ready = fs::create_dir_all(parent).is_ok();
+                if ready && append_ignore_entry(&info_exclude_path, ".cosmos/").is_ok() {
+                    return Ok(());
                 }
             }
         }
@@ -1027,6 +1060,20 @@ impl Cache {
         Ok(())
     }
 
+    /// Append one implementation-harness telemetry row (JSONL).
+    pub fn append_implementation_harness(
+        &self,
+        record: &ImplementationHarnessRecord,
+    ) -> anyhow::Result<()> {
+        let _lock = self.lock(true)?;
+        let path = self.cache_dir.join(IMPLEMENTATION_HARNESS_FILE);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let row = serde_json::to_string(record)?;
+        use std::io::Write;
+        writeln!(file, "{}", row)?;
+        Ok(())
+    }
+
     /// Load up to `limit` latest suggestion-quality records (newest last).
     pub fn load_recent_suggestion_quality(
         &self,
@@ -1140,6 +1187,7 @@ impl Cache {
                 ResetOption::QuestionCache => vec![QUESTION_CACHE_FILE],
                 ResetOption::PipelineMetrics => vec![PIPELINE_METRICS_FILE],
                 ResetOption::SuggestionQuality => vec![SUGGESTION_QUALITY_FILE],
+                ResetOption::ImplementationHarness => vec![IMPLEMENTATION_HARNESS_FILE],
             };
 
             for file in files_to_remove {
@@ -1459,9 +1507,11 @@ mod tests {
         assert!(options.contains(&ResetOption::QuestionCache));
         assert!(options.contains(&ResetOption::PipelineMetrics));
         assert!(options.contains(&ResetOption::SuggestionQuality));
+        assert!(options.contains(&ResetOption::ImplementationHarness));
         assert!(!ResetOption::defaults().contains(&ResetOption::QuestionCache));
         assert!(!ResetOption::defaults().contains(&ResetOption::PipelineMetrics));
         assert!(!ResetOption::defaults().contains(&ResetOption::SuggestionQuality));
+        assert!(!ResetOption::defaults().contains(&ResetOption::ImplementationHarness));
     }
 
     #[test]
@@ -1515,23 +1565,43 @@ mod tests {
             user_verify_outcome: None,
         };
         cache.append_suggestion_quality(&quality).unwrap();
+        let harness = ImplementationHarnessRecord {
+            schema_version: 2,
+            timestamp: Utc::now(),
+            run_id: "run-1".to_string(),
+            suggestion_id: "suggestion-1".to_string(),
+            passed: true,
+            attempt_count: 1,
+            total_ms: 2000,
+            total_cost_usd: 0.002,
+            changed_file_count: 1,
+            quick_check_status: "passed".to_string(),
+            finalization_status: "applied".to_string(),
+            mutation_on_failure: Some(false),
+            fail_reasons: Vec::new(),
+            report_path: None,
+        };
+        cache.append_implementation_harness(&harness).unwrap();
 
         let cache_dir = root.join(CACHE_DIR);
         assert!(cache_dir.join(QUESTION_CACHE_FILE).exists());
         assert!(cache_dir.join(PIPELINE_METRICS_FILE).exists());
         assert!(cache_dir.join(SUGGESTION_QUALITY_FILE).exists());
+        assert!(cache_dir.join(IMPLEMENTATION_HARNESS_FILE).exists());
 
         cache
             .clear_selective(&[
                 ResetOption::QuestionCache,
                 ResetOption::PipelineMetrics,
                 ResetOption::SuggestionQuality,
+                ResetOption::ImplementationHarness,
             ])
             .unwrap();
 
         assert!(!cache_dir.join(QUESTION_CACHE_FILE).exists());
         assert!(!cache_dir.join(PIPELINE_METRICS_FILE).exists());
         assert!(!cache_dir.join(SUGGESTION_QUALITY_FILE).exists());
+        assert!(!cache_dir.join(IMPLEMENTATION_HARNESS_FILE).exists());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1640,6 +1710,26 @@ mod tests {
         assert!(parsed.command_outcomes.is_empty());
         assert!(parsed.reliability_metrics.is_none());
         assert!(parsed.notes.is_empty());
+        assert!(parsed.report_path.is_none());
+    }
+
+    #[test]
+    fn implementation_harness_record_deserializes_legacy_shape() {
+        let row = serde_json::json!({
+            "timestamp": Utc::now(),
+            "run_id": "run-legacy",
+            "suggestion_id": "s-1",
+            "passed": false,
+            "attempt_count": 2,
+            "total_ms": 3000,
+            "total_cost_usd": 0.004,
+            "changed_file_count": 0,
+            "quick_check_status": "unavailable"
+        });
+        let parsed: ImplementationHarnessRecord = serde_json::from_value(row).unwrap();
+        assert_eq!(parsed.schema_version, 2);
+        assert_eq!(parsed.finalization_status, "");
+        assert!(parsed.mutation_on_failure.is_none());
         assert!(parsed.report_path.is_none());
     }
 }

@@ -398,9 +398,7 @@ fn get_secondary_buttons(app: &App) -> Vec<FooterButton> {
                 }
             }
             WorkflowStep::Review => {
-                if app.review_passed() {
-                    vec![secondary_button("Esc", "back")]
-                } else if app.review_state.verification_failed {
+                if app.review_passed() || app.review_state.verification_failed {
                     vec![secondary_button("Esc", "back")]
                 } else {
                     vec![hint_button("␣", "select"), secondary_button("Esc", "back")]

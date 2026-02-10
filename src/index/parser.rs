@@ -33,6 +33,12 @@ thread_local! {
         p
     });
 
+    static TSX_PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        let _ = p.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into());
+        p
+    });
+
     static PYTHON_PARSER: RefCell<Parser> = RefCell::new({
         let mut p = Parser::new();
         let _ = p.set_language(&tree_sitter_python::LANGUAGE.into());
@@ -50,11 +56,23 @@ thread_local! {
 fn parse_with_pooled_parser(
     content: &str,
     language: Language,
+    path: Option<&Path>,
 ) -> anyhow::Result<tree_sitter::Tree> {
     let parse_result = match language {
         Language::Rust => RUST_PARSER.with(|p| p.borrow_mut().parse(content, None)),
         Language::JavaScript => JS_PARSER.with(|p| p.borrow_mut().parse(content, None)),
-        Language::TypeScript => TS_PARSER.with(|p| p.borrow_mut().parse(content, None)),
+        Language::TypeScript => {
+            let use_tsx = path
+                .and_then(|p| p.extension())
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("tsx"))
+                .unwrap_or(false);
+            if use_tsx {
+                TSX_PARSER.with(|p| p.borrow_mut().parse(content, None))
+            } else {
+                TS_PARSER.with(|p| p.borrow_mut().parse(content, None))
+            }
+        }
         Language::Python => PYTHON_PARSER.with(|p| p.borrow_mut().parse(content, None)),
         Language::Go => GO_PARSER.with(|p| p.borrow_mut().parse(content, None)),
         Language::Unknown => return Err(anyhow::anyhow!("Unknown language")),
@@ -73,7 +91,7 @@ pub fn parse_file(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    let tree = parse_with_pooled_parser(content, language)?;
+    let tree = parse_with_pooled_parser(content, language, Some(path))?;
     let root = tree.root_node();
 
     // Extract symbols and dependencies based on language
@@ -94,6 +112,19 @@ pub fn parse_file(
     };
 
     Ok((symbols, dependencies))
+}
+
+/// Returns true if parsing produced syntax error nodes.
+pub fn parse_file_has_errors(
+    path: &Path,
+    content: &str,
+    language: Language,
+) -> anyhow::Result<bool> {
+    if language == Language::Unknown {
+        return Ok(false);
+    }
+    let tree = parse_with_pooled_parser(content, language, Some(path))?;
+    Ok(tree.root_node().has_error())
 }
 
 /// Extract symbols from Rust code
@@ -730,5 +761,37 @@ mod tests {
         let (symbols, _) = parse_file(Path::new("test.js"), content, Language::JavaScript).unwrap();
 
         assert!(!symbols.is_empty());
+    }
+
+    #[test]
+    fn test_tsx_parsing_uses_tsx_grammar() {
+        let content = r#"
+            import React from "react";
+
+            export function Widget() {
+                return <div className="x">Hello</div>;
+            }
+        "#;
+
+        let path = Path::new("widget.tsx");
+        let (symbols, _) = parse_file(path, content, Language::TypeScript).unwrap();
+        assert!(!symbols.is_empty());
+        assert!(!parse_file_has_errors(path, content, Language::TypeScript).unwrap());
+    }
+
+    #[test]
+    fn test_typescript_parsing_uses_ts_grammar() {
+        let content = r#"
+            export type Id = string;
+            export const value: Id = "x";
+            export function hello(name: string): string {
+                return name;
+            }
+        "#;
+
+        let path = Path::new("types.ts");
+        let (symbols, _) = parse_file(path, content, Language::TypeScript).unwrap();
+        assert!(!symbols.is_empty());
+        assert!(!parse_file_has_errors(path, content, Language::TypeScript).unwrap());
     }
 }

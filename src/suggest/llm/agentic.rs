@@ -158,6 +158,8 @@ struct ProviderThresholds {
 
 #[derive(Serialize)]
 struct ProviderConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    order: Option<Vec<String>>,
     allow_fallbacks: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     require_parameters: Option<bool>,
@@ -165,6 +167,8 @@ struct ProviderConfig {
     preferred_max_latency: Option<ProviderThresholds>,
     #[serde(skip_serializing_if = "Option::is_none")]
     preferred_min_throughput: Option<ProviderThresholds>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quantizations: Option<Vec<String>>,
 }
 
 /// OpenRouter reasoning configuration for extended thinking
@@ -201,10 +205,34 @@ fn response_healing_plugins() -> Vec<PluginConfig> {
     }]
 }
 
-fn provider_config(require_parameters: bool) -> ProviderConfig {
+const GPT_OSS_PROVIDER_ORDER: [&str; 3] = ["cerebras/fp16", "crusoe/bf16", "deepinfra/turbo"];
+
+fn provider_config(model: Model, require_parameters: bool) -> ProviderConfig {
+    let require_parameters = if require_parameters { Some(true) } else { None };
+
+    // For gpt-oss-120b (Speed tier), strongly prefer Cerebras fp16, with explicit fallbacks.
+    if model == Model::Speed {
+        return ProviderConfig {
+            order: Some(
+                GPT_OSS_PROVIDER_ORDER
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect(),
+            ),
+            // Restrict routing to the explicit order only (Cerebras fp16 first, then
+            // explicitly-approved fallbacks).
+            allow_fallbacks: false,
+            require_parameters,
+            preferred_max_latency: None,
+            preferred_min_throughput: None,
+            quantizations: None,
+        };
+    }
+
     ProviderConfig {
+        order: None,
         allow_fallbacks: true,
-        require_parameters: if require_parameters { Some(true) } else { None },
+        require_parameters,
         preferred_max_latency: Some(ProviderThresholds {
             p50: None,
             p75: None,
@@ -217,6 +245,7 @@ fn provider_config(require_parameters: bool) -> ProviderConfig {
             p90: Some(15.0),
             p99: None,
         }),
+        quantizations: None,
     }
 }
 
@@ -310,7 +339,7 @@ pub async fn call_llm_agentic(
             tools: Some(tools.clone()),
             tool_choice: Some(ToolChoice::Auto),
             parallel_tool_calls: Some(true),
-            provider: Some(provider_config(false)),
+            provider: Some(provider_config(model, false)),
         };
 
         // Use shared retry helper - handles timeouts, rate limits, server errors
@@ -405,9 +434,8 @@ pub async fn call_llm_agentic(
             if empty_response_retries < EMPTY_RESPONSE_MAX_RETRIES && start.elapsed() < LOOP_TIMEOUT
             {
                 empty_response_retries += 1;
-                if iteration > 0 {
-                    iteration -= 1; // don't count empty response against iteration budget
-                }
+                // Don't count empty response against iteration budget.
+                iteration = iteration.saturating_sub(1);
                 let delay_ms = 250u64 * (1 << empty_response_retries);
                 tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 continue;
@@ -457,7 +485,7 @@ pub async fn call_llm_agentic(
                 tools: None,
                 tool_choice: None,
                 parallel_tool_calls: None,
-                provider: Some(provider_config(true)),
+                provider: Some(provider_config(model, true)),
             };
 
             let text = send_with_retry(&client, &api_key, &format_request).await?;
@@ -529,7 +557,7 @@ pub async fn call_llm_agentic(
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
-        provider: Some(provider_config(use_structured_output)),
+        provider: Some(provider_config(model, use_structured_output)),
     };
     // Use shared retry helper for final request too, plus a few retries for empty content.
     let mut last_error: Option<anyhow::Error> = None;
