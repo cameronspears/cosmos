@@ -2350,9 +2350,14 @@ fn detect_quick_check_command(repo_root: &Path) -> Option<QuickCheckCommand> {
     }
 
     if repo_root.join("Cargo.toml").exists() {
+        let args = if repo_root.join("Cargo.lock").exists() {
+            vec!["check".to_string(), "--locked".to_string()]
+        } else {
+            vec!["check".to_string()]
+        };
         return Some(QuickCheckCommand::Program {
             program: "cargo".to_string(),
-            args: vec!["check".to_string(), "--locked".to_string()],
+            args,
         });
     }
 
@@ -2392,6 +2397,22 @@ fn detect_quick_check_command(repo_root: &Path) -> Option<QuickCheckCommand> {
         return Some(QuickCheckCommand::Program {
             program: "go".to_string(),
             args: vec!["test".to_string(), "./...".to_string()],
+        });
+    }
+
+    if repo_root.join("pyproject.toml").exists()
+        || repo_root.join("requirements.txt").exists()
+        || repo_root.join("setup.py").exists()
+        || repo_root.join("setup.cfg").exists()
+    {
+        return Some(QuickCheckCommand::Program {
+            program: "python".to_string(),
+            args: vec![
+                "-m".to_string(),
+                "compileall".to_string(),
+                "-q".to_string(),
+                ".".to_string(),
+            ],
         });
     }
 
@@ -2610,7 +2631,18 @@ fn copy_node_modules_from_source(
         }
     }
 
-    let src = source_node_modules.to_string_lossy().to_string();
+    let resolved_source = if is_node_modules_symlink(source_node_modules) {
+        match std::fs::canonicalize(source_node_modules) {
+            Ok(path) => {
+                notes.push("resolved_source_node_modules_symlink".to_string());
+                path
+            }
+            Err(_) => source_node_modules.to_path_buf(),
+        }
+    } else {
+        source_node_modules.to_path_buf()
+    };
+    let src = resolved_source.to_string_lossy().to_string();
     let dst = node_modules.to_string_lossy().to_string();
 
     // Prefer copy-on-write / reflink where available, but fall back to a plain archive copy.
@@ -2748,8 +2780,20 @@ fn run_quick_checks(
     }
 
     let start = std::time::Instant::now();
-    let output = run_command_with_timeout(&mut cmd, Duration::from_millis(timeout_ms))
-        .map_err(|e| anyhow::anyhow!("Quick check failed to start: {}", e))?;
+    let output = match run_command_with_timeout(&mut cmd, Duration::from_millis(timeout_ms)) {
+        Ok(output) => output,
+        Err(err) => {
+            notes.push(format!(
+                "quick_check_failed_to_start: {}",
+                truncate(&err, 160)
+            ));
+            return Ok((
+                ImplementationQuickCheckStatus::Unavailable,
+                Some(command_str),
+                None,
+            ));
+        }
+    };
     let outcome = ImplementationCommandOutcome {
         command: command_str.clone(),
         duration_ms: start.elapsed().as_millis() as u64,
@@ -3156,6 +3200,72 @@ diff --git a/a.rs b/a.rs
                 assert_eq!(args, vec!["build".to_string()]);
             }
             _ => panic!("expected program quick check"),
+        }
+    }
+
+    #[test]
+    fn quick_check_detects_rust_without_lockfile_as_unlocked_check() {
+        let root = tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let command = detect_quick_check_command(root.path()).expect("expected check command");
+        match command {
+            QuickCheckCommand::Program { program, args } => {
+                assert_eq!(program, "cargo");
+                assert_eq!(args, vec!["check".to_string()]);
+            }
+            _ => panic!("expected cargo quick check"),
+        }
+    }
+
+    #[test]
+    fn quick_check_detects_rust_with_lockfile_as_locked_check() {
+        let root = tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("Cargo.lock"), "").unwrap();
+
+        let command = detect_quick_check_command(root.path()).expect("expected check command");
+        match command {
+            QuickCheckCommand::Program { program, args } => {
+                assert_eq!(program, "cargo");
+                assert_eq!(args, vec!["check".to_string(), "--locked".to_string()]);
+            }
+            _ => panic!("expected cargo quick check"),
+        }
+    }
+
+    #[test]
+    fn quick_check_detects_python_compileall_from_pyproject() {
+        let root = tempdir().unwrap();
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n",
+        )
+        .unwrap();
+
+        let command = detect_quick_check_command(root.path()).expect("expected check command");
+        match command {
+            QuickCheckCommand::Program { program, args } => {
+                assert_eq!(program, "python");
+                assert_eq!(
+                    args,
+                    vec![
+                        "-m".to_string(),
+                        "compileall".to_string(),
+                        "-q".to_string(),
+                        ".".to_string()
+                    ]
+                );
+            }
+            _ => panic!("expected python quick check"),
         }
     }
 
