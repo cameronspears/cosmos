@@ -158,6 +158,8 @@ struct ImplementArgs {
     output: Option<PathBuf>,
     #[arg(long)]
     keep_sandboxes: bool,
+    #[arg(long)]
+    enforce: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1254,6 +1256,12 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
     println!("Executed: {}", report.executed_count);
     println!("Passed: {}", report.passed);
     println!("Report: {}", output_path.display());
+    if args.enforce && !report.passed {
+        return Err(anyhow!(
+            "Implementation harness quality gate failed. Report: {}",
+            output_path.display()
+        ));
+    }
     Ok(())
 }
 
@@ -2348,6 +2356,7 @@ edition = "2021"
             sample_size: 2,
             output: Some(output.clone()),
             keep_sandboxes: false,
+            enforce: false,
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
