@@ -1,0 +1,45 @@
+schema_version = 1
+
+# A small, pinned open-source corpus for stress-testing Cosmos' suggestion + implementation pipeline.
+# Keep refs pinned to commit SHAs for reproducibility.
+
+[[repo]]
+id = "rust-anyhow"
+git_url = "https://github.com/dtolnay/anyhow.git"
+ref = "80bfe291b16071c70f141e90e67e7032d966826b"
+
+[[repo]]
+id = "rust-thiserror"
+git_url = "https://github.com/dtolnay/thiserror.git"
+ref = "fc03a4c391f71b847d45fb64c46815ff53f9ceb2"
+
+[[repo]]
+id = "go-logrus"
+git_url = "https://github.com/sirupsen/logrus.git"
+ref = "c0382cd486bfc0d6a35f1cbc750d783b9f953784"
+
+[[repo]]
+id = "go-cobra"
+git_url = "https://github.com/spf13/cobra.git"
+ref = "61968e893eee2f27696c2fbc8e34fa5c4afaf7c4"
+
+[[repo]]
+id = "py-click"
+git_url = "https://github.com/pallets/click.git"
+ref = "cdab890e57a30a9f437b88ce9652f7bfce980c1f"
+
+[[repo]]
+id = "py-itsdangerous"
+git_url = "https://github.com/pallets/itsdangerous.git"
+ref = "672971d66a2ef9f85151e53283113f33d642dabd"
+
+[[repo]]
+id = "ts-create-t3-app"
+git_url = "https://github.com/t3-oss/create-t3-app.git"
+ref = "4709861f7e67a15564c0460c13e7b4b6cfcae40d"
+
+[[repo]]
+id = "ts-vitest"
+git_url = "https://github.com/vitest-dev/vitest.git"
+ref = "cee999bb51411ad91d737dcef9188fc3880b53b5"
+

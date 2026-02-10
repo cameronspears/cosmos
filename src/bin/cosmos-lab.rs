@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use cosmos_tui::cache::{
     Cache, SelfIterationCommandOutcome, SelfIterationRunRecord, SelfIterationSuggestionMetrics,
 };
 use cosmos_tui::context::WorkContext;
 use cosmos_tui::index::CodebaseIndex;
+use cosmos_tui::lab::corpus::{sync_repo, CorpusManifest};
 use cosmos_tui::lab::reliability::{
     classify_reliability_error, run_trial, run_trials, ReliabilityDiagnosticsSummary,
     ReliabilityTrialResult,
@@ -18,7 +19,8 @@ use cosmos_tui::suggest::llm::{
     ImplementationFinalizationStatus, ImplementationHarnessConfig, SuggestionQualityGateConfig,
 };
 use cosmos_tui::suggest::{
-    Priority, Suggestion, SuggestionKind, SuggestionSource, SuggestionValidationState,
+    Priority, Suggestion, SuggestionEvidenceRef, SuggestionKind, SuggestionSource,
+    SuggestionValidationState,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -160,6 +162,18 @@ struct ImplementArgs {
     keep_sandboxes: bool,
     #[arg(long)]
     enforce: bool,
+    /// Run implement over a corpus manifest instead of a primary+canary set of local repos.
+    #[arg(long)]
+    corpus_manifest: Option<PathBuf>,
+    /// Local corpus root where repos are cloned/checked out (defaults to .cosmos/corpus in the Cosmos repo).
+    #[arg(long)]
+    corpus_root: Option<PathBuf>,
+    /// Sync (clone/fetch/checkout) corpus repos before running implement (default true; disable with --sync=false).
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    sync: bool,
+    /// Limit how many enabled repos are used from the corpus manifest.
+    #[arg(long)]
+    max_repos: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,8 +273,23 @@ struct ImplementSuggestionResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct FailureCluster {
+    gate: String,
+    reason_code: String,
+    count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ImplementRepoReport {
     repo_path: PathBuf,
+    #[serde(default)]
+    repo_id: Option<String>,
+    #[serde(default)]
+    requested_ref: Option<String>,
+    #[serde(default)]
+    head_sha: Option<String>,
+    #[serde(default)]
+    subdir: Option<String>,
     sample_size: usize,
     candidate_count: usize,
     executed_count: usize,
@@ -276,6 +305,14 @@ struct ImplementRepoReport {
     syntax_failure_after_pass_rate: Option<f64>,
     #[serde(default)]
     mutation_on_failure_rate: Option<f64>,
+    #[serde(default)]
+    quick_check_detected: bool,
+    #[serde(default)]
+    quick_check_command: Option<String>,
+    #[serde(default)]
+    failure_reason_histogram: HashMap<String, usize>,
+    #[serde(default)]
+    top_failure_clusters: Vec<FailureCluster>,
     results: Vec<ImplementSuggestionResult>,
     passed: bool,
     #[serde(default)]
@@ -304,6 +341,10 @@ struct ImplementReport {
     syntax_failure_after_pass_rate: Option<f64>,
     #[serde(default)]
     mutation_on_failure_rate: Option<f64>,
+    #[serde(default)]
+    failure_reason_histogram: HashMap<String, usize>,
+    #[serde(default)]
+    top_failure_clusters: Vec<FailureCluster>,
     repo_reports: Vec<ImplementRepoReport>,
     passed: bool,
     notes: Vec<String>,
@@ -714,31 +755,128 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
         .context("Failed to read current working directory")?
         .canonicalize()
         .context("Failed to resolve current working directory")?;
-    let primary_target_repo = canonical_repo_path(&args.target_repo, "target repo")?;
-    let mut all_targets = vec![primary_target_repo.clone()];
-    for canary in &args.canary_repos {
-        match canonical_repo_path(canary, "canary repo") {
-            Ok(path) => {
-                if !all_targets.contains(&path) {
-                    all_targets.push(path);
-                }
-            }
-            Err(error) => {
-                return Err(anyhow!(
-                    "Failed to resolve canary repo '{}': {}",
-                    canary.display(),
-                    error
-                ));
-            }
-        }
-    }
     let sandbox_env = SandboxSession::env_overrides();
     let mut notes = Vec::new();
     let fake_mode = fake_implement_enabled();
-    let sample_size = args.sample_size.max(1);
+    let default_sample_size = args.sample_size.max(1);
     let mut repo_reports = Vec::new();
 
-    for (repo_idx, repo_root) in all_targets.iter().enumerate() {
+    #[derive(Debug, Clone)]
+    struct ImplementTarget {
+        repo_path: PathBuf,
+        repo_id: Option<String>,
+        requested_ref: Option<String>,
+        head_sha: Option<String>,
+        subdir: Option<String>,
+        sample_size: usize,
+    }
+
+    let mut targets: Vec<ImplementTarget> = Vec::new();
+    let primary_target_repo: PathBuf;
+    let canary_repos: Vec<PathBuf>;
+
+    if let Some(manifest_path) = args.corpus_manifest.as_ref() {
+        let manifest_path = if manifest_path.is_absolute() {
+            manifest_path.clone()
+        } else {
+            cosmos_repo.join(manifest_path)
+        };
+        let corpus_root = match args.corpus_root.as_ref() {
+            Some(root) if root.is_absolute() => root.clone(),
+            Some(root) => cosmos_repo.join(root),
+            None => cosmos_repo.join(".cosmos").join("corpus"),
+        };
+
+        let manifest = CorpusManifest::load(&manifest_path)?;
+        let mut specs = manifest
+            .repo
+            .into_iter()
+            .filter(|spec| spec.enabled)
+            .collect::<Vec<_>>();
+        if let Some(max) = args.max_repos {
+            specs.truncate(max);
+        }
+        if specs.is_empty() {
+            return Err(anyhow!(
+                "Corpus manifest '{}' contains no enabled repos",
+                manifest_path.display()
+            ));
+        }
+
+        for spec in specs {
+            let checkout = sync_repo(&spec, &corpus_root, args.sync)
+                .with_context(|| format!("Failed to sync corpus repo '{}'", spec.id))?;
+            let repo_path = canonical_repo_path(&checkout.local_path, "corpus repo")?;
+            targets.push(ImplementTarget {
+                repo_path,
+                repo_id: Some(checkout.id),
+                requested_ref: Some(checkout.requested_ref),
+                head_sha: Some(checkout.head_sha),
+                subdir: checkout.subdir,
+                sample_size: spec
+                    .sample_size_override
+                    .unwrap_or(default_sample_size)
+                    .max(1),
+            });
+        }
+
+        primary_target_repo = targets
+            .first()
+            .map(|target| target.repo_path.clone())
+            .unwrap_or_else(|| corpus_root.clone());
+        canary_repos = targets
+            .iter()
+            .skip(1)
+            .map(|target| target.repo_path.clone())
+            .collect();
+        notes.push(format!(
+            "Using corpus manifest '{}' (root '{}')",
+            manifest_path.display(),
+            corpus_root.display()
+        ));
+    } else {
+        primary_target_repo = canonical_repo_path(&args.target_repo, "target repo")?;
+        let mut all_targets = vec![primary_target_repo.clone()];
+        for canary in &args.canary_repos {
+            match canonical_repo_path(canary, "canary repo") {
+                Ok(path) => {
+                    if !all_targets.contains(&path) {
+                        all_targets.push(path);
+                    }
+                }
+                Err(error) => {
+                    return Err(anyhow!(
+                        "Failed to resolve canary repo '{}': {}",
+                        canary.display(),
+                        error
+                    ));
+                }
+            }
+        }
+
+        targets = all_targets
+            .into_iter()
+            .map(|repo_path| ImplementTarget {
+                repo_path,
+                repo_id: None,
+                requested_ref: None,
+                head_sha: None,
+                subdir: None,
+                sample_size: default_sample_size,
+            })
+            .collect();
+        canary_repos = targets
+            .iter()
+            .skip(1)
+            .map(|target| target.repo_path.clone())
+            .collect();
+    }
+
+    let mut global_reason_histogram: HashMap<String, usize> = HashMap::new();
+
+    for (repo_idx, target) in targets.iter().enumerate() {
+        let repo_root = &target.repo_path;
+        let sample_size = target.sample_size.max(1);
         let mut repo_notes = Vec::new();
         let repo_run_id = format!("{}-repo-{}", run_id, repo_idx + 1);
         let base_sandbox =
@@ -756,13 +894,28 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
             }
         }
 
-        let index = CodebaseIndex::new(base_sandbox.path()).with_context(|| {
+        let (analysis_root, path_prefix) = match target.subdir.as_deref() {
+            Some(subdir) => {
+                let root = base_sandbox.path().join(subdir);
+                if !root.exists() {
+                    return Err(anyhow!(
+                        "Corpus repo subdir '{}' does not exist in base sandbox {}",
+                        subdir,
+                        base_sandbox.path().display()
+                    ));
+                }
+                (root, Some(PathBuf::from(subdir)))
+            }
+            None => (base_sandbox.path().to_path_buf(), None),
+        };
+
+        let index = CodebaseIndex::new(&analysis_root).with_context(|| {
             format!(
                 "Failed to build codebase index for implement command in {}",
                 repo_root.display()
             )
         })?;
-        let context = WorkContext::load(base_sandbox.path()).with_context(|| {
+        let context = WorkContext::load(&analysis_root).with_context(|| {
             format!(
                 "Failed to load work context for implement command in {}",
                 repo_root.display()
@@ -781,7 +934,7 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
             });
 
             let suggest_result = run_fast_grounded_with_gate(
-                base_sandbox.path(),
+                &analysis_root,
                 &index,
                 &context,
                 None,
@@ -805,6 +958,17 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                 .take(sample_size)
                 .collect::<Vec<Suggestion>>()
         };
+        let sampled = if let Some(prefix) = path_prefix.as_ref() {
+            sampled
+                .into_iter()
+                .map(|mut suggestion| {
+                    prefix_suggestion_paths(&mut suggestion, prefix);
+                    suggestion
+                })
+                .collect::<Vec<_>>()
+        } else {
+            sampled
+        };
 
         let candidate_count = sampled.len();
         if candidate_count == 0 {
@@ -822,6 +986,9 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
         let mut blocking_residual_count = 0usize;
         let mut syntax_failure_after_pass_count = 0usize;
         let mut mutation_on_failure_count = 0usize;
+        let mut reason_histogram: HashMap<String, usize> = HashMap::new();
+        let mut quick_check_detected = false;
+        let mut quick_check_command: Option<String> = None;
 
         for (idx, suggestion) in sampled.into_iter().enumerate() {
             let case_run_id = format!("{}-case-{}", repo_run_id, idx + 1);
@@ -836,15 +1003,22 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
             })?;
 
             if !fake_mode {
-                if let Some(install_outcome) =
-                    prepare_target_workspace(case_sandbox.path(), &sandbox_env, &mut repo_notes)
-                {
-                    if !install_outcome.success {
-                        repo_notes.push(format!(
-                            "Dependency install failed in case sandbox {} for {}",
-                            idx + 1,
-                            repo_root.display()
-                        ));
+                let linked = link_node_modules_from_base(
+                    base_sandbox.path(),
+                    case_sandbox.path(),
+                    &mut repo_notes,
+                );
+                if !linked {
+                    if let Some(install_outcome) =
+                        prepare_target_workspace(case_sandbox.path(), &sandbox_env, &mut repo_notes)
+                    {
+                        if !install_outcome.success {
+                            repo_notes.push(format!(
+                                "Dependency install failed in case sandbox {} for {}",
+                                idx + 1,
+                                repo_root.display()
+                            ));
+                        }
                     }
                 }
             }
@@ -991,6 +1165,25 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                     total_ms_sum += result.diagnostics.total_ms;
                     total_cost_sum += result.diagnostics.total_cost_usd;
 
+                    for attempt in &result.diagnostics.attempts {
+                        if let Some(cmd) = attempt
+                            .quick_check_command
+                            .as_ref()
+                            .filter(|cmd| !cmd.trim().is_empty())
+                        {
+                            if !quick_check_detected {
+                                quick_check_detected = true;
+                                quick_check_command = Some(cmd.clone());
+                            }
+                        }
+
+                        for record in &attempt.fail_reason_records {
+                            let key = format!("{}:{}", record.gate, record.code);
+                            *reason_histogram.entry(key.clone()).or_insert(0) += 1;
+                            *global_reason_histogram.entry(key).or_insert(0) += 1;
+                        }
+                    }
+
                     case_result = ImplementSuggestionResult {
                         repo_path: repo_root.clone(),
                         suggestion_id: suggestion.id.to_string(),
@@ -1088,8 +1281,14 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
             mutation_on_failure_rate,
         );
 
+        let top_failure_clusters = top_failure_clusters(&reason_histogram, 3);
+
         repo_reports.push(ImplementRepoReport {
             repo_path: repo_root.clone(),
+            repo_id: target.repo_id.clone(),
+            requested_ref: target.requested_ref.clone(),
+            head_sha: target.head_sha.clone(),
+            subdir: target.subdir.clone(),
             sample_size,
             candidate_count,
             executed_count,
@@ -1102,6 +1301,10 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
             residual_blocking_rate,
             syntax_failure_after_pass_rate,
             mutation_on_failure_rate,
+            quick_check_detected,
+            quick_check_command,
+            failure_reason_histogram: reason_histogram,
+            top_failure_clusters,
             results,
             passed: repo_passed,
             notes: repo_notes,
@@ -1222,17 +1425,15 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
         notes.push("At least one repo-level implement gate failed".to_string());
     }
 
+    let overall_top_failure_clusters = top_failure_clusters(&global_reason_histogram, 3);
+
     let report = ImplementReport {
         timestamp: Utc::now(),
         run_id: run_id.clone(),
         cosmos_repo: cosmos_repo.clone(),
         primary_target_repo: primary_target_repo.clone(),
-        canary_repos: all_targets
-            .iter()
-            .filter(|path| **path != primary_target_repo)
-            .cloned()
-            .collect(),
-        sample_size,
+        canary_repos,
+        sample_size: default_sample_size,
         total_candidate_count,
         executed_count,
         passed_count,
@@ -1244,6 +1445,8 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
         residual_blocking_rate,
         syntax_failure_after_pass_rate,
         mutation_on_failure_rate,
+        failure_reason_histogram: global_reason_histogram,
+        top_failure_clusters: overall_top_failure_clusters,
         repo_reports,
         passed,
         notes,
@@ -1256,6 +1459,15 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
     println!("Executed: {}", report.executed_count);
     println!("Passed: {}", report.passed);
     println!("Report: {}", output_path.display());
+    if !report.top_failure_clusters.is_empty() {
+        println!("Top failure clusters:");
+        for cluster in &report.top_failure_clusters {
+            println!(
+                "- {}:{} ({})",
+                cluster.gate, cluster.reason_code, cluster.count
+            );
+        }
+    }
     if args.enforce && !report.passed {
         return Err(anyhow!(
             "Implementation harness quality gate failed. Report: {}",
@@ -1269,6 +1481,51 @@ fn repo_has_uncommitted_mutations(repo_root: &Path) -> bool {
     cosmos_tui::git_ops::current_status(repo_root)
         .map(|status| !(status.staged.is_empty() && status.modified.is_empty()))
         .unwrap_or(true)
+}
+
+fn prefix_suggestion_paths(suggestion: &mut Suggestion, prefix: &Path) {
+    suggestion.file = prefix.join(&suggestion.file);
+    suggestion.additional_files = suggestion
+        .additional_files
+        .iter()
+        .map(|path| prefix.join(path))
+        .collect();
+    suggestion.evidence_refs = suggestion
+        .evidence_refs
+        .iter()
+        .cloned()
+        .map(|mut evidence| {
+            evidence.file = prefix.join(&evidence.file);
+            evidence
+        })
+        .collect::<Vec<SuggestionEvidenceRef>>();
+}
+
+fn top_failure_clusters(
+    histogram: &HashMap<String, usize>,
+    max_clusters: usize,
+) -> Vec<FailureCluster> {
+    let mut items = histogram
+        .iter()
+        .map(|(key, count)| (key.clone(), *count))
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    items
+        .into_iter()
+        .take(max_clusters.max(1))
+        .map(|(key, count)| {
+            let (gate, reason_code) = key
+                .split_once(':')
+                .map(|(g, c)| (g.to_string(), c.to_string()))
+                .unwrap_or_else(|| (key, "unknown".to_string()));
+            FailureCluster {
+                gate,
+                reason_code,
+                count,
+            }
+        })
+        .collect()
 }
 
 fn implement_gate_passes(
@@ -1611,6 +1868,76 @@ fn evaluate_quality_gate(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsPackageManager {
+    Pnpm,
+    Yarn,
+    Npm,
+    Bun,
+}
+
+fn detect_js_package_manager(repo_root: &Path) -> Option<JsPackageManager> {
+    if repo_root.join("pnpm-lock.yaml").exists() {
+        return Some(JsPackageManager::Pnpm);
+    }
+    if repo_root.join("yarn.lock").exists() {
+        return Some(JsPackageManager::Yarn);
+    }
+    if repo_root.join("package-lock.json").exists()
+        || repo_root.join("npm-shrinkwrap.json").exists()
+    {
+        return Some(JsPackageManager::Npm);
+    }
+    if repo_root.join("bun.lockb").exists() || repo_root.join("bun.lock").exists() {
+        return Some(JsPackageManager::Bun);
+    }
+    None
+}
+
+fn link_node_modules_from_base(
+    base_sandbox: &Path,
+    case_sandbox: &Path,
+    notes: &mut Vec<String>,
+) -> bool {
+    if !case_sandbox.join("package.json").exists() {
+        return false;
+    }
+    let base_node_modules = base_sandbox.join("node_modules");
+    if !base_node_modules.exists() {
+        return false;
+    }
+    let case_node_modules = case_sandbox.join("node_modules");
+    if case_node_modules.exists() {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        match symlink(&base_node_modules, &case_node_modules) {
+            Ok(()) => {
+                notes.push("Linked node_modules from base sandbox".to_string());
+                true
+            }
+            Err(err) => {
+                notes.push(format!(
+                    "Failed to link node_modules from base sandbox: {}",
+                    err
+                ));
+                false
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = base_node_modules;
+        let _ = case_node_modules;
+        notes.push("Skipping node_modules link on non-unix platform".to_string());
+        false
+    }
+}
+
 fn prepare_target_workspace(
     sandbox_repo: &Path,
     env: &[(String, String)],
@@ -1620,21 +1947,77 @@ fn prepare_target_workspace(
     if sandbox_node_modules.exists() {
         return None;
     }
+    if !sandbox_repo.join("package.json").exists() {
+        return None;
+    }
 
-    let outcome = run_command(
-        &CommandSpec::new("target:install", sandbox_repo, "pnpm")
-            .args(&["install", "--prefer-offline"])
-            .timeout_secs(1_800)
-            .with_env_overrides(env),
-    );
+    let pm = detect_js_package_manager(sandbox_repo);
+    let run_install = |program: &str, args: &[&str]| -> SelfIterationCommandOutcome {
+        run_command(
+            &CommandSpec::new("target:install", sandbox_repo, program)
+                .args(args)
+                .timeout_secs(1_800)
+                .with_env_overrides(env),
+        )
+    };
+
+    let outcome = match pm {
+        Some(JsPackageManager::Pnpm) => {
+            notes.push("Installing JS dependencies via pnpm (ignore scripts)".to_string());
+            run_install("pnpm", &["install", "--prefer-offline", "--ignore-scripts"])
+        }
+        Some(JsPackageManager::Yarn) => {
+            notes.push("Installing JS dependencies via yarn (ignore scripts)".to_string());
+            let first = run_install("yarn", &["install", "--immutable", "--ignore-scripts"]);
+            if first.success {
+                first
+            } else {
+                let stderr_lower =
+                    format!("{}\n{}", first.stdout_tail, first.stderr_tail).to_ascii_lowercase();
+                let unknown_option = stderr_lower.contains("unknown option")
+                    || stderr_lower.contains("unrecognized option")
+                    || stderr_lower.contains("invalid option")
+                    || stderr_lower.contains("illegal option");
+                if unknown_option {
+                    notes.push(
+                        "Yarn immutable install unsupported; falling back to --frozen-lockfile"
+                            .to_string(),
+                    );
+                    run_install(
+                        "yarn",
+                        &["install", "--frozen-lockfile", "--ignore-scripts"],
+                    )
+                } else {
+                    first
+                }
+            }
+        }
+        Some(JsPackageManager::Npm) => {
+            notes.push("Installing JS dependencies via npm ci (ignore scripts)".to_string());
+            run_install("npm", &["ci", "--ignore-scripts"])
+        }
+        Some(JsPackageManager::Bun) => {
+            notes.push("Installing JS dependencies via bun (ignore scripts)".to_string());
+            run_install("bun", &["install", "--ignore-scripts"])
+        }
+        None => {
+            notes.push(
+                "No JS lockfile detected; skipping dependency install (node_modules missing)"
+                    .to_string(),
+            );
+            return None;
+        }
+    };
+
     if outcome.success {
-        notes.push("Installed target sandbox dependencies via pnpm install".to_string());
+        notes.push("Installed target sandbox dependencies".to_string());
     } else {
         notes.push(
             "Failed to install target sandbox dependencies; downstream target commands may fail"
                 .to_string(),
         );
     }
+
     Some(outcome)
 }
 
@@ -1906,6 +2289,10 @@ mod tests {
                 assert_eq!(args.sample_size, 5);
                 assert!(!args.keep_sandboxes);
                 assert_eq!(args.canary_repos.len(), 2);
+                assert!(args.corpus_manifest.is_none());
+                assert!(args.corpus_root.is_none());
+                assert!(args.sync);
+                assert!(args.max_repos.is_none());
             }
             _ => panic!("expected implement command defaults"),
         }
@@ -1940,6 +2327,38 @@ mod tests {
             Some(0.1),
             Some(0.0)
         ));
+    }
+
+    #[test]
+    fn js_package_manager_detection_prefers_lockfiles_in_expected_order() {
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("pnpm-lock.yaml"), "").unwrap();
+        std::fs::write(root.path().join("yarn.lock"), "").unwrap();
+        std::fs::write(root.path().join("package-lock.json"), "").unwrap();
+        std::fs::write(root.path().join("bun.lockb"), "").unwrap();
+
+        assert_eq!(
+            detect_js_package_manager(root.path()),
+            Some(JsPackageManager::Pnpm)
+        );
+
+        std::fs::remove_file(root.path().join("pnpm-lock.yaml")).unwrap();
+        assert_eq!(
+            detect_js_package_manager(root.path()),
+            Some(JsPackageManager::Yarn)
+        );
+
+        std::fs::remove_file(root.path().join("yarn.lock")).unwrap();
+        assert_eq!(
+            detect_js_package_manager(root.path()),
+            Some(JsPackageManager::Npm)
+        );
+
+        std::fs::remove_file(root.path().join("package-lock.json")).unwrap();
+        assert_eq!(
+            detect_js_package_manager(root.path()),
+            Some(JsPackageManager::Bun)
+        );
     }
 
     #[test]
@@ -2357,6 +2776,10 @@ edition = "2021"
             output: Some(output.clone()),
             keep_sandboxes: false,
             enforce: false,
+            corpus_manifest: None,
+            corpus_root: None,
+            sync: true,
+            max_repos: None,
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
