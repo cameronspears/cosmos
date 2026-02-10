@@ -11,6 +11,7 @@ use crate::lab::sandbox::SandboxSession;
 use crate::suggest::{Suggestion, SuggestionValidationState};
 use crate::util::{resolve_repo_path_allow_new, run_command_with_timeout, truncate};
 use chrono::Utc;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,7 @@ const REASON_QUICK_CHECK_FAILED: &str = "quick_check_failed";
 const REASON_BLOCKING_REVIEW_RESIDUAL: &str = "blocking_review_residual";
 const REASON_PLAIN_LANGUAGE_FAILURE: &str = "plain_language_failure";
 const REASON_NON_EMPTY_DIFF: &str = "non_empty_diff_violation";
+const REASON_BUDGET_EXCEEDED: &str = "budget_exceeded";
 const BINARY_FILE_EXTENSIONS: &[&str] = &[
     "7z", "avi", "bmp", "class", "db", "dll", "dylib", "exe", "gif", "gz", "ico", "jar", "jpeg",
     "jpg", "mov", "mp3", "mp4", "ogg", "otf", "pdf", "png", "so", "sqlite", "tar", "tgz", "ttf",
@@ -59,6 +61,7 @@ pub struct ImplementationHarnessConfig {
     pub max_total_ms: u64,
     pub max_total_cost_usd: f64,
     pub max_auto_review_fix_loops: usize,
+    pub max_auto_quick_check_fix_loops: usize,
     pub quick_checks_mode: ImplementationQuickChecksMode,
     pub review_blocking_severities: Vec<String>,
     pub max_changed_files: usize,
@@ -67,6 +70,7 @@ pub struct ImplementationHarnessConfig {
     pub quick_check_timeout_ms: u64,
     pub require_quick_check_detectable: bool,
     pub fail_on_reduced_confidence: bool,
+    pub quick_check_fix_requires_in_scope_error: bool,
 }
 
 impl Default for ImplementationHarnessConfig {
@@ -82,6 +86,7 @@ impl ImplementationHarnessConfig {
             max_total_ms: 45_000,
             max_total_cost_usd: 0.020,
             max_auto_review_fix_loops: 2,
+            max_auto_quick_check_fix_loops: 1,
             quick_checks_mode: ImplementationQuickChecksMode::StrictAuto,
             review_blocking_severities: vec!["critical".to_string(), "warning".to_string()],
             max_changed_files: 6,
@@ -90,6 +95,7 @@ impl ImplementationHarnessConfig {
             quick_check_timeout_ms: 120_000,
             require_quick_check_detectable: false,
             fail_on_reduced_confidence: false,
+            quick_check_fix_requires_in_scope_error: true,
         }
     }
 
@@ -98,6 +104,43 @@ impl ImplementationHarnessConfig {
         config.require_quick_check_detectable = true;
         config.fail_on_reduced_confidence = true;
         config
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImplementationBudget {
+    started_at: std::time::Instant,
+    max_total_ms: u64,
+    max_total_cost_usd: f64,
+}
+
+impl ImplementationBudget {
+    fn exhausted(&self, usage: &Option<Usage>) -> Option<ImplementationFailReason> {
+        let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+        if elapsed_ms >= self.max_total_ms {
+            return Some(ImplementationFailReason {
+                code: REASON_BUDGET_EXCEEDED.to_string(),
+                gate: "budget".to_string(),
+                message: format!(
+                    "Stopped to respect the configured time budget ({}ms elapsed; limit {}ms)",
+                    elapsed_ms, self.max_total_ms
+                ),
+            });
+        }
+
+        let cost_usd = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+        if cost_usd >= self.max_total_cost_usd {
+            return Some(ImplementationFailReason {
+                code: REASON_BUDGET_EXCEEDED.to_string(),
+                gate: "budget".to_string(),
+                message: format!(
+                    "Stopped to respect the configured cost budget (${:0.4} spent; limit ${:0.4})",
+                    cost_usd, self.max_total_cost_usd
+                ),
+            });
+        }
+
+        None
     }
 }
 
@@ -163,8 +206,18 @@ pub struct ImplementationAttemptDiagnostics {
     pub quick_check_command: Option<String>,
     #[serde(default)]
     pub quick_check_outcome: Option<ImplementationCommandOutcome>,
+    #[serde(default)]
+    pub quick_check_outcomes: Vec<ImplementationCommandOutcome>,
+    #[serde(default)]
+    pub quick_check_fix_loops: usize,
+    #[serde(default)]
+    pub quick_check_failure_summary: Option<String>,
     pub review_iterations: usize,
     pub review_blocking_remaining: usize,
+    #[serde(default)]
+    pub remaining_blocking_titles: Vec<String>,
+    #[serde(default)]
+    pub remaining_blocking_categories: Vec<String>,
     pub attempt_ms: u64,
     pub attempt_cost_usd: f64,
     #[serde(default)]
@@ -254,9 +307,6 @@ fn parse_path_line_col(raw: &str) -> Option<(String, u32, u32)> {
     if trimmed.is_empty() {
         return None;
     }
-    if !(trimmed.starts_with("./") || trimmed.starts_with("../") || trimmed.starts_with('/')) {
-        return None;
-    }
     let parts = trimmed.split(':').collect::<Vec<_>>();
     if parts.len() < 3 {
         return None;
@@ -269,12 +319,64 @@ fn parse_path_line_col(raw: &str) -> Option<(String, u32, u32)> {
         .ok()?;
     let file = parts[..parts.len().saturating_sub(2)].join(":");
     let file = file.trim_start_matches("./").to_string();
+    let ext_ok = Path::new(&file)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "rs" | "go" | "py"
+            )
+        })
+        .unwrap_or(false);
+    if !ext_ok {
+        return None;
+    }
     Some((file, line, col))
+}
+
+fn parse_tsc_error_line(raw: &str) -> Option<(String, u32, u32, String)> {
+    // Example:
+    //   src/foo.ts(12,34): error TS2304: Cannot find name 'X'.
+    let trimmed = raw.trim();
+    let re = Regex::new(
+        r"^\s*(?P<path>[^\s:(][^():]*)\((?P<line>\d+),(?P<col>\d+)\):\s*error\s*TS\d+:\s*(?P<msg>.+)$",
+    )
+    .ok()?;
+    let caps = re.captures(trimmed)?;
+    let path = caps.name("path")?.as_str();
+    let path = path.trim_start_matches("./").replace('\\', "/");
+    let line = caps.name("line")?.as_str().parse::<u32>().ok()?;
+    let col = caps.name("col")?.as_str().parse::<u32>().ok()?;
+    let msg = caps.name("msg").map(|m| m.as_str().trim().to_string())?;
+    let ext_ok = Path::new(&path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "rs" | "go" | "py"
+            )
+        })
+        .unwrap_or(false);
+    if !ext_ok {
+        return None;
+    }
+    Some((path, line, col, msg))
 }
 
 fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Option<String> {
     let stderr = strip_ansi_sequences(&outcome.stderr_tail);
     let stdout = strip_ansi_sequences(&outcome.stdout_tail);
+
+    for line in stderr.lines().chain(stdout.lines()).map(str::trim) {
+        if let Some((file, ln, col, msg)) = parse_tsc_error_line(line) {
+            return Some(format!(
+                "Quick check failed ({}): {}:{}:{} {}",
+                outcome.command, file, ln, col, msg
+            ));
+        }
+    }
 
     // Next.js TypeScript errors often look like:
     //   ./path/file.ts:12:34
@@ -330,6 +432,102 @@ fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Opti
     None
 }
 
+fn is_safe_relative_path(path: &Path) -> bool {
+    if path.is_absolute() {
+        return false;
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn normalize_quick_check_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.replace('\\', "/");
+    let normalized = normalized.trim_start_matches("./");
+    let path = PathBuf::from(normalized);
+    if !is_safe_relative_path(&path) {
+        return None;
+    }
+    Some(path)
+}
+
+fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Vec<PathBuf> {
+    let combined = format!(
+        "{}\n{}",
+        strip_ansi_sequences(&outcome.stderr_tail),
+        strip_ansi_sequences(&outcome.stdout_tail)
+    );
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    let tsc_re = Regex::new(
+        r"(?m)^\s*(?P<path>[^\s:(][^():]*)\((?P<line>\d+),(?P<col>\d+)\):\s*error\s*TS\d+:",
+    );
+    if let Ok(re) = tsc_re {
+        for caps in re.captures_iter(&combined) {
+            if let Some(path) = caps
+                .name("path")
+                .and_then(|m| normalize_quick_check_path(m.as_str()))
+            {
+                if seen.insert(path.clone()) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+
+    let colon_re = Regex::new(
+        r"(?m)^\s*(?:-->\s*)?(?:\./)?(?P<path>[^\s:]+?\.[A-Za-z0-9]+):(?P<line>\d+):(?P<col>\d+)",
+    );
+    if let Ok(re) = colon_re {
+        for caps in re.captures_iter(&combined) {
+            if let Some(path) = caps
+                .name("path")
+                .and_then(|m| normalize_quick_check_path(m.as_str()))
+            {
+                if seen.insert(path.clone()) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn format_quick_check_repair_modifier(
+    existing: Option<&str>,
+    error_summary: &str,
+    target: &Path,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(existing) = existing {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    parts.push(format!(
+        "Quick-check repair request:\n- Quick-check failure: {}\n- File to repair: {}\nRules:\n- Modify only this file.\n- Fix the reported error.\n- Keep the diff minimal and avoid unrelated reformatting.\n- Do not change behavior outside what's needed for the error.",
+        truncate(error_summary, 240),
+        target.display()
+    ));
+    parts.join("\n\n")
+}
+
 fn dedup_preserve_order(items: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -358,6 +556,19 @@ fn feedback_reasons_for_next_attempt(diag: &ImplementationAttemptDiagnostics) ->
         }
     } else {
         out.extend(diag.fail_reasons.clone());
+    }
+
+    if !diag.remaining_blocking_titles.is_empty() {
+        let titles = diag
+            .remaining_blocking_titles
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !titles.trim().is_empty() {
+            out.push(format!("Blocking findings remained: {}", titles));
+        }
     }
 
     dedup_preserve_order(out)
@@ -448,6 +659,11 @@ where
     })?;
     let run_id = Uuid::new_v4().to_string();
     let start = std::time::Instant::now();
+    let budget = ImplementationBudget {
+        started_at: start,
+        max_total_ms: config.max_total_ms,
+        max_total_cost_usd: config.max_total_cost_usd,
+    };
     let mut usage: Option<Usage> = None;
     let mut attempts = Vec::new();
     let mut pass_payload: Option<AttemptPassPayload> = None;
@@ -465,10 +681,8 @@ where
         .collect::<HashSet<_>>();
 
     for attempt_index in 1..=config.max_attempts.max(1) {
-        if start.elapsed().as_millis() as u64 >= config.max_total_ms {
-            break;
-        }
-        if usage.as_ref().map(|u| u.cost()).unwrap_or(0.0) >= config.max_total_cost_usd {
+        if let Some(reason) = budget.exhausted(&usage) {
+            feedback_reasons.push(reason.message);
             break;
         }
 
@@ -493,6 +707,8 @@ where
             &allowed_files,
             &blocking_severities,
             &config,
+            &budget,
+            &usage,
             attempt_index,
             &run_id,
             feedback.as_deref(),
@@ -599,6 +815,8 @@ async fn run_attempt(
     allowed_files: &HashSet<PathBuf>,
     blocking_severities: &HashSet<String>,
     config: &ImplementationHarnessConfig,
+    budget: &ImplementationBudget,
+    usage_so_far: &Option<Usage>,
     attempt_index: usize,
     run_id: &str,
     feedback: Option<&str>,
@@ -609,6 +827,52 @@ async fn run_attempt(
     let mut fail_reason_records = Vec::new();
     let mut usage: Option<Usage> = None;
     let mut notes = Vec::new();
+
+    if let Some(reason) = budget.exhausted(usage_so_far) {
+        notes.push("budget_exceeded".to_string());
+        push_fail_reason(
+            &mut fail_reasons,
+            &mut fail_reason_records,
+            &reason.gate,
+            &reason.code,
+            reason.message.clone(),
+        );
+        push_gate(
+            &mut gates,
+            "budget",
+            false,
+            reason.message,
+            Some(REASON_BUDGET_EXCEEDED),
+        );
+        let diag = ImplementationAttemptDiagnostics {
+            attempt_index,
+            passed: false,
+            fail_reasons,
+            fail_reason_records,
+            gates,
+            changed_files: Vec::new(),
+            changed_lines_total: 0,
+            changed_lines_by_file: HashMap::new(),
+            quick_check_status: ImplementationQuickCheckStatus::Unavailable,
+            quick_check_command: None,
+            quick_check_outcome: None,
+            quick_check_outcomes: Vec::new(),
+            quick_check_fix_loops: 0,
+            quick_check_failure_summary: None,
+            review_iterations: 0,
+            review_blocking_remaining: 0,
+            remaining_blocking_titles: Vec::new(),
+            remaining_blocking_categories: Vec::new(),
+            attempt_ms: attempt_start.elapsed().as_millis() as u64,
+            attempt_cost_usd: 0.0,
+            notes,
+        };
+        return Ok(AttemptExecution {
+            diagnostics: diag,
+            usage: None,
+            pass_payload: None,
+        });
+    }
 
     let sandbox_label = format!("apply-attempt-{}-{}", attempt_index, run_id);
     let sandbox = match SandboxSession::create(repo_root, run_id, &sandbox_label, false) {
@@ -641,8 +905,13 @@ async fn run_attempt(
                 quick_check_status: ImplementationQuickCheckStatus::Unavailable,
                 quick_check_command: None,
                 quick_check_outcome: None,
+                quick_check_outcomes: Vec::new(),
+                quick_check_fix_loops: 0,
+                quick_check_failure_summary: None,
                 review_iterations: 0,
                 review_blocking_remaining: 0,
+                remaining_blocking_titles: Vec::new(),
+                remaining_blocking_categories: Vec::new(),
                 attempt_ms: attempt_start.elapsed().as_millis() as u64,
                 attempt_cost_usd: 0.0,
                 notes,
@@ -665,6 +934,53 @@ async fn run_attempt(
                 )
             }
             _ => format!("Harness feedback from previous attempt:\n{}", feedback),
+        });
+    }
+
+    if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+        notes.push("budget_exceeded".to_string());
+        push_fail_reason(
+            &mut fail_reasons,
+            &mut fail_reason_records,
+            &reason.gate,
+            &reason.code,
+            reason.message.clone(),
+        );
+        push_gate(
+            &mut gates,
+            "budget",
+            false,
+            reason.message,
+            Some(REASON_BUDGET_EXCEEDED),
+        );
+        let _ = sandbox.cleanup();
+        let diag = ImplementationAttemptDiagnostics {
+            attempt_index,
+            passed: false,
+            fail_reasons,
+            fail_reason_records,
+            gates,
+            changed_files: Vec::new(),
+            changed_lines_total: 0,
+            changed_lines_by_file: HashMap::new(),
+            quick_check_status: ImplementationQuickCheckStatus::Unavailable,
+            quick_check_command: None,
+            quick_check_outcome: None,
+            quick_check_outcomes: Vec::new(),
+            quick_check_fix_loops: 0,
+            quick_check_failure_summary: None,
+            review_iterations: 0,
+            review_blocking_remaining: 0,
+            remaining_blocking_titles: Vec::new(),
+            remaining_blocking_categories: Vec::new(),
+            attempt_ms: attempt_start.elapsed().as_millis() as u64,
+            attempt_cost_usd: usage.as_ref().map(|u| u.cost()).unwrap_or(0.0),
+            notes,
+        };
+        return Ok(AttemptExecution {
+            diagnostics: diag,
+            usage,
+            pass_payload: None,
         });
     }
 
@@ -708,8 +1024,13 @@ async fn run_attempt(
                 quick_check_status: ImplementationQuickCheckStatus::Unavailable,
                 quick_check_command: None,
                 quick_check_outcome: None,
+                quick_check_outcomes: Vec::new(),
+                quick_check_fix_loops: 0,
+                quick_check_failure_summary: None,
                 review_iterations: 0,
                 review_blocking_remaining: 0,
+                remaining_blocking_titles: Vec::new(),
+                remaining_blocking_categories: Vec::new(),
                 attempt_ms: attempt_start.elapsed().as_millis() as u64,
                 attempt_cost_usd: 0.0,
                 notes,
@@ -723,6 +1044,53 @@ async fn run_attempt(
     };
 
     usage = merge_usage(usage, generated.usage.take());
+    if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+        notes.push("budget_exceeded".to_string());
+        push_fail_reason(
+            &mut fail_reasons,
+            &mut fail_reason_records,
+            &reason.gate,
+            &reason.code,
+            reason.message.clone(),
+        );
+        push_gate(
+            &mut gates,
+            "budget",
+            false,
+            reason.message,
+            Some(REASON_BUDGET_EXCEEDED),
+        );
+        let _ = sandbox.cleanup();
+        let attempt_cost_usd = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+        let diag = ImplementationAttemptDiagnostics {
+            attempt_index,
+            passed: false,
+            fail_reasons,
+            fail_reason_records,
+            gates,
+            changed_files: Vec::new(),
+            changed_lines_total: 0,
+            changed_lines_by_file: HashMap::new(),
+            quick_check_status: ImplementationQuickCheckStatus::Unavailable,
+            quick_check_command: None,
+            quick_check_outcome: None,
+            quick_check_outcomes: Vec::new(),
+            quick_check_fix_loops: 0,
+            quick_check_failure_summary: None,
+            review_iterations: 0,
+            review_blocking_remaining: 0,
+            remaining_blocking_titles: Vec::new(),
+            remaining_blocking_categories: Vec::new(),
+            attempt_ms: attempt_start.elapsed().as_millis() as u64,
+            attempt_cost_usd,
+            notes,
+        };
+        return Ok(AttemptExecution {
+            diagnostics: diag,
+            usage,
+            pass_payload: None,
+        });
+    }
     let mut repo_changes = collect_repo_changes(sandbox.path())?;
     repo_changes.files.sort();
     let scope_ok = deterministic_scope_gate(&repo_changes.files, allowed_files);
@@ -876,6 +1244,8 @@ async fn run_attempt(
 
     let mut review_iterations = 0usize;
     let mut blocking_remaining = 0usize;
+    let mut remaining_blocking_titles = Vec::new();
+    let mut remaining_blocking_categories = Vec::new();
     let mut fixed_titles = Vec::new();
     let mut files_changed_set = repo_changes.files.iter().cloned().collect::<HashSet<_>>();
     let review_result = run_review_gate(
@@ -887,14 +1257,50 @@ async fn run_attempt(
         repo_memory.clone(),
         blocking_severities,
         config.max_auto_review_fix_loops,
+        budget,
+        usage_so_far,
         &mut usage,
         &mut review_iterations,
         &mut blocking_remaining,
+        &mut remaining_blocking_titles,
+        &mut remaining_blocking_categories,
         &mut fixed_titles,
         &mut files_changed_set,
     )
     .await;
-    let review_ok = review_result.is_ok() && blocking_remaining == 0;
+    let mut review_budget_exceeded = false;
+    match &review_result {
+        Ok(()) => {}
+        Err(ReviewGateError::BudgetExceeded(reason)) => {
+            review_budget_exceeded = true;
+            notes.push("budget_exceeded".to_string());
+            push_fail_reason(
+                &mut fail_reasons,
+                &mut fail_reason_records,
+                &reason.gate,
+                &reason.code,
+                reason.message.clone(),
+            );
+            push_gate(
+                &mut gates,
+                "budget",
+                false,
+                reason.message.clone(),
+                Some(REASON_BUDGET_EXCEEDED),
+            );
+        }
+        Err(ReviewGateError::Failed(err)) => {
+            push_fail_reason(
+                &mut fail_reasons,
+                &mut fail_reason_records,
+                "review",
+                REASON_BLOCKING_REVIEW_RESIDUAL,
+                err.clone(),
+            );
+        }
+    }
+
+    let review_ok = !review_budget_exceeded && blocking_remaining == 0 && review_result.is_ok();
     push_gate(
         &mut gates,
         "review",
@@ -913,19 +1319,13 @@ async fn run_attempt(
         },
         if review_ok {
             None
+        } else if review_budget_exceeded {
+            Some(REASON_BUDGET_EXCEEDED)
         } else {
             Some(REASON_BLOCKING_REVIEW_RESIDUAL)
         },
     );
-    if let Err(err) = review_result {
-        push_fail_reason(
-            &mut fail_reasons,
-            &mut fail_reason_records,
-            "review",
-            REASON_BLOCKING_REVIEW_RESIDUAL,
-            err,
-        );
-    } else if blocking_remaining > 0 {
+    if !review_budget_exceeded && review_result.is_ok() && blocking_remaining > 0 {
         push_fail_reason(
             &mut fail_reasons,
             &mut fail_reason_records,
@@ -938,7 +1338,7 @@ async fn run_attempt(
         );
     }
 
-    let mut final_changed_files = files_changed_set.into_iter().collect::<Vec<_>>();
+    let mut final_changed_files = files_changed_set.iter().cloned().collect::<Vec<_>>();
     final_changed_files.sort();
     let binary_ok = match binary_write_gate(sandbox.path(), &final_changed_files) {
         Ok(()) => true,
@@ -994,13 +1394,276 @@ async fn run_attempt(
         );
     }
 
-    let (quick_status, quick_command, quick_outcome) = run_quick_checks(
+    let mut quick_check_outcomes: Vec<ImplementationCommandOutcome> = Vec::new();
+    let mut quick_check_fix_loops = 0usize;
+    let mut quick_check_failure_summary: Option<String> = None;
+    let (mut quick_status, mut quick_command, mut quick_outcome) = run_quick_checks(
         sandbox.path(),
         Some(repo_root),
         &mut notes,
         config.quick_checks_mode,
         config.quick_check_timeout_ms,
     )?;
+
+    if let Some(outcome) = quick_outcome.clone() {
+        quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+        quick_check_outcomes.push(outcome);
+    }
+
+    let eligible_for_quick_check_repair = quick_status == ImplementationQuickCheckStatus::Failed
+        && config.max_auto_quick_check_fix_loops > 0
+        && fail_reasons.is_empty();
+    if eligible_for_quick_check_repair {
+        for loop_index in 0..config.max_auto_quick_check_fix_loops {
+            let Some(outcome) = quick_outcome.as_ref() else {
+                break;
+            };
+            let candidates = extract_quick_check_error_paths(outcome);
+            let target = candidates.into_iter().find(|path| {
+                if config.quick_check_fix_requires_in_scope_error {
+                    allowed_files.contains(path)
+                } else {
+                    allowed_files.contains(path) || files_changed_set.contains(path)
+                }
+            });
+            let Some(target) = target else {
+                notes.push("quick_check_repair_skipped_no_in_scope_error_path".to_string());
+                break;
+            };
+
+            quick_check_fix_loops = loop_index + 1;
+            notes.push(format!("quick_check_fix_loop_{}", quick_check_fix_loops));
+
+            if let Some(reason) =
+                budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone()))
+            {
+                notes.push("budget_exceeded".to_string());
+                push_fail_reason(
+                    &mut fail_reasons,
+                    &mut fail_reason_records,
+                    &reason.gate,
+                    &reason.code,
+                    reason.message.clone(),
+                );
+                push_gate(
+                    &mut gates,
+                    "budget",
+                    false,
+                    reason.message,
+                    Some(REASON_BUDGET_EXCEEDED),
+                );
+                break;
+            }
+
+            let resolved = resolve_repo_path_allow_new(sandbox.path(), &target).map_err(|e| {
+                anyhow::anyhow!("Unsafe quick-check repair path {}: {}", target.display(), e)
+            })?;
+            let current_content = match std::fs::read_to_string(&resolved.absolute) {
+                Ok(content) => content,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    push_fail_reason(
+                        &mut fail_reasons,
+                        &mut fail_reason_records,
+                        "quick_check",
+                        REASON_QUICK_CHECK_FAILED,
+                        format!(
+                            "Quick check auto-repair failed reading {}: {}",
+                            target.display(),
+                            truncate(&e.to_string(), 180)
+                        ),
+                    );
+                    break;
+                }
+            };
+            let is_new_file = !resolved.absolute.exists() || current_content.trim().is_empty();
+
+            let mut repair_preview = feedback_preview.clone();
+            let error_summary = quick_check_failure_summary
+                .as_deref()
+                .unwrap_or("Quick checks failed");
+            repair_preview.modifier = Some(format_quick_check_repair_modifier(
+                feedback_preview.modifier.as_deref(),
+                error_summary,
+                &target,
+            ));
+
+            ensure_implementation_model(IMPLEMENTATION_MODEL)?;
+            let fix = match generate_fix_content_with_model(
+                &target,
+                &current_content,
+                suggestion,
+                &repair_preview,
+                repo_memory.clone(),
+                is_new_file,
+                IMPLEMENTATION_MODEL,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    push_fail_reason(
+                        &mut fail_reasons,
+                        &mut fail_reason_records,
+                        "quick_check",
+                        REASON_QUICK_CHECK_FAILED,
+                        format!(
+                            "Quick check auto-repair failed: {}",
+                            truncate(&err.to_string(), 180)
+                        ),
+                    );
+                    break;
+                }
+            };
+            usage = merge_usage(usage, fix.usage.clone());
+            if let Some(reason) =
+                budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone()))
+            {
+                notes.push("budget_exceeded".to_string());
+                push_fail_reason(
+                    &mut fail_reasons,
+                    &mut fail_reason_records,
+                    &reason.gate,
+                    &reason.code,
+                    reason.message.clone(),
+                );
+                push_gate(
+                    &mut gates,
+                    "budget",
+                    false,
+                    reason.message,
+                    Some(REASON_BUDGET_EXCEEDED),
+                );
+                break;
+            }
+
+            if let Some(parent) = resolved.absolute.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&resolved.absolute, &fix.new_content).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed writing quick-check repair {}: {}",
+                    target.display(),
+                    e
+                )
+            })?;
+            files_changed_set.insert(target.clone());
+            generated
+                .modified_areas_by_file
+                .entry(target.clone())
+                .or_default()
+                .extend(fix.modified_areas.clone());
+
+            final_changed_files = files_changed_set.iter().cloned().collect::<Vec<_>>();
+            final_changed_files.sort();
+
+            if let Err(err) = syntax_gate(sandbox.path(), &final_changed_files) {
+                push_fail_reason(
+                    &mut fail_reasons,
+                    &mut fail_reason_records,
+                    "post_review_syntax",
+                    REASON_SYNTAX_VIOLATION,
+                    err,
+                );
+                break;
+            }
+
+            let initial_review_iterations = review_iterations;
+            let mut rerun_review_iterations = 0usize;
+            let mut rerun_blocking_remaining = 0usize;
+            let mut rerun_remaining_titles = Vec::new();
+            let mut rerun_remaining_categories = Vec::new();
+            let review_rerun = run_review_gate(
+                sandbox.path(),
+                suggestion,
+                &generated.description,
+                &generated.old_contents,
+                &final_changed_files,
+                repo_memory.clone(),
+                blocking_severities,
+                config.max_auto_review_fix_loops,
+                budget,
+                usage_so_far,
+                &mut usage,
+                &mut rerun_review_iterations,
+                &mut rerun_blocking_remaining,
+                &mut rerun_remaining_titles,
+                &mut rerun_remaining_categories,
+                &mut fixed_titles,
+                &mut files_changed_set,
+            )
+            .await;
+            match review_rerun {
+                Ok(()) => {}
+                Err(ReviewGateError::BudgetExceeded(reason)) => {
+                    notes.push("budget_exceeded".to_string());
+                    push_fail_reason(
+                        &mut fail_reasons,
+                        &mut fail_reason_records,
+                        &reason.gate,
+                        &reason.code,
+                        reason.message.clone(),
+                    );
+                    push_gate(
+                        &mut gates,
+                        "budget",
+                        false,
+                        reason.message,
+                        Some(REASON_BUDGET_EXCEEDED),
+                    );
+                    break;
+                }
+                Err(ReviewGateError::Failed(err)) => {
+                    push_fail_reason(
+                        &mut fail_reasons,
+                        &mut fail_reason_records,
+                        "review",
+                        REASON_BLOCKING_REVIEW_RESIDUAL,
+                        err,
+                    );
+                    break;
+                }
+            }
+
+            final_changed_files = files_changed_set.iter().cloned().collect::<Vec<_>>();
+            final_changed_files.sort();
+
+            review_iterations = initial_review_iterations + rerun_review_iterations;
+            blocking_remaining = rerun_blocking_remaining;
+            remaining_blocking_titles = rerun_remaining_titles;
+            remaining_blocking_categories = rerun_remaining_categories;
+
+            if blocking_remaining > 0 {
+                push_fail_reason(
+                    &mut fail_reasons,
+                    &mut fail_reason_records,
+                    "review",
+                    REASON_BLOCKING_REVIEW_RESIDUAL,
+                    "Blocking review findings appeared after quick-check repair",
+                );
+                break;
+            }
+
+            let (status, command, outcome) = run_quick_checks(
+                sandbox.path(),
+                Some(repo_root),
+                &mut notes,
+                config.quick_checks_mode,
+                config.quick_check_timeout_ms,
+            )?;
+            quick_status = status;
+            quick_command = command;
+            quick_outcome = outcome;
+            if let Some(outcome) = quick_outcome.clone() {
+                quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+                quick_check_outcomes.push(outcome);
+            }
+            if quick_status != ImplementationQuickCheckStatus::Failed {
+                break;
+            }
+        }
+    }
+
     if quick_status == ImplementationQuickCheckStatus::Failed {
         push_fail_reason(
             &mut fail_reasons,
@@ -1107,8 +1770,13 @@ async fn run_attempt(
         quick_check_status: quick_status,
         quick_check_command: quick_command,
         quick_check_outcome: quick_outcome,
+        quick_check_outcomes,
+        quick_check_fix_loops,
+        quick_check_failure_summary,
         review_iterations,
         review_blocking_remaining: blocking_remaining,
+        remaining_blocking_titles,
+        remaining_blocking_categories,
         attempt_ms: attempt_start.elapsed().as_millis() as u64,
         attempt_cost_usd,
         notes,
@@ -1408,6 +2076,12 @@ fn binary_write_gate(repo_root: &Path, changed_files: &[PathBuf]) -> Result<(), 
     Ok(())
 }
 
+#[derive(Debug)]
+enum ReviewGateError {
+    BudgetExceeded(ImplementationFailReason),
+    Failed(String),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_review_gate(
     sandbox_root: &Path,
@@ -1418,20 +2092,29 @@ async fn run_review_gate(
     repo_memory: Option<String>,
     blocking_severities: &HashSet<String>,
     max_fix_loops: usize,
+    budget: &ImplementationBudget,
+    usage_so_far: &Option<Usage>,
     usage: &mut Option<Usage>,
     review_iterations: &mut usize,
     blocking_remaining: &mut usize,
+    remaining_blocking_titles: &mut Vec<String>,
+    remaining_blocking_categories: &mut Vec<String>,
     fixed_titles: &mut Vec<String>,
     files_changed_set: &mut HashSet<PathBuf>,
-) -> Result<(), String> {
+) -> Result<(), ReviewGateError> {
     if changed_files.is_empty() {
         *blocking_remaining = 0;
         return Ok(());
     }
 
     let mut files_with_content =
-        build_files_with_content(sandbox_root, old_contents, changed_files)?;
+        build_files_with_content(sandbox_root, old_contents, changed_files)
+            .map_err(ReviewGateError::Failed)?;
     let mut iteration = 1u32;
+
+    if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+        return Err(ReviewGateError::BudgetExceeded(reason));
+    }
     let mut review = verify_changes(
         &files_with_content,
         iteration,
@@ -1447,24 +2130,61 @@ async fn run_review_gate(
         }),
     )
     .await
-    .map_err(|e| format!("Review failed: {}", truncate(&e.to_string(), 180)))?;
+    .map_err(|e| {
+        ReviewGateError::Failed(format!("Review failed: {}", truncate(&e.to_string(), 180)))
+    })?;
     *usage = merge_usage(usage.take(), review.usage.clone());
 
     let mut blocking = blocking_findings(&review.findings, blocking_severities);
+    if blocking.len() > 6 {
+        *blocking_remaining = blocking.len();
+        *remaining_blocking_titles = dedup_preserve_order(
+            blocking
+                .iter()
+                .map(|finding| finding.title.clone())
+                .collect(),
+        );
+        *remaining_blocking_categories = dedup_preserve_order(
+            blocking
+                .iter()
+                .map(|finding| finding.category.clone())
+                .collect(),
+        );
+        return Err(ReviewGateError::Failed(
+            "Review found too many blocking issues to auto-fix safely within budget (more than 6)"
+                .to_string(),
+        ));
+    }
+    if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+        return Err(ReviewGateError::BudgetExceeded(reason));
+    }
+
     *review_iterations = 1;
     while !blocking.is_empty() && (*review_iterations - 1) < max_fix_loops {
+        if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+            return Err(ReviewGateError::BudgetExceeded(reason));
+        }
+
         let grouped = group_findings_by_file(&blocking, changed_files);
         if grouped.is_empty() {
             break;
         }
         for (path, findings) in grouped {
-            let resolved = resolve_repo_path_allow_new(sandbox_root, &path)
-                .map_err(|e| format!("Unsafe review fix path {}: {}", path.display(), e))?;
-            let current_content = std::fs::read_to_string(&resolved.absolute)
-                .map_err(|e| format!("Failed reading {}: {}", path.display(), e))?;
+            if let Some(reason) =
+                budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone()))
+            {
+                return Err(ReviewGateError::BudgetExceeded(reason));
+            }
+            let resolved = resolve_repo_path_allow_new(sandbox_root, &path).map_err(|e| {
+                ReviewGateError::Failed(format!("Unsafe review fix path {}: {}", path.display(), e))
+            })?;
+            let current_content = std::fs::read_to_string(&resolved.absolute).map_err(|e| {
+                ReviewGateError::Failed(format!("Failed reading {}: {}", path.display(), e))
+            })?;
             let original = old_contents.get(&path).map(String::as_str);
-            ensure_implementation_model(IMPLEMENTATION_MODEL)
-                .map_err(|e| format!("Implementation model policy check failed: {}", e))?;
+            ensure_implementation_model(IMPLEMENTATION_MODEL).map_err(|e| {
+                ReviewGateError::Failed(format!("Implementation model policy check failed: {}", e))
+            })?;
             let fix = fix_review_findings_with_model(
                 &resolved.absolute,
                 &current_content,
@@ -1476,10 +2196,25 @@ async fn run_review_gate(
                 IMPLEMENTATION_MODEL,
             )
             .await
-            .map_err(|e| format!("Review auto-fix failed: {}", truncate(&e.to_string(), 180)))?;
+            .map_err(|e| {
+                ReviewGateError::Failed(format!(
+                    "Review auto-fix failed: {}",
+                    truncate(&e.to_string(), 180)
+                ))
+            })?;
             *usage = merge_usage(usage.take(), fix.usage.clone());
-            std::fs::write(&resolved.absolute, &fix.new_content)
-                .map_err(|e| format!("Failed writing review fix {}: {}", path.display(), e))?;
+            if let Some(reason) =
+                budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone()))
+            {
+                return Err(ReviewGateError::BudgetExceeded(reason));
+            }
+            std::fs::write(&resolved.absolute, &fix.new_content).map_err(|e| {
+                ReviewGateError::Failed(format!(
+                    "Failed writing review fix {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
             files_changed_set.insert(path.clone());
             for finding in findings {
                 fixed_titles.push(finding.title);
@@ -1489,15 +2224,39 @@ async fn run_review_gate(
         iteration += 1;
         *review_iterations += 1;
         let review_files = files_changed_set.iter().cloned().collect::<Vec<_>>();
-        files_with_content = build_files_with_content(sandbox_root, old_contents, &review_files)?;
+        files_with_content = build_files_with_content(sandbox_root, old_contents, &review_files)
+            .map_err(ReviewGateError::Failed)?;
+        if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+            return Err(ReviewGateError::BudgetExceeded(reason));
+        }
         review = verify_changes(&files_with_content, iteration, fixed_titles, None)
             .await
-            .map_err(|e| format!("Re-review failed: {}", truncate(&e.to_string(), 180)))?;
+            .map_err(|e| {
+                ReviewGateError::Failed(format!(
+                    "Re-review failed: {}",
+                    truncate(&e.to_string(), 180)
+                ))
+            })?;
         *usage = merge_usage(usage.take(), review.usage.clone());
+        if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+            return Err(ReviewGateError::BudgetExceeded(reason));
+        }
         blocking = blocking_findings(&review.findings, blocking_severities);
     }
 
     *blocking_remaining = blocking.len();
+    *remaining_blocking_titles = dedup_preserve_order(
+        blocking
+            .iter()
+            .map(|finding| finding.title.clone())
+            .collect(),
+    );
+    *remaining_blocking_categories = dedup_preserve_order(
+        blocking
+            .iter()
+            .map(|finding| finding.category.clone())
+            .collect(),
+    );
     Ok(())
 }
 
@@ -2446,5 +3205,62 @@ diff --git a/a.rs b/a.rs
         assert!(summary.contains("npm run build --silent"));
         assert!(summary.contains("lib/constants.ts:60:44"));
         assert!(summary.contains("Cannot find name 'FontPreferenceId'"));
+    }
+
+    #[test]
+    fn quick_check_failure_summary_extracts_tsc_format() {
+        let outcome = ImplementationCommandOutcome {
+            command: "pnpm type-check".to_string(),
+            duration_ms: 0,
+            success: false,
+            timed_out: false,
+            exit_code: Some(2),
+            stdout_tail: "src/foo.ts(12,34): error TS2304: Cannot find name 'X'.\n".to_string(),
+            stderr_tail: String::new(),
+        };
+
+        let summary = summarize_quick_check_failure(&outcome).expect("expected summary");
+        assert!(summary.contains("pnpm type-check"));
+        assert!(summary.contains("src/foo.ts:12:34"));
+        assert!(summary.contains("Cannot find name 'X'"));
+    }
+
+    #[test]
+    fn quick_check_error_path_extraction_handles_multiple_formats_and_rejects_traversal() {
+        let outcome = ImplementationCommandOutcome {
+            command: "pnpm type-check".to_string(),
+            duration_ms: 0,
+            success: false,
+            timed_out: false,
+            exit_code: Some(2),
+            stdout_tail: "src/foo.ts(12,34): error TS2304: Cannot find name 'X'.\n../oops.ts(1,1): error TS2304: bad\n"
+                .to_string(),
+            stderr_tail: "--> src/main.rs:7:9\nerror[E0425]: cannot find value\n".to_string(),
+        };
+
+        let paths = extract_quick_check_error_paths(&outcome);
+        assert!(paths.contains(&PathBuf::from("src/foo.ts")), "{:?}", paths);
+        assert!(paths.contains(&PathBuf::from("src/main.rs")), "{:?}", paths);
+        assert!(!paths.contains(&PathBuf::from("../oops.ts")), "{:?}", paths);
+    }
+
+    #[test]
+    fn budget_exhausted_triggers_cost_gate() {
+        let budget = ImplementationBudget {
+            started_at: std::time::Instant::now(),
+            max_total_ms: u64::MAX,
+            max_total_cost_usd: 0.01,
+        };
+        let usage = Usage {
+            cost: Some(0.02),
+            ..Usage::default()
+        };
+
+        let reason = budget
+            .exhausted(&Some(usage))
+            .expect("expected budget to be exhausted");
+        assert_eq!(reason.gate, "budget");
+        assert_eq!(reason.code, REASON_BUDGET_EXCEEDED);
+        assert!(reason.message.to_ascii_lowercase().contains("cost"));
     }
 }
