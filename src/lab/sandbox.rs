@@ -137,7 +137,13 @@ impl SandboxSession {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("run");
-        let branch = format!("codex/self-iterate-{}", sanitize_branch_fragment(run_id));
+        let label = self
+            .worktree_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("worktree");
+        let fragment = format!("{}-{}", run_id, label);
+        let branch = format!("codex/self-iterate-{}", sanitize_branch_fragment(&fragment));
 
         let switch_result = run_git(
             &self.worktree_path,
@@ -219,7 +225,7 @@ fn sanitize_branch_fragment(input: &str) -> String {
     while out.contains("--") {
         out = out.replace("--", "-");
     }
-    out.trim_matches('-').chars().take(24).collect::<String>()
+    out.trim_matches('-').chars().take(80).collect::<String>()
 }
 
 #[cfg(test)]

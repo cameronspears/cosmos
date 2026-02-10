@@ -52,6 +52,27 @@ jobs:
             target/perf-metrics.env
             target/criterion
 
+  harness-quality-gate:
+    name: Harness Quality Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run deterministic harness gate tests
+        env:
+          COSMOS_LAB_FAKE_IMPLEMENT: "1"
+          COSMOS_LAB_FAKE_RELIABILITY: "1"
+        run: |
+          cargo test --locked implement_smoke_writes_multi_repo_report_in_fake_mode
+          cargo test --locked implement_gate_requires_elite_thresholds
+          cargo test --locked syntax_gate_rejects_parse_broken_outputs
+
   # Test install scripts on all platforms
   install-script-test:
     name: Install Script (${{ matrix.os }})

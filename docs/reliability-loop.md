@@ -126,6 +126,16 @@ cargo run --bin cosmos-lab -- reliability \
   --verify-sample 4
 ```
 
+### Implementation Harness Command (Primary + Canaries)
+
+```bash
+cargo run --bin cosmos-lab -- implement \
+  --target-repo /Users/cam/WebstormProjects/gielinor-gains \
+  --canary-repo /Users/cam/WebstormProjects/stole-builder \
+  --canary-repo /Users/cam/WebstormProjects/Jira-Ingress-Intel \
+  --sample-size 5
+```
+
 ### Reliability Trials With Rolling Quality Gate
 
 ```bash
@@ -216,6 +226,15 @@ Use these targets to keep tuning decisions objective:
 - Contradictions guardrail: keep `preview_contradicted_count` low and non-trending.
 - Evidence anchor quality: keep `evidence_line1_ratio <= 0.25`.
 - Evidence diversity: no single source family should dominate without rationale.
+
+Implementation harness elite targets:
+- `pass_rate >= 0.90`
+- `first_attempt_pass_rate >= 0.70`
+- `avg_total_cost_usd <= 0.015`
+- `avg_total_ms <= 35000`
+- `residual_blocking_rate == 0`
+- `syntax_failure_after_pass_rate == 0`
+- `mutation_on_failure_rate == 0`
 
 ## Failure Classification Playbook
 

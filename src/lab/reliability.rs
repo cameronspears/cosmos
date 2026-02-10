@@ -327,8 +327,10 @@ pub fn aggregate_trial_metrics(
         return SelfIterationSuggestionMetrics::default();
     }
 
-    let mut aggregated = SelfIterationSuggestionMetrics::default();
-    aggregated.trials = metrics.len();
+    let mut aggregated = SelfIterationSuggestionMetrics {
+        trials: metrics.len(),
+        ..SelfIterationSuggestionMetrics::default()
+    };
 
     let mut weighted_line1_numerator = 0.0f64;
     let mut weighted_line1_denominator = 0usize;

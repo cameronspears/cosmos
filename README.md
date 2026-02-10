@@ -51,7 +51,7 @@ This is your chance to understand the change and decide whether to proceed.
 
 ### 2. Verify [and Apply]
 
-Once you approve, Cosmos creates a new git branch and applies the fix. Your main branch stays untouched. The fix is generated as search-and-replace edits and applied to update file contents, keeping changes focused.
+Once you approve, Cosmos runs a strict implementation harness in isolated sandboxes. Only when a candidate passes deterministic safety gates, syntax gates, quick checks, and adversarial review does Cosmos create a fix branch and apply the approved files. Your main branch stays untouched.
 
 ### 3. Review
 
@@ -113,6 +113,16 @@ Cosmos uses [OpenRouter](https://openrouter.ai) for AI access. You only pay for 
 **To change your key later:** Run `cosmos --setup`
 
 **Costs:** Results are cached locally to minimize repeat calls. Monitor usage at [openrouter.ai/usage](https://openrouter.ai/usage).
+
+### Provider Routing (Elite Baseline)
+
+Cosmos uses OpenRouter's provider routing to strongly prefer **Cerebras fp16** for the Speed-tier model (`openai/gpt-oss-120b`). If Cerebras is unavailable, Cosmos falls back in this order:
+
+1. `cerebras/fp16`
+2. `crusoe/bf16`
+3. `deepinfra/turbo`
+
+This is intentional: it makes Cosmos more consistent and dependable. It can increase costs, and that's an explicit tradeoff.
 
 ---
 
@@ -259,6 +269,13 @@ cargo run --bin cosmos-lab -- validate --mode full
 
 # Reliability trials only
 cargo run --bin cosmos-lab -- reliability --trials 3
+
+# Implementation harness quality (primary + canaries)
+cargo run --bin cosmos-lab -- implement \
+  --target-repo /Users/cam/WebstormProjects/gielinor-gains \
+  --canary-repo /Users/cam/WebstormProjects/stole-builder \
+  --canary-repo /Users/cam/WebstormProjects/Jira-Ingress-Intel \
+  --sample-size 5
 ```
 
 Recommended cadence: run fast validation each iteration, run full validation every 3 successful fast loops (or before major merges), and run reliability trials when tuning suggestion quality.

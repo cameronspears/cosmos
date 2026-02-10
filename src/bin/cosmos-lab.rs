@@ -4,12 +4,22 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use cosmos_tui::cache::{
     Cache, SelfIterationCommandOutcome, SelfIterationRunRecord, SelfIterationSuggestionMetrics,
 };
+use cosmos_tui::context::WorkContext;
+use cosmos_tui::index::CodebaseIndex;
 use cosmos_tui::lab::reliability::{
     classify_reliability_error, run_trial, run_trials, ReliabilityDiagnosticsSummary,
     ReliabilityTrialResult,
 };
 use cosmos_tui::lab::runner::{run_command, CommandSpec};
 use cosmos_tui::lab::sandbox::SandboxSession;
+use cosmos_tui::suggest::llm::{
+    build_fix_preview_from_validated_suggestion, implement_validated_suggestion_with_harness,
+    record_harness_finalization_outcome, run_fast_grounded_with_gate,
+    ImplementationFinalizationStatus, ImplementationHarnessConfig, SuggestionQualityGateConfig,
+};
+use cosmos_tui::suggest::{
+    Priority, Suggestion, SuggestionKind, SuggestionSource, SuggestionValidationState,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -17,6 +27,8 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const DEFAULT_TARGET_REPO: &str = "/Users/cam/WebstormProjects/gielinor-gains";
+const DEFAULT_CANARY_REPO_1: &str = "/Users/cam/WebstormProjects/stole-builder";
+const DEFAULT_CANARY_REPO_2: &str = "/Users/cam/WebstormProjects/Jira-Ingress-Intel";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -32,6 +44,7 @@ struct Cli {
 enum Commands {
     Validate(ValidateArgs),
     Reliability(ReliabilityArgs),
+    Implement(ImplementArgs),
 }
 
 #[derive(Args, Debug)]
@@ -130,6 +143,23 @@ struct ReliabilityArgs {
     gate_source: GateSource,
 }
 
+#[derive(Args, Debug)]
+struct ImplementArgs {
+    #[arg(long, default_value = DEFAULT_TARGET_REPO)]
+    target_repo: PathBuf,
+    #[arg(
+        long = "canary-repo",
+        default_values = [DEFAULT_CANARY_REPO_1, DEFAULT_CANARY_REPO_2]
+    )]
+    canary_repos: Vec<PathBuf>,
+    #[arg(long, default_value_t = 5)]
+    sample_size: usize,
+    #[arg(long)]
+    output: Option<PathBuf>,
+    #[arg(long)]
+    keep_sandboxes: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LintCounts {
     errors: usize,
@@ -203,12 +233,87 @@ struct ReliabilityReport {
     notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImplementSuggestionResult {
+    repo_path: PathBuf,
+    suggestion_id: String,
+    summary: String,
+    passed: bool,
+    attempt_count: usize,
+    total_ms: u64,
+    total_cost_usd: f64,
+    file_changes: usize,
+    first_attempt_passed: bool,
+    #[serde(default)]
+    fail_reasons: Vec<String>,
+    #[serde(default)]
+    report_path: Option<PathBuf>,
+    #[serde(default)]
+    residual_blocking: usize,
+    #[serde(default)]
+    syntax_failure_after_pass: bool,
+    #[serde(default)]
+    mutation_on_failure: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImplementRepoReport {
+    repo_path: PathBuf,
+    sample_size: usize,
+    candidate_count: usize,
+    executed_count: usize,
+    passed_count: usize,
+    first_attempt_pass_count: usize,
+    avg_total_ms: Option<f64>,
+    avg_total_cost_usd: Option<f64>,
+    pass_rate: Option<f64>,
+    first_attempt_pass_rate: Option<f64>,
+    #[serde(default)]
+    residual_blocking_rate: Option<f64>,
+    #[serde(default)]
+    syntax_failure_after_pass_rate: Option<f64>,
+    #[serde(default)]
+    mutation_on_failure_rate: Option<f64>,
+    results: Vec<ImplementSuggestionResult>,
+    passed: bool,
+    #[serde(default)]
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImplementReport {
+    timestamp: DateTime<Utc>,
+    run_id: String,
+    cosmos_repo: PathBuf,
+    primary_target_repo: PathBuf,
+    canary_repos: Vec<PathBuf>,
+    sample_size: usize,
+    total_candidate_count: usize,
+    executed_count: usize,
+    passed_count: usize,
+    first_attempt_pass_count: usize,
+    avg_total_ms: Option<f64>,
+    avg_total_cost_usd: Option<f64>,
+    pass_rate: Option<f64>,
+    first_attempt_pass_rate: Option<f64>,
+    #[serde(default)]
+    residual_blocking_rate: Option<f64>,
+    #[serde(default)]
+    syntax_failure_after_pass_rate: Option<f64>,
+    #[serde(default)]
+    mutation_on_failure_rate: Option<f64>,
+    repo_reports: Vec<ImplementRepoReport>,
+    passed: bool,
+    notes: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Validate(args) => run_validate(args).await,
         Commands::Reliability(args) => run_reliability(args).await,
+        Commands::Implement(args) => run_implement(args).await,
     }
 }
 
@@ -601,6 +706,576 @@ async fn run_reliability(args: ReliabilityArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_implement(args: ImplementArgs) -> Result<()> {
+    let run_id = Uuid::new_v4().to_string();
+    let cosmos_repo = std::env::current_dir()
+        .context("Failed to read current working directory")?
+        .canonicalize()
+        .context("Failed to resolve current working directory")?;
+    let primary_target_repo = canonical_repo_path(&args.target_repo, "target repo")?;
+    let mut all_targets = vec![primary_target_repo.clone()];
+    for canary in &args.canary_repos {
+        match canonical_repo_path(canary, "canary repo") {
+            Ok(path) => {
+                if !all_targets.contains(&path) {
+                    all_targets.push(path);
+                }
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "Failed to resolve canary repo '{}': {}",
+                    canary.display(),
+                    error
+                ));
+            }
+        }
+    }
+    let sandbox_env = SandboxSession::env_overrides();
+    let mut notes = Vec::new();
+    let fake_mode = fake_implement_enabled();
+    let sample_size = args.sample_size.max(1);
+    let mut repo_reports = Vec::new();
+
+    for (repo_idx, repo_root) in all_targets.iter().enumerate() {
+        let mut repo_notes = Vec::new();
+        let repo_run_id = format!("{}-repo-{}", run_id, repo_idx + 1);
+        let base_sandbox =
+            SandboxSession::create(repo_root, &repo_run_id, "target-impl-base", true)?;
+        if !fake_mode {
+            if let Some(install_outcome) =
+                prepare_target_workspace(base_sandbox.path(), &sandbox_env, &mut repo_notes)
+            {
+                if !install_outcome.success {
+                    repo_notes.push(
+                        "Base sandbox dependency install failed; implementation runs may fail"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        let index = CodebaseIndex::new(base_sandbox.path()).with_context(|| {
+            format!(
+                "Failed to build codebase index for implement command in {}",
+                repo_root.display()
+            )
+        })?;
+        let context = WorkContext::load(base_sandbox.path()).with_context(|| {
+            format!(
+                "Failed to load work context for implement command in {}",
+                repo_root.display()
+            )
+        })?;
+        let sampled = if fake_mode {
+            fake_validated_suggestions(&index, sample_size)
+        } else {
+            let cache = Cache::new(base_sandbox.path());
+            let summaries = cache.load_llm_summaries_cache().map(|summaries_cache| {
+                summaries_cache
+                    .summaries
+                    .into_iter()
+                    .map(|(path, entry)| (path, entry.summary))
+                    .collect::<HashMap<PathBuf, String>>()
+            });
+
+            let suggest_result = run_fast_grounded_with_gate(
+                base_sandbox.path(),
+                &index,
+                &context,
+                None,
+                summaries.as_ref(),
+                SuggestionQualityGateConfig::default(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to generate validated suggestions for {}",
+                    repo_root.display()
+                )
+            })?;
+
+            suggest_result
+                .suggestions
+                .into_iter()
+                .filter(|suggestion| {
+                    suggestion.validation_state == SuggestionValidationState::Validated
+                })
+                .take(sample_size)
+                .collect::<Vec<Suggestion>>()
+        };
+
+        let candidate_count = sampled.len();
+        if candidate_count == 0 {
+            repo_notes.push(
+                "No validated suggestions available for implementation harness sampling"
+                    .to_string(),
+            );
+        }
+
+        let mut results = Vec::new();
+        let mut passed_count = 0usize;
+        let mut first_attempt_pass_count = 0usize;
+        let mut total_ms_sum = 0u64;
+        let mut total_cost_sum = 0.0f64;
+        let mut blocking_residual_count = 0usize;
+        let mut syntax_failure_after_pass_count = 0usize;
+        let mut mutation_on_failure_count = 0usize;
+
+        for (idx, suggestion) in sampled.into_iter().enumerate() {
+            let case_run_id = format!("{}-case-{}", repo_run_id, idx + 1);
+            let case_label = format!("target-impl-{}", idx + 1);
+            let case_sandbox = SandboxSession::create(repo_root, &case_run_id, &case_label, true)
+                .with_context(|| {
+                format!(
+                    "Failed to create sandbox for suggestion {} in {}",
+                    idx + 1,
+                    repo_root.display()
+                )
+            })?;
+
+            if !fake_mode {
+                if let Some(install_outcome) =
+                    prepare_target_workspace(case_sandbox.path(), &sandbox_env, &mut repo_notes)
+                {
+                    if !install_outcome.success {
+                        repo_notes.push(format!(
+                            "Dependency install failed in case sandbox {} for {}",
+                            idx + 1,
+                            repo_root.display()
+                        ));
+                    }
+                }
+            }
+
+            let preview = build_fix_preview_from_validated_suggestion(&suggestion);
+            let run: Result<cosmos_tui::suggest::llm::ImplementationRunResult> = if fake_mode {
+                Ok(cosmos_tui::suggest::llm::ImplementationRunResult {
+                    description: "Fake harness run for deterministic lab test".to_string(),
+                    file_changes: Vec::new(),
+                    usage: None,
+                    diagnostics: cosmos_tui::suggest::llm::ImplementationRunDiagnostics {
+                        run_id: format!("fake-{}-{}", repo_idx + 1, idx + 1),
+                        suggestion_id: suggestion.id.to_string(),
+                        suggestion_summary: suggestion.summary.clone(),
+                        model: "openai/gpt-oss-120b".to_string(),
+                        strict_mode: true,
+                        passed: true,
+                        attempt_count: 1,
+                        total_ms: 15_000,
+                        total_cost_usd: 0.005,
+                        reduced_confidence: false,
+                        fail_reasons: Vec::new(),
+                        attempts: vec![
+                            cosmos_tui::suggest::llm::ImplementationAttemptDiagnostics {
+                                attempt_index: 1,
+                                passed: true,
+                                fail_reasons: Vec::new(),
+                                fail_reason_records: Vec::new(),
+                                gates: Vec::new(),
+                                changed_files: Vec::new(),
+                                changed_lines_total: 0,
+                                changed_lines_by_file: HashMap::new(),
+                                quick_check_status:
+                                    cosmos_tui::suggest::llm::ImplementationQuickCheckStatus::Passed,
+                                quick_check_command: Some("fake check".to_string()),
+                                quick_check_outcome: None,
+                                review_iterations: 1,
+                                review_blocking_remaining: 0,
+                                attempt_ms: 15_000,
+                                attempt_cost_usd: 0.005,
+                                notes: vec!["fake".to_string()],
+                            },
+                        ],
+                        report_path: None,
+                        finalization:
+                            cosmos_tui::suggest::llm::ImplementationFinalizationDiagnostics::default(
+                            ),
+                    },
+                })
+            } else {
+                implement_validated_suggestion_with_harness(
+                    case_sandbox.path(),
+                    &suggestion,
+                    &preview,
+                    None,
+                    ImplementationHarnessConfig::lab_strict(),
+                )
+                .await
+            };
+
+            let mut case_result = ImplementSuggestionResult {
+                repo_path: repo_root.clone(),
+                suggestion_id: suggestion.id.to_string(),
+                summary: suggestion.summary.clone(),
+                passed: false,
+                attempt_count: 0,
+                total_ms: 0,
+                total_cost_usd: 0.0,
+                file_changes: 0,
+                first_attempt_passed: false,
+                fail_reasons: Vec::new(),
+                report_path: None,
+                residual_blocking: 0,
+                syntax_failure_after_pass: false,
+                mutation_on_failure: false,
+            };
+
+            match run {
+                Ok(mut result) => {
+                    let first_attempt_passed = result
+                        .diagnostics
+                        .attempts
+                        .first()
+                        .map(|attempt| attempt.passed)
+                        .unwrap_or(false);
+                    let residual_blocking = result
+                        .diagnostics
+                        .attempts
+                        .last()
+                        .map(|attempt| attempt.review_blocking_remaining)
+                        .unwrap_or(0);
+                    // "After pass" should reflect the *passing attempt*, not any earlier failed attempt.
+                    // The harness is allowed to iterate; we only care that a reported pass never ships
+                    // parse-broken output.
+                    let syntax_failure_after_pass = result.diagnostics.passed
+                        && result
+                            .diagnostics
+                            .attempts
+                            .last()
+                            .map(|attempt| {
+                                attempt
+                                    .gates
+                                    .iter()
+                                    .any(|gate| gate.gate == "post_review_syntax" && !gate.passed)
+                            })
+                            .unwrap_or(false);
+                    let mutation_on_failure = if result.diagnostics.passed {
+                        false
+                    } else {
+                        repo_has_uncommitted_mutations(case_sandbox.path())
+                    };
+                    let _ = record_harness_finalization_outcome(
+                        case_sandbox.path(),
+                        &mut result.diagnostics,
+                        ImplementationFinalizationStatus::FailedBeforeFinalize,
+                        Some(
+                            "Lab run validates harness output without applying branch finalization"
+                                .to_string(),
+                        ),
+                        Some(mutation_on_failure),
+                    );
+
+                    if residual_blocking > 0 {
+                        blocking_residual_count += 1;
+                    }
+                    if syntax_failure_after_pass {
+                        syntax_failure_after_pass_count += 1;
+                    }
+                    if mutation_on_failure {
+                        mutation_on_failure_count += 1;
+                    }
+
+                    if result.diagnostics.passed {
+                        passed_count += 1;
+                    }
+                    if first_attempt_passed {
+                        first_attempt_pass_count += 1;
+                    }
+                    total_ms_sum += result.diagnostics.total_ms;
+                    total_cost_sum += result.diagnostics.total_cost_usd;
+
+                    case_result = ImplementSuggestionResult {
+                        repo_path: repo_root.clone(),
+                        suggestion_id: suggestion.id.to_string(),
+                        summary: suggestion.summary.clone(),
+                        passed: result.diagnostics.passed,
+                        attempt_count: result.diagnostics.attempt_count,
+                        total_ms: result.diagnostics.total_ms,
+                        total_cost_usd: result.diagnostics.total_cost_usd,
+                        file_changes: result.file_changes.len(),
+                        first_attempt_passed,
+                        fail_reasons: result.diagnostics.fail_reasons.clone(),
+                        report_path: result.diagnostics.report_path.clone(),
+                        residual_blocking,
+                        syntax_failure_after_pass,
+                        mutation_on_failure,
+                    };
+                }
+                Err(error) => {
+                    case_result.fail_reasons = vec![error.to_string()];
+                }
+            }
+
+            results.push(case_result);
+
+            if args.keep_sandboxes {
+                repo_notes.push(format!(
+                    "Keeping implement case sandbox {} at {}",
+                    idx + 1,
+                    case_sandbox.path().display()
+                ));
+            } else if let Err(error) = case_sandbox.cleanup() {
+                repo_notes.push(format!(
+                    "Failed to cleanup implement case sandbox: {}",
+                    error
+                ));
+            }
+        }
+
+        if args.keep_sandboxes {
+            repo_notes.push(format!(
+                "Keeping implement base sandbox at {}",
+                base_sandbox.path().display()
+            ));
+        } else if let Err(error) = base_sandbox.cleanup() {
+            repo_notes.push(format!(
+                "Failed to cleanup implement base sandbox: {}",
+                error
+            ));
+        }
+
+        let executed_count = results.len();
+        let avg_total_ms = if executed_count == 0 {
+            None
+        } else {
+            Some(total_ms_sum as f64 / executed_count as f64)
+        };
+        let avg_total_cost_usd = if executed_count == 0 {
+            None
+        } else {
+            Some(total_cost_sum / executed_count as f64)
+        };
+        let pass_rate = if executed_count == 0 {
+            None
+        } else {
+            Some(passed_count as f64 / executed_count as f64)
+        };
+        let first_attempt_pass_rate = if executed_count == 0 {
+            None
+        } else {
+            Some(first_attempt_pass_count as f64 / executed_count as f64)
+        };
+        let residual_blocking_rate = if executed_count == 0 {
+            None
+        } else {
+            Some(blocking_residual_count as f64 / executed_count as f64)
+        };
+        let syntax_failure_after_pass_rate = if executed_count == 0 {
+            None
+        } else {
+            Some(syntax_failure_after_pass_count as f64 / executed_count as f64)
+        };
+        let mutation_on_failure_rate = if executed_count == 0 {
+            None
+        } else {
+            Some(mutation_on_failure_count as f64 / executed_count as f64)
+        };
+
+        let repo_passed = implement_gate_passes(
+            pass_rate,
+            first_attempt_pass_rate,
+            avg_total_cost_usd,
+            avg_total_ms,
+            residual_blocking_rate,
+            syntax_failure_after_pass_rate,
+            mutation_on_failure_rate,
+        );
+
+        repo_reports.push(ImplementRepoReport {
+            repo_path: repo_root.clone(),
+            sample_size,
+            candidate_count,
+            executed_count,
+            passed_count,
+            first_attempt_pass_count,
+            avg_total_ms,
+            avg_total_cost_usd,
+            pass_rate,
+            first_attempt_pass_rate,
+            residual_blocking_rate,
+            syntax_failure_after_pass_rate,
+            mutation_on_failure_rate,
+            results,
+            passed: repo_passed,
+            notes: repo_notes,
+        });
+    }
+
+    let total_candidate_count = repo_reports
+        .iter()
+        .map(|report| report.candidate_count)
+        .sum();
+    let executed_count = repo_reports
+        .iter()
+        .map(|report| report.executed_count)
+        .sum();
+    let passed_count = repo_reports.iter().map(|report| report.passed_count).sum();
+    let first_attempt_pass_count = repo_reports
+        .iter()
+        .map(|report| report.first_attempt_pass_count)
+        .sum();
+    let total_ms_sum: u64 = repo_reports
+        .iter()
+        .map(|report| {
+            report
+                .results
+                .iter()
+                .map(|result| result.total_ms)
+                .sum::<u64>()
+        })
+        .sum();
+    let total_cost_sum: f64 = repo_reports
+        .iter()
+        .map(|report| {
+            report
+                .results
+                .iter()
+                .map(|result| result.total_cost_usd)
+                .sum::<f64>()
+        })
+        .sum();
+    let residual_blocking_count: usize = repo_reports
+        .iter()
+        .map(|report| {
+            report
+                .results
+                .iter()
+                .filter(|result| result.residual_blocking > 0)
+                .count()
+        })
+        .sum();
+    let syntax_failure_after_pass_count: usize = repo_reports
+        .iter()
+        .map(|report| {
+            report
+                .results
+                .iter()
+                .filter(|result| result.syntax_failure_after_pass)
+                .count()
+        })
+        .sum();
+    let mutation_on_failure_count: usize = repo_reports
+        .iter()
+        .map(|report| {
+            report
+                .results
+                .iter()
+                .filter(|result| result.mutation_on_failure)
+                .count()
+        })
+        .sum();
+
+    let avg_total_ms = if executed_count == 0 {
+        None
+    } else {
+        Some(total_ms_sum as f64 / executed_count as f64)
+    };
+    let avg_total_cost_usd = if executed_count == 0 {
+        None
+    } else {
+        Some(total_cost_sum / executed_count as f64)
+    };
+    let pass_rate = if executed_count == 0 {
+        None
+    } else {
+        Some(passed_count as f64 / executed_count as f64)
+    };
+    let first_attempt_pass_rate = if executed_count == 0 {
+        None
+    } else {
+        Some(first_attempt_pass_count as f64 / executed_count as f64)
+    };
+    let residual_blocking_rate = if executed_count == 0 {
+        None
+    } else {
+        Some(residual_blocking_count as f64 / executed_count as f64)
+    };
+    let syntax_failure_after_pass_rate = if executed_count == 0 {
+        None
+    } else {
+        Some(syntax_failure_after_pass_count as f64 / executed_count as f64)
+    };
+    let mutation_on_failure_rate = if executed_count == 0 {
+        None
+    } else {
+        Some(mutation_on_failure_count as f64 / executed_count as f64)
+    };
+
+    let passed = implement_gate_passes(
+        pass_rate,
+        first_attempt_pass_rate,
+        avg_total_cost_usd,
+        avg_total_ms,
+        residual_blocking_rate,
+        syntax_failure_after_pass_rate,
+        mutation_on_failure_rate,
+    );
+
+    if !repo_reports.iter().all(|report| report.passed) {
+        notes.push("At least one repo-level implement gate failed".to_string());
+    }
+
+    let report = ImplementReport {
+        timestamp: Utc::now(),
+        run_id: run_id.clone(),
+        cosmos_repo: cosmos_repo.clone(),
+        primary_target_repo: primary_target_repo.clone(),
+        canary_repos: all_targets
+            .iter()
+            .filter(|path| **path != primary_target_repo)
+            .cloned()
+            .collect(),
+        sample_size,
+        total_candidate_count,
+        executed_count,
+        passed_count,
+        first_attempt_pass_count,
+        avg_total_ms,
+        avg_total_cost_usd,
+        pass_rate,
+        first_attempt_pass_rate,
+        residual_blocking_rate,
+        syntax_failure_after_pass_rate,
+        mutation_on_failure_rate,
+        repo_reports,
+        passed,
+        notes,
+    };
+
+    let output_path = output_path(args.output.as_ref(), &cosmos_repo, "implement", &run_id, "");
+    write_report_json(&output_path, &report)?;
+
+    println!("Run ID: {}", run_id);
+    println!("Executed: {}", report.executed_count);
+    println!("Passed: {}", report.passed);
+    println!("Report: {}", output_path.display());
+    Ok(())
+}
+
+fn repo_has_uncommitted_mutations(repo_root: &Path) -> bool {
+    cosmos_tui::git_ops::current_status(repo_root)
+        .map(|status| !(status.staged.is_empty() && status.modified.is_empty()))
+        .unwrap_or(true)
+}
+
+fn implement_gate_passes(
+    pass_rate: Option<f64>,
+    first_attempt_pass_rate: Option<f64>,
+    avg_total_cost_usd: Option<f64>,
+    avg_total_ms: Option<f64>,
+    residual_blocking_rate: Option<f64>,
+    syntax_failure_after_pass_rate: Option<f64>,
+    mutation_on_failure_rate: Option<f64>,
+) -> bool {
+    pass_rate.unwrap_or(0.0) >= 0.90
+        && first_attempt_pass_rate.unwrap_or(0.0) >= 0.70
+        && avg_total_cost_usd.unwrap_or(f64::MAX) <= 0.015
+        && avg_total_ms.unwrap_or(f64::MAX) <= 35_000.0
+        && residual_blocking_rate.unwrap_or(1.0) == 0.0
+        && syntax_failure_after_pass_rate.unwrap_or(1.0) == 0.0
+        && mutation_on_failure_rate.unwrap_or(1.0) == 0.0
+}
+
 fn canonical_repo_path(path: &Path, label: &str) -> Result<PathBuf> {
     let canonical = path
         .canonicalize()
@@ -788,6 +1463,7 @@ fn gate_candidate_from_metrics(metrics: &SelfIterationSuggestionMetrics) -> Gate
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_quality_gate(
     cache: &Cache,
     source: GateSource,
@@ -956,8 +1632,40 @@ fn fake_reliability_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn fake_implement_enabled() -> bool {
+    std::env::var("COSMOS_LAB_FAKE_IMPLEMENT")
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+}
+
+fn fake_validated_suggestions(index: &CodebaseIndex, sample_size: usize) -> Vec<Suggestion> {
+    let mut file_paths = index.files.keys().cloned().collect::<Vec<_>>();
+    file_paths.sort();
+    if file_paths.is_empty() {
+        file_paths.push(PathBuf::from("src/lib.rs"));
+    }
+
+    file_paths
+        .into_iter()
+        .take(sample_size.max(1))
+        .enumerate()
+        .map(|(idx, path)| {
+            Suggestion::new(
+                SuggestionKind::Quality,
+                Priority::High,
+                path,
+                format!("Fake validated suggestion {}", idx + 1),
+                SuggestionSource::LlmDeep,
+            )
+            .with_validation_state(SuggestionValidationState::Validated)
+            .with_line(1)
+        })
+        .collect()
+}
+
 fn fake_trial_result(target_repo: &Path, verify_sample: usize) -> ReliabilityTrialResult {
-    let preview_sampled = verify_sample.max(1).min(4);
+    let preview_sampled = verify_sample.clamp(1, 4);
     let preview_verified = preview_sampled.saturating_sub(1);
     let preview_contradicted = 1.min(preview_sampled);
     let mut source_mix = std::collections::HashMap::new();
@@ -1175,6 +1883,50 @@ mod tests {
             }
             _ => panic!("expected reliability command defaults"),
         }
+    }
+
+    #[test]
+    fn implement_cli_defaults_use_strict_profile() {
+        let cli = Cli::parse_from(["cosmos-lab", "implement"]);
+        match cli.command {
+            Commands::Implement(args) => {
+                assert_eq!(args.sample_size, 5);
+                assert!(!args.keep_sandboxes);
+                assert_eq!(args.canary_repos.len(), 2);
+            }
+            _ => panic!("expected implement command defaults"),
+        }
+    }
+
+    #[test]
+    fn implement_gate_requires_elite_thresholds() {
+        assert!(implement_gate_passes(
+            Some(0.91),
+            Some(0.75),
+            Some(0.01),
+            Some(30_000.0),
+            Some(0.0),
+            Some(0.0),
+            Some(0.0)
+        ));
+        assert!(!implement_gate_passes(
+            Some(0.89),
+            Some(0.75),
+            Some(0.01),
+            Some(30_000.0),
+            Some(0.0),
+            Some(0.0),
+            Some(0.0)
+        ));
+        assert!(!implement_gate_passes(
+            Some(0.95),
+            Some(0.75),
+            Some(0.01),
+            Some(30_000.0),
+            Some(0.0),
+            Some(0.1),
+            Some(0.0)
+        ));
     }
 
     #[test]
@@ -1566,6 +2318,45 @@ edition = "2021"
         assert!(target_sandbox.ends_with("target-repo"));
 
         std::env::remove_var("COSMOS_LAB_FAKE_RELIABILITY");
+    }
+
+    #[test]
+    fn implement_smoke_writes_multi_repo_report_in_fake_mode() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("COSMOS_LAB_FAKE_IMPLEMENT", "1");
+
+        let workspace = tempdir().unwrap();
+        let primary_repo = workspace.path().join("target-primary");
+        let canary_one = workspace.path().join("target-canary-one");
+        let canary_two = workspace.path().join("target-canary-two");
+
+        for repo in [&primary_repo, &canary_one, &canary_two] {
+            std::fs::create_dir_all(repo.join("src")).unwrap();
+            std::fs::write(repo.join("src/lib.rs"), "pub fn ok() -> bool { true }\n").unwrap();
+            init_git_repo(repo);
+        }
+
+        let output = workspace.path().join("implement-report.json");
+        let args = ImplementArgs {
+            target_repo: primary_repo.clone(),
+            canary_repos: vec![canary_one.clone(), canary_two.clone()],
+            sample_size: 2,
+            output: Some(output.clone()),
+            keep_sandboxes: false,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async { run_implement(args).await }).unwrap();
+
+        let content = std::fs::read_to_string(&output).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(json["repo_reports"].is_array());
+        assert_eq!(json["repo_reports"].as_array().unwrap().len(), 3);
+        assert!(json["pass_rate"].is_number());
+        assert!(json["mutation_on_failure_rate"].is_number());
+        assert!(json["passed"].as_bool().unwrap_or(false));
+
+        std::env::remove_var("COSMOS_LAB_FAKE_IMPLEMENT");
     }
 
     fn init_git_repo(path: &Path) {
