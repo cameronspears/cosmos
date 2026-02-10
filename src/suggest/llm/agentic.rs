@@ -205,7 +205,7 @@ fn response_healing_plugins() -> Vec<PluginConfig> {
     }]
 }
 
-const GPT_OSS_PROVIDER_ORDER: [&str; 3] = ["cerebras/fp16", "crusoe/bf16", "deepinfra/turbo"];
+const GPT_OSS_PROVIDER_ORDER: [&str; 3] = ["cerebras/fp16", "deepinfra/turbo", "groq"];
 
 fn provider_config(model: Model, require_parameters: bool) -> ProviderConfig {
     let require_parameters = if require_parameters { Some(true) } else { None };

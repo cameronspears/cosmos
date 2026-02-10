@@ -106,7 +106,7 @@ Cosmos uses [OpenRouter](https://openrouter.ai) for AI access. You only pay for 
 1. **Create an account** at [openrouter.ai](https://openrouter.ai)
 2. **Add credits** at [openrouter.ai/credits](https://openrouter.ai/credits)
 3. **Create an API key** at [openrouter.ai/keys](https://openrouter.ai/keys) — copy the key (starts with `sk-`)
-4. **Paste it in Cosmos** when prompted on first run (stored in your system keychain)
+4. **Paste it in Cosmos** when prompted on first run (stored in your system keychain by default)
 
 **Alternative:** Set `OPENROUTER_API_KEY` as an environment variable instead.
 
@@ -114,15 +114,29 @@ Cosmos uses [OpenRouter](https://openrouter.ai) for AI access. You only pay for 
 
 **Costs:** Results are cached locally to minimize repeat calls. Monitor usage at [openrouter.ai/usage](https://openrouter.ai/usage).
 
+### Keychain Prompts (macOS)
+
+If macOS keeps prompting for a password when Cosmos reads the keychain, Cosmos can also use a local credentials file instead.
+
+1. Run once: `COSMOS_DISABLE_KEYRING=1 cosmos --setup`
+2. Cosmos writes `credentials.json` with `0600` permissions under your OS config directory.
+3. macOS path: `~/Library/Application Support/cosmos/credentials.json`
+4. Linux path: `~/.config/cosmos/credentials.json`
+
+After the file exists and contains credentials, Cosmos will prefer it automatically to avoid keychain prompts.
+
 ### Provider Routing (Elite Baseline)
 
 Cosmos uses OpenRouter's provider routing to strongly prefer **Cerebras fp16** for the Speed-tier model (`openai/gpt-oss-120b`). If Cerebras is unavailable, Cosmos falls back in this order:
 
 1. `cerebras/fp16`
-2. `crusoe/bf16`
-3. `deepinfra/turbo`
+2. `deepinfra/turbo`
+3. `groq`
 
 This is intentional: it makes Cosmos more consistent and dependable. It can increase costs, and that's an explicit tradeoff.
+
+For the full "elite" definition (targets, metrics, and release gates), see:
+`docs/elite-targets.md`
 
 ---
 

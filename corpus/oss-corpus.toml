@@ -17,11 +17,13 @@ ref = "fc03a4c391f71b847d45fb64c46815ff53f9ceb2"
 id = "go-logrus"
 git_url = "https://github.com/sirupsen/logrus.git"
 ref = "c0382cd486bfc0d6a35f1cbc750d783b9f953784"
+enabled = false
 
 [[repo]]
 id = "go-cobra"
 git_url = "https://github.com/spf13/cobra.git"
 ref = "61968e893eee2f27696c2fbc8e34fa5c4afaf7c4"
+enabled = false
 
 [[repo]]
 id = "py-click"
@@ -37,9 +39,14 @@ ref = "672971d66a2ef9f85151e53283113f33d642dabd"
 id = "ts-create-t3-app"
 git_url = "https://github.com/t3-oss/create-t3-app.git"
 ref = "4709861f7e67a15564c0460c13e7b4b6cfcae40d"
+enabled = false
 
 [[repo]]
-id = "ts-vitest"
-git_url = "https://github.com/vitest-dev/vitest.git"
-ref = "cee999bb51411ad91d737dcef9188fc3880b53b5"
+id = "js-commander"
+git_url = "https://github.com/tj/commander.js.git"
+ref = "8247364da749736570161e95682b07fc2d72497b"
 
+[[repo]]
+id = "js-nanoid"
+git_url = "https://github.com/ai/nanoid.git"
+ref = "9d574d2c9706f5cf82e2a043450c62664ea1fcf1"

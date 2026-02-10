@@ -761,6 +761,10 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
     let default_sample_size = args.sample_size.max(1);
     let mut repo_reports = Vec::new();
 
+    println!("Implement Run ID: {}", run_id);
+    println!("Fake mode: {}", fake_mode);
+    println!("Default sample size: {}", default_sample_size);
+
     #[derive(Debug, Clone)]
     struct ImplementTarget {
         repo_path: PathBuf,
@@ -786,6 +790,9 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
             Some(root) => cosmos_repo.join(root),
             None => cosmos_repo.join(".cosmos").join("corpus"),
         };
+
+        println!("Corpus manifest: {}", manifest_path.display());
+        println!("Corpus root: {}", corpus_root.display());
 
         let manifest = CorpusManifest::load(&manifest_path)?;
         let mut specs = manifest
@@ -874,13 +881,73 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
 
     let mut global_reason_histogram: HashMap<String, usize> = HashMap::new();
 
+    println!("Repos to run: {}", targets.len());
+
     for (repo_idx, target) in targets.iter().enumerate() {
         let repo_root = &target.repo_path;
         let sample_size = target.sample_size.max(1);
         let mut repo_notes = Vec::new();
         let repo_run_id = format!("{}-repo-{}", run_id, repo_idx + 1);
+        let repo_label = target
+            .repo_id
+            .as_deref()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| repo_root.display().to_string());
+        println!();
+        println!("[{}/{}] Repo: {}", repo_idx + 1, targets.len(), repo_label);
+        println!("Path: {}", repo_root.display());
+        if let Some(requested_ref) = target.requested_ref.as_deref() {
+            println!("Requested ref: {}", requested_ref);
+        }
+        if let Some(head_sha) = target.head_sha.as_deref() {
+            println!("HEAD SHA: {}", head_sha);
+        }
+        if let Some(subdir) = target.subdir.as_deref() {
+            println!("Subdir: {}", subdir);
+        }
+        println!("Sample size: {}", sample_size);
+
+        if !fake_mode {
+            if let Some(tool) = missing_required_tool_for_repo(repo_root) {
+                let note = format!(
+                    "Skipped repo because required tool '{}' is not available on PATH",
+                    tool
+                );
+                println!("{}", note);
+                repo_notes.push(note);
+                repo_reports.push(ImplementRepoReport {
+                    repo_path: repo_root.clone(),
+                    repo_id: target.repo_id.clone(),
+                    requested_ref: target.requested_ref.clone(),
+                    head_sha: target.head_sha.clone(),
+                    subdir: target.subdir.clone(),
+                    sample_size,
+                    candidate_count: 0,
+                    executed_count: 0,
+                    passed_count: 0,
+                    first_attempt_pass_count: 0,
+                    avg_total_ms: None,
+                    avg_total_cost_usd: None,
+                    pass_rate: None,
+                    first_attempt_pass_rate: None,
+                    residual_blocking_rate: None,
+                    syntax_failure_after_pass_rate: None,
+                    mutation_on_failure_rate: None,
+                    quick_check_detected: false,
+                    quick_check_command: None,
+                    failure_reason_histogram: HashMap::new(),
+                    top_failure_clusters: Vec::new(),
+                    results: Vec::new(),
+                    passed: false,
+                    notes: repo_notes,
+                });
+                continue;
+            }
+        }
+
         let base_sandbox =
             SandboxSession::create(repo_root, &repo_run_id, "target-impl-base", true)?;
+        println!("Base sandbox: {}", base_sandbox.path().display());
         if !fake_mode {
             if let Some(install_outcome) =
                 prepare_target_workspace(base_sandbox.path(), &sandbox_env, &mut repo_notes)
@@ -891,6 +958,15 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                             .to_string(),
                     );
                 }
+                println!(
+                    "Dependency prep: {} ({}ms)",
+                    if install_outcome.success {
+                        "ok"
+                    } else {
+                        "failed"
+                    },
+                    install_outcome.duration_ms
+                );
             }
         }
 
@@ -977,6 +1053,7 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                     .to_string(),
             );
         }
+        println!("Validated suggestions (sampled): {}", candidate_count);
 
         let mut results = Vec::new();
         let mut passed_count = 0usize;
@@ -1001,6 +1078,12 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                     repo_root.display()
                 )
             })?;
+            println!(
+                "  Case {}/{}: suggestion {}",
+                idx + 1,
+                candidate_count.max(1),
+                suggestion.id
+            );
 
             if !fake_mode {
                 let linked = link_node_modules_from_base(
@@ -1064,6 +1147,7 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                                 remaining_blocking_categories: Vec::new(),
                                 attempt_ms: 15_000,
                                 attempt_cost_usd: 0.005,
+                                llm_calls: Vec::new(),
                                 notes: vec!["fake".to_string()],
                             },
                         ],
@@ -1145,6 +1229,31 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                         ),
                         Some(mutation_on_failure),
                     );
+                    if let Some(source_report) = result.diagnostics.report_path.clone() {
+                        let repo_id_label = target
+                            .repo_id
+                            .clone()
+                            .unwrap_or_else(|| format!("repo-{}", repo_idx + 1));
+                        match persist_harness_report(
+                            &cosmos_repo,
+                            &run_id,
+                            &repo_id_label,
+                            idx + 1,
+                            &suggestion.id.to_string(),
+                            &source_report,
+                        ) {
+                            Ok(dest) => {
+                                result.diagnostics.report_path = Some(dest);
+                            }
+                            Err(error) => {
+                                repo_notes.push(format!(
+                                    "Failed to persist harness report for case {}: {}",
+                                    idx + 1,
+                                    error
+                                ));
+                            }
+                        }
+                    }
 
                     if residual_blocking > 0 {
                         blocking_residual_count += 1;
@@ -1207,6 +1316,27 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
             }
 
             results.push(case_result);
+            if let Some(last) = results.last() {
+                let report_display = last
+                    .report_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                println!(
+                    "    Result: {} (attempts={}, cost=${:.4}, ms={}, files={}, report={})",
+                    if last.passed { "PASS" } else { "FAIL" },
+                    last.attempt_count,
+                    last.total_cost_usd,
+                    last.total_ms,
+                    last.file_changes,
+                    report_display
+                );
+                if !last.passed {
+                    if let Some(reason) = last.fail_reasons.first() {
+                        println!("    Reason: {}", reason);
+                    }
+                }
+            }
 
             if args.keep_sandboxes {
                 repo_notes.push(format!(
@@ -1411,7 +1541,7 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
         Some(mutation_on_failure_count as f64 / executed_count as f64)
     };
 
-    let passed = implement_gate_passes(
+    let gate_passed = implement_gate_passes(
         pass_rate,
         first_attempt_pass_rate,
         avg_total_cost_usd,
@@ -1421,7 +1551,10 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
         mutation_on_failure_rate,
     );
 
-    if !repo_reports.iter().all(|report| report.passed) {
+    let all_repos_passed = repo_reports.iter().all(|report| report.passed);
+    let passed = gate_passed && all_repos_passed;
+
+    if !all_repos_passed {
         notes.push("At least one repo-level implement gate failed".to_string());
     }
 
@@ -1595,6 +1728,72 @@ fn write_report_json<T: Serialize>(path: &Path, report: &T) -> Result<()> {
     std::fs::write(path, content)
         .with_context(|| format!("Failed to write report '{}'", path.display()))?;
     Ok(())
+}
+
+fn sanitize_fs_component(input: &str, fallback: &str) -> String {
+    let cleaned = input
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect::<String>();
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn persist_harness_report(
+    cosmos_repo: &Path,
+    lab_run_id: &str,
+    repo_id: &str,
+    case_index: usize,
+    suggestion_id: &str,
+    source_path: &Path,
+) -> Result<PathBuf> {
+    let run_dir = sanitize_fs_component(lab_run_id, "run");
+    let repo_dir = sanitize_fs_component(repo_id, "repo");
+    let dest_dir = cosmos_repo
+        .join(".cosmos")
+        .join("lab")
+        .join("harness_reports")
+        .join(run_dir)
+        .join(repo_dir);
+    std::fs::create_dir_all(&dest_dir).with_context(|| {
+        format!(
+            "Failed to create harness report directory '{}'",
+            dest_dir.display()
+        )
+    })?;
+
+    let dest_path = dest_dir.join(format!("case-{}-{}.json", case_index, suggestion_id));
+
+    let content = std::fs::read_to_string(source_path).with_context(|| {
+        format!(
+            "Failed to read harness report '{}' for persistence",
+            source_path.display()
+        )
+    })?;
+    let mut json: serde_json::Value = serde_json::from_str(&content).with_context(|| {
+        format!(
+            "Failed to parse harness report '{}' as JSON",
+            source_path.display()
+        )
+    })?;
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(
+            "report_path".to_string(),
+            serde_json::Value::String(dest_path.display().to_string()),
+        );
+    }
+
+    let dest_content = serde_json::to_string_pretty(&json)?;
+    std::fs::write(&dest_path, dest_content).with_context(|| {
+        format!(
+            "Failed to write persisted harness report '{}'",
+            dest_path.display()
+        )
+    })?;
+    Ok(dest_path)
 }
 
 fn lint_baseline_path(target_repo: &Path) -> PathBuf {
@@ -1876,6 +2075,36 @@ enum JsPackageManager {
     Bun,
 }
 
+fn program_available_on_path(program: &str) -> bool {
+    let program = program.trim();
+    if program.is_empty() {
+        return false;
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(program);
+        if !candidate.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&candidate) {
+                if meta.permissions().mode() & 0o111 != 0 {
+                    return true;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn detect_js_package_manager(repo_root: &Path) -> Option<JsPackageManager> {
     if repo_root.join("pnpm-lock.yaml").exists() {
         return Some(JsPackageManager::Pnpm);
@@ -1891,6 +2120,49 @@ fn detect_js_package_manager(repo_root: &Path) -> Option<JsPackageManager> {
     if repo_root.join("bun.lockb").exists() || repo_root.join("bun.lock").exists() {
         return Some(JsPackageManager::Bun);
     }
+    None
+}
+
+fn missing_required_tool_for_repo(repo_root: &Path) -> Option<String> {
+    if repo_root.join("Cargo.toml").exists() && !program_available_on_path("cargo") {
+        return Some("cargo".to_string());
+    }
+    if repo_root.join("go.mod").exists() && !program_available_on_path("go") {
+        return Some("go".to_string());
+    }
+
+    let has_python = repo_root.join("pyproject.toml").exists()
+        || repo_root.join("requirements.txt").exists()
+        || repo_root.join("setup.py").exists()
+        || repo_root.join("setup.cfg").exists();
+    if has_python && !(program_available_on_path("python3") || program_available_on_path("python"))
+    {
+        return Some("python3/python".to_string());
+    }
+
+    if repo_root.join("package.json").exists() {
+        let pm = detect_js_package_manager(repo_root);
+        match pm {
+            Some(JsPackageManager::Pnpm) if !program_available_on_path("pnpm") => {
+                return Some("pnpm".to_string());
+            }
+            Some(JsPackageManager::Yarn) if !program_available_on_path("yarn") => {
+                return Some("yarn".to_string());
+            }
+            Some(JsPackageManager::Npm) if !program_available_on_path("npm") => {
+                return Some("npm".to_string());
+            }
+            Some(JsPackageManager::Bun) if !program_available_on_path("bun") => {
+                return Some("bun".to_string());
+            }
+            None if !program_available_on_path("npm") => {
+                // Fallback quick-check runner uses npm when no lockfile exists.
+                return Some("npm".to_string());
+            }
+            _ => {}
+        }
+    }
+
     None
 }
 

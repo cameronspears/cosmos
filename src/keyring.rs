@@ -50,13 +50,28 @@ fn keyring_disabled() -> bool {
     if cfg!(test) {
         return true;
     }
-    matches!(
+
+    // Explicit override for bypassing keychain prompts.
+    let disabled_by_env = matches!(
         std::env::var("COSMOS_DISABLE_KEYRING")
             .unwrap_or_default()
             .to_lowercase()
             .as_str(),
         "1" | "true" | "yes"
-    )
+    );
+    if disabled_by_env {
+        return true;
+    }
+
+    // If the local credentials file exists and already contains usable credentials, prefer it
+    // to avoid interactive system keychain prompts (common in CI/lab runs and some macOS setups).
+    if let Ok(creds) = read_fallback_credentials() {
+        if creds.openrouter_api_key.is_some() || creds.github_token.is_some() {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Human-friendly credential backend label used in CLI messages.

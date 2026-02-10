@@ -1,8 +1,11 @@
+use super::client::{SpeedFailoverDiagnostics, SpeedFailoverError};
 use super::fix::{
     generate_fix_content_with_model, generate_multi_file_fix_with_model, FileInput, FixPreview,
 };
 use super::models::{merge_usage, Model, Usage};
-use super::review::{fix_review_findings_with_model, verify_changes, FixContext, ReviewFinding};
+use super::review::{
+    fix_review_findings_with_model, verify_changes_bounded, FixContext, ReviewFinding,
+};
 use crate::cache::{Cache, ImplementationHarnessRecord};
 use crate::git_ops;
 use crate::index::parser::{parse_file, parse_file_has_errors};
@@ -101,6 +104,14 @@ impl ImplementationHarnessConfig {
 
     pub fn lab_strict() -> Self {
         let mut config = Self::interactive_strict();
+        // Lab/CI uses a stricter policy surface (quick checks required), but we allow a small
+        // amount of headroom above the *average* elite bars so the harness can finish a repair
+        // loop when it is close to done.
+        config.max_total_ms = 60_000;
+        config.max_total_cost_usd = 0.020;
+        // In lab/CI we prefer doing a bit more repair *within* attempt 1 to improve
+        // first-attempt pass rate and avoid costly multi-attempt runs.
+        config.max_auto_quick_check_fix_loops = 2;
         config.require_quick_check_detectable = true;
         config.fail_on_reduced_confidence = true;
         config
@@ -113,6 +124,16 @@ struct ImplementationBudget {
     max_total_ms: u64,
     max_total_cost_usd: f64,
 }
+
+const MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL: u64 = 6_000;
+// Conservative buffer to avoid starting an LLM call when we're so close to the budget cap that
+// normal token variance would likely overspend. The harness would rather stop and explain why
+// than silently exceed its configured budget.
+const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL: f64 = 0.004;
+const BUDGET_TIMEOUT_SLACK_MS: u64 = 250;
+const MAX_GENERATION_TIMEOUT_MS: u64 = 35_000;
+const MAX_REVIEW_TIMEOUT_MS: u64 = 25_000;
+const MAX_FIX_TIMEOUT_MS: u64 = 25_000;
 
 impl ImplementationBudget {
     fn exhausted(&self, usage: &Option<Usage>) -> Option<ImplementationFailReason> {
@@ -136,6 +157,56 @@ impl ImplementationBudget {
                 message: format!(
                     "Stopped to respect the configured cost budget (${:0.4} spent; limit ${:0.4})",
                     cost_usd, self.max_total_cost_usd
+                ),
+            });
+        }
+
+        None
+    }
+
+    fn remaining_ms(&self) -> u64 {
+        let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+        self.max_total_ms.saturating_sub(elapsed_ms)
+    }
+
+    fn remaining_cost_usd(&self, usage: &Option<Usage>) -> f64 {
+        let cost_usd = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+        (self.max_total_cost_usd - cost_usd).max(0.0)
+    }
+
+    fn timeout_ms_for_next_llm_call(&self) -> u64 {
+        self.remaining_ms()
+            .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
+            .max(1)
+    }
+
+    /// Guardrail to avoid starting a new LLM call when the remaining budget is too small
+    /// to safely complete it without overspending.
+    fn guard_before_llm_call(&self, usage: &Option<Usage>) -> Option<ImplementationFailReason> {
+        if let Some(reason) = self.exhausted(usage) {
+            return Some(reason);
+        }
+
+        let remaining_ms = self.remaining_ms();
+        if remaining_ms < MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL {
+            return Some(ImplementationFailReason {
+                code: REASON_BUDGET_EXCEEDED.to_string(),
+                gate: "budget".to_string(),
+                message: format!(
+                    "Stopped to respect the configured time budget ({}ms remaining; limit {}ms)",
+                    remaining_ms, self.max_total_ms
+                ),
+            });
+        }
+
+        let remaining_cost = self.remaining_cost_usd(usage);
+        if remaining_cost < MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL {
+            return Some(ImplementationFailReason {
+                code: REASON_BUDGET_EXCEEDED.to_string(),
+                gate: "budget".to_string(),
+                message: format!(
+                    "Stopped to respect the configured cost budget (${:0.4} remaining; limit ${:0.4})",
+                    remaining_cost, self.max_total_cost_usd
                 ),
             });
         }
@@ -181,6 +252,18 @@ pub struct ImplementationCommandOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementationLlmCallRecord {
+    /// Logical stage in the harness attempt ("generation", "review", "review_fix", etc.)
+    pub kind: String,
+    pub model: String,
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub speed_failover: Option<SpeedFailoverDiagnostics>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImplementationGateSnapshot {
     pub gate: String,
     pub passed: bool,
@@ -220,6 +303,8 @@ pub struct ImplementationAttemptDiagnostics {
     pub remaining_blocking_categories: Vec<String>,
     pub attempt_ms: u64,
     pub attempt_cost_usd: f64,
+    #[serde(default)]
+    pub llm_calls: Vec<ImplementationLlmCallRecord>,
     #[serde(default)]
     pub notes: Vec<String>,
 }
@@ -365,6 +450,125 @@ fn parse_tsc_error_line(raw: &str) -> Option<(String, u32, u32, String)> {
     Some((path, line, col, msg))
 }
 
+fn parse_colon_error_line_with_message(raw: &str) -> Option<(String, u32, u32, String)> {
+    // Common format (e.g. go/tsc in some modes):
+    //   ./path/file.ts:12:34: message...
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let re = Regex::new(
+        r"^\s*(?:-->\s*)?(?:\./)?(?P<path>[^\s:]+?\.[A-Za-z0-9]+):(?P<line>\d+):(?P<col>\d+):\s*(?P<msg>.+)$",
+    )
+    .ok()?;
+    let caps = re.captures(trimmed)?;
+    let path = caps.name("path")?.as_str().trim_start_matches("./");
+    let path = path.replace('\\', "/");
+    let line = caps.name("line")?.as_str().parse::<u32>().ok()?;
+    let col = caps.name("col")?.as_str().parse::<u32>().ok()?;
+    let msg = caps.name("msg")?.as_str().trim().to_string();
+    let ext_ok = Path::new(&path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "rs" | "go" | "py"
+            )
+        })
+        .unwrap_or(false);
+    if !ext_ok {
+        return None;
+    }
+    Some((path, line, col, msg))
+}
+
+fn parse_bracketed_path_line(raw: &str) -> Option<(String, String)> {
+    // Example (prettier):
+    //   [warn] lib/command.js
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let re = Regex::new(r"^\s*\[(?P<tag>warn|error)\]\s+(?P<path>[^\s]+?\.[A-Za-z0-9]+)\b").ok()?;
+    let caps = re.captures(trimmed)?;
+    let tag = caps.name("tag")?.as_str().to_ascii_lowercase();
+    let path = caps.name("path")?.as_str().trim_start_matches("./");
+    let path = path.replace('\\', "/");
+    Some((tag, path))
+}
+
+fn parse_python_compileall_error_line(raw: &str) -> Option<String> {
+    // Example:
+    //   *** Error compiling 'src/foo.py'...
+    let trimmed = raw.trim();
+    if !trimmed.contains("Error compiling") {
+        return None;
+    }
+    let re = Regex::new(r"^\s*\*{3}\s*Error compiling\s+'(?P<path>[^']+?\.py)'.*").ok()?;
+    let caps = re.captures(trimmed)?;
+    let path = caps.name("path")?.as_str().trim_start_matches("./");
+    let path = path.replace('\\', "/");
+    Some(path)
+}
+
+fn parse_python_file_line(raw: &str) -> Option<(String, u32)> {
+    // Example:
+    //   File "src/foo.py", line 12
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("File ") {
+        return None;
+    }
+    let re =
+        Regex::new(r#"^\s*File\s+"(?P<path>[^"]+?\.py)"\s*,\s*line\s*(?P<line>\d+)\b"#).ok()?;
+    let caps = re.captures(trimmed)?;
+    let path = caps.name("path")?.as_str().trim_start_matches("./");
+    let path = path.replace('\\', "/");
+    let line = caps.name("line")?.as_str().parse::<u32>().ok()?;
+    Some((path, line))
+}
+
+fn parse_eslint_detail_line(raw: &str) -> Option<(u32, u32)> {
+    // Example:
+    //   12:34  error  message...
+    let trimmed = raw.trim();
+    let re = Regex::new(r"^\s*(?P<line>\d+):(?P<col>\d+)\s+(?:error|warning)\b").ok()?;
+    let caps = re.captures(trimmed)?;
+    let line = caps.name("line")?.as_str().parse::<u32>().ok()?;
+    let col = caps.name("col")?.as_str().parse::<u32>().ok()?;
+    Some((line, col))
+}
+
+fn parse_rust_error_header_line(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("error") {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+fn parse_rust_location_line(raw: &str) -> Option<(String, u32, u32)> {
+    // Example:
+    //   --> src/error.rs:471:39
+    let trimmed = raw.trim();
+    let re = Regex::new(r"^\s*-->\s*(?P<path>[^\s:]+?\.[A-Za-z0-9]+):(?P<line>\d+):(?P<col>\d+)")
+        .ok()?;
+    let caps = re.captures(trimmed)?;
+    let path = caps.name("path")?.as_str().trim_start_matches("./");
+    let path = path.replace('\\', "/");
+    let line = caps.name("line")?.as_str().parse::<u32>().ok()?;
+    let col = caps.name("col")?.as_str().parse::<u32>().ok()?;
+    let ext_ok = Path::new(&path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase() == "rs")
+        .unwrap_or(false);
+    if !ext_ok {
+        return None;
+    }
+    Some((path, line, col))
+}
+
 fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Option<String> {
     let stderr = strip_ansi_sequences(&outcome.stderr_tail);
     let stdout = strip_ansi_sequences(&outcome.stdout_tail);
@@ -384,6 +588,14 @@ fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Opti
     let stderr_lines = stderr.lines().map(str::trim).collect::<Vec<_>>();
     for (idx, line) in stderr_lines.iter().enumerate() {
         if let Some((file, ln, col)) = parse_path_line_col(line) {
+            let ext = Path::new(&file)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase())
+                .unwrap_or_default();
+            if !matches!(ext.as_str(), "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs") {
+                continue;
+            }
             let next = stderr_lines.get(idx + 1).copied().unwrap_or("");
             let msg = next.strip_prefix("Type error:").unwrap_or(next).trim();
             if !msg.is_empty() {
@@ -399,6 +611,64 @@ fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Opti
         }
     }
 
+    for line in stderr.lines().chain(stdout.lines()).map(str::trim) {
+        if let Some((file, ln, col, msg)) = parse_colon_error_line_with_message(line) {
+            return Some(format!(
+                "Quick check failed ({}): {}:{}:{} {}",
+                outcome.command, file, ln, col, msg
+            ));
+        }
+    }
+
+    let combined_lines = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    for (idx, line) in combined_lines.iter().enumerate() {
+        if let Some((file, ln, col)) = parse_rust_location_line(line) {
+            let header = combined_lines
+                .iter()
+                .take(idx)
+                .rev()
+                .find_map(|prev| parse_rust_error_header_line(prev));
+            if let Some(header) = header {
+                return Some(format!(
+                    "Quick check failed ({}): {}:{}:{} {}",
+                    outcome.command, file, ln, col, header
+                ));
+            }
+            return Some(format!(
+                "Quick check failed ({}): {}:{}:{}",
+                outcome.command, file, ln, col
+            ));
+        }
+    }
+
+    for line in stderr.lines().chain(stdout.lines()).map(str::trim) {
+        if let Some((tag, file)) = parse_bracketed_path_line(line) {
+            return Some(format!(
+                "Quick check failed ({}): [{}] {}",
+                outcome.command, tag, file
+            ));
+        }
+    }
+
+    for line in stderr.lines().chain(stdout.lines()).map(str::trim) {
+        if let Some(file) = parse_python_compileall_error_line(line) {
+            return Some(format!(
+                "Quick check failed ({}): python compile error in {}",
+                outcome.command, file
+            ));
+        }
+        if let Some((file, ln)) = parse_python_file_line(line) {
+            return Some(format!(
+                "Quick check failed ({}): {}:{} (python compile error)",
+                outcome.command, file, ln
+            ));
+        }
+    }
+
     let pick_line = |text: &str| -> Option<String> {
         let mut best: Option<&str> = None;
         for line in text.lines().map(str::trim) {
@@ -406,6 +676,19 @@ fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Opti
                 continue;
             }
             let lower = line.to_ascii_lowercase();
+            // Avoid reporting normal progress output unless there's nothing else.
+            if lower.starts_with("updating ")
+                || lower.starts_with("checking ")
+                || lower.starts_with("compiling ")
+                || lower.starts_with("finished ")
+                || lower.starts_with("downloading ")
+                || lower.starts_with("locking ")
+            {
+                if best.is_none() {
+                    best = Some(line);
+                }
+                continue;
+            }
             if lower.contains("error") || lower.contains("failed") || lower.contains("cannot ") {
                 best = Some(line);
                 break;
@@ -505,7 +788,178 @@ fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Ve
         }
     }
 
+    let combined_lines = combined.lines().map(str::trim).collect::<Vec<_>>();
+    for (idx, line) in combined_lines.iter().enumerate() {
+        if let Some((_tag, file)) = parse_bracketed_path_line(line) {
+            if let Some(path) = normalize_quick_check_path(&file) {
+                if seen.insert(path.clone()) {
+                    out.push(path);
+                }
+            }
+        }
+
+        if let Some(file) = parse_python_compileall_error_line(line) {
+            if let Some(path) = normalize_quick_check_path(&file) {
+                if seen.insert(path.clone()) {
+                    out.push(path);
+                }
+            }
+        }
+
+        if let Some((file, _ln)) = parse_python_file_line(line) {
+            if let Some(path) = normalize_quick_check_path(&file) {
+                if seen.insert(path.clone()) {
+                    out.push(path);
+                }
+            }
+        }
+
+        // ESLint often prints the file path on its own line followed by `line:col  error ...`.
+        if !line.contains(':') {
+            if let Some(path) = normalize_quick_check_path(line) {
+                let ext = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .unwrap_or_default();
+                if matches!(ext.as_str(), "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs") {
+                    if combined_lines
+                        .get(idx + 1)
+                        .and_then(|next| parse_eslint_detail_line(next))
+                        .is_some()
+                        && seen.insert(path.clone())
+                    {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+    }
+
     out
+}
+
+fn extract_quick_check_error_locations(
+    outcome: &ImplementationCommandOutcome,
+) -> Vec<(PathBuf, u32, u32)> {
+    let combined = format!(
+        "{}\n{}",
+        strip_ansi_sequences(&outcome.stderr_tail),
+        strip_ansi_sequences(&outcome.stdout_tail)
+    );
+
+    let mut out: Vec<(PathBuf, u32, u32)> = Vec::new();
+    let mut seen: HashSet<(PathBuf, u32, u32)> = HashSet::new();
+
+    let combined_lines = combined.lines().map(str::trim).collect::<Vec<_>>();
+    let mut current_eslint_file: Option<PathBuf> = None;
+
+    for raw in combined_lines.iter().copied() {
+        if let Some((file, ln, col, _msg)) = parse_tsc_error_line(raw) {
+            if let Some(path) = normalize_quick_check_path(&file) {
+                let key = (path.clone(), ln, col);
+                if seen.insert(key.clone()) {
+                    out.push(key);
+                }
+            }
+            continue;
+        }
+
+        if let Some((file, ln, col, _msg)) = parse_colon_error_line_with_message(raw) {
+            if let Some(path) = normalize_quick_check_path(&file) {
+                let key = (path.clone(), ln, col);
+                if seen.insert(key.clone()) {
+                    out.push(key);
+                }
+            }
+            continue;
+        }
+
+        // Rust-style location lines: `--> path:line:col`
+        if let Some((file, ln, col)) = parse_rust_location_line(raw) {
+            if let Some(path) = normalize_quick_check_path(&file) {
+                let key = (path.clone(), ln, col);
+                if seen.insert(key.clone()) {
+                    out.push(key);
+                }
+            }
+            continue;
+        }
+
+        // Next.js style: `./path/file.ts:line:col` (message may be on the next line)
+        if let Some((file, ln, col)) = parse_path_line_col(raw) {
+            if let Some(path) = normalize_quick_check_path(&file) {
+                let key = (path.clone(), ln, col);
+                if seen.insert(key.clone()) {
+                    out.push(key);
+                }
+            }
+            continue;
+        }
+
+        if let Some((file, ln)) = parse_python_file_line(raw) {
+            if let Some(path) = normalize_quick_check_path(&file) {
+                // Python compile errors don't always include a column.
+                let key = (path.clone(), ln, 1);
+                if seen.insert(key.clone()) {
+                    out.push(key);
+                }
+            }
+            continue;
+        }
+
+        // ESLint path header line (relative path only)
+        if !raw.contains(':') {
+            if let Some(path) = normalize_quick_check_path(raw) {
+                let ext = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .unwrap_or_default();
+                if matches!(ext.as_str(), "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs") {
+                    current_eslint_file = Some(path);
+                    continue;
+                }
+            }
+        }
+
+        if let Some((ln, col)) = parse_eslint_detail_line(raw) {
+            if let Some(path) = current_eslint_file.clone() {
+                let key = (path.clone(), ln, col);
+                if seen.insert(key.clone()) {
+                    out.push(key);
+                }
+            }
+            continue;
+        }
+
+        if raw.is_empty() {
+            current_eslint_file = None;
+        }
+    }
+
+    out
+}
+
+fn snippet_around_line(content: &str, line: u32, context_lines: usize) -> Option<String> {
+    if line == 0 {
+        return None;
+    }
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let idx = line.saturating_sub(1) as usize;
+    if idx >= lines.len() {
+        return None;
+    }
+    let start = idx.saturating_sub(context_lines);
+    let end = (idx + context_lines + 1).min(lines.len());
+    let snippet = lines[start..end].join("\n");
+    if snippet.trim().is_empty() {
+        return None;
+    }
+    Some(snippet)
 }
 
 fn format_quick_check_repair_modifier(
@@ -681,7 +1135,7 @@ where
         .collect::<HashSet<_>>();
 
     for attempt_index in 1..=config.max_attempts.max(1) {
-        if let Some(reason) = budget.exhausted(&usage) {
+        if let Some(reason) = budget.guard_before_llm_call(&usage) {
             feedback_reasons.push(reason.message);
             break;
         }
@@ -827,8 +1281,13 @@ async fn run_attempt(
     let mut fail_reason_records = Vec::new();
     let mut usage: Option<Usage> = None;
     let mut notes = Vec::new();
+    let mut llm_calls: Vec<ImplementationLlmCallRecord> = Vec::new();
+    // Detect the repo's quick-check command up-front so diagnostics can still surface it even if
+    // the attempt fails before reaching the quick-check gate (e.g. budget exhaustion during generation).
+    let detected_quick_check = detect_quick_check_command(repo_root);
+    let detected_quick_check_command = detected_quick_check.as_ref().map(command_to_string);
 
-    if let Some(reason) = budget.exhausted(usage_so_far) {
+    if let Some(reason) = budget.guard_before_llm_call(usage_so_far) {
         notes.push("budget_exceeded".to_string());
         push_fail_reason(
             &mut fail_reasons,
@@ -854,7 +1313,7 @@ async fn run_attempt(
             changed_lines_total: 0,
             changed_lines_by_file: HashMap::new(),
             quick_check_status: ImplementationQuickCheckStatus::Unavailable,
-            quick_check_command: None,
+            quick_check_command: detected_quick_check_command.clone(),
             quick_check_outcome: None,
             quick_check_outcomes: Vec::new(),
             quick_check_fix_loops: 0,
@@ -865,6 +1324,7 @@ async fn run_attempt(
             remaining_blocking_categories: Vec::new(),
             attempt_ms: attempt_start.elapsed().as_millis() as u64,
             attempt_cost_usd: 0.0,
+            llm_calls,
             notes,
         };
         return Ok(AttemptExecution {
@@ -872,6 +1332,90 @@ async fn run_attempt(
             usage: None,
             pass_payload: None,
         });
+    }
+
+    // In lab/CI strict mode we require quick checks to be detectable. If the repo's quick-check
+    // command isn't detectable or can't even start (missing toolchain), fail early before any LLM
+    // calls to avoid wasting budget on an attempt that cannot pass policy.
+    if config.require_quick_check_detectable {
+        let (quick_command, tool_required, tool_ok) = match detected_quick_check.as_ref() {
+            None => (None, None, false),
+            Some(cmd) => {
+                let quick_command = Some(command_to_string(cmd));
+                match cmd {
+                    QuickCheckCommand::Shell(_) => (
+                        quick_command,
+                        Some("sh".to_string()),
+                        program_available_on_path("sh"),
+                    ),
+                    QuickCheckCommand::Program { program, .. } if program == "python3" => (
+                        quick_command,
+                        Some("python3 or python".to_string()),
+                        program_available_on_path("python3") || program_available_on_path("python"),
+                    ),
+                    QuickCheckCommand::Program { program, .. } => (
+                        quick_command,
+                        Some(program.clone()),
+                        program_available_on_path(program),
+                    ),
+                }
+            }
+        };
+        if !tool_ok {
+            let message = if detected_quick_check.is_none() {
+                "No quick-check command could be detected for this repo, and strict policy requires quick checks."
+                    .to_string()
+            } else {
+                format!(
+                    "Quick checks require '{}' but it isn't available in this environment.",
+                    tool_required.unwrap_or_else(|| "required tool".to_string())
+                )
+            };
+            notes.push("quick_check_unavailable".to_string());
+            push_fail_reason(
+                &mut fail_reasons,
+                &mut fail_reason_records,
+                "quick_check",
+                REASON_QUICK_CHECK_UNAVAILABLE,
+                message.clone(),
+            );
+            push_gate(
+                &mut gates,
+                "quick_check",
+                false,
+                message,
+                Some(REASON_QUICK_CHECK_UNAVAILABLE),
+            );
+            let diag = ImplementationAttemptDiagnostics {
+                attempt_index,
+                passed: false,
+                fail_reasons,
+                fail_reason_records,
+                gates,
+                changed_files: Vec::new(),
+                changed_lines_total: 0,
+                changed_lines_by_file: HashMap::new(),
+                quick_check_status: ImplementationQuickCheckStatus::Unavailable,
+                quick_check_command: quick_command,
+                quick_check_outcome: None,
+                quick_check_outcomes: Vec::new(),
+                quick_check_fix_loops: 0,
+                quick_check_failure_summary: None,
+                review_iterations: 0,
+                review_blocking_remaining: 0,
+                remaining_blocking_titles: Vec::new(),
+                remaining_blocking_categories: Vec::new(),
+                attempt_ms: attempt_start.elapsed().as_millis() as u64,
+                attempt_cost_usd: 0.0,
+                llm_calls,
+                notes,
+            };
+            return Ok(AttemptExecution {
+                diagnostics: diag,
+                usage: None,
+                pass_payload: None,
+            });
+        }
     }
 
     let sandbox_label = format!("apply-attempt-{}-{}", attempt_index, run_id);
@@ -903,7 +1447,7 @@ async fn run_attempt(
                 changed_lines_total: 0,
                 changed_lines_by_file: HashMap::new(),
                 quick_check_status: ImplementationQuickCheckStatus::Unavailable,
-                quick_check_command: None,
+                quick_check_command: detected_quick_check_command.clone(),
                 quick_check_outcome: None,
                 quick_check_outcomes: Vec::new(),
                 quick_check_fix_loops: 0,
@@ -914,6 +1458,7 @@ async fn run_attempt(
                 remaining_blocking_categories: Vec::new(),
                 attempt_ms: attempt_start.elapsed().as_millis() as u64,
                 attempt_cost_usd: 0.0,
+                llm_calls,
                 notes,
             };
             return Ok(AttemptExecution {
@@ -937,7 +1482,9 @@ async fn run_attempt(
         });
     }
 
-    if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+    if let Some(reason) =
+        budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
+    {
         notes.push("budget_exceeded".to_string());
         push_fail_reason(
             &mut fail_reasons,
@@ -964,7 +1511,7 @@ async fn run_attempt(
             changed_lines_total: 0,
             changed_lines_by_file: HashMap::new(),
             quick_check_status: ImplementationQuickCheckStatus::Unavailable,
-            quick_check_command: None,
+            quick_check_command: detected_quick_check_command.clone(),
             quick_check_outcome: None,
             quick_check_outcomes: Vec::new(),
             quick_check_fix_loops: 0,
@@ -975,6 +1522,7 @@ async fn run_attempt(
             remaining_blocking_categories: Vec::new(),
             attempt_ms: attempt_start.elapsed().as_millis() as u64,
             attempt_cost_usd: usage.as_ref().map(|u| u.cost()).unwrap_or(0.0),
+            llm_calls,
             notes,
         };
         return Ok(AttemptExecution {
@@ -984,14 +1532,78 @@ async fn run_attempt(
         });
     }
 
-    let generation = generate_attempt_candidate(
-        sandbox.path(),
-        suggestion,
-        &feedback_preview,
-        repo_memory.clone(),
-        allowed_files,
+    let generation_timeout_ms = budget
+        .timeout_ms_for_next_llm_call()
+        .min(MAX_GENERATION_TIMEOUT_MS);
+    let generation = tokio::time::timeout(
+        Duration::from_millis(generation_timeout_ms),
+        generate_attempt_candidate(
+            sandbox.path(),
+            suggestion,
+            &feedback_preview,
+            repo_memory.clone(),
+            allowed_files,
+            &mut llm_calls,
+            generation_timeout_ms,
+        ),
     )
     .await;
+
+    let generation = match generation {
+        Ok(result) => result,
+        Err(_) => {
+            let message = format!(
+                "Stopped to respect the configured time budget (generation timed out after {}ms; limit {}ms)",
+                generation_timeout_ms, budget.max_total_ms
+            );
+            notes.push("budget_exceeded".to_string());
+            push_fail_reason(
+                &mut fail_reasons,
+                &mut fail_reason_records,
+                "budget",
+                REASON_BUDGET_EXCEEDED,
+                message.clone(),
+            );
+            push_gate(
+                &mut gates,
+                "budget",
+                false,
+                message,
+                Some(REASON_BUDGET_EXCEEDED),
+            );
+            let _ = sandbox.cleanup();
+            let attempt_cost_usd = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+            let diag = ImplementationAttemptDiagnostics {
+                attempt_index,
+                passed: false,
+                fail_reasons,
+                fail_reason_records,
+                gates,
+                changed_files: Vec::new(),
+                changed_lines_total: 0,
+                changed_lines_by_file: HashMap::new(),
+                quick_check_status: ImplementationQuickCheckStatus::Unavailable,
+                quick_check_command: detected_quick_check_command.clone(),
+                quick_check_outcome: None,
+                quick_check_outcomes: Vec::new(),
+                quick_check_fix_loops: 0,
+                quick_check_failure_summary: None,
+                review_iterations: 0,
+                review_blocking_remaining: 0,
+                remaining_blocking_titles: Vec::new(),
+                remaining_blocking_categories: Vec::new(),
+                attempt_ms: attempt_start.elapsed().as_millis() as u64,
+                attempt_cost_usd,
+                llm_calls,
+                notes,
+            };
+            return Ok(AttemptExecution {
+                diagnostics: diag,
+                usage,
+                pass_payload: None,
+            });
+        }
+    };
 
     let mut generated = match generation {
         Ok(value) => value,
@@ -1022,7 +1634,7 @@ async fn run_attempt(
                 changed_lines_total: 0,
                 changed_lines_by_file: HashMap::new(),
                 quick_check_status: ImplementationQuickCheckStatus::Unavailable,
-                quick_check_command: None,
+                quick_check_command: detected_quick_check_command.clone(),
                 quick_check_outcome: None,
                 quick_check_outcomes: Vec::new(),
                 quick_check_fix_loops: 0,
@@ -1033,6 +1645,7 @@ async fn run_attempt(
                 remaining_blocking_categories: Vec::new(),
                 attempt_ms: attempt_start.elapsed().as_millis() as u64,
                 attempt_cost_usd: 0.0,
+                llm_calls,
                 notes,
             };
             return Ok(AttemptExecution {
@@ -1072,7 +1685,7 @@ async fn run_attempt(
             changed_lines_total: 0,
             changed_lines_by_file: HashMap::new(),
             quick_check_status: ImplementationQuickCheckStatus::Unavailable,
-            quick_check_command: None,
+            quick_check_command: detected_quick_check_command.clone(),
             quick_check_outcome: None,
             quick_check_outcomes: Vec::new(),
             quick_check_fix_loops: 0,
@@ -1083,6 +1696,7 @@ async fn run_attempt(
             remaining_blocking_categories: Vec::new(),
             attempt_ms: attempt_start.elapsed().as_millis() as u64,
             attempt_cost_usd,
+            llm_calls,
             notes,
         };
         return Ok(AttemptExecution {
@@ -1242,19 +1856,407 @@ async fn run_attempt(
         );
     }
 
+    // If deterministic gates already failed, don't spend more time/cost running review or checks.
+    // This keeps budgets meaningful and avoids muddying failure reasons with downstream noise.
+    if !fail_reasons.is_empty() {
+        notes.push("attempt_failed_before_review".to_string());
+        let _ = sandbox.cleanup();
+        let attempt_cost_usd = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+        let diagnostics = ImplementationAttemptDiagnostics {
+            attempt_index,
+            passed: false,
+            fail_reasons,
+            fail_reason_records,
+            gates,
+            changed_files: repo_changes.files,
+            changed_lines_total: changed_total,
+            changed_lines_by_file: changed_by_file,
+            quick_check_status: ImplementationQuickCheckStatus::Unavailable,
+            quick_check_command: detected_quick_check_command.clone(),
+            quick_check_outcome: None,
+            quick_check_outcomes: Vec::new(),
+            quick_check_fix_loops: 0,
+            quick_check_failure_summary: None,
+            review_iterations: 0,
+            review_blocking_remaining: 0,
+            remaining_blocking_titles: Vec::new(),
+            remaining_blocking_categories: Vec::new(),
+            attempt_ms: attempt_start.elapsed().as_millis() as u64,
+            attempt_cost_usd,
+            llm_calls,
+            notes,
+        };
+        return Ok(AttemptExecution {
+            pass_payload: None,
+            diagnostics,
+            usage,
+        });
+    }
+
+    // Run quick checks before the (LLM) review gate. This prevents spending review budget on code
+    // that doesn't even build/typecheck, and improves first-attempt pass rate by repairing common
+    // compiler/typechecker failures in-attempt.
+    let mut quick_check_outcomes: Vec<ImplementationCommandOutcome> = Vec::new();
+    let mut quick_check_fix_loops = 0usize;
+    let mut quick_check_failure_summary: Option<String> = None;
+
+    let mut files_changed_set = repo_changes.files.iter().cloned().collect::<HashSet<_>>();
+    let mut final_changed_files = repo_changes.files.clone();
+    final_changed_files.sort();
+
+    let pre_review_quick_check_timeout_ms = config.quick_check_timeout_ms.min(
+        budget
+            .remaining_ms()
+            .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
+            .max(1),
+    );
+    let (mut quick_status, mut quick_command, mut quick_outcome) = run_quick_checks(
+        sandbox.path(),
+        Some(repo_root),
+        &mut notes,
+        config.quick_checks_mode,
+        pre_review_quick_check_timeout_ms,
+    )?;
+
+    if let Some(outcome) = quick_outcome.clone() {
+        if quick_status == ImplementationQuickCheckStatus::Failed {
+            quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+        } else {
+            quick_check_failure_summary = None;
+        }
+        quick_check_outcomes.push(outcome);
+    }
+
+    let eligible_for_pre_review_quick_check_repair = quick_status
+        == ImplementationQuickCheckStatus::Failed
+        && config.max_auto_quick_check_fix_loops > 0
+        && fail_reasons.is_empty();
+    if eligible_for_pre_review_quick_check_repair {
+        let remaining_loops = config
+            .max_auto_quick_check_fix_loops
+            .saturating_sub(quick_check_fix_loops);
+        for _ in 0..remaining_loops {
+            let Some(outcome) = quick_outcome.as_ref() else {
+                break;
+            };
+            let candidates = extract_quick_check_error_paths(outcome);
+            let target = candidates.into_iter().find(|path| {
+                if config.quick_check_fix_requires_in_scope_error {
+                    allowed_files.contains(path)
+                } else {
+                    allowed_files.contains(path) || files_changed_set.contains(path)
+                }
+            });
+            let Some(target) = target else {
+                notes.push("quick_check_repair_skipped_no_in_scope_error_path".to_string());
+                break;
+            };
+
+            quick_check_fix_loops = quick_check_fix_loops.saturating_add(1);
+            notes.push(format!("quick_check_fix_loop_{}", quick_check_fix_loops));
+
+            if let Some(reason) =
+                budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
+            {
+                notes.push("budget_exceeded".to_string());
+                push_fail_reason(
+                    &mut fail_reasons,
+                    &mut fail_reason_records,
+                    &reason.gate,
+                    &reason.code,
+                    reason.message.clone(),
+                );
+                push_gate(
+                    &mut gates,
+                    "budget",
+                    false,
+                    reason.message,
+                    Some(REASON_BUDGET_EXCEEDED),
+                );
+                break;
+            }
+
+            let resolved = resolve_repo_path_allow_new(sandbox.path(), &target).map_err(|e| {
+                anyhow::anyhow!("Unsafe quick-check repair path {}: {}", target.display(), e)
+            })?;
+            let current_content = match std::fs::read_to_string(&resolved.absolute) {
+                Ok(content) => content,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    push_fail_reason(
+                        &mut fail_reasons,
+                        &mut fail_reason_records,
+                        "quick_check",
+                        REASON_QUICK_CHECK_FAILED,
+                        format!(
+                            "Quick check auto-repair failed reading {}: {}",
+                            target.display(),
+                            truncate(&e.to_string(), 180)
+                        ),
+                    );
+                    break;
+                }
+            };
+            let is_new_file = !resolved.absolute.exists() || current_content.trim().is_empty();
+
+            let mut repair_preview = feedback_preview.clone();
+            let error_summary = quick_check_failure_summary
+                .as_deref()
+                .unwrap_or("Quick checks failed");
+            repair_preview.modifier = Some(format_quick_check_repair_modifier(
+                feedback_preview.modifier.as_deref(),
+                error_summary,
+                &target,
+            ));
+            if !is_new_file {
+                if let Some((_, ln, _col)) = extract_quick_check_error_locations(outcome)
+                    .into_iter()
+                    .find(|(path, _, _)| path == &target)
+                {
+                    repair_preview.evidence_line = Some(ln);
+                    repair_preview.evidence_snippet = snippet_around_line(&current_content, ln, 8);
+                }
+            }
+
+            ensure_implementation_model(IMPLEMENTATION_MODEL)?;
+            let repair_timeout_ms = budget
+                .timeout_ms_for_next_llm_call()
+                .min(MAX_FIX_TIMEOUT_MS);
+            let fix = tokio::time::timeout(
+                Duration::from_millis(repair_timeout_ms),
+                generate_fix_content_with_model(
+                    &target,
+                    &current_content,
+                    suggestion,
+                    &repair_preview,
+                    repo_memory.clone(),
+                    is_new_file,
+                    IMPLEMENTATION_MODEL,
+                    repair_timeout_ms,
+                ),
+            )
+            .await;
+            let fix = match fix {
+                Ok(result) => match result {
+                    Ok(value) => value,
+                    Err(err) => {
+                        push_fail_reason(
+                            &mut fail_reasons,
+                            &mut fail_reason_records,
+                            "quick_check",
+                            REASON_QUICK_CHECK_FAILED,
+                            format!(
+                                "Quick check auto-repair failed: {}",
+                                truncate(&err.to_string(), 180)
+                            ),
+                        );
+                        break;
+                    }
+                },
+                Err(_) => {
+                    notes.push("budget_exceeded".to_string());
+                    let message = format!(
+                        "Stopped to respect the configured time budget (quick-check repair timed out after {}ms; limit {}ms)",
+                        repair_timeout_ms, budget.max_total_ms
+                    );
+                    push_fail_reason(
+                        &mut fail_reasons,
+                        &mut fail_reason_records,
+                        "budget",
+                        REASON_BUDGET_EXCEEDED,
+                        message.clone(),
+                    );
+                    push_gate(
+                        &mut gates,
+                        "budget",
+                        false,
+                        message,
+                        Some(REASON_BUDGET_EXCEEDED),
+                    );
+                    break;
+                }
+            };
+            usage = merge_usage(usage, fix.usage.clone());
+            if let Some(reason) =
+                budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone()))
+            {
+                notes.push("budget_exceeded".to_string());
+                push_fail_reason(
+                    &mut fail_reasons,
+                    &mut fail_reason_records,
+                    &reason.gate,
+                    &reason.code,
+                    reason.message.clone(),
+                );
+                push_gate(
+                    &mut gates,
+                    "budget",
+                    false,
+                    reason.message,
+                    Some(REASON_BUDGET_EXCEEDED),
+                );
+                break;
+            }
+
+            if let Some(parent) = resolved.absolute.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&resolved.absolute, &fix.new_content).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed writing quick-check repair {}: {}",
+                    target.display(),
+                    e
+                )
+            })?;
+            files_changed_set.insert(target.clone());
+            generated
+                .modified_areas_by_file
+                .entry(target.clone())
+                .or_default()
+                .extend(fix.modified_areas.clone());
+
+            final_changed_files = files_changed_set.iter().cloned().collect::<Vec<_>>();
+            final_changed_files.sort();
+
+            if let Err(err) = syntax_gate(sandbox.path(), &final_changed_files) {
+                push_fail_reason(
+                    &mut fail_reasons,
+                    &mut fail_reason_records,
+                    "syntax",
+                    REASON_SYNTAX_VIOLATION,
+                    err,
+                );
+                break;
+            }
+
+            // Re-run quick checks immediately after repair. Review only runs once we have a
+            // candidate that builds/typechecks.
+            let (status, command, outcome) = run_quick_checks(
+                sandbox.path(),
+                Some(repo_root),
+                &mut notes,
+                config.quick_checks_mode,
+                config.quick_check_timeout_ms.min(
+                    budget
+                        .remaining_ms()
+                        .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
+                        .max(1),
+                ),
+            )?;
+            quick_status = status;
+            quick_command = command;
+            quick_outcome = outcome;
+            if let Some(outcome) = quick_outcome.clone() {
+                if quick_status == ImplementationQuickCheckStatus::Failed {
+                    quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+                } else {
+                    quick_check_failure_summary = None;
+                }
+                quick_check_outcomes.push(outcome);
+            }
+            if quick_status == ImplementationQuickCheckStatus::Failed {
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    // If quick checks don't pass policy, fail early before spending review budget.
+    if quick_status == ImplementationQuickCheckStatus::Failed {
+        push_fail_reason(
+            &mut fail_reasons,
+            &mut fail_reason_records,
+            "quick_check",
+            REASON_QUICK_CHECK_FAILED,
+            "Quick project checks failed",
+        );
+    } else if quick_status == ImplementationQuickCheckStatus::Unavailable {
+        notes.push("quick_check_unavailable".to_string());
+        if config.require_quick_check_detectable {
+            push_fail_reason(
+                &mut fail_reasons,
+                &mut fail_reason_records,
+                "quick_check",
+                REASON_QUICK_CHECK_UNAVAILABLE,
+                "Quick checks were unavailable and strict policy requires a detectable check command",
+            );
+        }
+    }
+    let quick_check_ok_pre = quick_check_passes_policy(quick_status, config);
+    if !quick_check_ok_pre {
+        let quick_reason_code = match quick_status {
+            ImplementationQuickCheckStatus::Passed => None,
+            ImplementationQuickCheckStatus::Failed => Some(REASON_QUICK_CHECK_FAILED),
+            ImplementationQuickCheckStatus::Unavailable
+                if config.require_quick_check_detectable =>
+            {
+                Some(REASON_QUICK_CHECK_UNAVAILABLE)
+            }
+            ImplementationQuickCheckStatus::Unavailable => None,
+        };
+        push_gate(
+            &mut gates,
+            "quick_check",
+            quick_check_ok_pre,
+            match quick_status {
+                ImplementationQuickCheckStatus::Passed => "Quick checks passed".to_string(),
+                ImplementationQuickCheckStatus::Failed => "Quick checks failed".to_string(),
+                ImplementationQuickCheckStatus::Unavailable => {
+                    "No detectable quick-check command".to_string()
+                }
+            },
+            quick_reason_code,
+        );
+        notes.push("attempt_failed_before_review".to_string());
+        let _ = sandbox.cleanup();
+        let attempt_cost_usd = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+        let diagnostics = ImplementationAttemptDiagnostics {
+            attempt_index,
+            passed: false,
+            fail_reasons,
+            fail_reason_records,
+            gates,
+            changed_files: final_changed_files,
+            changed_lines_total: changed_total,
+            changed_lines_by_file: changed_by_file,
+            quick_check_status: quick_status,
+            quick_check_command: quick_command,
+            quick_check_outcome: quick_outcome,
+            quick_check_outcomes,
+            quick_check_fix_loops,
+            quick_check_failure_summary,
+            review_iterations: 0,
+            review_blocking_remaining: 0,
+            remaining_blocking_titles: Vec::new(),
+            remaining_blocking_categories: Vec::new(),
+            attempt_ms: attempt_start.elapsed().as_millis() as u64,
+            attempt_cost_usd,
+            llm_calls,
+            notes,
+        };
+        return Ok(AttemptExecution {
+            pass_payload: None,
+            diagnostics,
+            usage,
+        });
+    }
+
+    // LLM review gate (adversarial) runs only after the code builds/typechecks.
     let mut review_iterations = 0usize;
     let mut blocking_remaining = 0usize;
     let mut remaining_blocking_titles = Vec::new();
     let mut remaining_blocking_categories = Vec::new();
     let mut fixed_titles = Vec::new();
-    let mut files_changed_set = repo_changes.files.iter().cloned().collect::<HashSet<_>>();
     let review_result = run_review_gate(
         sandbox.path(),
         suggestion,
         &generated.description,
         &generated.old_contents,
-        &repo_changes.files,
+        &final_changed_files,
         repo_memory.clone(),
+        quick_status,
+        quick_command.as_deref(),
         blocking_severities,
         config.max_auto_review_fix_loops,
         budget,
@@ -1269,10 +2271,13 @@ async fn run_attempt(
     )
     .await;
     let mut review_budget_exceeded = false;
+    let mut review_budget_message: Option<String> = None;
+    let mut review_error: Option<String> = None;
     match &review_result {
         Ok(()) => {}
         Err(ReviewGateError::BudgetExceeded(reason)) => {
             review_budget_exceeded = true;
+            review_budget_message = Some(reason.message.clone());
             notes.push("budget_exceeded".to_string());
             push_fail_reason(
                 &mut fail_reasons,
@@ -1290,6 +2295,7 @@ async fn run_attempt(
             );
         }
         Err(ReviewGateError::Failed(err)) => {
+            review_error = Some(err.clone());
             push_fail_reason(
                 &mut fail_reasons,
                 &mut fail_reason_records,
@@ -1305,17 +2311,25 @@ async fn run_attempt(
         &mut gates,
         "review",
         review_ok,
-        if blocking_remaining == 0 {
+        if review_ok {
             format!(
                 "Review gate passed after {} iteration(s)",
                 review_iterations.max(1)
             )
-        } else {
+        } else if review_budget_exceeded {
+            review_budget_message
+                .clone()
+                .unwrap_or_else(|| "Stopped to respect the configured budget".to_string())
+        } else if let Some(err) = review_error.as_deref() {
+            err.to_string()
+        } else if blocking_remaining > 0 {
             format!(
                 "Review found {} blocking finding(s) after {} iteration(s)",
                 blocking_remaining,
                 review_iterations.max(1)
             )
+        } else {
+            "Review failed".to_string()
         },
         if review_ok {
             None
@@ -1338,8 +2352,62 @@ async fn run_attempt(
         );
     }
 
-    let mut final_changed_files = files_changed_set.iter().cloned().collect::<Vec<_>>();
+    final_changed_files = files_changed_set.iter().cloned().collect::<Vec<_>>();
     final_changed_files.sort();
+
+    // If review failed (including due to budget exhaustion), stop immediately. Downstream gates
+    // are only meaningful for passing candidates. Record the passing quick-check gate snapshot
+    // for transparency since we won't reach the post-review quick-check phase.
+    if !fail_reasons.is_empty() {
+        if !gates.iter().any(|gate| gate.gate == "quick_check") {
+            push_gate(
+                &mut gates,
+                "quick_check",
+                true,
+                match quick_status {
+                    ImplementationQuickCheckStatus::Passed => "Quick checks passed".to_string(),
+                    ImplementationQuickCheckStatus::Failed => "Quick checks failed".to_string(),
+                    ImplementationQuickCheckStatus::Unavailable => {
+                        "No detectable quick-check command".to_string()
+                    }
+                },
+                None,
+            );
+        }
+        notes.push("attempt_failed_after_review".to_string());
+        let _ = sandbox.cleanup();
+        let attempt_cost_usd = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+        let diagnostics = ImplementationAttemptDiagnostics {
+            attempt_index,
+            passed: false,
+            fail_reasons,
+            fail_reason_records,
+            gates,
+            changed_files: final_changed_files,
+            changed_lines_total: changed_total,
+            changed_lines_by_file: changed_by_file,
+            quick_check_status: quick_status,
+            quick_check_command: quick_command,
+            quick_check_outcome: quick_outcome,
+            quick_check_outcomes,
+            quick_check_fix_loops,
+            quick_check_failure_summary,
+            review_iterations,
+            review_blocking_remaining: blocking_remaining,
+            remaining_blocking_titles,
+            remaining_blocking_categories,
+            attempt_ms: attempt_start.elapsed().as_millis() as u64,
+            attempt_cost_usd,
+            llm_calls,
+            notes,
+        };
+        return Ok(AttemptExecution {
+            pass_payload: None,
+            diagnostics,
+            usage,
+        });
+    }
+
     let binary_ok = match binary_write_gate(sandbox.path(), &final_changed_files) {
         Ok(()) => true,
         Err(err) => {
@@ -1394,27 +2462,155 @@ async fn run_attempt(
         );
     }
 
-    let mut quick_check_outcomes: Vec<ImplementationCommandOutcome> = Vec::new();
-    let mut quick_check_fix_loops = 0usize;
-    let mut quick_check_failure_summary: Option<String> = None;
-    let (mut quick_status, mut quick_command, mut quick_outcome) = run_quick_checks(
+    // Fail-fast if we already know this attempt cannot pass.
+    if !fail_reasons.is_empty() {
+        notes.push("attempt_failed_before_quick_check".to_string());
+        if !gates.iter().any(|gate| gate.gate == "quick_check") {
+            push_gate(
+                &mut gates,
+                "quick_check",
+                true,
+                match quick_status {
+                    ImplementationQuickCheckStatus::Passed => "Quick checks passed".to_string(),
+                    ImplementationQuickCheckStatus::Failed => "Quick checks failed".to_string(),
+                    ImplementationQuickCheckStatus::Unavailable => {
+                        "No detectable quick-check command".to_string()
+                    }
+                },
+                None,
+            );
+        }
+        let _ = sandbox.cleanup();
+        let attempt_cost_usd = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+        let diagnostics = ImplementationAttemptDiagnostics {
+            attempt_index,
+            passed: false,
+            fail_reasons,
+            fail_reason_records,
+            gates,
+            changed_files: final_changed_files,
+            changed_lines_total: changed_total,
+            changed_lines_by_file: changed_by_file,
+            quick_check_status: quick_status,
+            quick_check_command: quick_command.clone(),
+            quick_check_outcome: quick_outcome.clone(),
+            quick_check_outcomes: quick_check_outcomes.clone(),
+            quick_check_fix_loops,
+            quick_check_failure_summary: quick_check_failure_summary.clone(),
+            review_iterations,
+            review_blocking_remaining: blocking_remaining,
+            remaining_blocking_titles,
+            remaining_blocking_categories,
+            attempt_ms: attempt_start.elapsed().as_millis() as u64,
+            attempt_cost_usd,
+            llm_calls,
+            notes,
+        };
+        return Ok(AttemptExecution {
+            pass_payload: None,
+            diagnostics,
+            usage,
+        });
+    }
+
+    if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+        notes.push("budget_exceeded".to_string());
+        push_fail_reason(
+            &mut fail_reasons,
+            &mut fail_reason_records,
+            &reason.gate,
+            &reason.code,
+            reason.message.clone(),
+        );
+        push_gate(
+            &mut gates,
+            "budget",
+            false,
+            reason.message,
+            Some(REASON_BUDGET_EXCEEDED),
+        );
+        if !gates.iter().any(|gate| gate.gate == "quick_check") {
+            push_gate(
+                &mut gates,
+                "quick_check",
+                true,
+                match quick_status {
+                    ImplementationQuickCheckStatus::Passed => "Quick checks passed".to_string(),
+                    ImplementationQuickCheckStatus::Failed => "Quick checks failed".to_string(),
+                    ImplementationQuickCheckStatus::Unavailable => {
+                        "No detectable quick-check command".to_string()
+                    }
+                },
+                None,
+            );
+        }
+        let _ = sandbox.cleanup();
+        let attempt_cost_usd = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+        let diagnostics = ImplementationAttemptDiagnostics {
+            attempt_index,
+            passed: false,
+            fail_reasons,
+            fail_reason_records,
+            gates,
+            changed_files: final_changed_files,
+            changed_lines_total: changed_total,
+            changed_lines_by_file: changed_by_file,
+            quick_check_status: quick_status,
+            quick_check_command: quick_command.clone(),
+            quick_check_outcome: quick_outcome.clone(),
+            quick_check_outcomes: quick_check_outcomes.clone(),
+            quick_check_fix_loops,
+            quick_check_failure_summary: quick_check_failure_summary.clone(),
+            review_iterations,
+            review_blocking_remaining: blocking_remaining,
+            remaining_blocking_titles,
+            remaining_blocking_categories,
+            attempt_ms: attempt_start.elapsed().as_millis() as u64,
+            attempt_cost_usd,
+            llm_calls,
+            notes,
+        };
+        return Ok(AttemptExecution {
+            pass_payload: None,
+            diagnostics,
+            usage,
+        });
+    }
+
+    let quick_check_timeout_ms = config.quick_check_timeout_ms.min(
+        budget
+            .remaining_ms()
+            .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
+            .max(1),
+    );
+    let (status, command, outcome) = run_quick_checks(
         sandbox.path(),
         Some(repo_root),
         &mut notes,
         config.quick_checks_mode,
-        config.quick_check_timeout_ms,
+        quick_check_timeout_ms,
     )?;
+    quick_status = status;
+    quick_command = command;
+    quick_outcome = outcome;
 
     if let Some(outcome) = quick_outcome.clone() {
-        quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+        if quick_status == ImplementationQuickCheckStatus::Failed {
+            quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+        } else {
+            quick_check_failure_summary = None;
+        }
         quick_check_outcomes.push(outcome);
     }
 
+    let remaining_quick_check_fix_loops = config
+        .max_auto_quick_check_fix_loops
+        .saturating_sub(quick_check_fix_loops);
     let eligible_for_quick_check_repair = quick_status == ImplementationQuickCheckStatus::Failed
-        && config.max_auto_quick_check_fix_loops > 0
+        && remaining_quick_check_fix_loops > 0
         && fail_reasons.is_empty();
     if eligible_for_quick_check_repair {
-        for loop_index in 0..config.max_auto_quick_check_fix_loops {
+        for _ in 0..remaining_quick_check_fix_loops {
             let Some(outcome) = quick_outcome.as_ref() else {
                 break;
             };
@@ -1431,11 +2627,11 @@ async fn run_attempt(
                 break;
             };
 
-            quick_check_fix_loops = loop_index + 1;
+            quick_check_fix_loops = quick_check_fix_loops.saturating_add(1);
             notes.push(format!("quick_check_fix_loop_{}", quick_check_fix_loops));
 
             if let Some(reason) =
-                budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone()))
+                budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
             {
                 notes.push("budget_exceeded".to_string());
                 push_fail_reason(
@@ -1487,30 +2683,70 @@ async fn run_attempt(
                 error_summary,
                 &target,
             ));
+            if !is_new_file {
+                if let Some((_, ln, _col)) = extract_quick_check_error_locations(outcome)
+                    .into_iter()
+                    .find(|(path, _, _)| path == &target)
+                {
+                    repair_preview.evidence_line = Some(ln);
+                    repair_preview.evidence_snippet = snippet_around_line(&current_content, ln, 8);
+                }
+            }
 
             ensure_implementation_model(IMPLEMENTATION_MODEL)?;
-            let fix = match generate_fix_content_with_model(
-                &target,
-                &current_content,
-                suggestion,
-                &repair_preview,
-                repo_memory.clone(),
-                is_new_file,
-                IMPLEMENTATION_MODEL,
+            let repair_timeout_ms = budget
+                .timeout_ms_for_next_llm_call()
+                .min(MAX_FIX_TIMEOUT_MS);
+            let fix = tokio::time::timeout(
+                Duration::from_millis(repair_timeout_ms),
+                generate_fix_content_with_model(
+                    &target,
+                    &current_content,
+                    suggestion,
+                    &repair_preview,
+                    repo_memory.clone(),
+                    is_new_file,
+                    IMPLEMENTATION_MODEL,
+                    repair_timeout_ms,
+                ),
             )
-            .await
-            {
-                Ok(value) => value,
-                Err(err) => {
+            .await;
+            let fix = match fix {
+                Ok(result) => match result {
+                    Ok(value) => value,
+                    Err(err) => {
+                        push_fail_reason(
+                            &mut fail_reasons,
+                            &mut fail_reason_records,
+                            "quick_check",
+                            REASON_QUICK_CHECK_FAILED,
+                            format!(
+                                "Quick check auto-repair failed: {}",
+                                truncate(&err.to_string(), 180)
+                            ),
+                        );
+                        break;
+                    }
+                },
+                Err(_) => {
+                    notes.push("budget_exceeded".to_string());
+                    let message = format!(
+                        "Stopped to respect the configured time budget (quick-check repair timed out after {}ms; limit {}ms)",
+                        repair_timeout_ms, budget.max_total_ms
+                    );
                     push_fail_reason(
                         &mut fail_reasons,
                         &mut fail_reason_records,
-                        "quick_check",
-                        REASON_QUICK_CHECK_FAILED,
-                        format!(
-                            "Quick check auto-repair failed: {}",
-                            truncate(&err.to_string(), 180)
-                        ),
+                        "budget",
+                        REASON_BUDGET_EXCEEDED,
+                        message.clone(),
+                    );
+                    push_gate(
+                        &mut gates,
+                        "budget",
+                        false,
+                        message,
+                        Some(REASON_BUDGET_EXCEEDED),
                     );
                     break;
                 }
@@ -1568,6 +2804,36 @@ async fn run_attempt(
                 break;
             }
 
+            // Re-run the quick check immediately after repair. Don't spend review budget
+            // until the code builds/typechecks. We'll do a single review rerun after the
+            // quick check passes, to ensure the final code is still safe and correct.
+            let (status, command, outcome) = run_quick_checks(
+                sandbox.path(),
+                Some(repo_root),
+                &mut notes,
+                config.quick_checks_mode,
+                config.quick_check_timeout_ms.min(
+                    budget
+                        .remaining_ms()
+                        .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
+                        .max(1),
+                ),
+            )?;
+            quick_status = status;
+            quick_command = command;
+            quick_outcome = outcome;
+            if let Some(outcome) = quick_outcome.clone() {
+                if quick_status == ImplementationQuickCheckStatus::Failed {
+                    quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+                } else {
+                    quick_check_failure_summary = None;
+                }
+                quick_check_outcomes.push(outcome);
+            }
+            if quick_status == ImplementationQuickCheckStatus::Failed {
+                continue;
+            }
+
             let initial_review_iterations = review_iterations;
             let mut rerun_review_iterations = 0usize;
             let mut rerun_blocking_remaining = 0usize;
@@ -1580,6 +2846,8 @@ async fn run_attempt(
                 &generated.old_contents,
                 &final_changed_files,
                 repo_memory.clone(),
+                quick_status,
+                quick_command.as_deref(),
                 blocking_severities,
                 config.max_auto_review_fix_loops,
                 budget,
@@ -1644,23 +2912,43 @@ async fn run_attempt(
                 break;
             }
 
+            if let Err(err) = syntax_gate(sandbox.path(), &final_changed_files) {
+                push_fail_reason(
+                    &mut fail_reasons,
+                    &mut fail_reason_records,
+                    "post_review_syntax",
+                    REASON_SYNTAX_VIOLATION,
+                    err,
+                );
+                break;
+            }
+
+            // Review fixes could re-break the build/typecheck, so re-run quick checks once.
             let (status, command, outcome) = run_quick_checks(
                 sandbox.path(),
                 Some(repo_root),
                 &mut notes,
                 config.quick_checks_mode,
-                config.quick_check_timeout_ms,
+                config.quick_check_timeout_ms.min(
+                    budget
+                        .remaining_ms()
+                        .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
+                        .max(1),
+                ),
             )?;
             quick_status = status;
             quick_command = command;
             quick_outcome = outcome;
             if let Some(outcome) = quick_outcome.clone() {
-                quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+                if quick_status == ImplementationQuickCheckStatus::Failed {
+                    quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+                } else {
+                    quick_check_failure_summary = None;
+                }
                 quick_check_outcomes.push(outcome);
             }
-            if quick_status != ImplementationQuickCheckStatus::Failed {
-                break;
-            }
+
+            break;
         }
     }
 
@@ -1707,30 +2995,33 @@ async fn run_attempt(
         quick_reason_code,
     );
 
-    let plain_language_ok = is_plain_language_text(&generated.description);
-    push_gate(
-        &mut gates,
-        "plain_language",
-        plain_language_ok,
-        if plain_language_ok {
-            "Description passed plain-language heuristic".to_string()
-        } else {
-            "Description was too technical or noisy".to_string()
-        },
-        if plain_language_ok {
-            None
-        } else {
-            Some(REASON_PLAIN_LANGUAGE_FAILURE)
-        },
-    );
-    if !plain_language_ok {
-        push_fail_reason(
-            &mut fail_reasons,
-            &mut fail_reason_records,
+    // Plain-language gate is only meaningful for candidates that otherwise pass all technical gates.
+    if fail_reasons.is_empty() {
+        let plain_language_ok = is_plain_language_text(&generated.description);
+        push_gate(
+            &mut gates,
             "plain_language",
-            REASON_PLAIN_LANGUAGE_FAILURE,
-            "Description did not meet plain-language quality standard",
+            plain_language_ok,
+            if plain_language_ok {
+                "Description passed plain-language heuristic".to_string()
+            } else {
+                "Description was too technical or noisy".to_string()
+            },
+            if plain_language_ok {
+                None
+            } else {
+                Some(REASON_PLAIN_LANGUAGE_FAILURE)
+            },
         );
+        if !plain_language_ok {
+            push_fail_reason(
+                &mut fail_reasons,
+                &mut fail_reason_records,
+                "plain_language",
+                REASON_PLAIN_LANGUAGE_FAILURE,
+                "Description did not meet plain-language quality standard",
+            );
+        }
     }
 
     let passed = fail_reasons.is_empty();
@@ -1779,6 +3070,7 @@ async fn run_attempt(
         remaining_blocking_categories,
         attempt_ms: attempt_start.elapsed().as_millis() as u64,
         attempt_cost_usd,
+        llm_calls,
         notes,
     };
 
@@ -1821,6 +3113,8 @@ async fn generate_attempt_candidate(
     preview: &FixPreview,
     repo_memory: Option<String>,
     allowed_files: &HashSet<PathBuf>,
+    llm_calls: &mut Vec<ImplementationLlmCallRecord>,
+    timeout_ms: u64,
 ) -> anyhow::Result<GeneratedCandidate> {
     ensure_implementation_model(IMPLEMENTATION_MODEL)?;
 
@@ -1858,8 +3152,42 @@ async fn generate_attempt_candidate(
             preview,
             repo_memory,
             IMPLEMENTATION_MODEL,
+            timeout_ms,
         )
-        .await?;
+        .await;
+
+        let result = match result {
+            Ok(value) => {
+                llm_calls.push(ImplementationLlmCallRecord {
+                    kind: "generation".to_string(),
+                    model: IMPLEMENTATION_MODEL.id().to_string(),
+                    timeout_ms: value
+                        .speed_failover
+                        .as_ref()
+                        .map(|d| d.total_timeout_ms)
+                        .unwrap_or(timeout_ms),
+                    speed_failover: value.speed_failover.clone(),
+                    error: None,
+                });
+                value
+            }
+            Err(err) => {
+                let speed_failover = err
+                    .downcast_ref::<SpeedFailoverError>()
+                    .map(|e| e.diagnostics.clone());
+                llm_calls.push(ImplementationLlmCallRecord {
+                    kind: "generation".to_string(),
+                    model: IMPLEMENTATION_MODEL.id().to_string(),
+                    timeout_ms: speed_failover
+                        .as_ref()
+                        .map(|d| d.total_timeout_ms)
+                        .unwrap_or(timeout_ms),
+                    speed_failover,
+                    error: Some(truncate(&err.to_string(), 240)),
+                });
+                return Err(err);
+            }
+        };
 
         let mut modified_areas_by_file = HashMap::new();
         for file_edit in &result.file_edits {
@@ -1904,8 +3232,42 @@ async fn generate_attempt_candidate(
         repo_memory,
         is_new_file,
         IMPLEMENTATION_MODEL,
+        timeout_ms,
     )
-    .await?;
+    .await;
+
+    let result = match result {
+        Ok(value) => {
+            llm_calls.push(ImplementationLlmCallRecord {
+                kind: "generation".to_string(),
+                model: IMPLEMENTATION_MODEL.id().to_string(),
+                timeout_ms: value
+                    .speed_failover
+                    .as_ref()
+                    .map(|d| d.total_timeout_ms)
+                    .unwrap_or(timeout_ms),
+                speed_failover: value.speed_failover.clone(),
+                error: None,
+            });
+            value
+        }
+        Err(err) => {
+            let speed_failover = err
+                .downcast_ref::<SpeedFailoverError>()
+                .map(|e| e.diagnostics.clone());
+            llm_calls.push(ImplementationLlmCallRecord {
+                kind: "generation".to_string(),
+                model: IMPLEMENTATION_MODEL.id().to_string(),
+                timeout_ms: speed_failover
+                    .as_ref()
+                    .map(|d| d.total_timeout_ms)
+                    .unwrap_or(timeout_ms),
+                speed_failover,
+                error: Some(truncate(&err.to_string(), 240)),
+            });
+            return Err(err);
+        }
+    };
 
     if let Some(parent) = resolved.absolute.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2090,6 +3452,8 @@ async fn run_review_gate(
     old_contents: &HashMap<PathBuf, String>,
     changed_files: &[PathBuf],
     repo_memory: Option<String>,
+    quick_check_status: ImplementationQuickCheckStatus,
+    quick_check_command: Option<&str>,
     blocking_severities: &HashSet<String>,
     max_fix_loops: usize,
     budget: &ImplementationBudget,
@@ -2112,56 +3476,100 @@ async fn run_review_gate(
             .map_err(ReviewGateError::Failed)?;
     let mut iteration = 1u32;
 
-    if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
-        return Err(ReviewGateError::BudgetExceeded(reason));
-    }
-    let mut review = verify_changes(
-        &files_with_content,
-        iteration,
-        fixed_titles,
-        Some(&FixContext {
-            problem_summary: suggestion.summary.clone(),
-            outcome: suggestion
-                .detail
-                .clone()
-                .unwrap_or_else(|| suggestion.summary.clone()),
-            description: description.to_string(),
-            modified_areas: Vec::new(),
-        }),
-    )
-    .await
-    .map_err(|e| {
-        ReviewGateError::Failed(format!("Review failed: {}", truncate(&e.to_string(), 180)))
-    })?;
-    *usage = merge_usage(usage.take(), review.usage.clone());
-
-    let mut blocking = blocking_findings(&review.findings, blocking_severities);
-    if blocking.len() > 6 {
-        *blocking_remaining = blocking.len();
+    let mut snapshot_blocking = |current_blocking: &[ReviewFinding]| {
+        *blocking_remaining = current_blocking.len();
         *remaining_blocking_titles = dedup_preserve_order(
-            blocking
+            current_blocking
                 .iter()
                 .map(|finding| finding.title.clone())
                 .collect(),
         );
         *remaining_blocking_categories = dedup_preserve_order(
-            blocking
+            current_blocking
                 .iter()
                 .map(|finding| finding.category.clone())
                 .collect(),
         );
+    };
+
+    if let Some(reason) =
+        budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
+    {
+        snapshot_blocking(&[]);
+        return Err(ReviewGateError::BudgetExceeded(reason));
+    }
+    let review_timeout_ms = budget
+        .timeout_ms_for_next_llm_call()
+        .min(MAX_REVIEW_TIMEOUT_MS);
+    let review = tokio::time::timeout(
+        Duration::from_millis(review_timeout_ms),
+        verify_changes_bounded(
+            &files_with_content,
+            iteration,
+            fixed_titles,
+            Some(&FixContext {
+                problem_summary: suggestion.summary.clone(),
+                outcome: suggestion
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| suggestion.summary.clone()),
+                description: description.to_string(),
+                modified_areas: Vec::new(),
+            }),
+            review_timeout_ms,
+        ),
+    )
+    .await;
+    let mut review = match review {
+        Ok(result) => result.map_err(|e| {
+            ReviewGateError::Failed(format!("Review failed: {}", truncate(&e.to_string(), 180)))
+        })?,
+        Err(_) => {
+            snapshot_blocking(&[]);
+            return Err(ReviewGateError::BudgetExceeded(ImplementationFailReason {
+                code: REASON_BUDGET_EXCEEDED.to_string(),
+                gate: "budget".to_string(),
+                message: format!(
+                    "Stopped to respect the configured time budget (review timed out after {}ms; limit {}ms)",
+                    review_timeout_ms, budget.max_total_ms
+                ),
+            }));
+        }
+    };
+    *usage = merge_usage(usage.take(), review.usage.clone());
+
+    let mut blocking = blocking_findings(&review.findings, blocking_severities);
+    // If the repo's quick check (e.g. `cargo check`) already passed, treat certain classes of
+    // "missing import / undefined symbol" findings as non-blocking. These are typically false
+    // positives (the compiler would have failed) and failing the attempt on them harms trust and
+    // first-attempt pass rate.
+    if quick_check_status == ImplementationQuickCheckStatus::Passed
+        && quick_check_command
+            .map(|cmd| cmd.contains("cargo check"))
+            .unwrap_or(false)
+    {
+        blocking.retain(|finding| !is_probable_compile_error_false_positive(&finding.title));
+    }
+    if blocking.len() > 6 {
+        snapshot_blocking(&blocking);
         return Err(ReviewGateError::Failed(
             "Review found too many blocking issues to auto-fix safely within budget (more than 6)"
                 .to_string(),
         ));
     }
-    if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+    if let Some(reason) =
+        budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
+    {
+        snapshot_blocking(&blocking);
         return Err(ReviewGateError::BudgetExceeded(reason));
     }
 
     *review_iterations = 1;
     while !blocking.is_empty() && (*review_iterations - 1) < max_fix_loops {
-        if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+        if let Some(reason) =
+            budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
+        {
+            snapshot_blocking(&blocking);
             return Err(ReviewGateError::BudgetExceeded(reason));
         }
 
@@ -2171,8 +3579,9 @@ async fn run_review_gate(
         }
         for (path, findings) in grouped {
             if let Some(reason) =
-                budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone()))
+                budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
             {
+                snapshot_blocking(&blocking);
                 return Err(ReviewGateError::BudgetExceeded(reason));
             }
             let resolved = resolve_repo_path_allow_new(sandbox_root, &path).map_err(|e| {
@@ -2185,27 +3594,65 @@ async fn run_review_gate(
             ensure_implementation_model(IMPLEMENTATION_MODEL).map_err(|e| {
                 ReviewGateError::Failed(format!("Implementation model policy check failed: {}", e))
             })?;
-            let fix = fix_review_findings_with_model(
-                &resolved.absolute,
-                &current_content,
-                original,
-                &findings,
-                repo_memory.clone(),
-                *review_iterations as u32,
-                fixed_titles,
-                IMPLEMENTATION_MODEL,
+            let fix_timeout_ms = budget
+                .timeout_ms_for_next_llm_call()
+                .min(MAX_FIX_TIMEOUT_MS);
+            let fix = tokio::time::timeout(
+                Duration::from_millis(fix_timeout_ms),
+                fix_review_findings_with_model(
+                    &resolved.absolute,
+                    &current_content,
+                    original,
+                    &findings,
+                    repo_memory.clone(),
+                    *review_iterations as u32,
+                    fixed_titles,
+                    IMPLEMENTATION_MODEL,
+                    fix_timeout_ms,
+                ),
             )
-            .await
-            .map_err(|e| {
-                ReviewGateError::Failed(format!(
-                    "Review auto-fix failed: {}",
-                    truncate(&e.to_string(), 180)
-                ))
-            })?;
+            .await;
+            let fix = match fix {
+                Ok(result) => match result {
+                    Ok(value) => value,
+                    Err(err) => {
+                        *blocking_remaining = blocking.len();
+                        *remaining_blocking_titles = dedup_preserve_order(
+                            blocking
+                                .iter()
+                                .map(|finding| finding.title.clone())
+                                .collect(),
+                        );
+                        *remaining_blocking_categories = dedup_preserve_order(
+                            blocking
+                                .iter()
+                                .map(|finding| finding.category.clone())
+                                .collect(),
+                        );
+                        return Err(ReviewGateError::Failed(format!(
+                            "Review auto-fix failed for {}: {}",
+                            path.display(),
+                            truncate(&err.to_string(), 180)
+                        )));
+                    }
+                },
+                Err(_) => {
+                    snapshot_blocking(&blocking);
+                    return Err(ReviewGateError::BudgetExceeded(ImplementationFailReason {
+                        code: REASON_BUDGET_EXCEEDED.to_string(),
+                        gate: "budget".to_string(),
+                        message: format!(
+                            "Stopped to respect the configured time budget (review auto-fix timed out after {}ms; limit {}ms)",
+                            fix_timeout_ms, budget.max_total_ms
+                        ),
+                    }));
+                }
+            };
             *usage = merge_usage(usage.take(), fix.usage.clone());
             if let Some(reason) =
                 budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone()))
             {
+                snapshot_blocking(&blocking);
                 return Err(ReviewGateError::BudgetExceeded(reason));
             }
             std::fs::write(&resolved.absolute, &fix.new_content).map_err(|e| {
@@ -2226,37 +3673,61 @@ async fn run_review_gate(
         let review_files = files_changed_set.iter().cloned().collect::<Vec<_>>();
         files_with_content = build_files_with_content(sandbox_root, old_contents, &review_files)
             .map_err(ReviewGateError::Failed)?;
-        if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+        if let Some(reason) =
+            budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
+        {
+            snapshot_blocking(&blocking);
             return Err(ReviewGateError::BudgetExceeded(reason));
         }
-        review = verify_changes(&files_with_content, iteration, fixed_titles, None)
-            .await
-            .map_err(|e| {
+        let rereview_timeout_ms = budget
+            .timeout_ms_for_next_llm_call()
+            .min(MAX_REVIEW_TIMEOUT_MS);
+        let rereview = tokio::time::timeout(
+            Duration::from_millis(rereview_timeout_ms),
+            verify_changes_bounded(
+                &files_with_content,
+                iteration,
+                fixed_titles,
+                None,
+                rereview_timeout_ms,
+            ),
+        )
+        .await;
+        review = match rereview {
+            Ok(result) => result.map_err(|e| {
                 ReviewGateError::Failed(format!(
                     "Re-review failed: {}",
                     truncate(&e.to_string(), 180)
                 ))
-            })?;
+            })?,
+            Err(_) => {
+                snapshot_blocking(&blocking);
+                return Err(ReviewGateError::BudgetExceeded(ImplementationFailReason {
+                    code: REASON_BUDGET_EXCEEDED.to_string(),
+                    gate: "budget".to_string(),
+                    message: format!(
+                        "Stopped to respect the configured time budget (re-review timed out after {}ms; limit {}ms)",
+                        rereview_timeout_ms, budget.max_total_ms
+                    ),
+                }));
+            }
+        };
         *usage = merge_usage(usage.take(), review.usage.clone());
         if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+            snapshot_blocking(&blocking);
             return Err(ReviewGateError::BudgetExceeded(reason));
         }
         blocking = blocking_findings(&review.findings, blocking_severities);
+        if quick_check_status == ImplementationQuickCheckStatus::Passed
+            && quick_check_command
+                .map(|cmd| cmd.contains("cargo check"))
+                .unwrap_or(false)
+        {
+            blocking.retain(|finding| !is_probable_compile_error_false_positive(&finding.title));
+        }
     }
 
-    *blocking_remaining = blocking.len();
-    *remaining_blocking_titles = dedup_preserve_order(
-        blocking
-            .iter()
-            .map(|finding| finding.title.clone())
-            .collect(),
-    );
-    *remaining_blocking_categories = dedup_preserve_order(
-        blocking
-            .iter()
-            .map(|finding| finding.category.clone())
-            .collect(),
-    );
+    snapshot_blocking(&blocking);
     Ok(())
 }
 
@@ -2289,6 +3760,24 @@ fn blocking_findings(
         })
         .cloned()
         .collect()
+}
+
+fn is_probable_compile_error_false_positive(title: &str) -> bool {
+    let lower = title.to_ascii_lowercase();
+    if lower.contains("missing import")
+        || lower.contains("not imported")
+        || lower.contains("unresolved import")
+    {
+        return true;
+    }
+
+    // Titles often look like "`symbol` undefined". Avoid matching broader phrases like
+    // "undefined behavior" by requiring backticks.
+    if title.contains('`') && lower.contains("undefined") {
+        return true;
+    }
+
+    false
 }
 
 fn group_findings_by_file(
@@ -2340,6 +3829,36 @@ fn resolve_finding_file_path(finding_file: &str, candidates: &[PathBuf]) -> Opti
 enum QuickCheckCommand {
     Shell(String),
     Program { program: String, args: Vec<String> },
+}
+
+fn program_available_on_path(program: &str) -> bool {
+    let program = program.trim();
+    if program.is_empty() {
+        return false;
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(program);
+        if !candidate.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&candidate) {
+                if meta.permissions().mode() & 0o111 != 0 {
+                    return true;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn detect_quick_check_command(repo_root: &Path) -> Option<QuickCheckCommand> {
@@ -2406,7 +3925,9 @@ fn detect_quick_check_command(repo_root: &Path) -> Option<QuickCheckCommand> {
         || repo_root.join("setup.cfg").exists()
     {
         return Some(QuickCheckCommand::Program {
-            program: "python".to_string(),
+            // Prefer python3 for modern environments; fall back to python at runtime
+            // if python3 isn't available.
+            program: "python3".to_string(),
             args: vec![
                 "-m".to_string(),
                 "compileall".to_string(),
@@ -2556,7 +4077,14 @@ fn quick_check_requires_real_node_modules(repo_root: &Path, command: &QuickCheck
     match command {
         QuickCheckCommand::Shell(cmd) => {
             let lower = cmd.to_ascii_lowercase();
-            lower.contains("next build") || lower.contains("turbopack") || lower.contains("--turbo")
+            lower.contains("next build")
+                || lower.contains("turbopack")
+                || lower.contains("--turbo")
+                // TypeScript type-checking can break with a symlinked node_modules across
+                // worktrees (type identity splits across different real paths).
+                || lower.contains("tsc")
+                || lower.contains("typecheck")
+                || lower.contains("type-check")
         }
         QuickCheckCommand::Program { program, args } => {
             let program = program.to_ascii_lowercase();
@@ -2570,11 +4098,22 @@ fn quick_check_requires_real_node_modules(repo_root: &Path, command: &QuickCheck
             let Some(script) = invoked_js_script(command) else {
                 return false;
             };
+            let script_lower = script.to_ascii_lowercase();
+            if script_lower == "typecheck" || script_lower == "type-check" {
+                return true;
+            }
             let Some(script_cmd) = read_package_json_script(repo_root, &script) else {
                 return false;
             };
             let lower = script_cmd.to_ascii_lowercase();
-            lower.contains("next build") || lower.contains("turbopack") || lower.contains("--turbo")
+            lower.contains("next build")
+                || lower.contains("turbopack")
+                || lower.contains("--turbo")
+                // TypeScript type-checking can break with a symlinked node_modules across
+                // worktrees (type identity splits across different real paths).
+                || lower.contains("tsc")
+                || lower.contains("typecheck")
+                || lower.contains("type-check")
         }
     }
 }
@@ -2762,7 +4301,12 @@ fn run_quick_checks(
         }
     }
 
-    let command_str = command_to_string(&command);
+    let python3_fallback_args = match &command {
+        QuickCheckCommand::Program { program, args } if program == "python3" => Some(args.clone()),
+        _ => None,
+    };
+
+    let mut command_str = command_to_string(&command);
     let mut cmd = match command {
         QuickCheckCommand::Shell(shell_cmd) => {
             let mut command = Command::new("sh");
@@ -2780,20 +4324,58 @@ fn run_quick_checks(
     }
 
     let start = std::time::Instant::now();
-    let output = match run_command_with_timeout(&mut cmd, Duration::from_millis(timeout_ms)) {
-        Ok(output) => output,
-        Err(err) => {
-            notes.push(format!(
-                "quick_check_failed_to_start: {}",
-                truncate(&err, 160)
-            ));
-            return Ok((
-                ImplementationQuickCheckStatus::Unavailable,
-                Some(command_str),
-                None,
-            ));
-        }
-    };
+    let (output, start) =
+        match run_command_with_timeout(&mut cmd, Duration::from_millis(timeout_ms)) {
+            Ok(output) => (output, start),
+            Err(err) => {
+                if let Some(args) = python3_fallback_args {
+                    notes.push(format!(
+                        "quick_check_failed_to_start: {} (retrying with python)",
+                        truncate(&err, 160)
+                    ));
+
+                    let fallback_command = QuickCheckCommand::Program {
+                        program: "python".to_string(),
+                        args: args.clone(),
+                    };
+                    command_str = command_to_string(&fallback_command);
+
+                    let mut fallback_cmd = Command::new("python");
+                    fallback_cmd.current_dir(repo_root).args(args);
+                    for (k, v) in SandboxSession::env_overrides() {
+                        fallback_cmd.env(k, v);
+                    }
+                    let fallback_start = std::time::Instant::now();
+                    match run_command_with_timeout(
+                        &mut fallback_cmd,
+                        Duration::from_millis(timeout_ms),
+                    ) {
+                        Ok(output) => (output, fallback_start),
+                        Err(err) => {
+                            notes.push(format!(
+                                "quick_check_failed_to_start: {}",
+                                truncate(&err, 160)
+                            ));
+                            return Ok((
+                                ImplementationQuickCheckStatus::Unavailable,
+                                Some(command_str),
+                                None,
+                            ));
+                        }
+                    }
+                } else {
+                    notes.push(format!(
+                        "quick_check_failed_to_start: {}",
+                        truncate(&err, 160)
+                    ));
+                    return Ok((
+                        ImplementationQuickCheckStatus::Unavailable,
+                        Some(command_str),
+                        None,
+                    ));
+                }
+            }
+        };
     let outcome = ImplementationCommandOutcome {
         command: command_str.clone(),
         duration_ms: start.elapsed().as_millis() as u64,
@@ -3254,7 +4836,7 @@ diff --git a/a.rs b/a.rs
         let command = detect_quick_check_command(root.path()).expect("expected check command");
         match command {
             QuickCheckCommand::Program { program, args } => {
-                assert_eq!(program, "python");
+                assert_eq!(program, "python3");
                 assert_eq!(
                     args,
                     vec![
@@ -3267,6 +4849,26 @@ diff --git a/a.rs b/a.rs
             }
             _ => panic!("expected python quick check"),
         }
+    }
+
+    #[test]
+    fn quick_check_requires_real_node_modules_for_typecheck_script() {
+        let root = tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{
+  "name": "x",
+  "private": true,
+  "scripts": { "typecheck": "tsc -p ." }
+}"#,
+        )
+        .unwrap();
+
+        let command = detect_quick_check_command(root.path()).expect("expected check command");
+        assert!(quick_check_requires_real_node_modules(
+            root.path(),
+            &command
+        ));
     }
 
     #[test]

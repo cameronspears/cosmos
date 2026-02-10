@@ -1,5 +1,8 @@
 use super::agentic::{call_llm_agentic, schema_to_response_format};
-use super::client::{call_llm_structured_cached, StructuredResponse};
+use super::client::{
+    call_llm_structured_cached, call_llm_structured_limited_speed_with_failover,
+    SpeedFailoverDiagnostics, StructuredResponse,
+};
 use super::models::{merge_usage, Model, Usage};
 use super::parse::{truncate_content, truncate_content_around_line};
 use super::prompt_utils::format_repo_memory_section;
@@ -25,17 +28,85 @@ pub struct AppliedFix {
     pub modified_areas: Vec<String>,
     /// Usage stats
     pub usage: Option<Usage>,
+    /// Speed-tier provider failover diagnostics for transparency (if applicable).
+    pub speed_failover: Option<SpeedFailoverDiagnostics>,
 }
 
-// Context limits - generous to let models work with full context.
-// Modern models handle 100k+ tokens easily; these limits only kick in for unusually large files.
-const MAX_FIX_EXCERPT_CHARS: usize = 60000;
-const MAX_MULTI_FILE_EXCERPT_CHARS: usize = 120000;
+// Context limits - tuned for low cost and reliability.
+// We intentionally prefer focused excerpts over full-file dumps to keep token usage bounded.
+const MAX_FIX_EXCERPT_CHARS: usize = 20000;
+const MAX_MULTI_FILE_EXCERPT_CHARS: usize = 60000;
 const MAX_EDIT_REPAIR_ATTEMPTS: usize = 3;
+
+const MAX_FIX_RESPONSE_TOKENS_SPEED: u32 = 4096;
+const MAX_MULTI_FILE_FIX_RESPONSE_TOKENS_SPEED: u32 = 6144;
 
 struct PromptContent {
     content: String,
     note: Option<String>,
+}
+
+fn allocate_attempt_time_slices_ms(total_ms: u64, slots: usize) -> Vec<u64> {
+    if slots == 0 {
+        return Vec::new();
+    }
+    if slots == 1 {
+        return vec![total_ms.max(1)];
+    }
+
+    // Reserve meaningful time per retry. If the caller budget is too small, try once
+    // (the harness will enforce the overall timeout anyway).
+    const MIN_PER_ATTEMPT_MS: u64 = 1_200;
+    if total_ms < MIN_PER_ATTEMPT_MS.saturating_mul(slots as u64) {
+        let mut out = vec![0; slots];
+        out[0] = total_ms.max(1);
+        return out;
+    }
+
+    // Front-load time onto attempt 1. If providers are slow (latency spikes, rate limiting),
+    // splitting evenly tends to create "all providers timed out" failures. Retries are still
+    // possible, but we bias toward a strong first attempt.
+    let remaining_slots = slots.saturating_sub(1);
+    let min_reserve_ms = MIN_PER_ATTEMPT_MS.saturating_mul(remaining_slots as u64);
+    let max_first_ms = total_ms
+        .saturating_sub(min_reserve_ms)
+        .max(MIN_PER_ATTEMPT_MS);
+    let first_ms = ((total_ms * 2) / 3).clamp(MIN_PER_ATTEMPT_MS, max_first_ms);
+
+    let mut out = Vec::with_capacity(slots);
+    out.push(first_ms.max(1));
+
+    let remaining_ms = total_ms.saturating_sub(first_ms);
+    if remaining_slots == 0 {
+        return out;
+    }
+
+    let per = remaining_ms / remaining_slots as u64;
+    let mut rem = remaining_ms.saturating_sub(per.saturating_mul(remaining_slots as u64));
+    for _ in 0..remaining_slots {
+        let mut slice = per.max(MIN_PER_ATTEMPT_MS);
+        if rem > 0 {
+            slice = slice.saturating_add(1);
+            rem -= 1;
+        }
+        out.push(slice.max(1));
+    }
+
+    out
+}
+
+fn max_tokens_for_fix_response(model: Model) -> u32 {
+    match model {
+        Model::Speed => MAX_FIX_RESPONSE_TOKENS_SPEED,
+        _ => model.max_tokens(),
+    }
+}
+
+fn max_tokens_for_multi_file_fix_response(model: Model) -> u32 {
+    match model {
+        Model::Speed => MAX_MULTI_FILE_FIX_RESPONSE_TOKENS_SPEED,
+        _ => model.max_tokens(),
+    }
 }
 
 fn prompt_budget_per_file(file_count: usize) -> usize {
@@ -228,8 +299,14 @@ pub(crate) fn format_edit_apply_repair_guidance(message: &str, code_block_label:
     let msg = message.to_ascii_lowercase();
     let mut bullets: Vec<&str> = Vec::new();
 
-    if msg.contains("matches") || msg.contains("must be unique") {
+    if msg.contains("no edits provided") || msg.contains("no file edits provided") {
+        bullets.push("Your response did not include any edits.");
+        bullets.push("Return at least one edit that changes the code to address the request.");
+        bullets.push("Keep the diff minimal and scoped. Avoid unrelated reformatting.");
+        bullets.push("Use exact `old_string` anchors copied verbatim from the code block.");
+    } else if msg.contains("matches") || msg.contains("must be unique") {
         bullets.push("Your `old_string` was too generic and matched multiple places.");
+        bullets.push("Use the provided match contexts in the error details: choose the occurrence closest to the target line, then expand the anchor with surrounding lines to make it unique.");
         bullets.push("Pick a larger anchor: include 3-10 surrounding lines and at least one unique identifier (function name, component name, string literal, or nearby props).");
         bullets
             .push("Avoid anchors like `</div>`, `</motion.div>`, `{}` blocks, or single braces.");
@@ -332,21 +409,62 @@ async fn call_llm_structured_with_fallback<T>(
     model: Model,
     schema_name: &str,
     schema: serde_json::Value,
+    prefer_full_prompt: bool,
+    max_tokens: u32,
+    timeout_ms: u64,
 ) -> anyhow::Result<StructuredResponse<T>>
 where
     T: serde::de::DeserializeOwned,
 {
-    // Use cached version - caches the system prompt for Anthropic models
-    match call_llm_structured_cached::<T>(system, user_full, model, schema_name, schema.clone())
+    // Default policy: prefer the excerpt to keep token usage bounded. Escalate to full-file
+    // context only when the caller decides it is necessary (typically after an edit-apply error).
+    let primary = if prefer_full_prompt {
+        user_full
+    } else {
+        user_excerpt
+    };
+
+    let primary_result = if model == Model::Speed {
+        call_llm_structured_limited_speed_with_failover::<T>(
+            system,
+            primary,
+            schema_name,
+            schema.clone(),
+            max_tokens,
+            timeout_ms,
+        )
         .await
-    {
+    } else {
+        // Cached version - caches the system prompt for Anthropic models.
+        call_llm_structured_cached::<T>(system, primary, model, schema_name, schema.clone()).await
+    };
+
+    match primary_result {
         Ok(response) => Ok(response),
         Err(err) => {
             let message = err.to_string();
-            // Handle context limit by trying with smaller excerpt
-            if is_context_limit_error(&message) && user_full != user_excerpt {
-                call_llm_structured_cached::<T>(system, user_excerpt, model, schema_name, schema)
+            // Handle context limit by retrying with the shorter excerpt.
+            if prefer_full_prompt && is_context_limit_error(&message) && user_full != user_excerpt {
+                if model == Model::Speed {
+                    call_llm_structured_limited_speed_with_failover::<T>(
+                        system,
+                        user_excerpt,
+                        schema_name,
+                        schema,
+                        max_tokens,
+                        timeout_ms,
+                    )
                     .await
+                } else {
+                    call_llm_structured_cached::<T>(
+                        system,
+                        user_excerpt,
+                        model,
+                        schema_name,
+                        schema,
+                    )
+                    .await
+                }
             } else {
                 Err(err)
             }
@@ -364,6 +482,7 @@ pub async fn generate_fix_content_with_model(
     repo_memory: Option<String>,
     is_new_file: bool,
     model: Model,
+    timeout_ms: u64,
 ) -> anyhow::Result<AppliedFix> {
     let plan_text = format!(
         "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
@@ -415,8 +534,16 @@ pub async fn generate_fix_content_with_model(
 
     let mut combined_usage: Option<Usage> = None;
     let mut last_apply_err: Option<String> = None;
+    // Prefer excerpt-first to keep costs bounded; escalate to full-file prompt only after a
+    // retryable edit-apply failure.
+    let mut prefer_full_prompt = false;
+    let slices = allocate_attempt_time_slices_ms(timeout_ms, MAX_EDIT_REPAIR_ATTEMPTS.max(1));
 
     for attempt in 1..=MAX_EDIT_REPAIR_ATTEMPTS.max(1) {
+        let attempt_timeout_ms = slices
+            .get(attempt.saturating_sub(1))
+            .copied()
+            .unwrap_or_else(|| timeout_ms.max(1));
         let (user_full_attempt, user_excerpt_attempt) = if let Some(ref err) = last_apply_err {
             let guidance = format_edit_apply_repair_guidance(err, "CURRENT CODE block");
             (
@@ -434,9 +561,13 @@ pub async fn generate_fix_content_with_model(
             model,
             "fix_response",
             fix_response_schema(),
+            prefer_full_prompt,
+            max_tokens_for_fix_response(model),
+            attempt_timeout_ms,
         )
         .await?;
         combined_usage = merge_usage(combined_usage, response.usage.clone());
+        let speed_failover = response.speed_failover.clone();
 
         let description = response
             .data
@@ -446,10 +577,23 @@ pub async fn generate_fix_content_with_model(
         let edits = response.data.edits;
 
         if edits.is_empty() {
-            return Err(anyhow::anyhow!("No edits provided in response"));
+            let message = "No edits provided in response".to_string();
+            if attempt < MAX_EDIT_REPAIR_ATTEMPTS.max(1) {
+                last_apply_err = Some(message);
+                continue;
+            }
+            return Err(anyhow::anyhow!(message));
         }
 
-        match apply_edits_with_context(content, &edits, "file") {
+        let anchor_line = plan
+            .evidence_line
+            .map(|l| l.max(1) as usize)
+            .or(suggestion.line);
+        let context_label = anchor_line
+            .map(|line| format!("file (target around line {})", line))
+            .unwrap_or_else(|| "file".to_string());
+
+        match apply_edits_with_context(content, &edits, &context_label) {
             Ok(new_content) => {
                 let new_content = normalize_generated_content(content, new_content, is_new_file);
                 if new_content.trim().is_empty() {
@@ -460,6 +604,7 @@ pub async fn generate_fix_content_with_model(
                     new_content,
                     modified_areas,
                     usage: combined_usage,
+                    speed_failover,
                 });
             }
             Err(err) => {
@@ -468,6 +613,11 @@ pub async fn generate_fix_content_with_model(
                     && is_retryable_edit_apply_error(&message)
                 {
                     last_apply_err = Some(message);
+                    // If we were using the excerpt prompt, try full-file context once on the next
+                    // attempt to help the model choose a unique, verbatim anchor.
+                    if !prefer_full_prompt {
+                        prefer_full_prompt = true;
+                    }
                     continue;
                 }
                 return Err(err);
@@ -495,6 +645,7 @@ pub async fn generate_fix_content(
         repo_memory,
         is_new_file,
         Model::Smart,
+        60_000,
     )
     .await
 }
@@ -536,12 +687,14 @@ pub(crate) fn apply_edits_with_context(
                 continue;
             }
             MatchRange::Many(count) => {
+                let contexts = match_contexts_for_error(&new_content, &edit.old_string, 2);
                 return Err(anyhow::anyhow!(
-                    "Edit {}: old_string matches {} times in {} (must be unique). Need more context.\nSearched for: {:?}",
+                    "Edit {}: old_string matches {} times in {} (must be unique). Need more context.\nSearched for: {:?}{}",
                     i + 1,
                     count,
                     context_label,
-                    truncate_for_error(&edit.old_string)
+                    truncate_for_error(&edit.old_string),
+                    contexts
                 ));
             }
             MatchRange::None => {}
@@ -557,12 +710,14 @@ pub(crate) fn apply_edits_with_context(
                     continue;
                 }
                 MatchRange::Many(count) => {
+                    let contexts = match_contexts_for_error(&new_content, &crlf_old, 2);
                     return Err(anyhow::anyhow!(
-                        "Edit {}: normalized old_string matches {} times in {} (must be unique).\nSearched for: {:?}",
+                        "Edit {}: normalized old_string matches {} times in {} (must be unique).\nSearched for: {:?}{}",
                         i + 1,
                         count,
                         context_label,
-                        truncate_for_error(&edit.old_string)
+                        truncate_for_error(&edit.old_string),
+                        contexts
                     ));
                 }
                 MatchRange::None => {}
@@ -578,12 +733,14 @@ pub(crate) fn apply_edits_with_context(
                     continue;
                 }
                 MatchRange::Many(count) => {
+                    let contexts = match_contexts_for_error(&new_content, trimmed_old, 2);
                     return Err(anyhow::anyhow!(
-                        "Edit {}: trimmed old_string matches {} times in {} (must be unique).\nSearched for: {:?}",
+                        "Edit {}: trimmed old_string matches {} times in {} (must be unique).\nSearched for: {:?}{}",
                         i + 1,
                         count,
                         context_label,
-                        truncate_for_error(&edit.old_string)
+                        truncate_for_error(&edit.old_string),
+                        contexts
                     ));
                 }
                 MatchRange::None => {}
@@ -620,6 +777,80 @@ fn find_unique_match_range(content: &str, needle: &str) -> MatchRange {
         }
         n => MatchRange::Many(n),
     }
+}
+
+fn byte_offset_to_line_number(content: &str, byte_offset: usize) -> usize {
+    // Lines are 1-based for human readability.
+    content
+        .as_bytes()
+        .iter()
+        .take(byte_offset.min(content.len()))
+        .filter(|b| **b == b'\n')
+        .count()
+        + 1
+}
+
+fn snippet_around_line_numbered(
+    content: &str,
+    line_number: usize,
+    before: usize,
+    after: usize,
+) -> String {
+    if line_number == 0 {
+        return String::new();
+    }
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let idx = line_number.saturating_sub(1);
+    if idx >= lines.len() {
+        return String::new();
+    }
+
+    let start = idx.saturating_sub(before);
+    let end = (idx + after + 1).min(lines.len());
+    let mut out = String::new();
+    for (offset, line) in lines[start..end].iter().enumerate() {
+        let ln = start + offset + 1;
+        out.push_str(&format!("{:4}| {}\n", ln, line));
+    }
+
+    // Keep this bounded; it's only meant to help the model choose a unique anchor.
+    const MAX_SNIPPET_CHARS: usize = 700;
+    truncate_content(&out, MAX_SNIPPET_CHARS)
+}
+
+fn match_contexts_for_error(content: &str, needle: &str, max_matches: usize) -> String {
+    if max_matches == 0 || needle.is_empty() {
+        return String::new();
+    }
+    let mut matches = content
+        .match_indices(needle)
+        .take(max_matches)
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return String::new();
+    }
+
+    // Include a small, numbered excerpt around each match so the model can pick a unique anchor
+    // without needing the entire file.
+    let mut out = String::new();
+    out.push_str("\n\nMatch contexts (first occurrences):");
+    for (idx, (start, _)) in matches.drain(..).enumerate() {
+        let line = byte_offset_to_line_number(content, start);
+        let snippet = snippet_around_line_numbered(content, line, 2, 3);
+        if snippet.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "\n- Match {} around line {}:\n{}",
+            idx + 1,
+            line,
+            snippet
+        ));
+    }
+    out
 }
 
 pub(crate) fn normalize_generated_content(
@@ -678,6 +909,8 @@ pub struct MultiFileAppliedFix {
     pub file_edits: Vec<FileEdit>,
     /// Usage stats
     pub usage: Option<Usage>,
+    /// Speed-tier provider failover diagnostics for transparency (if applicable).
+    pub speed_failover: Option<SpeedFailoverDiagnostics>,
 }
 
 /// Input for a single file in a multi-file fix
@@ -764,6 +997,7 @@ pub async fn generate_multi_file_fix_with_model(
     plan: &FixPreview,
     repo_memory: Option<String>,
     model: Model,
+    timeout_ms: u64,
 ) -> anyhow::Result<MultiFileAppliedFix> {
     if files.is_empty() {
         return Err(anyhow::anyhow!("No files provided for multi-file fix"));
@@ -850,8 +1084,16 @@ pub async fn generate_multi_file_fix_with_model(
 
     let mut combined_usage: Option<Usage> = None;
     let mut last_apply_err: Option<String> = None;
+    // Prefer excerpt-first; only allow full prompt if it is reasonably sized.
+    let allow_full_prompt = files_section_full.chars().count() <= MAX_MULTI_FILE_EXCERPT_CHARS;
+    let mut prefer_full_prompt = false;
+    let slices = allocate_attempt_time_slices_ms(timeout_ms, MAX_EDIT_REPAIR_ATTEMPTS.max(1));
 
     for attempt in 1..=MAX_EDIT_REPAIR_ATTEMPTS.max(1) {
+        let attempt_timeout_ms = slices
+            .get(attempt.saturating_sub(1))
+            .copied()
+            .unwrap_or_else(|| timeout_ms.max(1));
         let (user_full_attempt, user_excerpt_attempt) = if let Some(ref err) = last_apply_err {
             let guidance = format_edit_apply_repair_guidance(err, "FILES TO MODIFY code blocks");
             (
@@ -869,9 +1111,13 @@ pub async fn generate_multi_file_fix_with_model(
             model,
             "multi_file_fix_response",
             multi_file_fix_response_schema(),
+            prefer_full_prompt,
+            max_tokens_for_multi_file_fix_response(model),
+            attempt_timeout_ms,
         )
         .await?;
         combined_usage = merge_usage(combined_usage, response.usage.clone());
+        let speed_failover = response.speed_failover.clone();
 
         let description = response
             .data
@@ -880,7 +1126,12 @@ pub async fn generate_multi_file_fix_with_model(
         let file_edits_json = response.data.file_edits;
 
         if file_edits_json.is_empty() {
-            return Err(anyhow::anyhow!("No file edits provided in response"));
+            let message = "No file edits provided in response".to_string();
+            if attempt < MAX_EDIT_REPAIR_ATTEMPTS.max(1) {
+                last_apply_err = Some(message);
+                continue;
+            }
+            return Err(anyhow::anyhow!(message));
         }
 
         let mut file_edits = Vec::new();
@@ -903,7 +1154,18 @@ pub async fn generate_multi_file_fix_with_model(
                 }
             }
 
-            let context = format!("file {}", file_path.display());
+            let anchor_line = if file_path == suggestion.file {
+                plan.evidence_line
+                    .map(|l| l.max(1) as usize)
+                    .or(suggestion.line)
+            } else {
+                None
+            };
+            let context = if let Some(line) = anchor_line {
+                format!("file {} (target around line {})", file_path.display(), line)
+            } else {
+                format!("file {}", file_path.display())
+            };
             let new_content =
                 match apply_edits_with_context(&new_content, &file_edit_json.edits, &context) {
                     Ok(value) => value,
@@ -927,6 +1189,9 @@ pub async fn generate_multi_file_fix_with_model(
             if attempt < MAX_EDIT_REPAIR_ATTEMPTS.max(1) && is_retryable_edit_apply_error(&message)
             {
                 last_apply_err = Some(message);
+                if allow_full_prompt && !prefer_full_prompt {
+                    prefer_full_prompt = true;
+                }
                 continue;
             }
             return Err(err);
@@ -936,6 +1201,7 @@ pub async fn generate_multi_file_fix_with_model(
             description,
             file_edits,
             usage: combined_usage,
+            speed_failover,
         });
     }
 
@@ -951,7 +1217,8 @@ pub async fn generate_multi_file_fix(
     plan: &FixPreview,
     repo_memory: Option<String>,
 ) -> anyhow::Result<MultiFileAppliedFix> {
-    generate_multi_file_fix_with_model(files, suggestion, plan, repo_memory, Model::Smart).await
+    generate_multi_file_fix_with_model(files, suggestion, plan, repo_memory, Model::Smart, 60_000)
+        .await
 }
 
 /// Try to extract the modified function or area name from old_string

@@ -90,6 +90,7 @@ pub async fn classify_grouping_candidates(
     let StructuredResponse {
         data: parsed,
         usage,
+        ..
     } = call_llm_structured::<GroupingAiResponse>(
         GROUPING_CLASSIFY_SYSTEM,
         &user,

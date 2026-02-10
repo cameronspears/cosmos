@@ -1,10 +1,14 @@
 use super::agentic::{call_llm_agentic, schema_to_response_format};
-use super::client::{call_llm_structured_cached, parse_structured_content, StructuredResponse};
+use super::client::{
+    call_llm_structured_cached, call_llm_structured_limited_speed_with_failover,
+    parse_structured_content, SpeedFailoverDiagnostics, StructuredResponse,
+};
 use super::fix::{
     apply_edits_with_context, fix_response_schema, format_edit_apply_repair_guidance,
     normalize_generated_content, AppliedFix, FixResponse,
 };
 use super::models::{merge_usage, Model, Usage};
+use super::parse::{truncate_content, truncate_content_around_line};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{review_fix_system_prompt, review_system_prompt};
 use serde::{Deserialize, Serialize};
@@ -157,6 +161,7 @@ pub struct VerificationReview {
     pub findings: Vec<ReviewFinding>,
     pub summary: String, // Overall assessment
     pub usage: Option<Usage>,
+    pub speed_failover: Option<SpeedFailoverDiagnostics>,
 }
 
 /// Perform lean adversarial review of code changes
@@ -229,6 +234,42 @@ pub async fn verify_changes(
         findings: parsed.findings.into_iter().map(Into::into).collect(),
         summary: parsed.summary,
         usage: response.usage,
+        speed_failover: None,
+    })
+}
+
+/// Perform a bounded adversarial review suitable for strict apply harness loops.
+///
+/// This avoids agentic multi-step execution to keep cost/time predictable, while still
+/// requiring structured JSON output.
+pub async fn verify_changes_bounded(
+    files_with_content: &[(PathBuf, String, String)], // (path, old_content, new_content)
+    iteration: u32,
+    fixed_titles: &[String],
+    fix_context: Option<&FixContext>,
+    timeout_ms: u64,
+) -> anyhow::Result<VerificationReview> {
+    let system = review_system_prompt(iteration, fixed_titles, fix_context);
+    let user = build_lean_review_prompt(files_with_content, fix_context);
+
+    // Keep review cheap and predictable. The harness will re-run review after fixes.
+    const MAX_TOKENS: u32 = 1200;
+    let response: StructuredResponse<ReviewResponseJson> =
+        call_llm_structured_limited_speed_with_failover(
+            &system,
+            &user,
+            "review_response",
+            review_response_schema(),
+            MAX_TOKENS,
+            timeout_ms,
+        )
+        .await?;
+
+    Ok(VerificationReview {
+        findings: response.data.findings.into_iter().map(Into::into).collect(),
+        summary: response.data.summary,
+        usage: response.usage,
+        speed_failover: response.speed_failover,
     })
 }
 
@@ -379,6 +420,51 @@ fn add_line_numbers(content: &str) -> String {
         .join("\n")
 }
 
+fn allocate_attempt_time_slices_ms(total_ms: u64, slots: usize) -> Vec<u64> {
+    if slots == 0 {
+        return Vec::new();
+    }
+    if slots == 1 {
+        return vec![total_ms.max(1)];
+    }
+
+    const MIN_PER_ATTEMPT_MS: u64 = 1_200;
+    if total_ms < MIN_PER_ATTEMPT_MS.saturating_mul(slots as u64) {
+        let mut out = vec![0; slots];
+        out[0] = total_ms.max(1);
+        return out;
+    }
+
+    // Front-load time onto attempt 1 to reduce "everyone timed out" failures during
+    // provider latency spikes. Retries are still possible but less common.
+    let remaining_slots = slots.saturating_sub(1);
+    let min_reserve_ms = MIN_PER_ATTEMPT_MS.saturating_mul(remaining_slots as u64);
+    let max_first_ms = total_ms
+        .saturating_sub(min_reserve_ms)
+        .max(MIN_PER_ATTEMPT_MS);
+    let first_ms = ((total_ms * 2) / 3).clamp(MIN_PER_ATTEMPT_MS, max_first_ms);
+
+    let mut out = Vec::with_capacity(slots);
+    out.push(first_ms.max(1));
+
+    let remaining_ms = total_ms.saturating_sub(first_ms);
+    if remaining_slots == 0 {
+        return out;
+    }
+    let per = remaining_ms / remaining_slots as u64;
+    let mut rem = remaining_ms.saturating_sub(per.saturating_mul(remaining_slots as u64));
+    for _ in 0..remaining_slots {
+        let mut slice = per.max(MIN_PER_ATTEMPT_MS);
+        if rem > 0 {
+            slice = slice.saturating_add(1);
+            rem -= 1;
+        }
+        out.push(slice.max(1));
+    }
+
+    out
+}
+
 /// Fix selected review findings
 ///
 /// Takes the content and findings to address, returns fixed content.
@@ -401,6 +487,7 @@ pub async fn fix_review_findings(
         iteration,
         fixed_titles,
         Model::Smart,
+        60_000,
     )
     .await
 }
@@ -416,6 +503,7 @@ pub async fn fix_review_findings_with_model(
     iteration: u32,
     fixed_titles: &[String],
     model: Model,
+    timeout_ms: u64,
 ) -> anyhow::Result<AppliedFix> {
     if findings.is_empty() {
         return Err(anyhow::anyhow!("No findings to fix"));
@@ -443,29 +531,55 @@ pub async fn fix_review_findings_with_model(
 
     let memory_section = format_repo_memory_section(repo_memory.as_deref(), "Repo conventions");
 
+    const MAX_REVIEW_FIX_EXCERPT_CHARS: usize = 12_000;
+    let anchor_line = findings
+        .iter()
+        .filter_map(|f| f.line)
+        .next()
+        .unwrap_or(1)
+        .max(1) as usize;
+    let build_code_section = |label: &str, code: &str| -> String {
+        let len = code.chars().count();
+        if len <= MAX_REVIEW_FIX_EXCERPT_CHARS {
+            return format!("\n\n{}:\n```\n{}\n```", label, code);
+        }
+        let snippet = truncate_content_around_line(code, anchor_line, MAX_REVIEW_FIX_EXCERPT_CHARS)
+            .unwrap_or_else(|| truncate_content(code, MAX_REVIEW_FIX_EXCERPT_CHARS));
+        format!(
+            "\n\n{} (EXCERPT):\nNOTE: This file is large ({} chars). Showing an excerpt around line {} to keep the review-fix loop fast.\nIMPORTANT: Only an excerpt is shown. Your `old_string` values must still be unique in the full file, so include enough surrounding context.\n```\n{}\n```",
+            label, len, anchor_line, snippet
+        )
+    };
+
     // For iterations > 1, include original content so model can see the full evolution
     let original_section = if iteration > 1 {
         original_content
             .filter(|o| !o.is_empty())
-            .map(|o| format!("\n\nORIGINAL CODE (before any fixes):\n```\n{}\n```", o))
+            .map(|o| build_code_section("ORIGINAL CODE (before any fixes)", o))
             .unwrap_or_default()
     } else {
         String::new()
     };
 
+    let current_section = build_code_section("CURRENT CODE", content);
     let user = format!(
-        "File: {}\n\nFINDINGS TO FIX:\n{}\n{}{}\n\nCURRENT CODE:\n```\n{}\n```\n\nFix all listed findings. Think carefully about edge cases.",
+        "File: {}\n\nFINDINGS TO FIX:\n{}\n{}{}\n{}\n\nFix all listed findings. Think carefully about edge cases.",
         path.display(),
         findings_text.join("\n\n"),
         memory_section,
         original_section,
-        content
+        current_section
     );
 
     let mut combined_usage: Option<Usage> = None;
     let mut last_apply_err: Option<String> = None;
+    let slices = allocate_attempt_time_slices_ms(timeout_ms, 2);
 
     for attempt in 1..=2usize {
+        let attempt_timeout_ms = slices
+            .get(attempt.saturating_sub(1))
+            .copied()
+            .unwrap_or_else(|| timeout_ms.max(1));
         let user_attempt = if let Some(ref err) = last_apply_err {
             format!(
                 "{}{}",
@@ -476,15 +590,28 @@ pub async fn fix_review_findings_with_model(
             user.clone()
         };
 
-        let response: StructuredResponse<FixResponse> = call_llm_structured_cached(
-            &system,
-            &user_attempt,
-            model,
-            "fix_response",
-            fix_response_schema(),
-        )
-        .await?;
+        let response: StructuredResponse<FixResponse> = if model == Model::Speed {
+            call_llm_structured_limited_speed_with_failover(
+                &system,
+                &user_attempt,
+                "fix_response",
+                fix_response_schema(),
+                model.max_tokens(),
+                attempt_timeout_ms,
+            )
+            .await?
+        } else {
+            call_llm_structured_cached(
+                &system,
+                &user_attempt,
+                model,
+                "fix_response",
+                fix_response_schema(),
+            )
+            .await?
+        };
         combined_usage = merge_usage(combined_usage, response.usage.clone());
+        let speed_failover = response.speed_failover.clone();
 
         let description = response
             .data
@@ -494,10 +621,22 @@ pub async fn fix_review_findings_with_model(
         let edits = response.data.edits;
 
         if edits.is_empty() {
-            return Err(anyhow::anyhow!("No edits provided in response"));
+            let message = "No edits provided in response".to_string();
+            if attempt < 2 {
+                last_apply_err = Some(message);
+                continue;
+            }
+            return Err(anyhow::anyhow!(message));
         }
 
-        match apply_edits_with_context(content, &edits, "file") {
+        let context_label = findings
+            .iter()
+            .filter_map(|f| f.line)
+            .next()
+            .map(|line| format!("file (finding around line {})", line.max(1)))
+            .unwrap_or_else(|| "file".to_string());
+
+        match apply_edits_with_context(content, &edits, &context_label) {
             Ok(new_content) => {
                 let new_content = normalize_generated_content(content, new_content, false);
                 if new_content.trim().is_empty() {
@@ -508,6 +647,7 @@ pub async fn fix_review_findings_with_model(
                     new_content,
                     modified_areas,
                     usage: combined_usage,
+                    speed_failover,
                 });
             }
             Err(err) => {
