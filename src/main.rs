@@ -9,7 +9,7 @@ use anyhow::Result;
 use clap::Parser;
 use cosmos_tui::context::WorkContext;
 use cosmos_tui::index::CodebaseIndex;
-use cosmos_tui::{app, cache, config, git_ops, github, onboarding, suggest};
+use cosmos_tui::{app, cache, config, git_ops, github, keyring, onboarding, suggest};
 use std::path::{Path, PathBuf};
 use suggest::SuggestionEngine;
 
@@ -168,7 +168,10 @@ fn setup_api_key() -> Result<()> {
         None => {
             eprintln!();
             eprintln!("  ! Warning: API key was saved but cannot be read back.");
-            eprintln!("  ! This may be due to system keychain access issues.");
+            eprintln!(
+                "  ! This may be due to {} access issues.",
+                keyring::credentials_store_label()
+            );
             eprintln!();
             eprintln!("  Workaround: Set the OPENROUTER_API_KEY environment variable:");
             eprintln!("    export OPENROUTER_API_KEY=\"your-key-here\"");
@@ -188,7 +191,10 @@ async fn github_login() -> Result<()> {
     if github::is_authenticated() {
         println!();
         println!("  Already authenticated with GitHub.");
-        println!("  To re-authenticate, unset GITHUB_TOKEN or clear the keychain entry.");
+        println!(
+            "  To re-authenticate, unset GITHUB_TOKEN or clear credentials from {}.",
+            keyring::credentials_store_label()
+        );
         println!();
         return Ok(());
     }
@@ -229,7 +235,7 @@ async fn github_login() -> Result<()> {
             println!();
             println!();
             println!("  + Authenticated as @{}", username);
-            println!("  + Token saved to system keychain");
+            println!("  + Token saved to {}", keyring::credentials_store_label());
             println!();
         }
 

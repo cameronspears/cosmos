@@ -236,7 +236,11 @@ pub async fn run_device_flow<C: DeviceFlowCallbacks>(callbacks: &mut C) -> Resul
         if let Some(token) = token_data.access_token {
             // Step 4: Store token and get username
             if let Err(e) = keyring::set_github_token(&token) {
-                let err = format!("Failed to store token in keychain: {}", e);
+                let err = format!(
+                    "Failed to store token in {}: {}",
+                    keyring::credentials_store_label(),
+                    e
+                );
                 callbacks.on_error(&err);
                 return Err(anyhow::anyhow!("{}", err));
             }

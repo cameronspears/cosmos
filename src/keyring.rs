@@ -5,6 +5,9 @@
 
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -56,6 +59,15 @@ fn keyring_disabled() -> bool {
     )
 }
 
+/// Human-friendly credential backend label used in CLI messages.
+pub fn credentials_store_label() -> &'static str {
+    if keyring_disabled() {
+        "local credentials file"
+    } else {
+        "system keychain"
+    }
+}
+
 fn keyring_entry() -> Result<Entry, keyring::Error> {
     Entry::new(KEYRING_SERVICE, KEYRING_USERNAME)
 }
@@ -68,6 +80,105 @@ fn legacy_github_entry() -> Result<Entry, keyring::Error> {
     Entry::new(LEGACY_GITHUB_SERVICE, LEGACY_GITHUB_USERNAME)
 }
 
+fn fallback_credentials_path() -> KeyringResult<PathBuf> {
+    if let Ok(path) = std::env::var("COSMOS_CREDENTIALS_FILE") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+
+    if cfg!(test) {
+        return Ok(std::env::temp_dir().join("cosmos-test-credentials.json"));
+    }
+
+    dirs::config_dir()
+        .map(|p| p.join("cosmos").join("credentials.json"))
+        .ok_or_else(|| "Could not determine credentials file path".to_string())
+}
+
+fn read_fallback_credentials() -> KeyringResult<StoredCredentials> {
+    let path = fallback_credentials_path()?;
+    if !path.exists() {
+        return Ok(StoredCredentials::default());
+    }
+    let json = fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "Failed to read credentials file '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+    serde_json::from_str(&json).map_err(|e| {
+        format!(
+            "Failed to parse credentials file '{}': {}",
+            path.display(),
+            e
+        )
+    })
+}
+
+fn write_fallback_credentials(creds: &StoredCredentials) -> KeyringResult<()> {
+    let path = fallback_credentials_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create credentials directory '{}': {}",
+                parent.display(),
+                e
+            )
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    let content = serde_json::to_string(creds)
+        .map_err(|e| format!("Failed to serialize credentials: {}", e))?;
+    #[cfg(unix)]
+    {
+        let tmp_path = path.with_extension("json.tmp");
+        let mut tmp_file = fs::File::create(&tmp_path).map_err(|e| {
+            format!(
+                "Failed to create temp credentials file '{}': {}",
+                tmp_path.display(),
+                e
+            )
+        })?;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tmp_file.set_permissions(fs::Permissions::from_mode(0o600));
+        tmp_file.write_all(content.as_bytes()).map_err(|e| {
+            format!(
+                "Failed to write credentials file '{}': {}",
+                tmp_path.display(),
+                e
+            )
+        })?;
+        fs::rename(&tmp_path, &path).map_err(|e| {
+            format!(
+                "Failed to finalize credentials file '{}': {}",
+                path.display(),
+                e
+            )
+        })?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(&path, content).map_err(|e| {
+            format!(
+                "Failed to write credentials file '{}': {}",
+                path.display(),
+                e
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Warn about keychain errors only once per session
 pub fn warn_keychain_error_once(context: &str, err: &str) {
     if KEYRING_ERROR_WARNED.swap(true, Ordering::Relaxed) {
@@ -78,6 +189,7 @@ pub fn warn_keychain_error_once(context: &str, err: &str) {
         context, err
     );
     eprintln!("  Tip: When macOS prompts, choose \"Always Allow\" for cosmos.");
+    eprintln!("  Tip: To bypass keychain prompts: export COSMOS_DISABLE_KEYRING=1");
     eprintln!(
         "  Tip: You can also set OPENROUTER_API_KEY and GITHUB_TOKEN env vars to bypass keychain."
     );
@@ -86,7 +198,7 @@ pub fn warn_keychain_error_once(context: &str, err: &str) {
 /// Read credentials from the unified keychain entry
 fn read_credentials_uncached() -> KeyringResult<StoredCredentials> {
     if keyring_disabled() {
-        return Ok(StoredCredentials::default());
+        return read_fallback_credentials();
     }
     let entry = keyring_entry().map_err(|e| e.to_string())?;
     match entry.get_password() {
@@ -99,10 +211,13 @@ fn read_credentials_uncached() -> KeyringResult<StoredCredentials> {
 }
 
 /// Write credentials to the unified keychain entry
-fn write_credentials(creds: &StoredCredentials) -> Result<(), keyring::Error> {
-    let entry = keyring_entry()?;
+fn write_credentials(creds: &StoredCredentials) -> KeyringResult<()> {
+    if keyring_disabled() {
+        return write_fallback_credentials(creds);
+    }
+    let entry = keyring_entry().map_err(|e| e.to_string())?;
     let json = serde_json::to_string(creds).expect("Failed to serialize credentials");
-    entry.set_password(&json)?;
+    entry.set_password(&json).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -156,7 +271,7 @@ fn read_credentials_cached() -> KeyringResult<StoredCredentials> {
     // Attempt migration from legacy entries (only once)
     if !guard.migration_attempted {
         guard.migration_attempted = true;
-        if migrate_legacy_credentials(&mut creds) {
+        if !keyring_disabled() && migrate_legacy_credentials(&mut creds) {
             // Save migrated credentials
             if let Err(e) = write_credentials(&creds) {
                 eprintln!("  Warning: Failed to save migrated credentials: {}", e);
@@ -178,6 +293,18 @@ fn update_cache(creds: StoredCredentials) {
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.cached = Some(Ok(creds));
+}
+
+#[cfg(test)]
+fn reset_for_tests() {
+    let cache = credentials_cache();
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.cached = None;
+    guard.migration_attempted = false;
+    KEYRING_ERROR_WARNED.store(false, Ordering::Relaxed);
 }
 
 // ============================================================================
@@ -221,6 +348,7 @@ pub fn set_github_token(token: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_stored_credentials_default() {
@@ -271,5 +399,34 @@ mod tests {
         let parsed: StoredCredentials = serde_json::from_str(json).unwrap();
         assert!(parsed.openrouter_api_key.is_none());
         assert!(parsed.github_token.is_none());
+    }
+
+    #[test]
+    fn test_credentials_store_label_uses_file_backend_in_tests() {
+        assert_eq!(credentials_store_label(), "local credentials file");
+    }
+
+    #[test]
+    fn test_file_backend_round_trip_for_tokens() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("cosmos-keyring-test-{}.json", unique));
+        std::env::set_var("COSMOS_CREDENTIALS_FILE", &path);
+        let _ = std::fs::remove_file(&path);
+        reset_for_tests();
+
+        set_api_key("sk-test-key").unwrap();
+        set_github_token("ghp-test-token").unwrap();
+        assert_eq!(get_api_key().unwrap(), Some("sk-test-key".to_string()));
+        assert_eq!(
+            get_github_token().unwrap(),
+            Some("ghp-test-token".to_string())
+        );
+
+        let _ = std::fs::remove_file(&path);
+        std::env::remove_var("COSMOS_CREDENTIALS_FILE");
+        reset_for_tests();
     }
 }

@@ -100,7 +100,10 @@ async fn run_github_auth() -> Result<(), String> {
             println!();
             println!();
             println!("  + Authenticated as @{}", username);
-            println!("  + Token saved to system keychain");
+            println!(
+                "  + Token saved to {}",
+                crate::keyring::credentials_store_label()
+            );
         }
 
         fn on_error(&mut self, error: &str) {

@@ -132,8 +132,9 @@ impl Config {
         // Try to write to keychain
         keyring::set_api_key(key).map_err(|e| {
             format!(
-                "Failed to store API key in system keychain: {}. \
+                "Failed to store API key in {}: {}. \
                  You can set the OPENROUTER_API_KEY environment variable instead.",
+                keyring::credentials_store_label(),
                 e
             )
         })?;
@@ -145,17 +146,20 @@ impl Config {
                 self.openrouter_api_key = None;
                 self.save()
             }
-            Ok(Some(_)) => Err("API key verification failed: stored key doesn't match. \
-                     You can set the OPENROUTER_API_KEY environment variable instead."
-                .to_string()),
-            Ok(None) => Err(
-                "API key verification failed: key was not persisted to keychain. \
-                     You can set the OPENROUTER_API_KEY environment variable instead."
-                    .to_string(),
-            ),
-            Err(read_err) => Err(format!(
-                "API key verification failed: couldn't read back from keychain ({}). \
+            Ok(Some(_)) => Err(format!(
+                "API key verification failed: stored key doesn't match in {}. \
                      You can set the OPENROUTER_API_KEY environment variable instead.",
+                keyring::credentials_store_label()
+            )),
+            Ok(None) => Err(format!(
+                "API key verification failed: key was not persisted to {}. \
+                     You can set the OPENROUTER_API_KEY environment variable instead.",
+                keyring::credentials_store_label()
+            )),
+            Err(read_err) => Err(format!(
+                "API key verification failed: couldn't read back from {} ({}). \
+                     You can set the OPENROUTER_API_KEY environment variable instead.",
+                keyring::credentials_store_label(),
                 read_err
             )),
         }
@@ -207,7 +211,10 @@ pub fn setup_api_key_interactive() -> Result<String, String> {
     println!("    2) Add funds in OpenRouter (required to use Cosmos)");
     println!("    3) Paste the key below and press Enter");
     println!();
-    println!("  We'll store it in your system keychain when available.");
+    println!(
+        "  We'll store it in your {}.",
+        keyring::credentials_store_label()
+    );
     println!("  You can update it later with `cosmos --setup`.");
     println!("  Prefer env vars? Set OPENROUTER_API_KEY and rerun.");
     println!();
