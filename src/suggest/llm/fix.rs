@@ -32,6 +32,12 @@ pub struct AppliedFix {
     pub speed_failover: Option<SpeedFailoverDiagnostics>,
 }
 
+const PYTHON_IMPLEMENTATION_GUARDRAILS: &str = "\
+Python guardrails:
+- If you reference a module, import it.
+- Do not change exit codes or return values unless explicitly required by the plan.
+- Keep the diff minimal and avoid refactors.";
+
 // Context limits - tuned for low cost and reliability.
 // We intentionally prefer focused excerpts over full-file dumps to keep token usage bounded.
 const MAX_FIX_EXCERPT_CHARS: usize = 20000;
@@ -135,6 +141,42 @@ fn choose_fix_anchor_line(
         return line;
     }
     choose_preview_anchor_line(lines, suggestion_line, hint_tokens)
+}
+
+fn is_python_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("py"))
+        .unwrap_or(false)
+}
+
+fn build_plan_text(plan: &FixPreview, extra_guardrails: Option<&str>) -> String {
+    let mut tail = plan
+        .modifier
+        .as_ref()
+        .map(|m| format!("\nUser modifications: {}", m))
+        .unwrap_or_default();
+    if let Some(extra) = extra_guardrails {
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            tail.push_str("\n\n");
+            tail.push_str(extra);
+        }
+    }
+
+    format!(
+        "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
+        if plan.verified {
+            "CONFIRMED"
+        } else {
+            "UNCONFIRMED"
+        },
+        plan.verification_note,
+        plan.description,
+        plan.scope.label(),
+        plan.affected_areas.join(", "),
+        tail
+    )
 }
 
 fn build_fix_prompt_content(
@@ -484,21 +526,13 @@ pub async fn generate_fix_content_with_model(
     model: Model,
     timeout_ms: u64,
 ) -> anyhow::Result<AppliedFix> {
-    let plan_text = format!(
-        "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
-        if plan.verified {
-            "CONFIRMED"
+    let plan_text = build_plan_text(
+        plan,
+        if is_python_file(path) {
+            Some(PYTHON_IMPLEMENTATION_GUARDRAILS)
         } else {
-            "UNCONFIRMED"
+            None
         },
-        plan.verification_note,
-        plan.description,
-        plan.scope.label(),
-        plan.affected_areas.join(", "),
-        plan.modifier
-            .as_ref()
-            .map(|m| format!("\nUser modifications: {}", m))
-            .unwrap_or_default()
     );
 
     let memory_section =
@@ -1004,21 +1038,13 @@ pub async fn generate_multi_file_fix_with_model(
     }
     let per_file_budget = prompt_budget_per_file(files.len());
 
-    let plan_text = format!(
-        "Verification: {} - {}\nPlan: {}\nScope: {}\nAffected areas: {}{}",
-        if plan.verified {
-            "CONFIRMED"
+    let plan_text = build_plan_text(
+        plan,
+        if files.iter().any(|f| is_python_file(&f.path)) {
+            Some(PYTHON_IMPLEMENTATION_GUARDRAILS)
         } else {
-            "UNCONFIRMED"
+            None
         },
-        plan.verification_note,
-        plan.description,
-        plan.scope.label(),
-        plan.affected_areas.join(", "),
-        plan.modifier
-            .as_ref()
-            .map(|m| format!("\nUser modifications: {}", m))
-            .unwrap_or_default()
     );
 
     let memory_section =
@@ -1966,6 +1992,16 @@ mod tests {
             SuggestionSource::LlmDeep,
         )
         .with_detail("Details".to_string())
+    }
+
+    #[test]
+    fn test_build_plan_text_adds_python_guardrails_only_when_requested() {
+        let preview = sample_preview(Some(12));
+        let no_extra = build_plan_text(&preview, None);
+        assert!(!no_extra.contains("Python guardrails:"), "{}", no_extra);
+
+        let with_extra = build_plan_text(&preview, Some(PYTHON_IMPLEMENTATION_GUARDRAILS));
+        assert!(with_extra.contains("Python guardrails:"), "{}", with_extra);
     }
 
     #[test]
