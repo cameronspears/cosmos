@@ -215,6 +215,55 @@ impl ImplementationBudget {
     }
 }
 
+fn attempt_budget_weights(max_attempts: usize) -> Vec<f64> {
+    let max_attempts = max_attempts.max(1);
+    if max_attempts == 1 {
+        return vec![1.0];
+    }
+    if max_attempts == 2 {
+        // With only two attempts, keep attempt 2 meaningful and give attempt 1 the rest.
+        return vec![0.80, 0.20];
+    }
+
+    let mut weights = vec![0.0; max_attempts];
+    weights[0] = 0.70;
+    weights[1] = 0.20;
+    let tail = max_attempts.saturating_sub(2);
+    let per = 0.10 / tail as f64;
+    for idx in 0..tail {
+        weights[idx + 2] = per;
+    }
+    weights
+}
+
+fn compute_attempt_budget_caps(
+    global_budget: &ImplementationBudget,
+    usage_so_far: &Option<Usage>,
+    attempt_index: usize,
+    weights: &[f64],
+) -> (u64, f64) {
+    let remaining_ms = global_budget.remaining_ms().max(1);
+    let remaining_cost = global_budget.remaining_cost_usd(usage_so_far);
+    if weights.is_empty() {
+        return (remaining_ms, remaining_cost);
+    }
+
+    let idx = attempt_index
+        .saturating_sub(1)
+        .min(weights.len().saturating_sub(1));
+    let remaining_weight_sum = weights[idx..].iter().sum::<f64>();
+    let ratio = if remaining_weight_sum <= 0.0 {
+        1.0
+    } else {
+        (weights[idx] / remaining_weight_sum).clamp(0.0, 1.0)
+    };
+
+    let attempt_ms = ((remaining_ms as f64) * ratio).floor() as u64;
+    let attempt_ms = attempt_ms.clamp(1, remaining_ms);
+    let attempt_cost = (remaining_cost * ratio).max(0.0);
+    (attempt_ms, attempt_cost)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ImplementationFinalizationStatus {
@@ -671,30 +720,65 @@ fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Opti
 
     let pick_line = |text: &str| -> Option<String> {
         let mut best: Option<&str> = None;
+        let mut best_score: i32 = i32::MIN;
         for line in text.lines().map(str::trim) {
             if line.is_empty() {
                 continue;
             }
             let lower = line.to_ascii_lowercase();
-            // Avoid reporting normal progress output unless there's nothing else.
-            if lower.starts_with("updating ")
+
+            let is_progress = lower.starts_with("updating ")
                 || lower.starts_with("checking ")
                 || lower.starts_with("compiling ")
                 || lower.starts_with("finished ")
                 || lower.starts_with("downloading ")
-                || lower.starts_with("locking ")
-            {
-                if best.is_none() {
-                    best = Some(line);
-                }
-                continue;
+                || lower.starts_with("locking ");
+            // Many test runners print passing lines that include the word "error" (e.g.
+            // "✔ handles error cases"). De-prioritize those so users see the real failure.
+            let is_passing = line.starts_with('✔')
+                || line.starts_with('✓')
+                || lower.starts_with("pass ")
+                || lower.starts_with("passed ")
+                || lower.contains("0 errors")
+                || lower.contains("0 failed")
+                || lower.contains("no errors");
+
+            let high_signal = lower.starts_with("fail")
+                || lower.contains("command failed")
+                || lower.contains("elifecycle")
+                || lower.contains("npm err!")
+                || lower.contains("yarn err!")
+                || lower.contains("err!")
+                || lower.contains("exit code")
+                || lower.contains("assertionerror")
+                || lower.contains("typeerror")
+                || lower.contains("referenceerror")
+                || lower.contains("syntaxerror")
+                || lower.contains("panic")
+                || lower.contains("fatal");
+            let medium_signal =
+                lower.contains("error") || lower.contains("failed") || lower.contains("cannot ");
+
+            let mut score = 0i32;
+            if is_progress {
+                score -= 2;
             }
-            if lower.contains("error") || lower.contains("failed") || lower.contains("cannot ") {
+            if is_passing {
+                score -= 4;
+            }
+            if high_signal {
+                score += 10;
+            } else if medium_signal {
+                score += 5;
+            }
+
+            if score > best_score {
+                best_score = score;
                 best = Some(line);
+            }
+
+            if high_signal && !is_passing {
                 break;
-            }
-            if best.is_none() {
-                best = Some(line);
             }
         }
         best.map(|s| s.to_string())
@@ -746,6 +830,23 @@ fn normalize_quick_check_path(raw: &str) -> Option<PathBuf> {
     Some(path)
 }
 
+fn normalize_stack_trace_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let trimmed = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+    // Ignore non-file schemes.
+    if trimmed.starts_with("node:")
+        || trimmed.starts_with("http:")
+        || trimmed.starts_with("https:")
+        || trimmed.starts_with("webpack:")
+    {
+        return None;
+    }
+    normalize_quick_check_path(trimmed)
+}
+
 fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Vec<PathBuf> {
     let combined = format!(
         "{}\n{}",
@@ -780,6 +881,39 @@ fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Ve
             if let Some(path) = caps
                 .name("path")
                 .and_then(|m| normalize_quick_check_path(m.as_str()))
+            {
+                if seen.insert(path.clone()) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+
+    // Node/Vitest/Jest stack traces often look like:
+    //   at fn (src/file.ts:12:34)
+    //   at src/file.ts:12:34
+    let stack_paren_re = Regex::new(
+        r"(?m)^\s*at\s+.*\((?P<path>[^()]+?\.[A-Za-z0-9]+):(?P<line>\d+):(?P<col>\d+)\)",
+    );
+    if let Ok(re) = stack_paren_re {
+        for caps in re.captures_iter(&combined) {
+            if let Some(path) = caps
+                .name("path")
+                .and_then(|m| normalize_stack_trace_path(m.as_str()))
+            {
+                if seen.insert(path.clone()) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    let stack_simple_re =
+        Regex::new(r"(?m)^\s*at\s+(?P<path>[^\s()]+?\.[A-Za-z0-9]+):(?P<line>\d+):(?P<col>\d+)\b");
+    if let Ok(re) = stack_simple_re {
+        for caps in re.captures_iter(&combined) {
+            if let Some(path) = caps
+                .name("path")
+                .and_then(|m| normalize_stack_trace_path(m.as_str()))
             {
                 if seen.insert(path.clone()) {
                     out.push(path);
@@ -853,6 +987,11 @@ fn extract_quick_check_error_locations(
 
     let combined_lines = combined.lines().map(str::trim).collect::<Vec<_>>();
     let mut current_eslint_file: Option<PathBuf> = None;
+    let stack_paren_re =
+        Regex::new(r"^\s*at\s+.*\((?P<path>[^()]+?\.[A-Za-z0-9]+):(?P<line>\d+):(?P<col>\d+)\)")
+            .ok();
+    let stack_simple_re =
+        Regex::new(r"^\s*at\s+(?P<path>[^\s()]+?\.[A-Za-z0-9]+):(?P<line>\d+):(?P<col>\d+)\b").ok();
 
     for raw in combined_lines.iter().copied() {
         if let Some((file, ln, col, _msg)) = parse_tsc_error_line(raw) {
@@ -895,6 +1034,52 @@ fn extract_quick_check_error_locations(
                 }
             }
             continue;
+        }
+
+        // Node/Vitest/Jest stack traces: `at fn (path:line:col)` or `at path:line:col`.
+        if let Some(re) = stack_paren_re.as_ref() {
+            if let Some(caps) = re.captures(raw) {
+                let file = caps.name("path").map(|m| m.as_str()).unwrap_or_default();
+                if let (Some(path), Ok(ln), Ok(col)) = (
+                    normalize_stack_trace_path(file),
+                    caps.name("line")
+                        .map(|m| m.as_str())
+                        .unwrap_or("0")
+                        .parse::<u32>(),
+                    caps.name("col")
+                        .map(|m| m.as_str())
+                        .unwrap_or("0")
+                        .parse::<u32>(),
+                ) {
+                    let key = (path.clone(), ln.max(1), col.max(1));
+                    if seen.insert(key.clone()) {
+                        out.push(key);
+                    }
+                    continue;
+                }
+            }
+        }
+        if let Some(re) = stack_simple_re.as_ref() {
+            if let Some(caps) = re.captures(raw) {
+                let file = caps.name("path").map(|m| m.as_str()).unwrap_or_default();
+                if let (Some(path), Ok(ln), Ok(col)) = (
+                    normalize_stack_trace_path(file),
+                    caps.name("line")
+                        .map(|m| m.as_str())
+                        .unwrap_or("0")
+                        .parse::<u32>(),
+                    caps.name("col")
+                        .map(|m| m.as_str())
+                        .unwrap_or("0")
+                        .parse::<u32>(),
+                ) {
+                    let key = (path.clone(), ln.max(1), col.max(1));
+                    if seen.insert(key.clone()) {
+                        out.push(key);
+                    }
+                    continue;
+                }
+            }
         }
 
         if let Some((file, ln)) = parse_python_file_line(raw) {
@@ -965,6 +1150,7 @@ fn snippet_around_line(content: &str, line: u32, context_lines: usize) -> Option
 fn format_quick_check_repair_modifier(
     existing: Option<&str>,
     error_summary: &str,
+    outcome: &ImplementationCommandOutcome,
     target: &Path,
 ) -> String {
     let mut parts = Vec::new();
@@ -974,10 +1160,29 @@ fn format_quick_check_repair_modifier(
             parts.push(trimmed.to_string());
         }
     }
+    let output_excerpt = {
+        let stderr = strip_ansi_sequences(&outcome.stderr_tail);
+        let stdout = strip_ansi_sequences(&outcome.stdout_tail);
+        let excerpt = if !stderr.trim().is_empty() {
+            stderr
+        } else {
+            stdout
+        };
+        let excerpt = truncate(&excerpt, 700);
+        if excerpt.trim().is_empty() {
+            None
+        } else {
+            Some(excerpt)
+        }
+    };
     parts.push(format!(
-        "Quick-check repair request:\n- Quick-check failure: {}\n- File to repair: {}\nRules:\n- Modify only this file.\n- Fix the reported error.\n- Keep the diff minimal and avoid unrelated reformatting.\n- Do not change behavior outside what's needed for the error.",
+        "Quick-check repair request:\n- Quick-check failure: {}\n- File to repair: {}\n{}\nRules:\n- Modify only this file.\n- Fix the reported error.\n- Keep the diff minimal and avoid unrelated reformatting.\n- Do not change behavior outside what's needed for the error.",
         truncate(error_summary, 240),
-        target.display()
+        target.display(),
+        output_excerpt
+            .as_deref()
+            .map(|excerpt| format!("- Quick-check output (truncated):\n{}", excerpt))
+            .unwrap_or_default(),
     ));
     parts.join("\n\n")
 }
@@ -1113,7 +1318,7 @@ where
     })?;
     let run_id = Uuid::new_v4().to_string();
     let start = std::time::Instant::now();
-    let budget = ImplementationBudget {
+    let global_budget = ImplementationBudget {
         started_at: start,
         max_total_ms: config.max_total_ms,
         max_total_cost_usd: config.max_total_cost_usd,
@@ -1133,12 +1338,16 @@ where
         .iter()
         .map(|s| s.to_ascii_lowercase())
         .collect::<HashSet<_>>();
+    let attempt_weights = attempt_budget_weights(config.max_attempts.max(1));
 
     for attempt_index in 1..=config.max_attempts.max(1) {
-        if let Some(reason) = budget.guard_before_llm_call(&usage) {
+        if let Some(reason) = global_budget.guard_before_llm_call(&usage) {
             feedback_reasons.push(reason.message);
             break;
         }
+
+        let (attempt_budget_ms, attempt_budget_cost_usd) =
+            compute_attempt_budget_caps(&global_budget, &usage, attempt_index, &attempt_weights);
 
         let feedback = if feedback_reasons.is_empty() {
             None
@@ -1161,7 +1370,9 @@ where
             &allowed_files,
             &blocking_severities,
             &config,
-            &budget,
+            &global_budget,
+            attempt_budget_ms,
+            attempt_budget_cost_usd,
             &usage,
             attempt_index,
             &run_id,
@@ -1269,13 +1480,20 @@ async fn run_attempt(
     allowed_files: &HashSet<PathBuf>,
     blocking_severities: &HashSet<String>,
     config: &ImplementationHarnessConfig,
-    budget: &ImplementationBudget,
+    global_budget: &ImplementationBudget,
+    attempt_budget_ms: u64,
+    attempt_budget_cost_usd: f64,
     usage_so_far: &Option<Usage>,
     attempt_index: usize,
     run_id: &str,
     feedback: Option<&str>,
 ) -> anyhow::Result<AttemptExecution> {
     let attempt_start = std::time::Instant::now();
+    let attempt_budget = ImplementationBudget {
+        started_at: attempt_start,
+        max_total_ms: attempt_budget_ms.max(1),
+        max_total_cost_usd: attempt_budget_cost_usd.max(0.0),
+    };
     let mut gates = Vec::new();
     let mut fail_reasons = Vec::new();
     let mut fail_reason_records = Vec::new();
@@ -1287,7 +1505,7 @@ async fn run_attempt(
     let detected_quick_check = detect_quick_check_command(repo_root);
     let detected_quick_check_command = detected_quick_check.as_ref().map(command_to_string);
 
-    if let Some(reason) = budget.guard_before_llm_call(usage_so_far) {
+    if let Some(reason) = global_budget.guard_before_llm_call(usage_so_far) {
         notes.push("budget_exceeded".to_string());
         push_fail_reason(
             &mut fail_reasons,
@@ -1482,9 +1700,7 @@ async fn run_attempt(
         });
     }
 
-    if let Some(reason) =
-        budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
-    {
+    if let Some(reason) = attempt_budget.guard_before_llm_call(&usage) {
         notes.push("budget_exceeded".to_string());
         push_fail_reason(
             &mut fail_reasons,
@@ -1532,7 +1748,7 @@ async fn run_attempt(
         });
     }
 
-    let generation_timeout_ms = budget
+    let generation_timeout_ms = attempt_budget
         .timeout_ms_for_next_llm_call()
         .min(MAX_GENERATION_TIMEOUT_MS);
     let generation = tokio::time::timeout(
@@ -1554,7 +1770,7 @@ async fn run_attempt(
         Err(_) => {
             let message = format!(
                 "Stopped to respect the configured time budget (generation timed out after {}ms; limit {}ms)",
-                generation_timeout_ms, budget.max_total_ms
+                generation_timeout_ms, attempt_budget.max_total_ms
             );
             notes.push("budget_exceeded".to_string());
             push_fail_reason(
@@ -1657,7 +1873,7 @@ async fn run_attempt(
     };
 
     usage = merge_usage(usage, generated.usage.take());
-    if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+    if let Some(reason) = attempt_budget.exhausted(&usage) {
         notes.push("budget_exceeded".to_string());
         push_fail_reason(
             &mut fail_reasons,
@@ -1905,7 +2121,7 @@ async fn run_attempt(
     final_changed_files.sort();
 
     let pre_review_quick_check_timeout_ms = config.quick_check_timeout_ms.min(
-        budget
+        attempt_budget
             .remaining_ms()
             .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
             .max(1),
@@ -1940,13 +2156,21 @@ async fn run_attempt(
                 break;
             };
             let candidates = extract_quick_check_error_paths(outcome);
-            let target = candidates.into_iter().find(|path| {
+            let mut target = candidates.into_iter().find(|path| {
                 if config.quick_check_fix_requires_in_scope_error {
                     allowed_files.contains(path)
                 } else {
                     allowed_files.contains(path) || files_changed_set.contains(path)
                 }
             });
+            if target.is_none() && files_changed_set.len() == 1 {
+                if let Some(only) = files_changed_set.iter().next().cloned() {
+                    if allowed_files.contains(&only) {
+                        notes.push("quick_check_repair_fallback_single_changed_file".to_string());
+                        target = Some(only);
+                    }
+                }
+            }
             let Some(target) = target else {
                 notes.push("quick_check_repair_skipped_no_in_scope_error_path".to_string());
                 break;
@@ -1955,9 +2179,7 @@ async fn run_attempt(
             quick_check_fix_loops = quick_check_fix_loops.saturating_add(1);
             notes.push(format!("quick_check_fix_loop_{}", quick_check_fix_loops));
 
-            if let Some(reason) =
-                budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
-            {
+            if let Some(reason) = attempt_budget.guard_before_llm_call(&usage) {
                 notes.push("budget_exceeded".to_string());
                 push_fail_reason(
                     &mut fail_reasons,
@@ -2006,6 +2228,7 @@ async fn run_attempt(
             repair_preview.modifier = Some(format_quick_check_repair_modifier(
                 feedback_preview.modifier.as_deref(),
                 error_summary,
+                outcome,
                 &target,
             ));
             if !is_new_file {
@@ -2019,7 +2242,7 @@ async fn run_attempt(
             }
 
             ensure_implementation_model(IMPLEMENTATION_MODEL)?;
-            let repair_timeout_ms = budget
+            let repair_timeout_ms = attempt_budget
                 .timeout_ms_for_next_llm_call()
                 .min(MAX_FIX_TIMEOUT_MS);
             let fix = tokio::time::timeout(
@@ -2037,27 +2260,58 @@ async fn run_attempt(
             )
             .await;
             let fix = match fix {
-                Ok(result) => match result {
-                    Ok(value) => value,
-                    Err(err) => {
-                        push_fail_reason(
-                            &mut fail_reasons,
-                            &mut fail_reason_records,
-                            "quick_check",
-                            REASON_QUICK_CHECK_FAILED,
-                            format!(
-                                "Quick check auto-repair failed: {}",
-                                truncate(&err.to_string(), 180)
-                            ),
-                        );
-                        break;
-                    }
-                },
+                Ok(Ok(value)) => {
+                    llm_calls.push(ImplementationLlmCallRecord {
+                        kind: "quick_check_repair".to_string(),
+                        model: IMPLEMENTATION_MODEL.id().to_string(),
+                        timeout_ms: value
+                            .speed_failover
+                            .as_ref()
+                            .map(|d| d.total_timeout_ms)
+                            .unwrap_or(repair_timeout_ms),
+                        speed_failover: value.speed_failover.clone(),
+                        error: None,
+                    });
+                    value
+                }
+                Ok(Err(err)) => {
+                    let speed_failover = err
+                        .downcast_ref::<SpeedFailoverError>()
+                        .map(|e| e.diagnostics.clone());
+                    llm_calls.push(ImplementationLlmCallRecord {
+                        kind: "quick_check_repair".to_string(),
+                        model: IMPLEMENTATION_MODEL.id().to_string(),
+                        timeout_ms: speed_failover
+                            .as_ref()
+                            .map(|d| d.total_timeout_ms)
+                            .unwrap_or(repair_timeout_ms),
+                        speed_failover,
+                        error: Some(truncate(&err.to_string(), 240)),
+                    });
+                    push_fail_reason(
+                        &mut fail_reasons,
+                        &mut fail_reason_records,
+                        "quick_check",
+                        REASON_QUICK_CHECK_FAILED,
+                        format!(
+                            "Quick check auto-repair failed: {}",
+                            truncate(&err.to_string(), 180)
+                        ),
+                    );
+                    break;
+                }
                 Err(_) => {
+                    llm_calls.push(ImplementationLlmCallRecord {
+                        kind: "quick_check_repair".to_string(),
+                        model: IMPLEMENTATION_MODEL.id().to_string(),
+                        timeout_ms: repair_timeout_ms,
+                        speed_failover: None,
+                        error: Some(format!("Timed out after {}ms", repair_timeout_ms)),
+                    });
                     notes.push("budget_exceeded".to_string());
                     let message = format!(
                         "Stopped to respect the configured time budget (quick-check repair timed out after {}ms; limit {}ms)",
-                        repair_timeout_ms, budget.max_total_ms
+                        repair_timeout_ms, attempt_budget.max_total_ms
                     );
                     push_fail_reason(
                         &mut fail_reasons,
@@ -2077,9 +2331,7 @@ async fn run_attempt(
                 }
             };
             usage = merge_usage(usage, fix.usage.clone());
-            if let Some(reason) =
-                budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone()))
-            {
+            if let Some(reason) = attempt_budget.exhausted(&usage) {
                 notes.push("budget_exceeded".to_string());
                 push_fail_reason(
                     &mut fail_reasons,
@@ -2137,7 +2389,7 @@ async fn run_attempt(
                 &mut notes,
                 config.quick_checks_mode,
                 config.quick_check_timeout_ms.min(
-                    budget
+                    attempt_budget
                         .remaining_ms()
                         .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
                         .max(1),
@@ -2254,13 +2506,13 @@ async fn run_attempt(
         &generated.description,
         &generated.old_contents,
         &final_changed_files,
+        &mut llm_calls,
         repo_memory.clone(),
         quick_status,
         quick_command.as_deref(),
         blocking_severities,
         config.max_auto_review_fix_loops,
-        budget,
-        usage_so_far,
+        &attempt_budget,
         &mut usage,
         &mut review_iterations,
         &mut blocking_remaining,
@@ -2513,7 +2765,7 @@ async fn run_attempt(
         });
     }
 
-    if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+    if let Some(reason) = attempt_budget.exhausted(&usage) {
         notes.push("budget_exceeded".to_string());
         push_fail_reason(
             &mut fail_reasons,
@@ -2578,7 +2830,7 @@ async fn run_attempt(
     }
 
     let quick_check_timeout_ms = config.quick_check_timeout_ms.min(
-        budget
+        attempt_budget
             .remaining_ms()
             .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
             .max(1),
@@ -2615,13 +2867,21 @@ async fn run_attempt(
                 break;
             };
             let candidates = extract_quick_check_error_paths(outcome);
-            let target = candidates.into_iter().find(|path| {
+            let mut target = candidates.into_iter().find(|path| {
                 if config.quick_check_fix_requires_in_scope_error {
                     allowed_files.contains(path)
                 } else {
                     allowed_files.contains(path) || files_changed_set.contains(path)
                 }
             });
+            if target.is_none() && files_changed_set.len() == 1 {
+                if let Some(only) = files_changed_set.iter().next().cloned() {
+                    if allowed_files.contains(&only) {
+                        notes.push("quick_check_repair_fallback_single_changed_file".to_string());
+                        target = Some(only);
+                    }
+                }
+            }
             let Some(target) = target else {
                 notes.push("quick_check_repair_skipped_no_in_scope_error_path".to_string());
                 break;
@@ -2630,9 +2890,7 @@ async fn run_attempt(
             quick_check_fix_loops = quick_check_fix_loops.saturating_add(1);
             notes.push(format!("quick_check_fix_loop_{}", quick_check_fix_loops));
 
-            if let Some(reason) =
-                budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
-            {
+            if let Some(reason) = attempt_budget.guard_before_llm_call(&usage) {
                 notes.push("budget_exceeded".to_string());
                 push_fail_reason(
                     &mut fail_reasons,
@@ -2681,6 +2939,7 @@ async fn run_attempt(
             repair_preview.modifier = Some(format_quick_check_repair_modifier(
                 feedback_preview.modifier.as_deref(),
                 error_summary,
+                outcome,
                 &target,
             ));
             if !is_new_file {
@@ -2694,7 +2953,7 @@ async fn run_attempt(
             }
 
             ensure_implementation_model(IMPLEMENTATION_MODEL)?;
-            let repair_timeout_ms = budget
+            let repair_timeout_ms = attempt_budget
                 .timeout_ms_for_next_llm_call()
                 .min(MAX_FIX_TIMEOUT_MS);
             let fix = tokio::time::timeout(
@@ -2712,27 +2971,58 @@ async fn run_attempt(
             )
             .await;
             let fix = match fix {
-                Ok(result) => match result {
-                    Ok(value) => value,
-                    Err(err) => {
-                        push_fail_reason(
-                            &mut fail_reasons,
-                            &mut fail_reason_records,
-                            "quick_check",
-                            REASON_QUICK_CHECK_FAILED,
-                            format!(
-                                "Quick check auto-repair failed: {}",
-                                truncate(&err.to_string(), 180)
-                            ),
-                        );
-                        break;
-                    }
-                },
+                Ok(Ok(value)) => {
+                    llm_calls.push(ImplementationLlmCallRecord {
+                        kind: "quick_check_repair".to_string(),
+                        model: IMPLEMENTATION_MODEL.id().to_string(),
+                        timeout_ms: value
+                            .speed_failover
+                            .as_ref()
+                            .map(|d| d.total_timeout_ms)
+                            .unwrap_or(repair_timeout_ms),
+                        speed_failover: value.speed_failover.clone(),
+                        error: None,
+                    });
+                    value
+                }
+                Ok(Err(err)) => {
+                    let speed_failover = err
+                        .downcast_ref::<SpeedFailoverError>()
+                        .map(|e| e.diagnostics.clone());
+                    llm_calls.push(ImplementationLlmCallRecord {
+                        kind: "quick_check_repair".to_string(),
+                        model: IMPLEMENTATION_MODEL.id().to_string(),
+                        timeout_ms: speed_failover
+                            .as_ref()
+                            .map(|d| d.total_timeout_ms)
+                            .unwrap_or(repair_timeout_ms),
+                        speed_failover,
+                        error: Some(truncate(&err.to_string(), 240)),
+                    });
+                    push_fail_reason(
+                        &mut fail_reasons,
+                        &mut fail_reason_records,
+                        "quick_check",
+                        REASON_QUICK_CHECK_FAILED,
+                        format!(
+                            "Quick check auto-repair failed: {}",
+                            truncate(&err.to_string(), 180)
+                        ),
+                    );
+                    break;
+                }
                 Err(_) => {
+                    llm_calls.push(ImplementationLlmCallRecord {
+                        kind: "quick_check_repair".to_string(),
+                        model: IMPLEMENTATION_MODEL.id().to_string(),
+                        timeout_ms: repair_timeout_ms,
+                        speed_failover: None,
+                        error: Some(format!("Timed out after {}ms", repair_timeout_ms)),
+                    });
                     notes.push("budget_exceeded".to_string());
                     let message = format!(
                         "Stopped to respect the configured time budget (quick-check repair timed out after {}ms; limit {}ms)",
-                        repair_timeout_ms, budget.max_total_ms
+                        repair_timeout_ms, attempt_budget.max_total_ms
                     );
                     push_fail_reason(
                         &mut fail_reasons,
@@ -2752,9 +3042,7 @@ async fn run_attempt(
                 }
             };
             usage = merge_usage(usage, fix.usage.clone());
-            if let Some(reason) =
-                budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone()))
-            {
+            if let Some(reason) = attempt_budget.exhausted(&usage) {
                 notes.push("budget_exceeded".to_string());
                 push_fail_reason(
                     &mut fail_reasons,
@@ -2813,7 +3101,7 @@ async fn run_attempt(
                 &mut notes,
                 config.quick_checks_mode,
                 config.quick_check_timeout_ms.min(
-                    budget
+                    attempt_budget
                         .remaining_ms()
                         .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
                         .max(1),
@@ -2845,13 +3133,13 @@ async fn run_attempt(
                 &generated.description,
                 &generated.old_contents,
                 &final_changed_files,
+                &mut llm_calls,
                 repo_memory.clone(),
                 quick_status,
                 quick_command.as_deref(),
                 blocking_severities,
                 config.max_auto_review_fix_loops,
-                budget,
-                usage_so_far,
+                &attempt_budget,
                 &mut usage,
                 &mut rerun_review_iterations,
                 &mut rerun_blocking_remaining,
@@ -2930,7 +3218,7 @@ async fn run_attempt(
                 &mut notes,
                 config.quick_checks_mode,
                 config.quick_check_timeout_ms.min(
-                    budget
+                    attempt_budget
                         .remaining_ms()
                         .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
                         .max(1),
@@ -3451,13 +3739,13 @@ async fn run_review_gate(
     description: &str,
     old_contents: &HashMap<PathBuf, String>,
     changed_files: &[PathBuf],
+    llm_calls: &mut Vec<ImplementationLlmCallRecord>,
     repo_memory: Option<String>,
     quick_check_status: ImplementationQuickCheckStatus,
     quick_check_command: Option<&str>,
     blocking_severities: &HashSet<String>,
     max_fix_loops: usize,
     budget: &ImplementationBudget,
-    usage_so_far: &Option<Usage>,
     usage: &mut Option<Usage>,
     review_iterations: &mut usize,
     blocking_remaining: &mut usize,
@@ -3492,9 +3780,7 @@ async fn run_review_gate(
         );
     };
 
-    if let Some(reason) =
-        budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
-    {
+    if let Some(reason) = budget.guard_before_llm_call(&*usage) {
         snapshot_blocking(&[]);
         return Err(ReviewGateError::BudgetExceeded(reason));
     }
@@ -3521,10 +3807,47 @@ async fn run_review_gate(
     )
     .await;
     let mut review = match review {
-        Ok(result) => result.map_err(|e| {
-            ReviewGateError::Failed(format!("Review failed: {}", truncate(&e.to_string(), 180)))
-        })?,
+        Ok(Ok(value)) => {
+            llm_calls.push(ImplementationLlmCallRecord {
+                kind: "review".to_string(),
+                model: IMPLEMENTATION_MODEL.id().to_string(),
+                timeout_ms: value
+                    .speed_failover
+                    .as_ref()
+                    .map(|d| d.total_timeout_ms)
+                    .unwrap_or(review_timeout_ms),
+                speed_failover: value.speed_failover.clone(),
+                error: None,
+            });
+            value
+        }
+        Ok(Err(err)) => {
+            let speed_failover = err
+                .downcast_ref::<SpeedFailoverError>()
+                .map(|e| e.diagnostics.clone());
+            llm_calls.push(ImplementationLlmCallRecord {
+                kind: "review".to_string(),
+                model: IMPLEMENTATION_MODEL.id().to_string(),
+                timeout_ms: speed_failover
+                    .as_ref()
+                    .map(|d| d.total_timeout_ms)
+                    .unwrap_or(review_timeout_ms),
+                speed_failover,
+                error: Some(truncate(&err.to_string(), 240)),
+            });
+            return Err(ReviewGateError::Failed(format!(
+                "Review failed: {}",
+                truncate(&err.to_string(), 180)
+            )));
+        }
         Err(_) => {
+            llm_calls.push(ImplementationLlmCallRecord {
+                kind: "review".to_string(),
+                model: IMPLEMENTATION_MODEL.id().to_string(),
+                timeout_ms: review_timeout_ms,
+                speed_failover: None,
+                error: Some(format!("Timed out after {}ms", review_timeout_ms)),
+            });
             snapshot_blocking(&[]);
             return Err(ReviewGateError::BudgetExceeded(ImplementationFailReason {
                 code: REASON_BUDGET_EXCEEDED.to_string(),
@@ -3557,18 +3880,14 @@ async fn run_review_gate(
                 .to_string(),
         ));
     }
-    if let Some(reason) =
-        budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
-    {
+    if let Some(reason) = budget.guard_before_llm_call(&*usage) {
         snapshot_blocking(&blocking);
         return Err(ReviewGateError::BudgetExceeded(reason));
     }
 
     *review_iterations = 1;
     while !blocking.is_empty() && (*review_iterations - 1) < max_fix_loops {
-        if let Some(reason) =
-            budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
-        {
+        if let Some(reason) = budget.guard_before_llm_call(&*usage) {
             snapshot_blocking(&blocking);
             return Err(ReviewGateError::BudgetExceeded(reason));
         }
@@ -3578,9 +3897,7 @@ async fn run_review_gate(
             break;
         }
         for (path, findings) in grouped {
-            if let Some(reason) =
-                budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
-            {
+            if let Some(reason) = budget.guard_before_llm_call(&*usage) {
                 snapshot_blocking(&blocking);
                 return Err(ReviewGateError::BudgetExceeded(reason));
             }
@@ -3613,30 +3930,61 @@ async fn run_review_gate(
             )
             .await;
             let fix = match fix {
-                Ok(result) => match result {
-                    Ok(value) => value,
-                    Err(err) => {
-                        *blocking_remaining = blocking.len();
-                        *remaining_blocking_titles = dedup_preserve_order(
-                            blocking
-                                .iter()
-                                .map(|finding| finding.title.clone())
-                                .collect(),
-                        );
-                        *remaining_blocking_categories = dedup_preserve_order(
-                            blocking
-                                .iter()
-                                .map(|finding| finding.category.clone())
-                                .collect(),
-                        );
-                        return Err(ReviewGateError::Failed(format!(
-                            "Review auto-fix failed for {}: {}",
-                            path.display(),
-                            truncate(&err.to_string(), 180)
-                        )));
-                    }
-                },
+                Ok(Ok(value)) => {
+                    llm_calls.push(ImplementationLlmCallRecord {
+                        kind: "review_fix".to_string(),
+                        model: IMPLEMENTATION_MODEL.id().to_string(),
+                        timeout_ms: value
+                            .speed_failover
+                            .as_ref()
+                            .map(|d| d.total_timeout_ms)
+                            .unwrap_or(fix_timeout_ms),
+                        speed_failover: value.speed_failover.clone(),
+                        error: None,
+                    });
+                    value
+                }
+                Ok(Err(err)) => {
+                    let speed_failover = err
+                        .downcast_ref::<SpeedFailoverError>()
+                        .map(|e| e.diagnostics.clone());
+                    llm_calls.push(ImplementationLlmCallRecord {
+                        kind: "review_fix".to_string(),
+                        model: IMPLEMENTATION_MODEL.id().to_string(),
+                        timeout_ms: speed_failover
+                            .as_ref()
+                            .map(|d| d.total_timeout_ms)
+                            .unwrap_or(fix_timeout_ms),
+                        speed_failover,
+                        error: Some(truncate(&err.to_string(), 240)),
+                    });
+                    *blocking_remaining = blocking.len();
+                    *remaining_blocking_titles = dedup_preserve_order(
+                        blocking
+                            .iter()
+                            .map(|finding| finding.title.clone())
+                            .collect(),
+                    );
+                    *remaining_blocking_categories = dedup_preserve_order(
+                        blocking
+                            .iter()
+                            .map(|finding| finding.category.clone())
+                            .collect(),
+                    );
+                    return Err(ReviewGateError::Failed(format!(
+                        "Review auto-fix failed for {}: {}",
+                        path.display(),
+                        truncate(&err.to_string(), 180)
+                    )));
+                }
                 Err(_) => {
+                    llm_calls.push(ImplementationLlmCallRecord {
+                        kind: "review_fix".to_string(),
+                        model: IMPLEMENTATION_MODEL.id().to_string(),
+                        timeout_ms: fix_timeout_ms,
+                        speed_failover: None,
+                        error: Some(format!("Timed out after {}ms", fix_timeout_ms)),
+                    });
                     snapshot_blocking(&blocking);
                     return Err(ReviewGateError::BudgetExceeded(ImplementationFailReason {
                         code: REASON_BUDGET_EXCEEDED.to_string(),
@@ -3649,9 +3997,7 @@ async fn run_review_gate(
                 }
             };
             *usage = merge_usage(usage.take(), fix.usage.clone());
-            if let Some(reason) =
-                budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone()))
-            {
+            if let Some(reason) = budget.exhausted(&*usage) {
                 snapshot_blocking(&blocking);
                 return Err(ReviewGateError::BudgetExceeded(reason));
             }
@@ -3673,9 +4019,7 @@ async fn run_review_gate(
         let review_files = files_changed_set.iter().cloned().collect::<Vec<_>>();
         files_with_content = build_files_with_content(sandbox_root, old_contents, &review_files)
             .map_err(ReviewGateError::Failed)?;
-        if let Some(reason) =
-            budget.guard_before_llm_call(&merge_usage(usage_so_far.clone(), usage.clone()))
-        {
+        if let Some(reason) = budget.guard_before_llm_call(&*usage) {
             snapshot_blocking(&blocking);
             return Err(ReviewGateError::BudgetExceeded(reason));
         }
@@ -3694,13 +4038,47 @@ async fn run_review_gate(
         )
         .await;
         review = match rereview {
-            Ok(result) => result.map_err(|e| {
-                ReviewGateError::Failed(format!(
+            Ok(Ok(value)) => {
+                llm_calls.push(ImplementationLlmCallRecord {
+                    kind: "rereview".to_string(),
+                    model: IMPLEMENTATION_MODEL.id().to_string(),
+                    timeout_ms: value
+                        .speed_failover
+                        .as_ref()
+                        .map(|d| d.total_timeout_ms)
+                        .unwrap_or(rereview_timeout_ms),
+                    speed_failover: value.speed_failover.clone(),
+                    error: None,
+                });
+                value
+            }
+            Ok(Err(err)) => {
+                let speed_failover = err
+                    .downcast_ref::<SpeedFailoverError>()
+                    .map(|e| e.diagnostics.clone());
+                llm_calls.push(ImplementationLlmCallRecord {
+                    kind: "rereview".to_string(),
+                    model: IMPLEMENTATION_MODEL.id().to_string(),
+                    timeout_ms: speed_failover
+                        .as_ref()
+                        .map(|d| d.total_timeout_ms)
+                        .unwrap_or(rereview_timeout_ms),
+                    speed_failover,
+                    error: Some(truncate(&err.to_string(), 240)),
+                });
+                return Err(ReviewGateError::Failed(format!(
                     "Re-review failed: {}",
-                    truncate(&e.to_string(), 180)
-                ))
-            })?,
+                    truncate(&err.to_string(), 180)
+                )));
+            }
             Err(_) => {
+                llm_calls.push(ImplementationLlmCallRecord {
+                    kind: "rereview".to_string(),
+                    model: IMPLEMENTATION_MODEL.id().to_string(),
+                    timeout_ms: rereview_timeout_ms,
+                    speed_failover: None,
+                    error: Some(format!("Timed out after {}ms", rereview_timeout_ms)),
+                });
                 snapshot_blocking(&blocking);
                 return Err(ReviewGateError::BudgetExceeded(ImplementationFailReason {
                     code: REASON_BUDGET_EXCEEDED.to_string(),
@@ -3713,7 +4091,7 @@ async fn run_review_gate(
             }
         };
         *usage = merge_usage(usage.take(), review.usage.clone());
-        if let Some(reason) = budget.exhausted(&merge_usage(usage_so_far.clone(), usage.clone())) {
+        if let Some(reason) = budget.exhausted(&*usage) {
             snapshot_blocking(&blocking);
             return Err(ReviewGateError::BudgetExceeded(reason));
         }
@@ -4938,6 +5316,24 @@ diff --git a/a.rs b/a.rs
     }
 
     #[test]
+    fn quick_check_failure_summary_prefers_fail_over_passing_error_lines() {
+        let outcome = ImplementationCommandOutcome {
+            command: "pnpm test".to_string(),
+            duration_ms: 0,
+            success: false,
+            timed_out: false,
+            exit_code: Some(1),
+            stdout_tail: "✔ handles error cases\nFAIL src/foo.test.ts\nTypeError: boom\n"
+                .to_string(),
+            stderr_tail: String::new(),
+        };
+
+        let summary = summarize_quick_check_failure(&outcome).expect("expected summary");
+        assert!(summary.contains("pnpm test"));
+        assert!(summary.contains("FAIL"), "{}", summary);
+    }
+
+    #[test]
     fn quick_check_error_path_extraction_handles_multiple_formats_and_rejects_traversal() {
         let outcome = ImplementationCommandOutcome {
             command: "pnpm type-check".to_string(),
@@ -4954,6 +5350,24 @@ diff --git a/a.rs b/a.rs
         assert!(paths.contains(&PathBuf::from("src/foo.ts")), "{:?}", paths);
         assert!(paths.contains(&PathBuf::from("src/main.rs")), "{:?}", paths);
         assert!(!paths.contains(&PathBuf::from("../oops.ts")), "{:?}", paths);
+    }
+
+    #[test]
+    fn quick_check_error_path_extraction_parses_node_stack_traces() {
+        let outcome = ImplementationCommandOutcome {
+            command: "pnpm test".to_string(),
+            duration_ms: 0,
+            success: false,
+            timed_out: false,
+            exit_code: Some(1),
+            stdout_tail: "TypeError: boom\n    at foo (src/bar.ts:12:34)\n    at src/baz.js:1:2\n    at foo (/Users/me/project/abs.ts:9:9)\n".to_string(),
+            stderr_tail: String::new(),
+        };
+
+        let paths = extract_quick_check_error_paths(&outcome);
+        assert!(paths.contains(&PathBuf::from("src/bar.ts")), "{:?}", paths);
+        assert!(paths.contains(&PathBuf::from("src/baz.js")), "{:?}", paths);
+        assert!(!paths.iter().any(|p| p.is_absolute()), "{:?}", paths);
     }
 
     #[test]
@@ -4974,5 +5388,43 @@ diff --git a/a.rs b/a.rs
         assert_eq!(reason.gate, "budget");
         assert_eq!(reason.code, REASON_BUDGET_EXCEEDED);
         assert!(reason.message.to_ascii_lowercase().contains("cost"));
+    }
+
+    #[test]
+    fn attempt_budget_weights_sum_to_one_for_common_profiles() {
+        for attempts in [1usize, 2, 3, 4, 6] {
+            let weights = attempt_budget_weights(attempts);
+            assert_eq!(weights.len(), attempts);
+            let sum = weights.iter().sum::<f64>();
+            assert!(
+                (sum - 1.0).abs() < 1e-9,
+                "attempts={}, weights={:?}, sum={}",
+                attempts,
+                weights,
+                sum
+            );
+        }
+    }
+
+    #[test]
+    fn attempt_budget_partitioning_preserves_attempt2_budget_after_attempt1_spends_its_share() {
+        let global_budget = ImplementationBudget {
+            started_at: std::time::Instant::now(),
+            max_total_ms: u64::MAX,
+            max_total_cost_usd: 0.02,
+        };
+        let weights = attempt_budget_weights(4);
+
+        // Simulate attempt 1 spending 70% of the total cost budget.
+        let usage_so_far = Some(Usage {
+            cost: Some(0.014),
+            ..Usage::default()
+        });
+        let (_ms2, cost2) = compute_attempt_budget_caps(&global_budget, &usage_so_far, 2, &weights);
+        assert!(
+            (cost2 - 0.004).abs() < 1e-9,
+            "expected attempt2 cost cap 0.004, got {}",
+            cost2
+        );
     }
 }
