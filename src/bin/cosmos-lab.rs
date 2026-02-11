@@ -180,6 +180,10 @@ struct ImplementArgs {
     /// Adversarial reviewer model for harness review gate (lab only).
     #[arg(long, value_enum, default_value_t = ImplementReviewModelArg::Smart)]
     review_model: ImplementReviewModelArg,
+    /// Required number of consecutive passing corpus-manifest implement runs.
+    /// Set to 0 to disable this gate.
+    #[arg(long, default_value_t = 2)]
+    require_consecutive_corpus_passes: usize,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -359,6 +363,8 @@ struct ImplementReport {
     cosmos_repo: PathBuf,
     primary_target_repo: PathBuf,
     canary_repos: Vec<PathBuf>,
+    #[serde(default)]
+    corpus_manifest: Option<PathBuf>,
     sample_size: usize,
     total_candidate_count: usize,
     executed_count: usize,
@@ -380,6 +386,10 @@ struct ImplementReport {
     independent_review_executed_count: usize,
     #[serde(default)]
     independent_review_miss_count: usize,
+    #[serde(default)]
+    required_consecutive_corpus_passes: Option<usize>,
+    #[serde(default)]
+    consecutive_corpus_pass_count: Option<usize>,
     #[serde(default)]
     failure_reason_histogram: HashMap<String, usize>,
     #[serde(default)]
@@ -825,6 +835,7 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
     let mut targets: Vec<ImplementTarget> = Vec::new();
     let primary_target_repo: PathBuf;
     let canary_repos: Vec<PathBuf>;
+    let mut corpus_manifest_path: Option<PathBuf> = None;
 
     if let Some(manifest_path) = args.corpus_manifest.as_ref() {
         let manifest_path = if manifest_path.is_absolute() {
@@ -840,6 +851,8 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
 
         println!("Corpus manifest: {}", manifest_path.display());
         println!("Corpus root: {}", corpus_root.display());
+        notes.push(format!("corpus_manifest={}", manifest_path.display()));
+        corpus_manifest_path = Some(manifest_path.clone());
 
         let manifest = CorpusManifest::load(&manifest_path)?;
         let mut specs = manifest
@@ -1731,12 +1744,58 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
     }
 
     let all_repos_passed = repo_reports.iter().all(|report| report.passed);
-    let passed = gate_passed
+    let mut passed = gate_passed
         && all_repos_passed
         && (independent_review_gate_passed || !shadow_gate_blocking);
 
     if !all_repos_passed {
         notes.push("At least one repo-level implement gate failed".to_string());
+    }
+    let mut required_consecutive_corpus_passes = None;
+    let mut consecutive_corpus_pass_count = None;
+    if let Some(manifest_path) = corpus_manifest_path.as_ref() {
+        let required = args.require_consecutive_corpus_passes;
+        required_consecutive_corpus_passes = Some(required);
+        let consecutive = if required == 0 {
+            0
+        } else {
+            match compute_consecutive_corpus_pass_count(
+                &cosmos_repo,
+                manifest_path,
+                &run_id,
+                passed,
+                256,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    notes.push(format!(
+                        "Consecutive corpus-pass evaluation failed: {}",
+                        error
+                    ));
+                    0
+                }
+            }
+        };
+        consecutive_corpus_pass_count = Some(consecutive);
+        if required > 0 {
+            if consecutive < required {
+                notes.push(format!(
+                    "Consecutive corpus-pass gate failed: {} consecutive pass(es); require {}",
+                    consecutive, required
+                ));
+                passed = false;
+            } else {
+                notes.push(format!(
+                    "Consecutive corpus-pass gate satisfied: {} consecutive pass(es); require {}",
+                    consecutive, required
+                ));
+            }
+        } else {
+            notes.push(
+                "Consecutive corpus-pass gate disabled (--require-consecutive-corpus-passes=0)"
+                    .to_string(),
+            );
+        }
     }
 
     let overall_top_failure_clusters = top_failure_clusters(&global_reason_histogram, 3);
@@ -1747,6 +1806,7 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
         cosmos_repo: cosmos_repo.clone(),
         primary_target_repo: primary_target_repo.clone(),
         canary_repos,
+        corpus_manifest: corpus_manifest_path.clone(),
         sample_size: default_sample_size,
         total_candidate_count,
         executed_count,
@@ -1762,6 +1822,8 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
         independent_review_required_count,
         independent_review_executed_count,
         independent_review_miss_count,
+        required_consecutive_corpus_passes,
+        consecutive_corpus_pass_count,
         failure_reason_histogram: global_reason_histogram,
         top_failure_clusters: overall_top_failure_clusters,
         repo_reports,
@@ -1843,6 +1905,87 @@ fn top_failure_clusters(
             }
         })
         .collect()
+}
+
+fn canonicalize_or_identity(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn load_recent_implement_reports(cosmos_repo: &Path, limit: usize) -> Result<Vec<ImplementReport>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let lab_dir = cosmos_repo.join(".cosmos").join("lab");
+    if !lab_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut reports = Vec::new();
+    for entry in std::fs::read_dir(&lab_dir).with_context(|| {
+        format!(
+            "Failed to read implement report directory '{}'",
+            lab_dir.display()
+        )
+    })? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("implement-") || !name.ends_with(".json") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let report = match serde_json::from_str::<ImplementReport>(&content) {
+            Ok(report) => report,
+            Err(_) => continue,
+        };
+        reports.push(report);
+    }
+
+    reports.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    if reports.len() > limit {
+        reports.truncate(limit);
+    }
+    Ok(reports)
+}
+
+fn compute_consecutive_corpus_pass_count(
+    cosmos_repo: &Path,
+    manifest_path: &Path,
+    current_run_id: &str,
+    current_passed: bool,
+    scan_limit: usize,
+) -> Result<usize> {
+    if !current_passed {
+        return Ok(0);
+    }
+    let manifest = canonicalize_or_identity(manifest_path);
+    let reports = load_recent_implement_reports(cosmos_repo, scan_limit)?;
+    let mut count = 1usize; // include current run
+    for report in reports {
+        if report.run_id == current_run_id {
+            continue;
+        }
+        let Some(report_manifest) = report.corpus_manifest.as_ref() else {
+            continue;
+        };
+        if canonicalize_or_identity(report_manifest) != manifest {
+            continue;
+        }
+        if report.passed {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(count)
 }
 
 fn same_model_review_requires_independent(diagnostics: &ImplementationRunDiagnostics) -> bool {
@@ -2803,6 +2946,7 @@ mod tests {
                 assert!(args.corpus_root.is_none());
                 assert!(args.sync);
                 assert!(args.max_repos.is_none());
+                assert_eq!(args.require_consecutive_corpus_passes, 2);
             }
             _ => panic!("expected implement command defaults"),
         }
@@ -2948,6 +3092,102 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"mode\":\"validate_fast\""));
         assert!(json.contains("\"passed\":true"));
+    }
+
+    fn minimal_implement_report(
+        run_id: &str,
+        timestamp: DateTime<Utc>,
+        passed: bool,
+        corpus_manifest: Option<PathBuf>,
+    ) -> ImplementReport {
+        ImplementReport {
+            timestamp,
+            run_id: run_id.to_string(),
+            cosmos_repo: PathBuf::from("/tmp/cosmos"),
+            primary_target_repo: PathBuf::from("/tmp/target"),
+            canary_repos: Vec::new(),
+            corpus_manifest,
+            sample_size: 1,
+            total_candidate_count: 0,
+            executed_count: 0,
+            passed_count: 0,
+            first_attempt_pass_count: 0,
+            avg_total_ms: None,
+            avg_total_cost_usd: None,
+            pass_rate: None,
+            first_attempt_pass_rate: None,
+            residual_blocking_rate: None,
+            syntax_failure_after_pass_rate: None,
+            mutation_on_failure_rate: None,
+            independent_review_required_count: 0,
+            independent_review_executed_count: 0,
+            independent_review_miss_count: 0,
+            required_consecutive_corpus_passes: None,
+            consecutive_corpus_pass_count: None,
+            failure_reason_histogram: HashMap::new(),
+            top_failure_clusters: Vec::new(),
+            repo_reports: Vec::new(),
+            passed,
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn consecutive_corpus_pass_count_stops_on_first_failure() {
+        let workspace = tempdir().unwrap();
+        init_git_repo(workspace.path());
+        let manifest = workspace.path().join("corpus.toml");
+        std::fs::write(&manifest, "repo = []\n").unwrap();
+        let lab_dir = workspace.path().join(".cosmos").join("lab");
+        std::fs::create_dir_all(&lab_dir).unwrap();
+
+        let manifest_other = workspace.path().join("other-corpus.toml");
+        std::fs::write(&manifest_other, "repo = []\n").unwrap();
+
+        let now = Utc::now();
+        let older_fail = minimal_implement_report(
+            "run-fail",
+            now - chrono::Duration::minutes(3),
+            false,
+            Some(manifest.clone()),
+        );
+        let newer_pass = minimal_implement_report(
+            "run-pass",
+            now - chrono::Duration::minutes(2),
+            true,
+            Some(manifest.clone()),
+        );
+        let unrelated_manifest_pass = minimal_implement_report(
+            "run-other",
+            now - chrono::Duration::minutes(1),
+            true,
+            Some(manifest_other),
+        );
+
+        write_report_json(&lab_dir.join("implement-a.json"), &older_fail).unwrap();
+        write_report_json(&lab_dir.join("implement-b.json"), &newer_pass).unwrap();
+        write_report_json(&lab_dir.join("implement-c.json"), &unrelated_manifest_pass).unwrap();
+
+        let count = compute_consecutive_corpus_pass_count(
+            workspace.path(),
+            &manifest,
+            "current-run",
+            true,
+            32,
+        )
+        .unwrap();
+        // Current run + latest matching pass, then stop at next matching failure.
+        assert_eq!(count, 2);
+
+        let failing_now = compute_consecutive_corpus_pass_count(
+            workspace.path(),
+            &manifest,
+            "current-run",
+            false,
+            32,
+        )
+        .unwrap();
+        assert_eq!(failing_now, 0);
     }
 
     fn test_run_diagnostics(
@@ -3440,6 +3680,7 @@ edition = "2021"
             sync: true,
             max_repos: None,
             review_model: ImplementReviewModelArg::Smart,
+            require_consecutive_corpus_passes: 2,
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
