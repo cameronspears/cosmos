@@ -148,6 +148,8 @@ struct ReliabilityArgs {
 
 #[derive(Args, Debug)]
 struct ImplementArgs {
+    #[arg(long, default_value = ".")]
+    cosmos_repo: PathBuf,
     #[arg(long, default_value = DEFAULT_TARGET_REPO)]
     target_repo: PathBuf,
     #[arg(
@@ -788,10 +790,7 @@ async fn run_reliability(args: ReliabilityArgs) -> Result<()> {
 
 async fn run_implement(args: ImplementArgs) -> Result<()> {
     let run_id = Uuid::new_v4().to_string();
-    let cosmos_repo = std::env::current_dir()
-        .context("Failed to read current working directory")?
-        .canonicalize()
-        .context("Failed to resolve current working directory")?;
+    let cosmos_repo = canonical_repo_path(&args.cosmos_repo, "cosmos repo")?;
     let sandbox_env = SandboxSession::env_overrides();
     let mut notes = Vec::new();
     let fake_mode = fake_implement_enabled();
@@ -2796,6 +2795,7 @@ mod tests {
         let cli = Cli::parse_from(["cosmos-lab", "implement"]);
         match cli.command {
             Commands::Implement(args) => {
+                assert_eq!(args.cosmos_repo, PathBuf::from("."));
                 assert_eq!(args.sample_size, 5);
                 assert!(!args.keep_sandboxes);
                 assert_eq!(args.canary_repos.len(), 2);
@@ -3043,7 +3043,7 @@ mod tests {
 
     #[test]
     fn implement_shadow_gate_env_defaults_to_advisory() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("COSMOS_IMPLEMENT_SHADOW_GATES_BLOCKING");
         assert!(!implement_shadow_gates_blocking_enabled());
 
@@ -3329,7 +3329,7 @@ mod tests {
 
     #[test]
     fn validate_fast_smoke_writes_report_with_commands_and_metrics() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("COSMOS_LAB_FAKE_RELIABILITY", "1");
 
         let workspace = tempdir().unwrap();
@@ -3404,13 +3404,21 @@ edition = "2021"
 
     #[test]
     fn implement_smoke_writes_multi_repo_report_in_fake_mode() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("COSMOS_LAB_FAKE_IMPLEMENT", "1");
 
         let workspace = tempdir().unwrap();
+        let cosmos_repo = workspace.path().join("cosmos-mini");
         let primary_repo = workspace.path().join("target-primary");
         let canary_one = workspace.path().join("target-canary-one");
         let canary_two = workspace.path().join("target-canary-two");
+        std::fs::create_dir_all(cosmos_repo.join("src")).unwrap();
+        std::fs::write(
+            cosmos_repo.join("src/lib.rs"),
+            "pub fn ok() -> bool { true }\n",
+        )
+        .unwrap();
+        init_git_repo(&cosmos_repo);
 
         for repo in [&primary_repo, &canary_one, &canary_two] {
             std::fs::create_dir_all(repo.join("src")).unwrap();
@@ -3420,6 +3428,7 @@ edition = "2021"
 
         let output = workspace.path().join("implement-report.json");
         let args = ImplementArgs {
+            cosmos_repo: cosmos_repo.clone(),
             target_repo: primary_repo.clone(),
             canary_repos: vec![canary_one.clone(), canary_two.clone()],
             sample_size: 2,
@@ -3474,6 +3483,19 @@ edition = "2021"
             assert_eq!(quick_check_total, executed);
         }
         assert!(json["passed"].as_bool().unwrap_or(false));
+        let cache = Cache::new(&cosmos_repo);
+        let telemetry = cache.load_recent_implementation_harness(32).unwrap();
+        assert_eq!(
+            telemetry.len(),
+            json["executed_count"].as_u64().unwrap_or_default() as usize
+        );
+        for row in telemetry {
+            assert_eq!(row.schema_version, 3);
+            assert_eq!(row.run_context, "lab");
+            assert!(!row.independent_review_executed);
+            assert_eq!(row.finalization_status, "failed_before_finalize");
+            assert_eq!(row.mutation_on_failure, Some(false));
+        }
 
         std::env::remove_var("COSMOS_LAB_FAKE_IMPLEMENT");
     }

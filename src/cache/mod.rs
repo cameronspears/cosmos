@@ -1126,6 +1126,28 @@ impl Cache {
         Ok(records)
     }
 
+    /// Load up to `limit` latest implementation-harness telemetry records (newest last).
+    pub fn load_recent_implementation_harness(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ImplementationHarnessRecord>> {
+        let path = self.cache_dir.join(IMPLEMENTATION_HARNESS_FILE);
+        if !path.exists() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let _lock = self.lock(false)?;
+        let content = fs::read_to_string(&path)?;
+        let mut records: Vec<ImplementationHarnessRecord> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<ImplementationHarnessRecord>(line).ok())
+            .collect();
+        if records.len() > limit {
+            let split = records.len() - limit;
+            records.drain(0..split);
+        }
+        Ok(records)
+    }
+
     /// Compute rolling verify precision from suggestion-quality telemetry.
     ///
     /// Precision = verified / (verified + contradicted)
@@ -1743,5 +1765,54 @@ mod tests {
         assert_eq!(parsed.run_context, "interactive");
         assert!(!parsed.independent_review_executed);
         assert!(parsed.report_path.is_none());
+    }
+
+    #[test]
+    fn implementation_harness_round_trip_and_load_recent() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_impl_harness_recent_test_{}", nanos));
+        fs::create_dir_all(&root).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .expect("git init should run");
+
+        let cache = Cache::new(&root);
+        for idx in 0..3 {
+            let row = ImplementationHarnessRecord {
+                schema_version: 3,
+                timestamp: Utc::now(),
+                run_id: format!("run-{}", idx),
+                suggestion_id: format!("s-{}", idx),
+                passed: idx % 2 == 0,
+                attempt_count: 1,
+                total_ms: 1_000 + idx as u64,
+                total_cost_usd: 0.001 + idx as f64 * 0.0001,
+                changed_file_count: idx + 1,
+                quick_check_status: "passed".to_string(),
+                finalization_status: "failed_before_finalize".to_string(),
+                mutation_on_failure: Some(false),
+                run_context: "lab".to_string(),
+                independent_review_executed: idx % 2 == 0,
+                fail_reasons: Vec::new(),
+                report_path: None,
+            };
+            cache.append_implementation_harness(&row).unwrap();
+        }
+
+        let recent = cache.load_recent_implementation_harness(2).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].run_id, "run-1");
+        assert_eq!(recent[1].run_id, "run-2");
+        assert_eq!(recent[0].run_context, "lab");
+        assert_eq!(recent[1].schema_version, 3);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
