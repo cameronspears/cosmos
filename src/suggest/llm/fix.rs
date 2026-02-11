@@ -739,6 +739,16 @@ pub(crate) fn apply_edits_with_context(
 ) -> anyhow::Result<String> {
     let mut new_content = content.to_string();
     for (i, edit) in edits.iter().enumerate() {
+        let target_excerpt = context_label_target_line(context_label)
+            .and_then(|line| snippet_around_line_for_error(&new_content, line, 6))
+            .map(|snippet| {
+                format!(
+                    "\n\nTarget window excerpt (copy old_string from here):\n```\n{}\n```",
+                    snippet
+                )
+            })
+            .unwrap_or_default();
+
         if edit.old_string.is_empty() {
             if new_content.is_empty() {
                 new_content = edit.new_string.clone();
@@ -759,12 +769,13 @@ pub(crate) fn apply_edits_with_context(
             MatchRange::Many(count) => {
                 let contexts = match_contexts_for_error(&new_content, &edit.old_string, 2);
                 return Err(anyhow::anyhow!(
-                    "Edit {}: old_string matches {} times in {} (must be unique). Need more context.\nSearched for: {:?}{}",
+                    "Edit {}: old_string matches {} times in {} (must be unique). Need more context.\nSearched for: {:?}{}{}",
                     i + 1,
                     count,
                     context_label,
                     truncate_for_error(&edit.old_string),
-                    contexts
+                    contexts,
+                    target_excerpt
                 ));
             }
             MatchRange::None => {}
@@ -782,12 +793,13 @@ pub(crate) fn apply_edits_with_context(
                 MatchRange::Many(count) => {
                     let contexts = match_contexts_for_error(&new_content, &crlf_old, 2);
                     return Err(anyhow::anyhow!(
-                        "Edit {}: normalized old_string matches {} times in {} (must be unique).\nSearched for: {:?}{}",
+                        "Edit {}: normalized old_string matches {} times in {} (must be unique).\nSearched for: {:?}{}{}",
                         i + 1,
                         count,
                         context_label,
                         truncate_for_error(&edit.old_string),
-                        contexts
+                        contexts,
+                        target_excerpt
                     ));
                 }
                 MatchRange::None => {}
@@ -805,27 +817,18 @@ pub(crate) fn apply_edits_with_context(
                 MatchRange::Many(count) => {
                     let contexts = match_contexts_for_error(&new_content, trimmed_old, 2);
                     return Err(anyhow::anyhow!(
-                        "Edit {}: trimmed old_string matches {} times in {} (must be unique).\nSearched for: {:?}{}",
+                        "Edit {}: trimmed old_string matches {} times in {} (must be unique).\nSearched for: {:?}{}{}",
                         i + 1,
                         count,
                         context_label,
                         truncate_for_error(&edit.old_string),
-                        contexts
+                        contexts,
+                        target_excerpt
                     ));
                 }
                 MatchRange::None => {}
             }
         }
-
-        let target_excerpt = context_label_target_line(context_label)
-            .and_then(|line| snippet_around_line_for_error(&new_content, line, 6))
-            .map(|snippet| {
-                format!(
-                    "\n\nTarget window excerpt (copy old_string from here):\n```\n{}\n```",
-                    snippet
-                )
-            })
-            .unwrap_or_default();
 
         return Err(anyhow::anyhow!(
             "Edit {}: old_string not found in {}. The LLM may have made an error.\nSearched for: {:?}{}",
@@ -840,14 +843,19 @@ pub(crate) fn apply_edits_with_context(
 }
 
 fn context_label_target_line(context_label: &str) -> Option<usize> {
-    let needle = "target around line ";
-    let idx = context_label.find(needle)?;
-    let rest = &context_label[idx + needle.len()..];
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        return None;
+    for needle in ["target around line ", "finding around line "] {
+        if let Some(idx) = context_label.find(needle) {
+            let rest = &context_label[idx + needle.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                continue;
+            }
+            if let Ok(value) = digits.parse::<usize>() {
+                return Some(value);
+            }
+        }
     }
-    digits.parse::<usize>().ok()
+    None
 }
 
 fn snippet_around_line_for_error(
