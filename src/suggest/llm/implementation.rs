@@ -66,6 +66,10 @@ pub struct ImplementationHarnessConfig {
     pub max_total_cost_usd: f64,
     pub max_auto_review_fix_loops: usize,
     pub max_auto_quick_check_fix_loops: usize,
+    /// Repair parse/syntax failures inside an attempt to improve first-attempt pass rate.
+    /// This is only used for in-scope files and must keep diffs minimal.
+    #[serde(default = "default_max_auto_syntax_fix_loops")]
+    pub max_auto_syntax_fix_loops: usize,
     pub quick_checks_mode: ImplementationQuickChecksMode,
     pub review_blocking_severities: Vec<String>,
     pub max_changed_files: usize,
@@ -75,6 +79,10 @@ pub struct ImplementationHarnessConfig {
     pub require_quick_check_detectable: bool,
     pub fail_on_reduced_confidence: bool,
     pub quick_check_fix_requires_in_scope_error: bool,
+}
+
+fn default_max_auto_syntax_fix_loops() -> usize {
+    1
 }
 
 impl Default for ImplementationHarnessConfig {
@@ -91,6 +99,7 @@ impl ImplementationHarnessConfig {
             max_total_cost_usd: 0.020,
             max_auto_review_fix_loops: 2,
             max_auto_quick_check_fix_loops: 1,
+            max_auto_syntax_fix_loops: 1,
             quick_checks_mode: ImplementationQuickChecksMode::StrictAuto,
             review_blocking_severities: vec!["critical".to_string(), "warning".to_string()],
             max_changed_files: 6,
@@ -911,7 +920,27 @@ fn is_safe_relative_path(path: &Path) -> bool {
     true
 }
 
-fn normalize_quick_check_path(raw: &str) -> Option<PathBuf> {
+fn relativize_under_repo_root(path: &Path, repo_root: &Path) -> Option<PathBuf> {
+    // Prefer canonicalized comparisons so `/var` vs `/private/var` doesn't cause false negatives
+    // on macOS and symlink-heavy temp dirs.
+    let repo_root_canon =
+        std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let path_canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    let rel = if let Ok(rel) = path_canon.strip_prefix(&repo_root_canon) {
+        rel.to_path_buf()
+    } else if let Ok(rel) = path.strip_prefix(repo_root) {
+        rel.to_path_buf()
+    } else {
+        return None;
+    };
+    if !is_safe_relative_path(&rel) {
+        return None;
+    }
+    Some(rel)
+}
+
+fn normalize_quick_check_path_in_repo(raw: &str, repo_root: &Path) -> Option<PathBuf> {
     let trimmed = raw
         .trim()
         .trim_matches('`')
@@ -923,19 +952,23 @@ fn normalize_quick_check_path(raw: &str) -> Option<PathBuf> {
     let normalized = trimmed.replace('\\', "/");
     let normalized = normalized.trim_start_matches("./");
     let path = PathBuf::from(normalized);
+
+    if path.is_absolute() {
+        return relativize_under_repo_root(&path, repo_root);
+    }
+
     if !is_safe_relative_path(&path) {
         return None;
     }
     Some(path)
 }
 
-fn normalize_stack_trace_path(raw: &str) -> Option<PathBuf> {
+fn normalize_stack_trace_path_in_repo(raw: &str, repo_root: &Path) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
     let trimmed = trimmed.strip_prefix("file://").unwrap_or(trimmed);
-    // Ignore non-file schemes.
     if trimmed.starts_with("node:")
         || trimmed.starts_with("http:")
         || trimmed.starts_with("https:")
@@ -943,10 +976,13 @@ fn normalize_stack_trace_path(raw: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    normalize_quick_check_path(trimmed)
+    normalize_quick_check_path_in_repo(trimmed, repo_root)
 }
 
-fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Vec<PathBuf> {
+fn extract_quick_check_error_paths(
+    outcome: &ImplementationCommandOutcome,
+    repo_root: &Path,
+) -> Vec<PathBuf> {
     let combined = format!(
         "{}\n{}",
         strip_ansi_sequences(&outcome.stderr_tail),
@@ -963,7 +999,7 @@ fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Ve
         for caps in re.captures_iter(&combined) {
             if let Some(path) = caps
                 .name("path")
-                .and_then(|m| normalize_quick_check_path(m.as_str()))
+                .and_then(|m| normalize_quick_check_path_in_repo(m.as_str(), repo_root))
             {
                 if seen.insert(path.clone()) {
                     out.push(path);
@@ -979,7 +1015,7 @@ fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Ve
         for caps in re.captures_iter(&combined) {
             if let Some(path) = caps
                 .name("path")
-                .and_then(|m| normalize_quick_check_path(m.as_str()))
+                .and_then(|m| normalize_quick_check_path_in_repo(m.as_str(), repo_root))
             {
                 if seen.insert(path.clone()) {
                     out.push(path);
@@ -998,7 +1034,7 @@ fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Ve
         for caps in re.captures_iter(&combined) {
             if let Some(path) = caps
                 .name("path")
-                .and_then(|m| normalize_stack_trace_path(m.as_str()))
+                .and_then(|m| normalize_stack_trace_path_in_repo(m.as_str(), repo_root))
             {
                 if seen.insert(path.clone()) {
                     out.push(path);
@@ -1012,7 +1048,7 @@ fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Ve
         for caps in re.captures_iter(&combined) {
             if let Some(path) = caps
                 .name("path")
-                .and_then(|m| normalize_stack_trace_path(m.as_str()))
+                .and_then(|m| normalize_stack_trace_path_in_repo(m.as_str(), repo_root))
             {
                 if seen.insert(path.clone()) {
                     out.push(path);
@@ -1024,7 +1060,7 @@ fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Ve
     let combined_lines = combined.lines().map(str::trim).collect::<Vec<_>>();
     for (idx, line) in combined_lines.iter().enumerate() {
         if let Some((_tag, file)) = parse_bracketed_path_line(line) {
-            if let Some(path) = normalize_quick_check_path(&file) {
+            if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 if seen.insert(path.clone()) {
                     out.push(path);
                 }
@@ -1032,7 +1068,7 @@ fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Ve
         }
 
         if let Some(file) = parse_python_compileall_error_line(line) {
-            if let Some(path) = normalize_quick_check_path(&file) {
+            if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 if seen.insert(path.clone()) {
                     out.push(path);
                 }
@@ -1040,7 +1076,7 @@ fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Ve
         }
 
         if let Some((file, _ln)) = parse_python_file_line(line) {
-            if let Some(path) = normalize_quick_check_path(&file) {
+            if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 if seen.insert(path.clone()) {
                     out.push(path);
                 }
@@ -1049,7 +1085,7 @@ fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Ve
 
         // ESLint often prints the file path on its own line followed by `line:col  error ...`.
         if !line.contains(':') {
-            if let Some(path) = normalize_quick_check_path(line) {
+            if let Some(path) = normalize_quick_check_path_in_repo(line, repo_root) {
                 let ext = path
                     .extension()
                     .and_then(|ext| ext.to_str())
@@ -1074,6 +1110,7 @@ fn extract_quick_check_error_paths(outcome: &ImplementationCommandOutcome) -> Ve
 
 fn extract_quick_check_error_locations(
     outcome: &ImplementationCommandOutcome,
+    repo_root: &Path,
 ) -> Vec<(PathBuf, u32, u32)> {
     let combined = format!(
         "{}\n{}",
@@ -1094,7 +1131,7 @@ fn extract_quick_check_error_locations(
 
     for raw in combined_lines.iter().copied() {
         if let Some((file, ln, col, _msg)) = parse_tsc_error_line(raw) {
-            if let Some(path) = normalize_quick_check_path(&file) {
+            if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 let key = (path.clone(), ln, col);
                 if seen.insert(key.clone()) {
                     out.push(key);
@@ -1104,7 +1141,7 @@ fn extract_quick_check_error_locations(
         }
 
         if let Some((file, ln, col, _msg)) = parse_colon_error_line_with_message(raw) {
-            if let Some(path) = normalize_quick_check_path(&file) {
+            if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 let key = (path.clone(), ln, col);
                 if seen.insert(key.clone()) {
                     out.push(key);
@@ -1115,7 +1152,7 @@ fn extract_quick_check_error_locations(
 
         // Rust-style location lines: `--> path:line:col`
         if let Some((file, ln, col)) = parse_rust_location_line(raw) {
-            if let Some(path) = normalize_quick_check_path(&file) {
+            if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 let key = (path.clone(), ln, col);
                 if seen.insert(key.clone()) {
                     out.push(key);
@@ -1126,7 +1163,7 @@ fn extract_quick_check_error_locations(
 
         // Next.js style: `./path/file.ts:line:col` (message may be on the next line)
         if let Some((file, ln, col)) = parse_path_line_col(raw) {
-            if let Some(path) = normalize_quick_check_path(&file) {
+            if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 let key = (path.clone(), ln, col);
                 if seen.insert(key.clone()) {
                     out.push(key);
@@ -1140,7 +1177,7 @@ fn extract_quick_check_error_locations(
             if let Some(caps) = re.captures(raw) {
                 let file = caps.name("path").map(|m| m.as_str()).unwrap_or_default();
                 if let (Some(path), Ok(ln), Ok(col)) = (
-                    normalize_stack_trace_path(file),
+                    normalize_stack_trace_path_in_repo(file, repo_root),
                     caps.name("line")
                         .map(|m| m.as_str())
                         .unwrap_or("0")
@@ -1162,7 +1199,7 @@ fn extract_quick_check_error_locations(
             if let Some(caps) = re.captures(raw) {
                 let file = caps.name("path").map(|m| m.as_str()).unwrap_or_default();
                 if let (Some(path), Ok(ln), Ok(col)) = (
-                    normalize_stack_trace_path(file),
+                    normalize_stack_trace_path_in_repo(file, repo_root),
                     caps.name("line")
                         .map(|m| m.as_str())
                         .unwrap_or("0")
@@ -1182,7 +1219,7 @@ fn extract_quick_check_error_locations(
         }
 
         if let Some((file, ln)) = parse_python_file_line(raw) {
-            if let Some(path) = normalize_quick_check_path(&file) {
+            if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 // Python compile errors don't always include a column.
                 let key = (path.clone(), ln, 1);
                 if seen.insert(key.clone()) {
@@ -1194,7 +1231,7 @@ fn extract_quick_check_error_locations(
 
         // ESLint path header line (relative path only)
         if !raw.contains(':') {
-            if let Some(path) = normalize_quick_check_path(raw) {
+            if let Some(path) = normalize_quick_check_path_in_repo(raw, repo_root) {
                 let ext = path
                     .extension()
                     .and_then(|ext| ext.to_str())
@@ -1246,6 +1283,29 @@ fn snippet_around_line(content: &str, line: u32, context_lines: usize) -> Option
     Some(snippet)
 }
 
+fn quick_check_read_only_context_excerpt(
+    sandbox_root: &Path,
+    outcome: &ImplementationCommandOutcome,
+    target: &Path,
+) -> Option<String> {
+    let locations = extract_quick_check_error_locations(outcome, sandbox_root);
+    for (path, ln, _col) in locations {
+        if &path == target {
+            continue;
+        }
+        let resolved = resolve_repo_path_allow_new(sandbox_root, &path).ok()?;
+        let content = std::fs::read_to_string(&resolved.absolute).ok()?;
+        let snippet = snippet_around_line(&content, ln, 8)?;
+        return Some(format!(
+            "Read-only context from failing location (do not edit this file):\n- Location: {}:{}\n```\n{}\n```",
+            path.display(),
+            ln,
+            snippet
+        ));
+    }
+    None
+}
+
 fn format_quick_check_repair_modifier(
     existing: Option<&str>,
     error_summary: &str,
@@ -1295,6 +1355,26 @@ fn format_quick_check_repair_modifier(
             .as_deref()
             .map(|excerpt| format!("- Quick-check output (truncated):\n{}", excerpt))
             .unwrap_or_default(),
+    ));
+    parts.join("\n\n")
+}
+
+fn format_syntax_repair_modifier(
+    existing: Option<&str>,
+    parse_error: &str,
+    target: &Path,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(existing) = existing {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    parts.push(format!(
+        "Syntax repair request:\n- The syntax/parse gate failed for: {}\n- Error (truncated): {}\nRules:\n- Modify only this file.\n- Fix syntax/parse errors only.\n- Keep the diff minimal and avoid unrelated refactors or reformatting.\n- Do not change behavior beyond what is required to restore valid syntax.",
+        target.display(),
+        truncate(parse_error, 300),
     ));
     parts.join("\n\n")
 }
@@ -1358,6 +1438,22 @@ fn push_gate(
         detail: detail.into(),
         reason_code: reason_code.map(str::to_string),
     });
+}
+
+fn upsert_gate(
+    gates: &mut Vec<ImplementationGateSnapshot>,
+    gate: &str,
+    passed: bool,
+    detail: impl Into<String>,
+    reason_code: Option<&str>,
+) {
+    if let Some(existing) = gates.iter_mut().find(|g| g.gate == gate) {
+        existing.passed = passed;
+        existing.detail = detail.into();
+        existing.reason_code = reason_code.map(str::to_string);
+        return;
+    }
+    push_gate(gates, gate, passed, detail, reason_code);
 }
 
 fn push_fail_reason(
@@ -2113,7 +2209,7 @@ async fn run_attempt(
         );
     }
 
-    let (changed_total, changed_by_file) =
+    let (mut changed_total, mut changed_by_file) =
         compute_changed_lines(sandbox.path(), &repo_changes.files, &repo_changes.untracked)?;
     if changed_total > config.max_total_changed_lines {
         push_fail_reason(
@@ -2162,7 +2258,255 @@ async fn run_attempt(
         },
     );
 
-    let syntax_ok = syntax_gate(sandbox.path(), &repo_changes.files).is_ok();
+    // Parse/syntax gate with a bounded in-attempt repair loop. This converts common
+    // "attempt 2 fixes it" cases into "attempt 1 repairs it" without expanding scope.
+    let mut syntax_err = syntax_gate(sandbox.path(), &repo_changes.files).err();
+    if syntax_err.is_some() && fail_reasons.is_empty() {
+        let mut syntax_fix_loops_done = 0usize;
+        while syntax_err.is_some() && syntax_fix_loops_done < config.max_auto_syntax_fix_loops {
+            syntax_fix_loops_done = syntax_fix_loops_done.saturating_add(1);
+            notes.push(format!("syntax_fix_loop_{}", syntax_fix_loops_done));
+
+            let failures = collect_syntax_failures(sandbox.path(), &repo_changes.files);
+            if failures.is_empty() {
+                // We couldn't attribute the parse failure to a specific file; don't
+                // spend more budget guessing.
+                break;
+            }
+
+            for (target, parse_error) in failures.into_iter() {
+                if let Some(reason) = attempt_budget.guard_before_llm_call(&usage) {
+                    notes.push("budget_exceeded".to_string());
+                    push_fail_reason(
+                        &mut fail_reasons,
+                        &mut fail_reason_records,
+                        &reason.gate,
+                        &reason.code,
+                        reason.message.clone(),
+                    );
+                    push_gate(
+                        &mut gates,
+                        "budget",
+                        false,
+                        reason.message,
+                        Some(REASON_BUDGET_EXCEEDED),
+                    );
+                    break;
+                }
+
+                let resolved =
+                    resolve_repo_path_allow_new(sandbox.path(), &target).map_err(|e| {
+                        anyhow::anyhow!("Unsafe syntax repair path {}: {}", target.display(), e)
+                    })?;
+                let current_content = match std::fs::read_to_string(&resolved.absolute) {
+                    Ok(content) => content,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => {
+                        push_fail_reason(
+                            &mut fail_reasons,
+                            &mut fail_reason_records,
+                            "syntax",
+                            REASON_SYNTAX_VIOLATION,
+                            format!(
+                                "Syntax auto-repair failed reading {}: {}",
+                                target.display(),
+                                truncate(&e.to_string(), 180)
+                            ),
+                        );
+                        break;
+                    }
+                };
+                let is_new_file = !resolved.absolute.exists() || current_content.trim().is_empty();
+
+                let mut repair_preview = feedback_preview.clone();
+                repair_preview.modifier = Some(format_syntax_repair_modifier(
+                    feedback_preview.modifier.as_deref(),
+                    &parse_error,
+                    &target,
+                ));
+
+                ensure_implementation_model(IMPLEMENTATION_MODEL)?;
+                let repair_timeout_ms = attempt_budget
+                    .timeout_ms_for_next_llm_call()
+                    .min(MAX_FIX_TIMEOUT_MS);
+                let fix = tokio::time::timeout(
+                    Duration::from_millis(repair_timeout_ms),
+                    generate_fix_content_with_model(
+                        &target,
+                        &current_content,
+                        suggestion,
+                        &repair_preview,
+                        repo_memory.clone(),
+                        is_new_file,
+                        IMPLEMENTATION_MODEL,
+                        repair_timeout_ms,
+                    ),
+                )
+                .await;
+                let fix = match fix {
+                    Ok(Ok(value)) => {
+                        llm_calls.push(ImplementationLlmCallRecord {
+                            kind: "syntax_repair".to_string(),
+                            model: IMPLEMENTATION_MODEL.id().to_string(),
+                            timeout_ms: value
+                                .speed_failover
+                                .as_ref()
+                                .map(|d| d.total_timeout_ms)
+                                .unwrap_or(repair_timeout_ms),
+                            speed_failover: value.speed_failover.clone(),
+                            error: None,
+                        });
+                        value
+                    }
+                    Ok(Err(err)) => {
+                        let speed_failover = err
+                            .downcast_ref::<SpeedFailoverError>()
+                            .map(|e| e.diagnostics.clone())
+                            .or_else(|| {
+                                err.downcast_ref::<FixGenerationErrorWithUsage>()
+                                    .and_then(|e| e.speed_failover.clone())
+                            });
+                        if let Some(u) = err
+                            .downcast_ref::<FixGenerationErrorWithUsage>()
+                            .and_then(|e| e.usage.clone())
+                        {
+                            usage = merge_usage(usage, Some(u));
+                        }
+                        llm_calls.push(ImplementationLlmCallRecord {
+                            kind: "syntax_repair".to_string(),
+                            model: IMPLEMENTATION_MODEL.id().to_string(),
+                            timeout_ms: speed_failover
+                                .as_ref()
+                                .map(|d| d.total_timeout_ms)
+                                .unwrap_or(repair_timeout_ms),
+                            speed_failover,
+                            error: Some(truncate(&err.to_string(), 240)),
+                        });
+                        push_fail_reason(
+                            &mut fail_reasons,
+                            &mut fail_reason_records,
+                            "syntax",
+                            REASON_SYNTAX_VIOLATION,
+                            format!(
+                                "Syntax auto-repair failed: {}",
+                                truncate(&err.to_string(), 180)
+                            ),
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        llm_calls.push(ImplementationLlmCallRecord {
+                            kind: "syntax_repair".to_string(),
+                            model: IMPLEMENTATION_MODEL.id().to_string(),
+                            timeout_ms: repair_timeout_ms,
+                            speed_failover: None,
+                            error: Some(format!("Timed out after {}ms", repair_timeout_ms)),
+                        });
+                        notes.push("budget_exceeded".to_string());
+                        let message = format!(
+                            "Stopped to respect the configured time budget (syntax repair timed out after {}ms; limit {}ms)",
+                            repair_timeout_ms, attempt_budget.max_total_ms
+                        );
+                        push_fail_reason(
+                            &mut fail_reasons,
+                            &mut fail_reason_records,
+                            "budget",
+                            REASON_BUDGET_EXCEEDED,
+                            message.clone(),
+                        );
+                        push_gate(
+                            &mut gates,
+                            "budget",
+                            false,
+                            message,
+                            Some(REASON_BUDGET_EXCEEDED),
+                        );
+                        break;
+                    }
+                };
+                usage = merge_usage(usage, fix.usage.clone());
+                if let Some(reason) = attempt_budget.exhausted(&usage) {
+                    notes.push("budget_exceeded".to_string());
+                    push_fail_reason(
+                        &mut fail_reasons,
+                        &mut fail_reason_records,
+                        &reason.gate,
+                        &reason.code,
+                        reason.message.clone(),
+                    );
+                    push_gate(
+                        &mut gates,
+                        "budget",
+                        false,
+                        reason.message,
+                        Some(REASON_BUDGET_EXCEEDED),
+                    );
+                    break;
+                }
+
+                if let Some(parent) = resolved.absolute.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&resolved.absolute, &fix.new_content).map_err(|e| {
+                    anyhow::anyhow!("Failed writing syntax repair {}: {}", target.display(), e)
+                })?;
+                generated
+                    .modified_areas_by_file
+                    .entry(target.clone())
+                    .or_default()
+                    .extend(fix.modified_areas.clone());
+            }
+
+            if !fail_reasons.is_empty() {
+                break;
+            }
+
+            // Re-check diff budgets after syntax repair to ensure repairs don't bloat the diff.
+            repo_changes = collect_repo_changes(sandbox.path())?;
+            repo_changes.files.sort();
+            let (new_total, new_by_file) = compute_changed_lines(
+                sandbox.path(),
+                &repo_changes.files,
+                &repo_changes.untracked,
+            )?;
+            changed_total = new_total;
+            changed_by_file = new_by_file;
+            let diff_budget_ok_after = repo_changes.files.len() <= config.max_changed_files
+                && changed_total <= config.max_total_changed_lines
+                && changed_by_file
+                    .iter()
+                    .all(|(_f, c)| *c <= config.max_changed_lines_per_file);
+            upsert_gate(
+                &mut gates,
+                "diff_budget",
+                diff_budget_ok_after,
+                if diff_budget_ok_after {
+                    "Diff-size budgets passed".to_string()
+                } else {
+                    "Diff-size budgets exceeded".to_string()
+                },
+                if diff_budget_ok_after {
+                    None
+                } else {
+                    Some(REASON_DIFF_BUDGET_VIOLATION)
+                },
+            );
+            if !diff_budget_ok_after {
+                push_fail_reason(
+                    &mut fail_reasons,
+                    &mut fail_reason_records,
+                    "diff_budget",
+                    REASON_DIFF_BUDGET_VIOLATION,
+                    "Syntax repair exceeded configured diff-size budgets",
+                );
+                break;
+            }
+
+            syntax_err = syntax_gate(sandbox.path(), &repo_changes.files).err();
+        }
+    }
+
+    let syntax_ok = syntax_err.is_none();
     push_gate(
         &mut gates,
         "syntax",
@@ -2178,7 +2522,7 @@ async fn run_attempt(
             Some(REASON_SYNTAX_VIOLATION)
         },
     );
-    if let Err(err) = syntax_gate(sandbox.path(), &repo_changes.files) {
+    if let Some(err) = syntax_err {
         push_fail_reason(
             &mut fail_reasons,
             &mut fail_reason_records,
@@ -2271,7 +2615,7 @@ async fn run_attempt(
             let Some(outcome) = quick_outcome.as_ref() else {
                 break;
             };
-            let candidates = extract_quick_check_error_paths(outcome);
+            let candidates = extract_quick_check_error_paths(outcome, sandbox.path());
             let mut target = candidates.into_iter().find(|path| {
                 if config.quick_check_fix_requires_in_scope_error {
                     allowed_files.contains(path)
@@ -2294,6 +2638,80 @@ async fn run_attempt(
 
             quick_check_fix_loops = quick_check_fix_loops.saturating_add(1);
             notes.push(format!("quick_check_fix_loop_{}", quick_check_fix_loops));
+
+            // Deterministic fast-path: some JS repos fail quick checks solely due to formatting
+            // (Prettier). When that happens, run Prettier on the in-scope target file instead of
+            // spending LLM budget guessing the formatting rules.
+            if is_prettier_formatting_failure(outcome) {
+                let prettier_timeout_ms = 15_000.min(
+                    attempt_budget
+                        .remaining_ms()
+                        .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
+                        .max(1),
+                );
+                match run_prettier_write(sandbox.path(), &target, prettier_timeout_ms) {
+                    Ok(prettier_outcome) => {
+                        notes.push(format!(
+                            "quick_check_prettier_write_{}",
+                            if prettier_outcome.success {
+                                "ok"
+                            } else {
+                                "failed"
+                            }
+                        ));
+                        if prettier_outcome.success {
+                            final_changed_files =
+                                files_changed_set.iter().cloned().collect::<Vec<_>>();
+                            final_changed_files.sort();
+                            if let Err(err) = syntax_gate(sandbox.path(), &final_changed_files) {
+                                push_fail_reason(
+                                    &mut fail_reasons,
+                                    &mut fail_reason_records,
+                                    "syntax",
+                                    REASON_SYNTAX_VIOLATION,
+                                    err,
+                                );
+                                break;
+                            }
+
+                            let (status, command, outcome) = run_quick_checks(
+                                sandbox.path(),
+                                Some(repo_root),
+                                &mut notes,
+                                config.quick_checks_mode,
+                                config.quick_check_timeout_ms.min(
+                                    attempt_budget
+                                        .remaining_ms()
+                                        .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
+                                        .max(1),
+                                ),
+                            )?;
+                            quick_status = status;
+                            quick_command = command;
+                            quick_outcome = outcome;
+                            if let Some(outcome) = quick_outcome.clone() {
+                                if quick_status == ImplementationQuickCheckStatus::Failed {
+                                    quick_check_failure_summary =
+                                        summarize_quick_check_failure(&outcome);
+                                } else {
+                                    quick_check_failure_summary = None;
+                                }
+                                quick_check_outcomes.push(outcome);
+                            }
+                            if quick_status == ImplementationQuickCheckStatus::Failed {
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        notes.push(format!(
+                            "quick_check_prettier_write_failed: {}",
+                            truncate(&err.to_string(), 180)
+                        ));
+                    }
+                }
+            }
 
             if let Some(reason) = attempt_budget.guard_before_llm_call(&usage) {
                 notes.push("budget_exceeded".to_string());
@@ -2348,12 +2766,24 @@ async fn run_attempt(
                 &target,
             ));
             if !is_new_file {
-                if let Some((_, ln, _col)) = extract_quick_check_error_locations(outcome)
-                    .into_iter()
-                    .find(|(path, _, _)| path == &target)
+                if let Some((_, ln, _col)) =
+                    extract_quick_check_error_locations(outcome, sandbox.path())
+                        .into_iter()
+                        .find(|(path, _, _)| path == &target)
                 {
                     repair_preview.evidence_line = Some(ln);
                     repair_preview.evidence_snippet = snippet_around_line(&current_content, ln, 8);
+                }
+            }
+            if repair_preview.evidence_snippet.is_none() {
+                if let Some(extra) =
+                    quick_check_read_only_context_excerpt(sandbox.path(), outcome, &target)
+                {
+                    repair_preview.modifier = Some(format!(
+                        "{}\n\n{}",
+                        repair_preview.modifier.clone().unwrap_or_default(),
+                        extra
+                    ));
                 }
             }
 
@@ -2992,7 +3422,7 @@ async fn run_attempt(
             let Some(outcome) = quick_outcome.as_ref() else {
                 break;
             };
-            let candidates = extract_quick_check_error_paths(outcome);
+            let candidates = extract_quick_check_error_paths(outcome, sandbox.path());
             let mut target = candidates.into_iter().find(|path| {
                 if config.quick_check_fix_requires_in_scope_error {
                     allowed_files.contains(path)
@@ -3016,203 +3446,259 @@ async fn run_attempt(
             quick_check_fix_loops = quick_check_fix_loops.saturating_add(1);
             notes.push(format!("quick_check_fix_loop_{}", quick_check_fix_loops));
 
-            if let Some(reason) = attempt_budget.guard_before_llm_call(&usage) {
-                notes.push("budget_exceeded".to_string());
-                push_fail_reason(
-                    &mut fail_reasons,
-                    &mut fail_reason_records,
-                    &reason.gate,
-                    &reason.code,
-                    reason.message.clone(),
+            let mut repaired_by_prettier = false;
+            if is_prettier_formatting_failure(outcome) {
+                let prettier_timeout_ms = 15_000.min(
+                    attempt_budget
+                        .remaining_ms()
+                        .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
+                        .max(1),
                 );
-                push_gate(
-                    &mut gates,
-                    "budget",
-                    false,
-                    reason.message,
-                    Some(REASON_BUDGET_EXCEEDED),
-                );
-                break;
-            }
-
-            let resolved = resolve_repo_path_allow_new(sandbox.path(), &target).map_err(|e| {
-                anyhow::anyhow!("Unsafe quick-check repair path {}: {}", target.display(), e)
-            })?;
-            let current_content = match std::fs::read_to_string(&resolved.absolute) {
-                Ok(content) => content,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(e) => {
-                    push_fail_reason(
-                        &mut fail_reasons,
-                        &mut fail_reason_records,
-                        "quick_check",
-                        REASON_QUICK_CHECK_FAILED,
-                        format!(
-                            "Quick check auto-repair failed reading {}: {}",
-                            target.display(),
-                            truncate(&e.to_string(), 180)
-                        ),
-                    );
-                    break;
-                }
-            };
-            let is_new_file = !resolved.absolute.exists() || current_content.trim().is_empty();
-
-            let mut repair_preview = feedback_preview.clone();
-            let error_summary = quick_check_failure_summary
-                .as_deref()
-                .unwrap_or("Quick checks failed");
-            repair_preview.modifier = Some(format_quick_check_repair_modifier(
-                feedback_preview.modifier.as_deref(),
-                error_summary,
-                outcome,
-                &target,
-            ));
-            if !is_new_file {
-                if let Some((_, ln, _col)) = extract_quick_check_error_locations(outcome)
-                    .into_iter()
-                    .find(|(path, _, _)| path == &target)
-                {
-                    repair_preview.evidence_line = Some(ln);
-                    repair_preview.evidence_snippet = snippet_around_line(&current_content, ln, 8);
-                }
-            }
-
-            ensure_implementation_model(IMPLEMENTATION_MODEL)?;
-            let repair_timeout_ms = attempt_budget
-                .timeout_ms_for_next_llm_call()
-                .min(MAX_FIX_TIMEOUT_MS);
-            let fix = tokio::time::timeout(
-                Duration::from_millis(repair_timeout_ms),
-                generate_fix_content_with_model(
-                    &target,
-                    &current_content,
-                    suggestion,
-                    &repair_preview,
-                    repo_memory.clone(),
-                    is_new_file,
-                    IMPLEMENTATION_MODEL,
-                    repair_timeout_ms,
-                ),
-            )
-            .await;
-            let fix = match fix {
-                Ok(Ok(value)) => {
-                    llm_calls.push(ImplementationLlmCallRecord {
-                        kind: "quick_check_repair".to_string(),
-                        model: IMPLEMENTATION_MODEL.id().to_string(),
-                        timeout_ms: value
-                            .speed_failover
-                            .as_ref()
-                            .map(|d| d.total_timeout_ms)
-                            .unwrap_or(repair_timeout_ms),
-                        speed_failover: value.speed_failover.clone(),
-                        error: None,
-                    });
-                    value
-                }
-                Ok(Err(err)) => {
-                    let speed_failover = err
-                        .downcast_ref::<SpeedFailoverError>()
-                        .map(|e| e.diagnostics.clone())
-                        .or_else(|| {
-                            err.downcast_ref::<FixGenerationErrorWithUsage>()
-                                .and_then(|e| e.speed_failover.clone())
-                        });
-                    if let Some(u) = err
-                        .downcast_ref::<FixGenerationErrorWithUsage>()
-                        .and_then(|e| e.usage.clone())
-                    {
-                        usage = merge_usage(usage, Some(u));
+                match run_prettier_write(sandbox.path(), &target, prettier_timeout_ms) {
+                    Ok(prettier_outcome) => {
+                        notes.push(format!(
+                            "quick_check_prettier_write_{}",
+                            if prettier_outcome.success {
+                                "ok"
+                            } else {
+                                "failed"
+                            }
+                        ));
+                        if prettier_outcome.success {
+                            repaired_by_prettier = true;
+                            files_changed_set.insert(target.clone());
+                            generated
+                                .modified_areas_by_file
+                                .entry(target.clone())
+                                .or_default();
+                        }
                     }
-                    llm_calls.push(ImplementationLlmCallRecord {
-                        kind: "quick_check_repair".to_string(),
-                        model: IMPLEMENTATION_MODEL.id().to_string(),
-                        timeout_ms: speed_failover
-                            .as_ref()
-                            .map(|d| d.total_timeout_ms)
-                            .unwrap_or(repair_timeout_ms),
-                        speed_failover,
-                        error: Some(truncate(&err.to_string(), 240)),
-                    });
-                    push_fail_reason(
-                        &mut fail_reasons,
-                        &mut fail_reason_records,
-                        "quick_check",
-                        REASON_QUICK_CHECK_FAILED,
-                        format!(
-                            "Quick check auto-repair failed: {}",
+                    Err(err) => {
+                        notes.push(format!(
+                            "quick_check_prettier_write_failed: {}",
                             truncate(&err.to_string(), 180)
-                        ),
-                    );
-                    break;
+                        ));
+                    }
                 }
-                Err(_) => {
-                    llm_calls.push(ImplementationLlmCallRecord {
-                        kind: "quick_check_repair".to_string(),
-                        model: IMPLEMENTATION_MODEL.id().to_string(),
-                        timeout_ms: repair_timeout_ms,
-                        speed_failover: None,
-                        error: Some(format!("Timed out after {}ms", repair_timeout_ms)),
-                    });
+            }
+
+            if !repaired_by_prettier {
+                if let Some(reason) = attempt_budget.guard_before_llm_call(&usage) {
                     notes.push("budget_exceeded".to_string());
-                    let message = format!(
-                        "Stopped to respect the configured time budget (quick-check repair timed out after {}ms; limit {}ms)",
-                        repair_timeout_ms, attempt_budget.max_total_ms
-                    );
                     push_fail_reason(
                         &mut fail_reasons,
                         &mut fail_reason_records,
-                        "budget",
-                        REASON_BUDGET_EXCEEDED,
-                        message.clone(),
+                        &reason.gate,
+                        &reason.code,
+                        reason.message.clone(),
                     );
                     push_gate(
                         &mut gates,
                         "budget",
                         false,
-                        message,
+                        reason.message,
                         Some(REASON_BUDGET_EXCEEDED),
                     );
                     break;
                 }
-            };
-            usage = merge_usage(usage, fix.usage.clone());
-            if let Some(reason) = attempt_budget.exhausted(&usage) {
-                notes.push("budget_exceeded".to_string());
-                push_fail_reason(
-                    &mut fail_reasons,
-                    &mut fail_reason_records,
-                    &reason.gate,
-                    &reason.code,
-                    reason.message.clone(),
-                );
-                push_gate(
-                    &mut gates,
-                    "budget",
-                    false,
-                    reason.message,
-                    Some(REASON_BUDGET_EXCEEDED),
-                );
-                break;
-            }
 
-            if let Some(parent) = resolved.absolute.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&resolved.absolute, &fix.new_content).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed writing quick-check repair {}: {}",
-                    target.display(),
-                    e
+                let resolved =
+                    resolve_repo_path_allow_new(sandbox.path(), &target).map_err(|e| {
+                        anyhow::anyhow!(
+                            "Unsafe quick-check repair path {}: {}",
+                            target.display(),
+                            e
+                        )
+                    })?;
+                let current_content = match std::fs::read_to_string(&resolved.absolute) {
+                    Ok(content) => content,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => {
+                        push_fail_reason(
+                            &mut fail_reasons,
+                            &mut fail_reason_records,
+                            "quick_check",
+                            REASON_QUICK_CHECK_FAILED,
+                            format!(
+                                "Quick check auto-repair failed reading {}: {}",
+                                target.display(),
+                                truncate(&e.to_string(), 180)
+                            ),
+                        );
+                        break;
+                    }
+                };
+                let is_new_file = !resolved.absolute.exists() || current_content.trim().is_empty();
+
+                let mut repair_preview = feedback_preview.clone();
+                let error_summary = quick_check_failure_summary
+                    .as_deref()
+                    .unwrap_or("Quick checks failed");
+                repair_preview.modifier = Some(format_quick_check_repair_modifier(
+                    feedback_preview.modifier.as_deref(),
+                    error_summary,
+                    outcome,
+                    &target,
+                ));
+                if !is_new_file {
+                    if let Some((_, ln, _col)) =
+                        extract_quick_check_error_locations(outcome, sandbox.path())
+                            .into_iter()
+                            .find(|(path, _, _)| path == &target)
+                    {
+                        repair_preview.evidence_line = Some(ln);
+                        repair_preview.evidence_snippet =
+                            snippet_around_line(&current_content, ln, 8);
+                    }
+                }
+                if repair_preview.evidence_snippet.is_none() {
+                    if let Some(extra) =
+                        quick_check_read_only_context_excerpt(sandbox.path(), outcome, &target)
+                    {
+                        repair_preview.modifier = Some(format!(
+                            "{}\n\n{}",
+                            repair_preview.modifier.clone().unwrap_or_default(),
+                            extra
+                        ));
+                    }
+                }
+
+                ensure_implementation_model(IMPLEMENTATION_MODEL)?;
+                let repair_timeout_ms = attempt_budget
+                    .timeout_ms_for_next_llm_call()
+                    .min(MAX_FIX_TIMEOUT_MS);
+                let fix = tokio::time::timeout(
+                    Duration::from_millis(repair_timeout_ms),
+                    generate_fix_content_with_model(
+                        &target,
+                        &current_content,
+                        suggestion,
+                        &repair_preview,
+                        repo_memory.clone(),
+                        is_new_file,
+                        IMPLEMENTATION_MODEL,
+                        repair_timeout_ms,
+                    ),
                 )
-            })?;
-            files_changed_set.insert(target.clone());
-            generated
-                .modified_areas_by_file
-                .entry(target.clone())
-                .or_default()
-                .extend(fix.modified_areas.clone());
+                .await;
+                let fix = match fix {
+                    Ok(Ok(value)) => {
+                        llm_calls.push(ImplementationLlmCallRecord {
+                            kind: "quick_check_repair".to_string(),
+                            model: IMPLEMENTATION_MODEL.id().to_string(),
+                            timeout_ms: value
+                                .speed_failover
+                                .as_ref()
+                                .map(|d| d.total_timeout_ms)
+                                .unwrap_or(repair_timeout_ms),
+                            speed_failover: value.speed_failover.clone(),
+                            error: None,
+                        });
+                        value
+                    }
+                    Ok(Err(err)) => {
+                        let speed_failover = err
+                            .downcast_ref::<SpeedFailoverError>()
+                            .map(|e| e.diagnostics.clone())
+                            .or_else(|| {
+                                err.downcast_ref::<FixGenerationErrorWithUsage>()
+                                    .and_then(|e| e.speed_failover.clone())
+                            });
+                        if let Some(u) = err
+                            .downcast_ref::<FixGenerationErrorWithUsage>()
+                            .and_then(|e| e.usage.clone())
+                        {
+                            usage = merge_usage(usage, Some(u));
+                        }
+                        llm_calls.push(ImplementationLlmCallRecord {
+                            kind: "quick_check_repair".to_string(),
+                            model: IMPLEMENTATION_MODEL.id().to_string(),
+                            timeout_ms: speed_failover
+                                .as_ref()
+                                .map(|d| d.total_timeout_ms)
+                                .unwrap_or(repair_timeout_ms),
+                            speed_failover,
+                            error: Some(truncate(&err.to_string(), 240)),
+                        });
+                        push_fail_reason(
+                            &mut fail_reasons,
+                            &mut fail_reason_records,
+                            "quick_check",
+                            REASON_QUICK_CHECK_FAILED,
+                            format!(
+                                "Quick check auto-repair failed: {}",
+                                truncate(&err.to_string(), 180)
+                            ),
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        llm_calls.push(ImplementationLlmCallRecord {
+                            kind: "quick_check_repair".to_string(),
+                            model: IMPLEMENTATION_MODEL.id().to_string(),
+                            timeout_ms: repair_timeout_ms,
+                            speed_failover: None,
+                            error: Some(format!("Timed out after {}ms", repair_timeout_ms)),
+                        });
+                        notes.push("budget_exceeded".to_string());
+                        let message = format!(
+                            "Stopped to respect the configured time budget (quick-check repair timed out after {}ms; limit {}ms)",
+                            repair_timeout_ms, attempt_budget.max_total_ms
+                        );
+                        push_fail_reason(
+                            &mut fail_reasons,
+                            &mut fail_reason_records,
+                            "budget",
+                            REASON_BUDGET_EXCEEDED,
+                            message.clone(),
+                        );
+                        push_gate(
+                            &mut gates,
+                            "budget",
+                            false,
+                            message,
+                            Some(REASON_BUDGET_EXCEEDED),
+                        );
+                        break;
+                    }
+                };
+                usage = merge_usage(usage, fix.usage.clone());
+                if let Some(reason) = attempt_budget.exhausted(&usage) {
+                    notes.push("budget_exceeded".to_string());
+                    push_fail_reason(
+                        &mut fail_reasons,
+                        &mut fail_reason_records,
+                        &reason.gate,
+                        &reason.code,
+                        reason.message.clone(),
+                    );
+                    push_gate(
+                        &mut gates,
+                        "budget",
+                        false,
+                        reason.message,
+                        Some(REASON_BUDGET_EXCEEDED),
+                    );
+                    break;
+                }
+
+                if let Some(parent) = resolved.absolute.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&resolved.absolute, &fix.new_content).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed writing quick-check repair {}: {}",
+                        target.display(),
+                        e
+                    )
+                })?;
+                files_changed_set.insert(target.clone());
+                generated
+                    .modified_areas_by_file
+                    .entry(target.clone())
+                    .or_default()
+                    .extend(fix.modified_areas.clone());
+            }
 
             final_changed_files = files_changed_set.iter().cloned().collect::<Vec<_>>();
             final_changed_files.sort();
@@ -3418,6 +3904,86 @@ async fn run_attempt(
         },
         quick_reason_code,
     );
+
+    // Re-evaluate deterministic scope + diff-size budgets on the *final* sandbox state (after any
+    // in-attempt repairs). This guarantees we never accept a passing payload that drifted out of
+    // scope or exceeded budgets during review/repair loops.
+    let final_repo_changes = collect_repo_changes(sandbox.path())?;
+    let mut final_repo_files = final_repo_changes.files;
+    final_repo_files.sort();
+    final_changed_files = final_repo_files.clone();
+
+    let scope_ok_final = deterministic_scope_gate(&final_changed_files, allowed_files);
+    upsert_gate(
+        &mut gates,
+        "scope",
+        scope_ok_final,
+        if scope_ok_final {
+            format!("{} files changed in attempt", final_changed_files.len())
+        } else {
+            format!(
+                "Found out-of-scope file changes: {}",
+                final_changed_files
+                    .iter()
+                    .filter(|p| !allowed_files.contains(*p))
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+        if scope_ok_final {
+            None
+        } else {
+            Some(REASON_SCOPE_VIOLATION)
+        },
+    );
+    if !scope_ok_final {
+        push_fail_reason(
+            &mut fail_reasons,
+            &mut fail_reason_records,
+            "scope",
+            REASON_SCOPE_VIOLATION,
+            "Attempt changed files outside the validated suggestion scope",
+        );
+    }
+
+    let (final_changed_total, final_changed_by_file) = compute_changed_lines(
+        sandbox.path(),
+        &final_changed_files,
+        &final_repo_changes.untracked,
+    )?;
+    changed_total = final_changed_total;
+    changed_by_file = final_changed_by_file;
+
+    let diff_budget_ok_final = final_changed_files.len() <= config.max_changed_files
+        && changed_total <= config.max_total_changed_lines
+        && changed_by_file
+            .iter()
+            .all(|(_f, c)| *c <= config.max_changed_lines_per_file);
+    upsert_gate(
+        &mut gates,
+        "diff_budget",
+        diff_budget_ok_final,
+        if diff_budget_ok_final {
+            "Diff-size budgets passed".to_string()
+        } else {
+            "Diff-size budgets exceeded".to_string()
+        },
+        if diff_budget_ok_final {
+            None
+        } else {
+            Some(REASON_DIFF_BUDGET_VIOLATION)
+        },
+    );
+    if !diff_budget_ok_final {
+        push_fail_reason(
+            &mut fail_reasons,
+            &mut fail_reason_records,
+            "diff_budget",
+            REASON_DIFF_BUDGET_VIOLATION,
+            "Attempt exceeded configured diff-size budgets",
+        );
+    }
 
     // Plain-language gate is only meaningful for candidates that otherwise pass all technical gates.
     if fail_reasons.is_empty() {
@@ -3835,6 +4401,71 @@ fn syntax_gate(repo_root: &Path, changed_files: &[PathBuf]) -> Result<(), String
         }
     }
     Ok(())
+}
+
+fn collect_syntax_failures(repo_root: &Path, changed_files: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    for file in changed_files {
+        let Some(ext) = file.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let language = Language::from_extension(ext);
+        if language == Language::Unknown {
+            continue;
+        }
+
+        let resolved = match resolve_repo_path_allow_new(repo_root, file) {
+            Ok(r) => r,
+            Err(e) => {
+                out.push((
+                    file.clone(),
+                    format!("Unsafe changed file {}: {}", file.display(), e),
+                ));
+                continue;
+            }
+        };
+        let content = match std::fs::read_to_string(&resolved.absolute) {
+            Ok(content) => content,
+            Err(e) => {
+                out.push((
+                    file.clone(),
+                    format!("Failed reading {}: {}", file.display(), e),
+                ));
+                continue;
+            }
+        };
+
+        if let Err(err) = parse_file(file, &content, language) {
+            out.push((
+                file.clone(),
+                format!(
+                    "Parse gate failed for {}: {}",
+                    file.display(),
+                    truncate(&err.to_string(), 180)
+                ),
+            ));
+            continue;
+        }
+        match parse_file_has_errors(file, &content, language) {
+            Ok(true) => out.push((
+                file.clone(),
+                format!(
+                    "Parse gate failed for {}: syntax errors detected",
+                    file.display()
+                ),
+            )),
+            Ok(false) => {}
+            Err(err) => out.push((
+                file.clone(),
+                format!(
+                    "Parse gate failed for {}: {}",
+                    file.display(),
+                    truncate(&err.to_string(), 180)
+                ),
+            )),
+        }
+    }
+    out
 }
 
 fn is_binary_extension(path: &Path) -> bool {
@@ -4942,6 +5573,59 @@ fn run_quick_checks(
     Ok((status, Some(command_str), Some(outcome)))
 }
 
+fn is_prettier_formatting_failure(outcome: &ImplementationCommandOutcome) -> bool {
+    let stderr = strip_ansi_sequences(&outcome.stderr_tail);
+    let stdout = strip_ansi_sequences(&outcome.stdout_tail);
+    let combined = format!("{}\n{}", stderr, stdout).to_ascii_lowercase();
+
+    combined.contains("prettier")
+        && (combined.contains("--write") || combined.contains("code style"))
+}
+
+fn run_prettier_write(
+    repo_root: &Path,
+    target: &Path,
+    timeout_ms: u64,
+) -> anyhow::Result<ImplementationCommandOutcome> {
+    let prettier_candidates = [
+        repo_root.join("node_modules").join(".bin").join("prettier"),
+        repo_root
+            .join("node_modules")
+            .join(".bin")
+            .join("prettier.cmd"),
+    ];
+    let prettier = prettier_candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .ok_or_else(|| anyhow::anyhow!("Prettier binary not found under node_modules/.bin"))?;
+
+    let mut cmd = Command::new(prettier);
+    cmd.current_dir(repo_root)
+        .arg("--write")
+        .arg(target)
+        // Reduce output noise; we surface tails in diagnostics if it fails.
+        .arg("--log-level")
+        .arg("warn");
+    for (k, v) in SandboxSession::env_overrides() {
+        cmd.env(k, v);
+    }
+
+    let start = std::time::Instant::now();
+    let output =
+        run_command_with_timeout(&mut cmd, Duration::from_millis(timeout_ms)).map_err(|e| {
+            anyhow::anyhow!("Failed to run prettier --write {}: {}", target.display(), e)
+        })?;
+    Ok(ImplementationCommandOutcome {
+        command: format!("prettier --write {}", target.display()),
+        duration_ms: start.elapsed().as_millis() as u64,
+        success: !output.timed_out && output.status.map(|s| s.success()).unwrap_or(false),
+        timed_out: output.timed_out,
+        exit_code: output.status.and_then(|s| s.code()),
+        stdout_tail: tail_chars(&output.stdout, MAX_COMMAND_OUTPUT_TAIL_CHARS),
+        stderr_tail: tail_chars(&output.stderr, MAX_COMMAND_OUTPUT_TAIL_CHARS),
+    })
+}
+
 fn ensure_quick_check_prereqs(
     repo_root: &Path,
     source_repo_root: Option<&Path>,
@@ -5534,7 +6218,7 @@ ELIFECYCLE Command failed with exit code 1.\n\
             stderr_tail: "--> src/main.rs:7:9\nerror[E0425]: cannot find value\n".to_string(),
         };
 
-        let paths = extract_quick_check_error_paths(&outcome);
+        let paths = extract_quick_check_error_paths(&outcome, Path::new("."));
         assert!(paths.contains(&PathBuf::from("src/foo.ts")), "{:?}", paths);
         assert!(paths.contains(&PathBuf::from("src/main.rs")), "{:?}", paths);
         assert!(!paths.contains(&PathBuf::from("../oops.ts")), "{:?}", paths);
@@ -5552,7 +6236,7 @@ ELIFECYCLE Command failed with exit code 1.\n\
             stderr_tail: String::new(),
         };
 
-        let paths = extract_quick_check_error_paths(&outcome);
+        let paths = extract_quick_check_error_paths(&outcome, Path::new("."));
         assert!(paths.contains(&PathBuf::from("src/bar.ts")), "{:?}", paths);
         assert!(paths.contains(&PathBuf::from("src/baz.js")), "{:?}", paths);
         assert!(!paths.iter().any(|p| p.is_absolute()), "{:?}", paths);
