@@ -2643,6 +2643,7 @@ fn fake_trial_result(target_repo: &Path, verify_sample: usize) -> ReliabilityTri
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::process::Command;
     use std::sync::Mutex;
     use tempfile::tempdir;
@@ -2947,6 +2948,112 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"mode\":\"validate_fast\""));
         assert!(json.contains("\"passed\":true"));
+    }
+
+    fn test_run_diagnostics(
+        model: &str,
+        passed: bool,
+        llm_calls: Vec<(&str, &str)>,
+    ) -> ImplementationRunDiagnostics {
+        let llm_calls = llm_calls
+            .into_iter()
+            .map(|(kind, call_model)| {
+                cosmos_tui::suggest::llm::implementation::ImplementationLlmCallRecord {
+                    kind: kind.to_string(),
+                    independence_role: None,
+                    model: call_model.to_string(),
+                    timeout_ms: 1_000,
+                    speed_failover: None,
+                    error: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        ImplementationRunDiagnostics {
+            run_id: "run-1".to_string(),
+            suggestion_id: "s-1".to_string(),
+            suggestion_summary: "summary".to_string(),
+            model: model.to_string(),
+            strict_mode: true,
+            passed,
+            attempt_count: 1,
+            total_ms: 1_000,
+            total_cost_usd: 0.001,
+            reduced_confidence: false,
+            fail_reasons: Vec::new(),
+            attempts: vec![cosmos_tui::suggest::llm::ImplementationAttemptDiagnostics {
+                attempt_index: 1,
+                passed,
+                fail_reasons: Vec::new(),
+                fail_reason_records: Vec::new(),
+                gates: Vec::new(),
+                changed_files: Vec::new(),
+                changed_lines_total: 0,
+                changed_lines_by_file: HashMap::new(),
+                quick_check_status:
+                    cosmos_tui::suggest::llm::ImplementationQuickCheckStatus::Passed,
+                quick_check_command: Some("fake check".to_string()),
+                quick_check_outcome: None,
+                quick_check_outcomes: Vec::new(),
+                quick_check_fix_loops: 0,
+                quick_check_failure_summary: None,
+                review_iterations: 1,
+                review_blocking_remaining: 0,
+                remaining_blocking_titles: Vec::new(),
+                remaining_blocking_categories: Vec::new(),
+                attempt_ms: 1_000,
+                attempt_cost_usd: 0.001,
+                llm_calls,
+                notes: Vec::new(),
+            }],
+            report_path: None,
+            finalization: cosmos_tui::suggest::llm::ImplementationFinalizationDiagnostics::default(
+            ),
+        }
+    }
+
+    #[test]
+    fn same_model_review_pass_requires_independent_review() {
+        let diag = test_run_diagnostics(
+            "openai/gpt-oss-120b",
+            true,
+            vec![("review", "openai/gpt-oss-120b")],
+        );
+        assert!(same_model_review_requires_independent(&diag));
+        assert!(!diagnostics_has_independent_review(&diag));
+
+        let with_second_opinion = test_run_diagnostics(
+            "openai/gpt-oss-120b",
+            true,
+            vec![
+                ("review", "openai/gpt-oss-120b"),
+                ("independent_review", "openai/gpt-oss-20b"),
+            ],
+        );
+        assert!(same_model_review_requires_independent(&with_second_opinion));
+        assert!(diagnostics_has_independent_review(&with_second_opinion));
+
+        let cross_model_review = test_run_diagnostics(
+            "openai/gpt-oss-120b",
+            true,
+            vec![("review", "openai/gpt-oss-20b")],
+        );
+        assert!(!same_model_review_requires_independent(&cross_model_review));
+        assert!(!diagnostics_has_independent_review(&cross_model_review));
+    }
+
+    #[test]
+    fn implement_shadow_gate_env_defaults_to_advisory() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("COSMOS_IMPLEMENT_SHADOW_GATES_BLOCKING");
+        assert!(!implement_shadow_gates_blocking_enabled());
+
+        std::env::set_var("COSMOS_IMPLEMENT_SHADOW_GATES_BLOCKING", "true");
+        assert!(implement_shadow_gates_blocking_enabled());
+
+        std::env::set_var("COSMOS_IMPLEMENT_SHADOW_GATES_BLOCKING", "0");
+        assert!(!implement_shadow_gates_blocking_enabled());
+
+        std::env::remove_var("COSMOS_IMPLEMENT_SHADOW_GATES_BLOCKING");
     }
 
     #[test]
@@ -3335,6 +3442,37 @@ edition = "2021"
         assert_eq!(json["repo_reports"].as_array().unwrap().len(), 3);
         assert!(json["pass_rate"].is_number());
         assert!(json["mutation_on_failure_rate"].is_number());
+        assert!(json["independent_review_required_count"].is_number());
+        assert!(json["independent_review_executed_count"].is_number());
+        assert!(json["independent_review_miss_count"].is_number());
+        assert_eq!(json["independent_review_miss_count"], 0);
+        let notes = json["notes"].as_array().cloned().unwrap_or_default();
+        let note_set = notes
+            .iter()
+            .filter_map(|note| note.as_str())
+            .collect::<HashSet<_>>();
+        assert!(note_set.contains("Shadow gate mode: advisory"));
+
+        for repo in json["repo_reports"].as_array().unwrap() {
+            assert!(repo["quick_check_detected"].as_bool().unwrap_or(false));
+            assert!(repo["quick_check_passed_cases"].is_number());
+            assert!(repo["quick_check_failed_cases"].is_number());
+            assert!(repo["quick_check_unavailable_cases"].is_number());
+            assert!(repo["independent_review_required_count"].is_number());
+            assert!(repo["independent_review_executed_count"].is_number());
+            assert!(repo["independent_review_miss_count"].is_number());
+            let executed = repo["executed_count"].as_u64().unwrap_or_default();
+            let quick_check_total = repo["quick_check_passed_cases"]
+                .as_u64()
+                .unwrap_or_default()
+                + repo["quick_check_failed_cases"]
+                    .as_u64()
+                    .unwrap_or_default()
+                + repo["quick_check_unavailable_cases"]
+                    .as_u64()
+                    .unwrap_or_default();
+            assert_eq!(quick_check_total, executed);
+        }
         assert!(json["passed"].as_bool().unwrap_or(false));
 
         std::env::remove_var("COSMOS_LAB_FAKE_IMPLEMENT");
