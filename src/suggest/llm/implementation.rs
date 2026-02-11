@@ -1845,13 +1845,21 @@ fn ensure_implementation_model(model: Model) -> anyhow::Result<()> {
 }
 
 fn ensure_adversarial_review_model(model: Model) -> anyhow::Result<()> {
-    match model {
-        Model::Speed | Model::Smart => Ok(()),
-        _ => Err(anyhow::anyhow!(
+    const ALLOWED: &[Model] = &[Model::Speed, Model::Balanced, Model::Smart];
+    if ALLOWED.contains(&model) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
             "Adversarial review model '{}' is not allowed",
             model.id()
-        )),
+        ))
     }
+}
+
+fn is_response_format_schema_error_text(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("invalid schema for response_format")
+        || (lower.contains("invalid schema") && lower.contains("response_format"))
 }
 
 pub async fn implement_validated_suggestion_with_harness(
@@ -5675,91 +5683,119 @@ async fn run_review_gate(
         && require_independent_review_on_pass
         && review_model == IMPLEMENTATION_MODEL
     {
-        let independent_model = Model::Smart;
-        ensure_adversarial_review_model(independent_model).map_err(|e| {
-            ReviewGateError::Failed(format!("Review model policy check failed: {}", e))
-        })?;
-        if let Some(reason) = budget.guard_before_llm_call(&*usage) {
-            snapshot_blocking(&[]);
-            return Err(ReviewGateError::BudgetExceeded(reason));
-        }
-        let independent_timeout_ms = budget
-            .timeout_ms_for_next_llm_call()
-            .min(MAX_REVIEW_TIMEOUT_MS);
-        let independent_review = tokio::time::timeout(
-            Duration::from_millis(independent_timeout_ms),
-            verify_changes_bounded_with_model(
-                &files_with_content,
-                iteration + 1,
-                fixed_titles,
-                Some(&review_fix_context),
-                independent_model,
-                independent_timeout_ms,
-            ),
-        )
-        .await;
-        *review_iterations += 1;
-        let independent_review = match independent_review {
-            Ok(Ok(value)) => {
-                llm_calls.push(ImplementationLlmCallRecord {
-                    kind: "independent_review".to_string(),
-                    independence_role: Some("independent_second_opinion".to_string()),
-                    model: independent_model.id().to_string(),
-                    timeout_ms: value
-                        .speed_failover
-                        .as_ref()
-                        .map(|d| d.total_timeout_ms)
-                        .unwrap_or(independent_timeout_ms),
-                    speed_failover: value.speed_failover.clone(),
-                    error: None,
-                });
-                value
-            }
-            Ok(Err(err)) => {
-                let speed_failover = err
-                    .downcast_ref::<SpeedFailoverError>()
-                    .map(|e| e.diagnostics.clone())
-                    .or_else(|| {
-                        err.downcast_ref::<FixGenerationErrorWithUsage>()
-                            .and_then(|e| e.speed_failover.clone())
-                    });
-                llm_calls.push(ImplementationLlmCallRecord {
-                    kind: "independent_review".to_string(),
-                    independence_role: Some("independent_second_opinion".to_string()),
-                    model: independent_model.id().to_string(),
-                    timeout_ms: speed_failover
-                        .as_ref()
-                        .map(|d| d.total_timeout_ms)
-                        .unwrap_or(independent_timeout_ms),
-                    speed_failover,
-                    error: Some(truncate(&err.to_string(), 240)),
-                });
-                return Err(ReviewGateError::Failed(format!(
-                    "Independent adversarial review failed: {}",
-                    truncate(&err.to_string(), 180)
-                )));
-            }
-            Err(_) => {
-                llm_calls.push(ImplementationLlmCallRecord {
-                    kind: "independent_review".to_string(),
-                    independence_role: Some("independent_second_opinion".to_string()),
-                    model: independent_model.id().to_string(),
-                    timeout_ms: independent_timeout_ms,
-                    speed_failover: None,
-                    error: Some(format!("Timed out after {}ms", independent_timeout_ms)),
-                });
+        let mut independent_review = None;
+        let mut independent_error: Option<String> = None;
+        let independent_models = [Model::Smart, Model::Balanced];
+        for independent_model in independent_models {
+            ensure_adversarial_review_model(independent_model).map_err(|e| {
+                ReviewGateError::Failed(format!("Review model policy check failed: {}", e))
+            })?;
+            if let Some(reason) = budget.guard_before_llm_call(&*usage) {
                 snapshot_blocking(&[]);
-                return Err(ReviewGateError::BudgetExceeded(ImplementationFailReason {
-                    code: REASON_BUDGET_EXCEEDED.to_string(),
-                    gate: "budget".to_string(),
-                    message: format!(
-                        "Stopped to respect the configured time budget (independent review timed out after {}ms; limit {}ms)",
-                        independent_timeout_ms, budget.max_total_ms
-                    ),
-                    action: default_action_for_fail_reason("budget", REASON_BUDGET_EXCEEDED)
-                        .to_string(),
-                }));
+                return Err(ReviewGateError::BudgetExceeded(reason));
             }
+            let independent_timeout_ms = budget
+                .timeout_ms_for_next_llm_call()
+                .min(MAX_REVIEW_TIMEOUT_MS);
+            let review_attempt = tokio::time::timeout(
+                Duration::from_millis(independent_timeout_ms),
+                verify_changes_bounded_with_model(
+                    &files_with_content,
+                    iteration + 1,
+                    fixed_titles,
+                    Some(&review_fix_context),
+                    independent_model,
+                    independent_timeout_ms,
+                ),
+            )
+            .await;
+            *review_iterations += 1;
+            match review_attempt {
+                Ok(Ok(value)) => {
+                    llm_calls.push(ImplementationLlmCallRecord {
+                        kind: "independent_review".to_string(),
+                        independence_role: Some("independent_second_opinion".to_string()),
+                        model: independent_model.id().to_string(),
+                        timeout_ms: value
+                            .speed_failover
+                            .as_ref()
+                            .map(|d| d.total_timeout_ms)
+                            .unwrap_or(independent_timeout_ms),
+                        speed_failover: value.speed_failover.clone(),
+                        error: None,
+                    });
+                    independent_review = Some(value);
+                    break;
+                }
+                Ok(Err(err)) => {
+                    let speed_failover = err
+                        .downcast_ref::<SpeedFailoverError>()
+                        .map(|e| e.diagnostics.clone())
+                        .or_else(|| {
+                            err.downcast_ref::<FixGenerationErrorWithUsage>()
+                                .and_then(|e| e.speed_failover.clone())
+                        });
+                    if let Some(u) = err
+                        .downcast_ref::<FixGenerationErrorWithUsage>()
+                        .and_then(|e| e.usage.clone())
+                    {
+                        *usage = merge_usage(usage.take(), Some(u));
+                    }
+                    let err_text = err.to_string();
+                    llm_calls.push(ImplementationLlmCallRecord {
+                        kind: "independent_review".to_string(),
+                        independence_role: Some("independent_second_opinion".to_string()),
+                        model: independent_model.id().to_string(),
+                        timeout_ms: speed_failover
+                            .as_ref()
+                            .map(|d| d.total_timeout_ms)
+                            .unwrap_or(independent_timeout_ms),
+                        speed_failover,
+                        error: Some(truncate(&err_text, 240)),
+                    });
+                    independent_error = Some(err_text.clone());
+                    // Provider/schema incompatibility can be model-specific; retry once with a
+                    // second independent model before failing the attempt.
+                    if is_response_format_schema_error_text(&err_text)
+                        && independent_model != Model::Balanced
+                    {
+                        continue;
+                    }
+                }
+                Err(_) => {
+                    llm_calls.push(ImplementationLlmCallRecord {
+                        kind: "independent_review".to_string(),
+                        independence_role: Some("independent_second_opinion".to_string()),
+                        model: independent_model.id().to_string(),
+                        timeout_ms: independent_timeout_ms,
+                        speed_failover: None,
+                        error: Some(format!("Timed out after {}ms", independent_timeout_ms)),
+                    });
+                    snapshot_blocking(&[]);
+                    return Err(ReviewGateError::BudgetExceeded(ImplementationFailReason {
+                        code: REASON_BUDGET_EXCEEDED.to_string(),
+                        gate: "budget".to_string(),
+                        message: format!(
+                            "Stopped to respect the configured time budget (independent review timed out after {}ms; limit {}ms)",
+                            independent_timeout_ms, budget.max_total_ms
+                        ),
+                        action: default_action_for_fail_reason("budget", REASON_BUDGET_EXCEEDED)
+                            .to_string(),
+                    }));
+                }
+            }
+        }
+        let independent_review = if let Some(value) = independent_review {
+            value
+        } else {
+            let detail = independent_error
+                .as_deref()
+                .map(|err| truncate(err, 180))
+                .unwrap_or_else(|| "Unknown independent review failure".to_string());
+            return Err(ReviewGateError::Failed(format!(
+                "Independent adversarial review failed: {}",
+                detail
+            )));
         };
         *usage = merge_usage(usage.take(), independent_review.usage.clone());
         if let Some(reason) = budget.exhausted(&*usage) {
@@ -7020,10 +7056,20 @@ diff --git a/a.rs b/a.rs
     }
 
     #[test]
-    fn adversarial_review_model_policy_allows_speed_and_smart_only() {
+    fn adversarial_review_model_policy_allows_speed_smart_and_balanced() {
         assert!(ensure_adversarial_review_model(Model::Speed).is_ok());
         assert!(ensure_adversarial_review_model(Model::Smart).is_ok());
-        assert!(ensure_adversarial_review_model(Model::Balanced).is_err());
+        assert!(ensure_adversarial_review_model(Model::Balanced).is_ok());
+    }
+
+    #[test]
+    fn response_format_schema_error_detector_matches_provider_message() {
+        assert!(is_response_format_schema_error_text(
+            "API error 400 Bad Request: Invalid schema for response_format 'review_response'"
+        ));
+        assert!(!is_response_format_schema_error_text(
+            "API error 429 Too Many Requests: Rate limited"
+        ));
     }
 
     #[test]
