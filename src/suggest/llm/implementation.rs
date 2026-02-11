@@ -1,6 +1,7 @@
 use super::client::{SpeedFailoverDiagnostics, SpeedFailoverError};
 use super::fix::{
-    generate_fix_content_with_model, generate_multi_file_fix_with_model, FileInput, FixPreview,
+    generate_fix_content_with_model, generate_multi_file_fix_with_model, FileInput,
+    FixGenerationErrorWithUsage, FixPreview,
 };
 use super::models::{merge_usage, Model, Usage};
 use super::review::{
@@ -718,6 +719,45 @@ fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Opti
         }
     }
 
+    // JS quick checks often fail with actionable sub-tool output (eslint / size-limit), but the
+    // overall runner exit line (e.g. ELIFECYCLE) is not helpful. Prefer the actionable detail.
+    fn strip_test_prefix(line: &str) -> &str {
+        let trimmed = line.trim();
+        let prefixes = [". test:size:", ". test:lint:", ". test:coverage:"];
+        for prefix in prefixes {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                return rest.trim();
+            }
+        }
+        trimmed
+    }
+    let combined = format!("{}\n{}", stderr, stdout);
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(line) = combined.lines().map(str::trim).find(|l| {
+        l.to_ascii_lowercase()
+            .contains("package size limit has exceeded")
+    }) {
+        parts.push(strip_test_prefix(line).to_string());
+    }
+    if let Some(line) = combined.lines().map(str::trim).find(|l| {
+        let lower = l.to_ascii_lowercase();
+        lower.contains(" error ")
+            && (lower.contains("eslint")
+                || lower.contains("n/prefer-node-protocol")
+                || lower.contains("@typescript-eslint")
+                || lower.contains("tsc")
+                || lower.contains("lint"))
+    }) {
+        parts.push(strip_test_prefix(line).to_string());
+    }
+    if !parts.is_empty() {
+        return Some(format!(
+            "Quick check failed ({}): {}",
+            outcome.command,
+            truncate(&parts.join(" | "), 260)
+        ));
+    }
+
     let pick_line = |text: &str| -> Option<String> {
         let mut best: Option<&str> = None;
         let mut best_score: i32 = i32::MIN;
@@ -797,6 +837,65 @@ fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Opti
         ));
     }
     None
+}
+
+fn extract_size_limit_exceeded(outcome: &ImplementationCommandOutcome) -> Vec<(String, u32)> {
+    // Example (pnpm):
+    //   . test:size:   non-secure nanoid
+    //   . test:size:   Package size limit has exceeded by 25 B
+    let stdout = strip_ansi_sequences(&outcome.stdout_tail);
+    let stderr = strip_ansi_sequences(&outcome.stderr_tail);
+    let combined = format!("{}\n{}", stdout, stderr);
+
+    let re = Regex::new(r"(?i)package size limit has exceeded by\s+(?P<bytes>\d+)\s*b").ok();
+    let mut current: Option<String> = None;
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for raw in combined.lines().map(str::trim) {
+        let mut line = raw;
+        if let Some(rest) = line.strip_prefix(". test:size:") {
+            line = rest.trim();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if !lower.starts_with("size limit:")
+            && !lower.starts_with("size:")
+            && !lower.starts_with("package size limit")
+            && !lower.starts_with("try to reduce")
+            && !lower.starts_with("failed")
+        {
+            current = Some(line.to_string());
+        }
+        if let Some(re) = re.as_ref() {
+            if let Some(caps) = re.captures(line) {
+                if let Ok(bytes) = caps
+                    .name("bytes")
+                    .map(|m| m.as_str())
+                    .unwrap_or("0")
+                    .parse::<u32>()
+                {
+                    let label = current.clone().unwrap_or_else(|| "unknown".to_string());
+                    out.push((label, bytes));
+                }
+            }
+        }
+    }
+
+    // De-dupe by label while preserving first-seen ordering; keep max exceeded bytes.
+    let mut indices: HashMap<String, usize> = HashMap::new();
+    let mut deduped: Vec<(String, u32)> = Vec::new();
+    for (label, bytes) in out {
+        if let Some(&idx) = indices.get(&label) {
+            if bytes > deduped[idx].1 {
+                deduped[idx].1 = bytes;
+            }
+            continue;
+        }
+        indices.insert(label.clone(), deduped.len());
+        deduped.push((label, bytes));
+    }
+    deduped
 }
 
 fn is_safe_relative_path(path: &Path) -> bool {
@@ -1175,6 +1274,19 @@ fn format_quick_check_repair_modifier(
             Some(excerpt)
         }
     };
+    let size_exceeded = extract_size_limit_exceeded(outcome);
+    if !size_exceeded.is_empty() {
+        let details = size_exceeded
+            .iter()
+            .take(4)
+            .map(|(label, bytes)| format!("{} (+{}B)", label, bytes))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "Size-limit guidance:\n- The repo enforces bundle size limits and the check failed: {}.\n- Avoid adding new imports/dependencies unless the plan explicitly requires it.\n- Prefer the smallest possible change; if the plan is informational, implement it via comments/docs rather than runtime code.\n- Reduce output size enough to get under the configured limit.",
+            details
+        ));
+    }
     parts.push(format!(
         "Quick-check repair request:\n- Quick-check failure: {}\n- File to repair: {}\n{}\nRules:\n- Modify only this file.\n- Fix the reported error.\n- Keep the diff minimal and avoid unrelated reformatting.\n- Do not change behavior outside what's needed for the error.",
         truncate(error_summary, 240),
@@ -1824,7 +1936,11 @@ async fn run_attempt(
     let mut generated = match generation {
         Ok(value) => value,
         Err(err) => {
-            let message = truncate(&format!("Generation failed: {}", err), 240);
+            let usage_on_failure = err
+                .downcast_ref::<FixGenerationErrorWithUsage>()
+                .and_then(|e| e.usage.clone());
+            let attempt_cost_usd = usage_on_failure.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+            let message = truncate(&format!("Generation failed: {}", err), 700);
             push_fail_reason(
                 &mut fail_reasons,
                 &mut fail_reason_records,
@@ -1860,13 +1976,13 @@ async fn run_attempt(
                 remaining_blocking_titles: Vec::new(),
                 remaining_blocking_categories: Vec::new(),
                 attempt_ms: attempt_start.elapsed().as_millis() as u64,
-                attempt_cost_usd: 0.0,
+                attempt_cost_usd,
                 llm_calls,
                 notes,
             };
             return Ok(AttemptExecution {
                 diagnostics: diag,
-                usage: None,
+                usage: usage_on_failure,
                 pass_payload: None,
             });
         }
@@ -2277,7 +2393,17 @@ async fn run_attempt(
                 Ok(Err(err)) => {
                     let speed_failover = err
                         .downcast_ref::<SpeedFailoverError>()
-                        .map(|e| e.diagnostics.clone());
+                        .map(|e| e.diagnostics.clone())
+                        .or_else(|| {
+                            err.downcast_ref::<FixGenerationErrorWithUsage>()
+                                .and_then(|e| e.speed_failover.clone())
+                        });
+                    if let Some(u) = err
+                        .downcast_ref::<FixGenerationErrorWithUsage>()
+                        .and_then(|e| e.usage.clone())
+                    {
+                        usage = merge_usage(usage, Some(u));
+                    }
                     llm_calls.push(ImplementationLlmCallRecord {
                         kind: "quick_check_repair".to_string(),
                         model: IMPLEMENTATION_MODEL.id().to_string(),
@@ -2988,7 +3114,17 @@ async fn run_attempt(
                 Ok(Err(err)) => {
                     let speed_failover = err
                         .downcast_ref::<SpeedFailoverError>()
-                        .map(|e| e.diagnostics.clone());
+                        .map(|e| e.diagnostics.clone())
+                        .or_else(|| {
+                            err.downcast_ref::<FixGenerationErrorWithUsage>()
+                                .and_then(|e| e.speed_failover.clone())
+                        });
+                    if let Some(u) = err
+                        .downcast_ref::<FixGenerationErrorWithUsage>()
+                        .and_then(|e| e.usage.clone())
+                    {
+                        usage = merge_usage(usage, Some(u));
+                    }
                     llm_calls.push(ImplementationLlmCallRecord {
                         kind: "quick_check_repair".to_string(),
                         model: IMPLEMENTATION_MODEL.id().to_string(),
@@ -3462,7 +3598,11 @@ async fn generate_attempt_candidate(
             Err(err) => {
                 let speed_failover = err
                     .downcast_ref::<SpeedFailoverError>()
-                    .map(|e| e.diagnostics.clone());
+                    .map(|e| e.diagnostics.clone())
+                    .or_else(|| {
+                        err.downcast_ref::<FixGenerationErrorWithUsage>()
+                            .and_then(|e| e.speed_failover.clone())
+                    });
                 llm_calls.push(ImplementationLlmCallRecord {
                     kind: "generation".to_string(),
                     model: IMPLEMENTATION_MODEL.id().to_string(),
@@ -3542,7 +3682,11 @@ async fn generate_attempt_candidate(
         Err(err) => {
             let speed_failover = err
                 .downcast_ref::<SpeedFailoverError>()
-                .map(|e| e.diagnostics.clone());
+                .map(|e| e.diagnostics.clone())
+                .or_else(|| {
+                    err.downcast_ref::<FixGenerationErrorWithUsage>()
+                        .and_then(|e| e.speed_failover.clone())
+                });
             llm_calls.push(ImplementationLlmCallRecord {
                 kind: "generation".to_string(),
                 model: IMPLEMENTATION_MODEL.id().to_string(),
@@ -3824,7 +3968,11 @@ async fn run_review_gate(
         Ok(Err(err)) => {
             let speed_failover = err
                 .downcast_ref::<SpeedFailoverError>()
-                .map(|e| e.diagnostics.clone());
+                .map(|e| e.diagnostics.clone())
+                .or_else(|| {
+                    err.downcast_ref::<FixGenerationErrorWithUsage>()
+                        .and_then(|e| e.speed_failover.clone())
+                });
             llm_calls.push(ImplementationLlmCallRecord {
                 kind: "review".to_string(),
                 model: IMPLEMENTATION_MODEL.id().to_string(),
@@ -3947,7 +4095,17 @@ async fn run_review_gate(
                 Ok(Err(err)) => {
                     let speed_failover = err
                         .downcast_ref::<SpeedFailoverError>()
-                        .map(|e| e.diagnostics.clone());
+                        .map(|e| e.diagnostics.clone())
+                        .or_else(|| {
+                            err.downcast_ref::<FixGenerationErrorWithUsage>()
+                                .and_then(|e| e.speed_failover.clone())
+                        });
+                    if let Some(u) = err
+                        .downcast_ref::<FixGenerationErrorWithUsage>()
+                        .and_then(|e| e.usage.clone())
+                    {
+                        *usage = merge_usage(usage.take(), Some(u));
+                    }
                     llm_calls.push(ImplementationLlmCallRecord {
                         kind: "review_fix".to_string(),
                         model: IMPLEMENTATION_MODEL.id().to_string(),
@@ -4055,7 +4213,11 @@ async fn run_review_gate(
             Ok(Err(err)) => {
                 let speed_failover = err
                     .downcast_ref::<SpeedFailoverError>()
-                    .map(|e| e.diagnostics.clone());
+                    .map(|e| e.diagnostics.clone())
+                    .or_else(|| {
+                        err.downcast_ref::<FixGenerationErrorWithUsage>()
+                            .and_then(|e| e.speed_failover.clone())
+                    });
                 llm_calls.push(ImplementationLlmCallRecord {
                     kind: "rereview".to_string(),
                     model: IMPLEMENTATION_MODEL.id().to_string(),
@@ -5331,6 +5493,32 @@ diff --git a/a.rs b/a.rs
         let summary = summarize_quick_check_failure(&outcome).expect("expected summary");
         assert!(summary.contains("pnpm test"));
         assert!(summary.contains("FAIL"), "{}", summary);
+    }
+
+    #[test]
+    fn quick_check_failure_summary_prefers_size_limit_and_lint_details_over_elifecycle() {
+        let outcome = ImplementationCommandOutcome {
+            command: "pnpm test".to_string(),
+            duration_ms: 0,
+            success: false,
+            timed_out: false,
+            exit_code: Some(1),
+            stdout_tail: "\
+. test:size:   Package size limit has exceeded by 25 B\n\
+. test:size: Failed\n\
+ELIFECYCLE Command failed with exit code 1.\n\
+. test:lint:   13:24  error  Prefer `node:crypto` over `crypto`  n/prefer-node-protocol\n"
+                .to_string(),
+            stderr_tail: String::new(),
+        };
+
+        let summary = summarize_quick_check_failure(&outcome).expect("expected summary");
+        assert!(
+            summary.contains("Package size limit has exceeded"),
+            "{}",
+            summary
+        );
+        assert!(summary.contains("Prefer `node:crypto`"), "{}", summary);
     }
 
     #[test]

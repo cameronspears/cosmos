@@ -32,6 +32,24 @@ pub struct AppliedFix {
     pub speed_failover: Option<SpeedFailoverDiagnostics>,
 }
 
+/// `generate_*_with_model` can fail *after* the LLM call succeeds (for example, if the returned
+/// edits can't be applied safely). We still want usage/diagnostics so the harness can budget and
+/// report honestly.
+#[derive(Debug, Clone)]
+pub(crate) struct FixGenerationErrorWithUsage {
+    pub(crate) message: String,
+    pub(crate) usage: Option<Usage>,
+    pub(crate) speed_failover: Option<SpeedFailoverDiagnostics>,
+}
+
+impl std::fmt::Display for FixGenerationErrorWithUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for FixGenerationErrorWithUsage {}
+
 const PYTHON_IMPLEMENTATION_GUARDRAILS: &str = "\
 Python guardrails:
 - If you reference a module, import it.
@@ -568,6 +586,7 @@ pub async fn generate_fix_content_with_model(
 
     let mut combined_usage: Option<Usage> = None;
     let mut last_apply_err: Option<String> = None;
+    let mut last_speed_failover: Option<SpeedFailoverDiagnostics> = None;
     // Prefer excerpt-first to keep costs bounded; escalate to full-file prompt only after a
     // retryable edit-apply failure.
     let mut prefer_full_prompt = false;
@@ -602,6 +621,7 @@ pub async fn generate_fix_content_with_model(
         .await?;
         combined_usage = merge_usage(combined_usage, response.usage.clone());
         let speed_failover = response.speed_failover.clone();
+        last_speed_failover = speed_failover.clone();
 
         let description = response
             .data
@@ -616,7 +636,11 @@ pub async fn generate_fix_content_with_model(
                 last_apply_err = Some(message);
                 continue;
             }
-            return Err(anyhow::anyhow!(message));
+            return Err(anyhow::Error::new(FixGenerationErrorWithUsage {
+                message,
+                usage: combined_usage.clone(),
+                speed_failover,
+            }));
         }
 
         let anchor_line = plan
@@ -631,7 +655,11 @@ pub async fn generate_fix_content_with_model(
             Ok(new_content) => {
                 let new_content = normalize_generated_content(content, new_content, is_new_file);
                 if new_content.trim().is_empty() {
-                    return Err(anyhow::anyhow!("Generated content is empty"));
+                    return Err(anyhow::Error::new(FixGenerationErrorWithUsage {
+                        message: "Generated content is empty".to_string(),
+                        usage: combined_usage.clone(),
+                        speed_failover,
+                    }));
                 }
                 return Ok(AppliedFix {
                     description,
@@ -654,12 +682,20 @@ pub async fn generate_fix_content_with_model(
                     }
                     continue;
                 }
-                return Err(err);
+                return Err(anyhow::Error::new(FixGenerationErrorWithUsage {
+                    message,
+                    usage: combined_usage.clone(),
+                    speed_failover,
+                }));
             }
         }
     }
 
-    Err(anyhow::anyhow!("Failed to generate applyable edits"))
+    Err(anyhow::Error::new(FixGenerationErrorWithUsage {
+        message: "Failed to generate applyable edits".to_string(),
+        usage: combined_usage,
+        speed_failover: last_speed_failover,
+    }))
 }
 
 /// Generate fixed code content using the default high-capability model.
@@ -781,15 +817,58 @@ pub(crate) fn apply_edits_with_context(
             }
         }
 
+        let target_excerpt = context_label_target_line(context_label)
+            .and_then(|line| snippet_around_line_for_error(&new_content, line, 6))
+            .map(|snippet| {
+                format!(
+                    "\n\nTarget window excerpt (copy old_string from here):\n```\n{}\n```",
+                    snippet
+                )
+            })
+            .unwrap_or_default();
+
         return Err(anyhow::anyhow!(
-            "Edit {}: old_string not found in {}. The LLM may have made an error.\nSearched for: {:?}",
+            "Edit {}: old_string not found in {}. The LLM may have made an error.\nSearched for: {:?}{}",
             i + 1,
             context_label,
-            truncate_for_error(&edit.old_string)
+            truncate_for_error(&edit.old_string),
+            target_excerpt
         ));
     }
 
     Ok(new_content)
+}
+
+fn context_label_target_line(context_label: &str) -> Option<usize> {
+    let needle = "target around line ";
+    let idx = context_label.find(needle)?;
+    let rest = &context_label[idx + needle.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<usize>().ok()
+}
+
+fn snippet_around_line_for_error(
+    content: &str,
+    line: usize,
+    context_lines: usize,
+) -> Option<String> {
+    if line == 0 {
+        return None;
+    }
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let idx = line.saturating_sub(1);
+    if idx >= lines.len() {
+        return None;
+    }
+    let start = idx.saturating_sub(context_lines);
+    let end = (idx + context_lines + 1).min(lines.len());
+    Some(lines[start..end].join("\n"))
 }
 
 enum MatchRange {
@@ -1110,6 +1189,7 @@ pub async fn generate_multi_file_fix_with_model(
 
     let mut combined_usage: Option<Usage> = None;
     let mut last_apply_err: Option<String> = None;
+    let mut last_speed_failover: Option<SpeedFailoverDiagnostics> = None;
     // Prefer excerpt-first; only allow full prompt if it is reasonably sized.
     let allow_full_prompt = files_section_full.chars().count() <= MAX_MULTI_FILE_EXCERPT_CHARS;
     let mut prefer_full_prompt = false;
@@ -1144,6 +1224,7 @@ pub async fn generate_multi_file_fix_with_model(
         .await?;
         combined_usage = merge_usage(combined_usage, response.usage.clone());
         let speed_failover = response.speed_failover.clone();
+        last_speed_failover = speed_failover.clone();
 
         let description = response
             .data
@@ -1157,7 +1238,11 @@ pub async fn generate_multi_file_fix_with_model(
                 last_apply_err = Some(message);
                 continue;
             }
-            return Err(anyhow::anyhow!(message));
+            return Err(anyhow::Error::new(FixGenerationErrorWithUsage {
+                message,
+                usage: combined_usage.clone(),
+                speed_failover,
+            }));
         }
 
         let mut file_edits = Vec::new();
@@ -1220,7 +1305,11 @@ pub async fn generate_multi_file_fix_with_model(
                 }
                 continue;
             }
-            return Err(err);
+            return Err(anyhow::Error::new(FixGenerationErrorWithUsage {
+                message,
+                usage: combined_usage.clone(),
+                speed_failover,
+            }));
         }
 
         return Ok(MultiFileAppliedFix {
@@ -1231,9 +1320,11 @@ pub async fn generate_multi_file_fix_with_model(
         });
     }
 
-    Err(anyhow::anyhow!(
-        "Failed to generate applyable multi-file edits"
-    ))
+    Err(anyhow::Error::new(FixGenerationErrorWithUsage {
+        message: "Failed to generate applyable multi-file edits".to_string(),
+        usage: combined_usage,
+        speed_failover: last_speed_failover,
+    }))
 }
 
 /// Generate coordinated fixes across multiple files with the default model.
