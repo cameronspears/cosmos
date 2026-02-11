@@ -63,7 +63,7 @@ const MAX_MULTI_FILE_EXCERPT_CHARS: usize = 60000;
 // Keep internal edit-apply retries bounded and cheap. The harness itself already retries
 // whole attempts with feedback and strict gates, so large internal loops here can bypass
 // practical per-attempt budget expectations.
-const MAX_EDIT_REPAIR_ATTEMPTS: usize = 2;
+const MAX_EDIT_REPAIR_ATTEMPTS: usize = 3;
 
 const MAX_FIX_RESPONSE_TOKENS_SPEED: u32 = 4096;
 const MAX_MULTI_FILE_FIX_RESPONSE_TOKENS_SPEED: u32 = 6144;
@@ -805,11 +805,34 @@ fn old_string_looks_like_placeholder(old_string: &str) -> bool {
     false
 }
 
+fn old_string_is_delimiter_only(old_string: &str) -> bool {
+    let text = old_string.trim();
+    if text.is_empty() {
+        return false;
+    }
+    // Reject ultra-generic delimiter-only anchors (for example just "}" or "};"),
+    // which are almost always ambiguous and lead to non-deterministic edits.
+    text.chars().all(|c| {
+        c.is_ascii_whitespace()
+            || matches!(
+                c,
+                '{' | '}' | '(' | ')' | '[' | ']' | '<' | '>' | ';' | ',' | ':'
+            )
+    })
+}
+
 fn validate_edits_for_apply(edits: &[EditOp], context_label: &str) -> anyhow::Result<()> {
     for (i, edit) in edits.iter().enumerate() {
         if old_string_looks_like_placeholder(&edit.old_string) {
             return Err(anyhow::anyhow!(
                 "Edit {}: old_string contains placeholder ellipsis in {}. Copy exact code; do not use `...` or `…`.",
+                i + 1,
+                context_label
+            ));
+        }
+        if old_string_is_delimiter_only(&edit.old_string) {
+            return Err(anyhow::anyhow!(
+                "Edit {}: old_string is too generic in {} (delimiter-only). Use a larger unique anchor with nearby code context.",
                 i + 1,
                 context_label
             ));
@@ -854,13 +877,16 @@ pub(crate) fn apply_edits_with_context(
             }
             MatchRange::Many(count) => {
                 let contexts = match_contexts_for_error(&new_content, &edit.old_string, 2);
+                let target_hint =
+                    target_line_disambiguation_hint(&new_content, &edit.old_string, context_label);
                 return Err(anyhow::anyhow!(
-                    "Edit {}: old_string matches {} times in {} (must be unique). Need more context.\nSearched for: {:?}{}{}",
+                    "Edit {}: old_string matches {} times in {} (must be unique). Need more context.\nSearched for: {:?}{}{}{}",
                     i + 1,
                     count,
                     context_label,
                     truncate_for_error(&edit.old_string),
                     contexts,
+                    target_hint,
                     target_excerpt
                 ));
             }
@@ -878,13 +904,16 @@ pub(crate) fn apply_edits_with_context(
                 }
                 MatchRange::Many(count) => {
                     let contexts = match_contexts_for_error(&new_content, &crlf_old, 2);
+                    let target_hint =
+                        target_line_disambiguation_hint(&new_content, &crlf_old, context_label);
                     return Err(anyhow::anyhow!(
-                        "Edit {}: normalized old_string matches {} times in {} (must be unique).\nSearched for: {:?}{}{}",
+                        "Edit {}: normalized old_string matches {} times in {} (must be unique).\nSearched for: {:?}{}{}{}",
                         i + 1,
                         count,
                         context_label,
                         truncate_for_error(&edit.old_string),
                         contexts,
+                        target_hint,
                         target_excerpt
                     ));
                 }
@@ -902,13 +931,16 @@ pub(crate) fn apply_edits_with_context(
                 }
                 MatchRange::Many(count) => {
                     let contexts = match_contexts_for_error(&new_content, trimmed_old, 2);
+                    let target_hint =
+                        target_line_disambiguation_hint(&new_content, trimmed_old, context_label);
                     return Err(anyhow::anyhow!(
-                        "Edit {}: trimmed old_string matches {} times in {} (must be unique).\nSearched for: {:?}{}{}",
+                        "Edit {}: trimmed old_string matches {} times in {} (must be unique).\nSearched for: {:?}{}{}{}",
                         i + 1,
                         count,
                         context_label,
                         truncate_for_error(&edit.old_string),
                         contexts,
+                        target_hint,
                         target_excerpt
                     ));
                 }
@@ -1056,6 +1088,59 @@ fn match_contexts_for_error(content: &str, needle: &str, max_matches: usize) -> 
             line,
             snippet
         ));
+    }
+    out
+}
+
+fn appears_exactly_once(content: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut matches = content.match_indices(needle);
+    matches.next().is_some() && matches.next().is_none()
+}
+
+fn suggest_unique_anchor_near_line(content: &str, line: usize) -> Option<String> {
+    // Expand context around the closest candidate line until the snippet is unique.
+    for context in 1..=10 {
+        let snippet = snippet_around_line_for_error(content, line, context)?;
+        if snippet.trim().is_empty() {
+            continue;
+        }
+        if appears_exactly_once(content, &snippet) {
+            return Some(snippet);
+        }
+    }
+    None
+}
+
+fn target_line_disambiguation_hint(content: &str, needle: &str, context_label: &str) -> String {
+    let Some(target_line) = context_label_target_line(context_label) else {
+        return String::new();
+    };
+    let mut match_lines = content
+        .match_indices(needle)
+        .map(|(start, _)| byte_offset_to_line_number(content, start))
+        .take(64)
+        .collect::<Vec<_>>();
+    if match_lines.is_empty() {
+        return String::new();
+    }
+    match_lines.sort_unstable();
+    let closest_line = match_lines
+        .into_iter()
+        .min_by_key(|line| line.abs_diff(target_line))
+        .unwrap_or(target_line);
+
+    let mut out = format!(
+        "\nClosest match to target line {} is around line {}. Use that occurrence and include nearby lines in old_string.",
+        target_line, closest_line
+    );
+    if let Some(anchor) = suggest_unique_anchor_near_line(content, closest_line) {
+        out.push_str("\n\nSuggested unique old_string anchor near the target:\n```");
+        out.push('\n');
+        out.push_str(&anchor);
+        out.push_str("\n```");
     }
     out
 }
@@ -2237,6 +2322,27 @@ mod tests {
     }
 
     #[test]
+    fn test_target_line_disambiguation_hint_prefers_closest_match() {
+        let content = "\
+fn first() {\n\
+    let span = value;\n\
+    let from = 1;\n\
+}\n\
+\n\
+fn second() {\n\
+    let span = value;\n\
+    let from = 2;\n\
+}\n";
+        let hint = target_line_disambiguation_hint(
+            content,
+            "let span = value;",
+            "file (target around line 7)",
+        );
+        assert!(hint.contains("target line 7"), "{}", hint);
+        assert!(hint.contains("around line 7"), "{}", hint);
+    }
+
+    #[test]
     fn test_validate_edits_rejects_placeholder_ellipsis() {
         let edits = vec![EditOp {
             old_string: "if (ready) { doThing(); ... }".to_string(),
@@ -2253,6 +2359,16 @@ mod tests {
             new_string: "const copy = { ...obj, ok: false };".to_string(),
         }];
         validate_edits_for_apply(&edits, "file").unwrap();
+    }
+
+    #[test]
+    fn test_validate_edits_rejects_delimiter_only_anchor() {
+        let edits = vec![EditOp {
+            old_string: "}".to_string(),
+            new_string: "};".to_string(),
+        }];
+        let err = validate_edits_for_apply(&edits, "file").unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("too generic"));
     }
 
     #[test]

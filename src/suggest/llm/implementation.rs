@@ -96,7 +96,7 @@ impl ImplementationHarnessConfig {
         Self {
             max_attempts: 4,
             max_total_ms: 45_000,
-            max_total_cost_usd: 0.020,
+            max_total_cost_usd: 0.030,
             max_auto_review_fix_loops: 2,
             max_auto_quick_check_fix_loops: 1,
             max_auto_syntax_fix_loops: 1,
@@ -118,7 +118,7 @@ impl ImplementationHarnessConfig {
         // amount of headroom above the *average* elite bars so the harness can finish a repair
         // loop when it is close to done.
         config.max_total_ms = 60_000;
-        config.max_total_cost_usd = 0.020;
+        config.max_total_cost_usd = 0.030;
         // In lab/CI we prefer doing a bit more repair *within* attempt 1 to improve
         // first-attempt pass rate and avoid costly multi-attempt runs.
         config.max_auto_quick_check_fix_loops = 2;
@@ -141,9 +141,9 @@ const MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_RATIO: f64 = 0.15;
 // Conservative buffer to avoid starting an LLM call when we're so close to the budget cap that
 // normal token variance would likely overspend. The harness would rather stop and explain why
 // than silently exceed its configured budget.
-const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MIN: f64 = 0.001;
+const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MIN: f64 = 0.0005;
 const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MAX: f64 = 0.004;
-const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_RATIO: f64 = 0.15;
+const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_RATIO: f64 = 0.10;
 const BUDGET_TIMEOUT_SLACK_MS: u64 = 250;
 const MAX_GENERATION_TIMEOUT_MS: u64 = 35_000;
 const MAX_REVIEW_TIMEOUT_MS: u64 = 25_000;
@@ -253,17 +253,24 @@ fn attempt_budget_weights(max_attempts: usize) -> Vec<f64> {
         return vec![1.0];
     }
     if max_attempts == 2 {
-        // With only two attempts, keep attempt 2 meaningful and give attempt 1 the rest.
-        return vec![0.80, 0.20];
+        // Reserve a meaningful second attempt while prioritizing first-attempt success.
+        return vec![0.75, 0.25];
+    }
+    if max_attempts == 3 {
+        return vec![0.65, 0.25, 0.10];
     }
 
     let mut weights = vec![0.0; max_attempts];
-    weights[0] = 0.70;
-    weights[1] = 0.20;
-    let tail = max_attempts.saturating_sub(2);
-    let per = 0.10 / tail as f64;
+    weights[0] = 0.65;
+    weights[1] = 0.25;
+    weights[2] = 0.08;
+    let tail = max_attempts.saturating_sub(3);
+    if tail == 0 {
+        return weights;
+    }
+    let per = 0.02 / tail as f64;
     for idx in 0..tail {
-        weights[idx + 2] = per;
+        weights[idx + 3] = per;
     }
     weights
 }
@@ -568,10 +575,31 @@ fn parse_colon_error_line_with_message(raw: &str) -> Option<(String, u32, u32, S
     Some((path, line, col, msg))
 }
 
+fn strip_quick_check_subtask_prefix(raw: &str) -> &str {
+    // Common pnpm/yarn stream prefixes:
+    //   . test:lint: <actual line>
+    //   . test:coverage: <actual line>
+    let trimmed = raw.trim();
+    let Some(rest) = trimmed.strip_prefix(". ") else {
+        return trimmed;
+    };
+    let Some(split_idx) = rest.rfind(": ") else {
+        return trimmed;
+    };
+    let (label, tail_with_sep) = rest.split_at(split_idx);
+    if !label
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '-' || c == '_')
+    {
+        return trimmed;
+    }
+    tail_with_sep.trim_start_matches(": ").trim()
+}
+
 fn parse_bracketed_path_line(raw: &str) -> Option<(String, String)> {
     // Example (prettier):
     //   [warn] lib/command.js
-    let trimmed = raw.trim();
+    let trimmed = strip_quick_check_subtask_prefix(raw);
     if trimmed.is_empty() {
         return None;
     }
@@ -586,7 +614,7 @@ fn parse_bracketed_path_line(raw: &str) -> Option<(String, String)> {
 fn parse_python_compileall_error_line(raw: &str) -> Option<String> {
     // Example:
     //   *** Error compiling 'src/foo.py'...
-    let trimmed = raw.trim();
+    let trimmed = strip_quick_check_subtask_prefix(raw);
     if !trimmed.contains("Error compiling") {
         return None;
     }
@@ -600,7 +628,7 @@ fn parse_python_compileall_error_line(raw: &str) -> Option<String> {
 fn parse_python_file_line(raw: &str) -> Option<(String, u32)> {
     // Example:
     //   File "src/foo.py", line 12
-    let trimmed = raw.trim();
+    let trimmed = strip_quick_check_subtask_prefix(raw);
     if !trimmed.starts_with("File ") {
         return None;
     }
@@ -616,7 +644,7 @@ fn parse_python_file_line(raw: &str) -> Option<(String, u32)> {
 fn parse_eslint_detail_line(raw: &str) -> Option<(u32, u32)> {
     // Example:
     //   12:34  error  message...
-    let trimmed = raw.trim();
+    let trimmed = strip_quick_check_subtask_prefix(raw);
     let re = Regex::new(r"^\s*(?P<line>\d+):(?P<col>\d+)\s+(?:error|warning)\b").ok()?;
     let caps = re.captures(trimmed)?;
     let line = caps.name("line")?.as_str().parse::<u32>().ok()?;
@@ -757,17 +785,18 @@ fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Opti
     // JS quick checks often fail with actionable sub-tool output (eslint / size-limit), but the
     // overall runner exit line (e.g. ELIFECYCLE) is not helpful. Prefer the actionable detail.
     fn strip_test_prefix(line: &str) -> &str {
-        let trimmed = line.trim();
-        let prefixes = [". test:size:", ". test:lint:", ". test:coverage:"];
-        for prefix in prefixes {
-            if let Some(rest) = trimmed.strip_prefix(prefix) {
-                return rest.trim();
-            }
-        }
-        trimmed
+        strip_quick_check_subtask_prefix(line)
     }
     let combined = format!("{}\n{}", stderr, stdout);
     let mut parts: Vec<String> = Vec::new();
+    if let Some(line) = combined.lines().map(str::trim).find(|l| {
+        let lower = l.to_ascii_lowercase();
+        lower.contains("coverage for lines")
+            && lower.contains("does not meet")
+            && lower.contains("threshold")
+    }) {
+        parts.push(strip_test_prefix(line).to_string());
+    }
     if let Some(line) = combined.lines().map(str::trim).find(|l| {
         l.to_ascii_lowercase()
             .contains("package size limit has exceeded")
@@ -1115,7 +1144,9 @@ fn extract_quick_check_error_paths(
 
     let combined_lines = combined.lines().map(str::trim).collect::<Vec<_>>();
     for (idx, line) in combined_lines.iter().enumerate() {
-        if let Some((_tag, file)) = parse_bracketed_path_line(line) {
+        let normalized = strip_quick_check_subtask_prefix(line);
+
+        if let Some((_tag, file)) = parse_bracketed_path_line(normalized) {
             if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 if seen.insert(path.clone()) {
                     out.push(path);
@@ -1123,7 +1154,7 @@ fn extract_quick_check_error_paths(
             }
         }
 
-        if let Some(file) = parse_python_compileall_error_line(line) {
+        if let Some(file) = parse_python_compileall_error_line(normalized) {
             if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 if seen.insert(path.clone()) {
                     out.push(path);
@@ -1131,7 +1162,7 @@ fn extract_quick_check_error_paths(
             }
         }
 
-        if let Some((file, _ln)) = parse_python_file_line(line) {
+        if let Some((file, _ln)) = parse_python_file_line(normalized) {
             if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 if seen.insert(path.clone()) {
                     out.push(path);
@@ -1140,8 +1171,8 @@ fn extract_quick_check_error_paths(
         }
 
         // ESLint often prints the file path on its own line followed by `line:col  error ...`.
-        if !line.contains(':') {
-            if let Some(path) = normalize_quick_check_path_in_repo(line, repo_root) {
+        if !normalized.contains(':') {
+            if let Some(path) = normalize_quick_check_path_in_repo(normalized, repo_root) {
                 let ext = path
                     .extension()
                     .and_then(|ext| ext.to_str())
@@ -1150,7 +1181,9 @@ fn extract_quick_check_error_paths(
                 if matches!(ext.as_str(), "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs") {
                     if combined_lines
                         .get(idx + 1)
-                        .and_then(|next| parse_eslint_detail_line(next))
+                        .and_then(|next| {
+                            parse_eslint_detail_line(strip_quick_check_subtask_prefix(next))
+                        })
                         .is_some()
                         && seen.insert(path.clone())
                     {
@@ -1186,7 +1219,9 @@ fn extract_quick_check_error_locations(
         Regex::new(r"^\s*at\s+(?P<path>[^\s()]+?\.[A-Za-z0-9]+):(?P<line>\d+):(?P<col>\d+)\b").ok();
 
     for raw in combined_lines.iter().copied() {
-        if let Some((file, ln, col, _msg)) = parse_tsc_error_line(raw) {
+        let normalized = strip_quick_check_subtask_prefix(raw);
+
+        if let Some((file, ln, col, _msg)) = parse_tsc_error_line(normalized) {
             if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 let key = (path.clone(), ln, col);
                 if seen.insert(key.clone()) {
@@ -1196,7 +1231,7 @@ fn extract_quick_check_error_locations(
             continue;
         }
 
-        if let Some((file, ln, col, _msg)) = parse_colon_error_line_with_message(raw) {
+        if let Some((file, ln, col, _msg)) = parse_colon_error_line_with_message(normalized) {
             if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 let key = (path.clone(), ln, col);
                 if seen.insert(key.clone()) {
@@ -1207,7 +1242,7 @@ fn extract_quick_check_error_locations(
         }
 
         // Rust-style location lines: `--> path:line:col`
-        if let Some((file, ln, col)) = parse_rust_location_line(raw) {
+        if let Some((file, ln, col)) = parse_rust_location_line(normalized) {
             if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 let key = (path.clone(), ln, col);
                 if seen.insert(key.clone()) {
@@ -1218,7 +1253,7 @@ fn extract_quick_check_error_locations(
         }
 
         // Next.js style: `./path/file.ts:line:col` (message may be on the next line)
-        if let Some((file, ln, col)) = parse_path_line_col(raw) {
+        if let Some((file, ln, col)) = parse_path_line_col(normalized) {
             if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 let key = (path.clone(), ln, col);
                 if seen.insert(key.clone()) {
@@ -1230,7 +1265,7 @@ fn extract_quick_check_error_locations(
 
         // Node/Vitest/Jest stack traces: `at fn (path:line:col)` or `at path:line:col`.
         if let Some(re) = stack_paren_re.as_ref() {
-            if let Some(caps) = re.captures(raw) {
+            if let Some(caps) = re.captures(normalized) {
                 let file = caps.name("path").map(|m| m.as_str()).unwrap_or_default();
                 if let (Some(path), Ok(ln), Ok(col)) = (
                     normalize_stack_trace_path_in_repo(file, repo_root),
@@ -1252,7 +1287,7 @@ fn extract_quick_check_error_locations(
             }
         }
         if let Some(re) = stack_simple_re.as_ref() {
-            if let Some(caps) = re.captures(raw) {
+            if let Some(caps) = re.captures(normalized) {
                 let file = caps.name("path").map(|m| m.as_str()).unwrap_or_default();
                 if let (Some(path), Ok(ln), Ok(col)) = (
                     normalize_stack_trace_path_in_repo(file, repo_root),
@@ -1274,7 +1309,7 @@ fn extract_quick_check_error_locations(
             }
         }
 
-        if let Some((file, ln)) = parse_python_file_line(raw) {
+        if let Some((file, ln)) = parse_python_file_line(normalized) {
             if let Some(path) = normalize_quick_check_path_in_repo(&file, repo_root) {
                 // Python compile errors don't always include a column.
                 let key = (path.clone(), ln, 1);
@@ -1286,8 +1321,8 @@ fn extract_quick_check_error_locations(
         }
 
         // ESLint path header line (relative path only)
-        if !raw.contains(':') {
-            if let Some(path) = normalize_quick_check_path_in_repo(raw, repo_root) {
+        if !normalized.contains(':') {
+            if let Some(path) = normalize_quick_check_path_in_repo(normalized, repo_root) {
                 let ext = path
                     .extension()
                     .and_then(|ext| ext.to_str())
@@ -1300,7 +1335,7 @@ fn extract_quick_check_error_locations(
             }
         }
 
-        if let Some((ln, col)) = parse_eslint_detail_line(raw) {
+        if let Some((ln, col)) = parse_eslint_detail_line(normalized) {
             if let Some(path) = current_eslint_file.clone() {
                 let key = (path.clone(), ln, col);
                 if seen.insert(key.clone()) {
@@ -1310,7 +1345,7 @@ fn extract_quick_check_error_locations(
             continue;
         }
 
-        if raw.is_empty() {
+        if normalized.is_empty() {
             current_eslint_file = None;
         }
     }
@@ -1362,11 +1397,33 @@ fn quick_check_read_only_context_excerpt(
     None
 }
 
+fn quick_check_target_context_excerpt(
+    sandbox_root: &Path,
+    outcome: &ImplementationCommandOutcome,
+    target: &Path,
+    content: &str,
+) -> Option<String> {
+    extract_quick_check_error_locations(outcome, sandbox_root)
+        .into_iter()
+        .find(|(path, _, _)| path == target)
+        .and_then(|(path, ln, _)| {
+            snippet_around_line(content, ln, 8).map(|snippet| {
+                format!(
+                    "Focused context near the reported quick-check error in this file:\n- Location: {}:{}\n```\n{}\n```",
+                    path.display(),
+                    ln,
+                    snippet
+                )
+            })
+        })
+}
+
 fn format_quick_check_repair_modifier(
     existing: Option<&str>,
     error_summary: &str,
     outcome: &ImplementationCommandOutcome,
     target: &Path,
+    target_context_excerpt: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
     if let Some(existing) = existing {
@@ -1412,6 +1469,12 @@ fn format_quick_check_repair_modifier(
             .map(|excerpt| format!("- Quick-check output (truncated):\n{}", excerpt))
             .unwrap_or_default(),
     ));
+    if let Some(excerpt) = target_context_excerpt {
+        let excerpt = excerpt.trim();
+        if !excerpt.is_empty() {
+            parts.push(excerpt.to_string());
+        }
+    }
     parts.join("\n\n")
 }
 
@@ -2818,11 +2881,18 @@ async fn run_attempt(
             let error_summary = quick_check_failure_summary
                 .as_deref()
                 .unwrap_or("Quick checks failed");
+            let target_context_excerpt = quick_check_target_context_excerpt(
+                sandbox.path(),
+                outcome,
+                &target,
+                &current_content,
+            );
             repair_preview.modifier = Some(format_quick_check_repair_modifier(
                 feedback_preview.modifier.as_deref(),
                 error_summary,
                 outcome,
                 &target,
+                target_context_excerpt.as_deref(),
             ));
             if !is_new_file {
                 if let Some((_, ln, _col)) =
@@ -3606,11 +3676,18 @@ async fn run_attempt(
                 let error_summary = quick_check_failure_summary
                     .as_deref()
                     .unwrap_or("Quick checks failed");
+                let target_context_excerpt = quick_check_target_context_excerpt(
+                    sandbox.path(),
+                    outcome,
+                    &target,
+                    &current_content,
+                );
                 repair_preview.modifier = Some(format_quick_check_repair_modifier(
                     feedback_preview.modifier.as_deref(),
                     error_summary,
                     outcome,
                     &target,
+                    target_context_excerpt.as_deref(),
                 ));
                 if !is_new_file {
                     if let Some((_, ln, _col)) =
@@ -3992,8 +4069,44 @@ async fn run_attempt(
     // scope or exceeded budgets during review/repair loops.
     let final_repo_changes = collect_repo_changes(sandbox.path())?;
     let mut final_repo_files = final_repo_changes.files;
+    if final_repo_files.is_empty() && !final_changed_files.is_empty() {
+        // git status can occasionally miss transient changes in heavily scripted repos.
+        // Fall back to our tracked changed-file set so scope/diff gates stay deterministic.
+        notes.push("final_change_detection_fallback_used".to_string());
+        final_repo_files = final_changed_files.clone();
+    }
     final_repo_files.sort();
     final_changed_files = final_repo_files.clone();
+
+    let non_empty_diff_final = !final_changed_files.is_empty();
+    upsert_gate(
+        &mut gates,
+        "non_empty_diff",
+        non_empty_diff_final,
+        if non_empty_diff_final {
+            "Code changes detected".to_string()
+        } else {
+            "No file changes produced".to_string()
+        },
+        if non_empty_diff_final {
+            None
+        } else {
+            Some(REASON_NON_EMPTY_DIFF)
+        },
+    );
+    if !non_empty_diff_final
+        && !fail_reason_records
+            .iter()
+            .any(|r| r.code == REASON_NON_EMPTY_DIFF)
+    {
+        push_fail_reason(
+            &mut fail_reasons,
+            &mut fail_reason_records,
+            "non_empty_diff",
+            REASON_NON_EMPTY_DIFF,
+            "Attempt produced no code changes",
+        );
+    }
 
     let scope_ok_final = deterministic_scope_gate(&final_changed_files, allowed_files);
     upsert_gate(
@@ -4375,11 +4488,15 @@ fn collect_repo_changes(repo_root: &Path) -> anyhow::Result<RepoChanges> {
         .chain(status.modified.iter())
         .chain(status.untracked.iter())
     {
-        let rel = PathBuf::from(path);
+        let Some(rel) = normalize_repo_change_path(path) else {
+            continue;
+        };
         files.insert(rel.clone());
     }
     for path in &status.untracked {
-        untracked.insert(PathBuf::from(path));
+        if let Some(rel) = normalize_repo_change_path(path) {
+            untracked.insert(rel);
+        }
     }
     Ok(RepoChanges {
         files: files.into_iter().collect::<Vec<_>>(),
@@ -4387,11 +4504,22 @@ fn collect_repo_changes(repo_root: &Path) -> anyhow::Result<RepoChanges> {
     })
 }
 
+fn normalize_repo_change_path(path: &str) -> Option<PathBuf> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == "./" {
+        return None;
+    }
+    let normalized = trimmed.trim_start_matches("./");
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(normalized))
+}
+
 fn deterministic_scope_gate(changed_files: &[PathBuf], allowed_files: &HashSet<PathBuf>) -> bool {
-    !changed_files.is_empty()
-        && changed_files
-            .iter()
-            .all(|path| allowed_files.contains(path))
+    changed_files
+        .iter()
+        .all(|path| allowed_files.contains(path))
 }
 
 fn parse_diff_changed_lines(stdout: &str) -> usize {
@@ -5144,18 +5272,24 @@ fn detect_quick_check_command(repo_root: &Path) -> Option<QuickCheckCommand> {
                     for candidate in [
                         "typecheck",
                         "type-check",
+                        "check:type",
+                        "check:type:ts",
+                        "check:type:js",
                         "check",
+                        "check:lint",
+                        "test:lint",
+                        "lint",
                         "test:once",
                         "test",
-                        "lint",
                         "build",
                     ] {
                         let Some(script_value) = scripts.get(candidate) else {
                             continue;
                         };
                         let script_cmd = script_value.as_str().unwrap_or_default();
-                        if should_skip_js_quick_check_script(candidate, script_cmd, deps, dev_deps)
-                        {
+                        if should_skip_js_quick_check_script(
+                            candidate, script_cmd, scripts, deps, dev_deps,
+                        ) {
                             continue;
                         }
                         return Some(js_script_quick_check_command(repo_root, candidate));
@@ -5196,27 +5330,55 @@ fn detect_quick_check_command(repo_root: &Path) -> Option<QuickCheckCommand> {
 fn should_skip_js_quick_check_script(
     script_name: &str,
     script_cmd: &str,
+    scripts: &serde_json::Map<String, serde_json::Value>,
     deps: Option<&serde_json::Map<String, serde_json::Value>>,
     dev_deps: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> bool {
-    if script_name != "lint" {
-        return false;
-    }
-
     let cmd = script_cmd.to_ascii_lowercase();
 
-    // Common footgun: lint script uses `eslint` but the repo doesn't include it as a dependency.
-    // Running it will always fail and makes the harness look unreliable.
-    if cmd.contains("eslint") && !has_js_dep("eslint", deps, dev_deps) {
-        return true;
+    if script_name == "lint" || script_name == "check:lint" || script_name == "test:lint" {
+        // Common footgun: lint script uses `eslint` but the repo doesn't include it as a
+        // dependency. Running it will always fail and makes the harness look unreliable.
+        if cmd.contains("eslint") && !has_js_dep("eslint", deps, dev_deps) {
+            return true;
+        }
+
+        // Next.js v16 removed `next lint`. Some repos still carry a legacy `lint: next lint`
+        // script, which fails with "Invalid project directory .../lint". Prefer other checks.
+        if cmd.contains("next lint") {
+            let next_major = js_dep_major_version("next", deps, dev_deps).unwrap_or(0);
+            if next_major >= 16 {
+                return true;
+            }
+        }
     }
 
-    // Next.js v16 removed `next lint`. Some repos still carry a legacy `lint: next lint` script,
-    // which fails with "Invalid project directory .../lint". Prefer other checks (like build).
-    if cmd.contains("next lint") {
-        let next_major = js_dep_major_version("next", deps, dev_deps).unwrap_or(0);
-        if next_major >= 16 {
-            return true;
+    if script_name == "test" || script_name == "test:once" {
+        let is_heavy_test = cmd.contains("run /^test:/")
+            || cmd.contains("run /test:/")
+            || cmd.contains("c8")
+            || cmd.contains("nyc")
+            || cmd.contains("--coverage")
+            || cmd.contains("coverage")
+            || cmd.contains("bnt");
+        if is_heavy_test {
+            let has_lighter = [
+                "typecheck",
+                "type-check",
+                "check:type",
+                "check:type:ts",
+                "check:type:js",
+                "check",
+                "check:lint",
+                "test:lint",
+                "lint",
+                "build",
+            ]
+            .iter()
+            .any(|name| *name != script_name && scripts.contains_key(*name));
+            if has_lighter {
+                return true;
+            }
         }
     }
 
@@ -5988,6 +6150,33 @@ diff --git a/a.rs b/a.rs
     }
 
     #[test]
+    fn deterministic_scope_gate_allows_empty_changeset() {
+        let changed_files: Vec<PathBuf> = Vec::new();
+        let allowed_files = HashSet::from([PathBuf::from("src/a.rs")]);
+        assert!(deterministic_scope_gate(&changed_files, &allowed_files));
+    }
+
+    #[test]
+    fn normalize_repo_change_path_rejects_empty_and_dot() {
+        assert!(normalize_repo_change_path("").is_none());
+        assert!(normalize_repo_change_path("   ").is_none());
+        assert!(normalize_repo_change_path(".").is_none());
+        assert!(normalize_repo_change_path("./").is_none());
+    }
+
+    #[test]
+    fn normalize_repo_change_path_strips_leading_dot_slash() {
+        assert_eq!(
+            normalize_repo_change_path("./src/main.rs"),
+            Some(PathBuf::from("src/main.rs"))
+        );
+        assert_eq!(
+            normalize_repo_change_path("src/lib.rs"),
+            Some(PathBuf::from("src/lib.rs"))
+        );
+    }
+
+    #[test]
     fn syntax_gate_rejects_parse_broken_outputs() {
         let root = tempdir().unwrap();
         std::fs::write(root.path().join("broken.rs"), "fn broken( {").unwrap();
@@ -6086,6 +6275,35 @@ diff --git a/a.rs b/a.rs
             QuickCheckCommand::Program { program, args } => {
                 assert_eq!(program, "pnpm");
                 assert_eq!(args, vec!["build".to_string()]);
+            }
+            _ => panic!("expected program quick check"),
+        }
+    }
+
+    #[test]
+    fn quick_check_prefers_test_lint_over_heavy_test_aggregator() {
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("pnpm-lock.yaml"), "").unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{
+  "name": "x",
+  "private": true,
+  "scripts": {
+    "test": "pnpm run /^test:/",
+    "test:lint": "eslint .",
+    "test:coverage": "c8 vitest"
+  },
+  "devDependencies": { "eslint": "^9.0.0" }
+}"#,
+        )
+        .unwrap();
+
+        let command = detect_quick_check_command(root.path()).expect("expected check command");
+        match command {
+            QuickCheckCommand::Program { program, args } => {
+                assert_eq!(program, "pnpm");
+                assert_eq!(args, vec!["test:lint".to_string()]);
             }
             _ => panic!("expected program quick check"),
         }
@@ -6288,6 +6506,30 @@ ELIFECYCLE Command failed with exit code 1.\n\
     }
 
     #[test]
+    fn quick_check_failure_summary_extracts_coverage_threshold_failure() {
+        let outcome = ImplementationCommandOutcome {
+            command: "pnpm test".to_string(),
+            duration_ms: 0,
+            success: false,
+            timed_out: false,
+            exit_code: Some(1),
+            stdout_tail: "\
+. test:coverage: ERROR: Coverage for lines (98.48%) does not meet global threshold (100%)\n\
+ELIFECYCLE Command failed with exit code 1.\n"
+                .to_string(),
+            stderr_tail: String::new(),
+        };
+
+        let summary = summarize_quick_check_failure(&outcome).expect("expected summary");
+        assert!(summary.contains("Coverage for lines"), "{}", summary);
+        assert!(
+            summary.contains("does not meet global threshold"),
+            "{}",
+            summary
+        );
+    }
+
+    #[test]
     fn quick_check_error_path_extraction_handles_multiple_formats_and_rejects_traversal() {
         let outcome = ImplementationCommandOutcome {
             command: "pnpm type-check".to_string(),
@@ -6322,6 +6564,40 @@ ELIFECYCLE Command failed with exit code 1.\n\
         assert!(paths.contains(&PathBuf::from("src/bar.ts")), "{:?}", paths);
         assert!(paths.contains(&PathBuf::from("src/baz.js")), "{:?}", paths);
         assert!(!paths.iter().any(|p| p.is_absolute()), "{:?}", paths);
+    }
+
+    #[test]
+    fn quick_check_error_path_extraction_parses_prefixed_eslint_output() {
+        let root = tempdir().unwrap();
+        let file = root.path().join("index.js");
+        std::fs::write(&file, "const x = 1;\n").unwrap();
+
+        let outcome = ImplementationCommandOutcome {
+            command: "pnpm test".to_string(),
+            duration_ms: 0,
+            success: false,
+            timed_out: false,
+            exit_code: Some(1),
+            stdout_tail: format!(
+                ". test:lint: {}\n. test:lint:   26:5  error  no-undef\n",
+                file.display()
+            ),
+            stderr_tail: String::new(),
+        };
+
+        let paths = extract_quick_check_error_paths(&outcome, root.path());
+        assert!(paths.contains(&PathBuf::from("index.js")), "{:?}", paths);
+
+        let locations = extract_quick_check_error_locations(&outcome, root.path());
+        assert!(
+            locations
+                .iter()
+                .any(|(path, ln, col)| path == &PathBuf::from("index.js")
+                    && *ln == 26
+                    && *col == 5),
+            "{:?}",
+            locations
+        );
     }
 
     #[test]
@@ -6362,9 +6638,10 @@ ELIFECYCLE Command failed with exit code 1.\n\
             max_total_cost_usd: 0.0061,
         };
 
-        // Small attempt budgets should use the minimum buffer ($0.001), not the old fixed $0.004.
+        // Small attempt budgets should scale below the old fixed $0.004 floor.
+        let expected_buffer = 0.0061 * MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_RATIO;
         assert!(
-            (budget.min_remaining_cost_buffer_usd() - 0.001).abs() < f64::EPSILON,
+            (budget.min_remaining_cost_buffer_usd() - expected_buffer).abs() < f64::EPSILON,
             "buffer={}",
             budget.min_remaining_cost_buffer_usd()
         );
@@ -6379,7 +6656,7 @@ ELIFECYCLE Command failed with exit code 1.\n\
         );
 
         let usage_below_buffer = Some(Usage {
-            cost: Some(0.0052), // remaining 0.0009
+            cost: Some(0.00555), // remaining 0.00055
             ..Usage::default()
         });
         assert!(
@@ -6433,15 +6710,15 @@ ELIFECYCLE Command failed with exit code 1.\n\
         };
         let weights = attempt_budget_weights(4);
 
-        // Simulate attempt 1 spending 70% of the total cost budget.
+        // Simulate attempt 1 spending most of the total cost budget.
         let usage_so_far = Some(Usage {
             cost: Some(0.014),
             ..Usage::default()
         });
         let (_ms2, cost2) = compute_attempt_budget_caps(&global_budget, &usage_so_far, 2, &weights);
         assert!(
-            (cost2 - 0.004).abs() < 1e-9,
-            "expected attempt2 cost cap 0.004, got {}",
+            (cost2 - 0.004285714285714286).abs() < 1e-12,
+            "expected attempt2 cost cap ~0.004285714285714286, got {}",
             cost2
         );
     }
@@ -6462,9 +6739,9 @@ ELIFECYCLE Command failed with exit code 1.\n\
         let (attempt_ms, attempt_cost) =
             compute_attempt_budget_caps(&global_budget, &usage_so_far, 3, &weights);
 
-        // Cost floor should use all remaining budget when it is below the meaningful minimum.
+        // Late-attempt budget should still preserve a meaningful slice.
         assert!(
-            (attempt_cost - 0.0021).abs() < 1e-9,
+            (attempt_cost - 0.00168).abs() < 1e-9,
             "attempt_cost={}",
             attempt_cost
         );
