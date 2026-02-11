@@ -29,12 +29,14 @@ pub use implementation::{
     implement_validated_suggestion_with_harness_with_progress, record_harness_finalization_outcome,
     ImplementationAppliedFile, ImplementationAttemptDiagnostics,
     ImplementationFinalizationDiagnostics, ImplementationFinalizationStatus,
-    ImplementationGateSnapshot, ImplementationHarnessConfig, ImplementationQuickCheckStatus,
-    ImplementationRunDiagnostics, ImplementationRunResult,
+    ImplementationGateSnapshot, ImplementationHarnessConfig, ImplementationHarnessRunContext,
+    ImplementationQuickCheckStatus, ImplementationReviewModel, ImplementationRunDiagnostics,
+    ImplementationRunResult,
 };
 pub use models::Usage;
 pub use review::{
-    fix_review_findings, fix_review_findings_with_model, verify_changes, FixContext, ReviewFinding,
+    fix_review_findings, fix_review_findings_with_model, verify_changes,
+    verify_changes_bounded_with_model, FixContext, ReviewFinding,
 };
 pub use summaries::{
     discover_project_context, generate_summaries_for_files, prioritize_files_for_summary,

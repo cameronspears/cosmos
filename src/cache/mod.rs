@@ -542,6 +542,10 @@ pub struct ImplementationHarnessRecord {
     pub finalization_status: String,
     #[serde(default)]
     pub mutation_on_failure: Option<bool>,
+    #[serde(default = "implementation_harness_run_context_default")]
+    pub run_context: String,
+    #[serde(default)]
+    pub independent_review_executed: bool,
     #[serde(default)]
     pub fail_reasons: Vec<String>,
     #[serde(default)]
@@ -549,7 +553,11 @@ pub struct ImplementationHarnessRecord {
 }
 
 fn implementation_harness_schema_version_default() -> u32 {
-    2
+    3
+}
+
+fn implementation_harness_run_context_default() -> String {
+    "interactive".to_string()
 }
 
 impl GroupingAiCache {
@@ -1566,7 +1574,7 @@ mod tests {
         };
         cache.append_suggestion_quality(&quality).unwrap();
         let harness = ImplementationHarnessRecord {
-            schema_version: 2,
+            schema_version: 3,
             timestamp: Utc::now(),
             run_id: "run-1".to_string(),
             suggestion_id: "suggestion-1".to_string(),
@@ -1578,6 +1586,8 @@ mod tests {
             quick_check_status: "passed".to_string(),
             finalization_status: "applied".to_string(),
             mutation_on_failure: Some(false),
+            run_context: "interactive".to_string(),
+            independent_review_executed: false,
             fail_reasons: Vec::new(),
             report_path: None,
         };
@@ -1727,9 +1737,11 @@ mod tests {
             "quick_check_status": "unavailable"
         });
         let parsed: ImplementationHarnessRecord = serde_json::from_value(row).unwrap();
-        assert_eq!(parsed.schema_version, 2);
+        assert_eq!(parsed.schema_version, 3);
         assert_eq!(parsed.finalization_status, "");
         assert!(parsed.mutation_on_failure.is_none());
+        assert_eq!(parsed.run_context, "interactive");
+        assert!(!parsed.independent_review_executed);
         assert!(parsed.report_path.is_none());
     }
 }

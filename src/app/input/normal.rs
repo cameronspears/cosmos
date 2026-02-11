@@ -4,7 +4,9 @@ use crate::app::RuntimeContext;
 use crate::git_ops;
 use crate::suggest;
 use crate::suggest::llm::FixPreview;
-use crate::suggest::llm::{ImplementationAppliedFile, ImplementationFinalizationStatus};
+use crate::suggest::llm::{
+    ImplementationAppliedFile, ImplementationFinalizationStatus, ImplementationHarnessRunContext,
+};
 use crate::suggest::Suggestion;
 use crate::ui::{ActivePanel, App, LoadingState, Overlay, ShipStep, WorkflowStep};
 use crate::util::{hash_bytes, resolve_repo_path_allow_new};
@@ -600,6 +602,8 @@ fn start_apply_for_context(app: &mut App, ctx: &RuntimeContext, apply_ctx: Apply
                                 ImplementationFinalizationStatus::Applied,
                                 Some("Applied passing harness result on fix branch".to_string()),
                                 Some(false),
+                                ImplementationHarnessRunContext::Interactive,
+                                None,
                             );
                             if result.diagnostics.reduced_confidence {
                                 let _ = tx_apply.send(BackgroundMessage::ApplyHarnessReducedConfidence {
@@ -627,6 +631,8 @@ fn start_apply_for_context(app: &mut App, ctx: &RuntimeContext, apply_ctx: Apply
                                 finalize_error.status,
                                 Some(finalize_error.message.clone()),
                                 Some(finalize_error.mutation_on_failure),
+                                ImplementationHarnessRunContext::Interactive,
+                                None,
                             );
                             let _ = tx_apply.send(BackgroundMessage::ApplyHarnessFailed {
                                 summary:
@@ -644,6 +650,8 @@ fn start_apply_for_context(app: &mut App, ctx: &RuntimeContext, apply_ctx: Apply
                         ImplementationFinalizationStatus::FailedBeforeFinalize,
                         Some("Harness did not produce a passing attempt".to_string()),
                         Some(false),
+                        ImplementationHarnessRunContext::Interactive,
+                        None,
                     );
                     let _ = tx_apply.send(BackgroundMessage::ApplyHarnessFailed {
                         summary: result.description,

@@ -63,9 +63,9 @@ const MAX_MULTI_FILE_EXCERPT_CHARS: usize = 60000;
 // Keep internal edit-apply retries bounded and cheap. The harness itself already retries
 // whole attempts with feedback and strict gates, so large internal loops here can bypass
 // practical per-attempt budget expectations.
-const MAX_EDIT_REPAIR_ATTEMPTS: usize = 3;
+const MAX_EDIT_REPAIR_ATTEMPTS: usize = 5;
 
-const MAX_FIX_RESPONSE_TOKENS_SPEED: u32 = 4096;
+const MAX_FIX_RESPONSE_TOKENS_SPEED: u32 = 3072;
 const MAX_MULTI_FILE_FIX_RESPONSE_TOKENS_SPEED: u32 = 6144;
 
 struct PromptContent {
@@ -383,6 +383,7 @@ pub(crate) fn format_edit_apply_repair_guidance(message: &str, code_block_label:
     } else if msg.contains("not found") {
         bullets.push("Your `old_string` does not exist verbatim in the code block.");
         bullets.push("Copy/paste the exact text from the code block, including indentation and line endings.");
+        bullets.push("If the error includes a target-window excerpt, copy your anchor from that excerpt and keep it to the closest relevant function or block.");
         bullets.push("Do not use placeholders, summaries, or ellipses. The match must be exact.");
     } else if msg.contains("empty for non-empty") {
         bullets.push("Do not use an empty `old_string` when the file already has content.");
@@ -659,7 +660,7 @@ pub async fn generate_fix_content_with_model(
         let context_label = anchor_line
             .map(|line| format!("file (target around line {})", line))
             .unwrap_or_else(|| "file".to_string());
-        if let Err(err) = validate_edits_for_apply(&edits, &context_label) {
+        if let Err(err) = validate_edits_for_apply(&edits, &context_label, Some(content)) {
             let message = err.to_string();
             if attempt < MAX_EDIT_REPAIR_ATTEMPTS.max(1) && is_retryable_edit_apply_error(&message)
             {
@@ -821,20 +822,32 @@ fn old_string_is_delimiter_only(old_string: &str) -> bool {
     })
 }
 
-fn validate_edits_for_apply(edits: &[EditOp], context_label: &str) -> anyhow::Result<()> {
+fn validate_edits_for_apply(
+    edits: &[EditOp],
+    context_label: &str,
+    content: Option<&str>,
+) -> anyhow::Result<()> {
     for (i, edit) in edits.iter().enumerate() {
         if old_string_looks_like_placeholder(&edit.old_string) {
+            let target_hint = content
+                .map(|value| target_anchor_hint_for_not_found(value, context_label))
+                .unwrap_or_default();
             return Err(anyhow::anyhow!(
-                "Edit {}: old_string contains placeholder ellipsis in {}. Copy exact code; do not use `...` or `…`.",
+                "Edit {}: old_string contains placeholder ellipsis in {}. Copy exact code; do not use `...` or `…`.\nUse an exact anchor copied from the target file.{}",
                 i + 1,
-                context_label
+                context_label,
+                target_hint
             ));
         }
         if old_string_is_delimiter_only(&edit.old_string) {
+            let target_hint = content
+                .map(|value| target_anchor_hint_for_not_found(value, context_label))
+                .unwrap_or_default();
             return Err(anyhow::anyhow!(
-                "Edit {}: old_string is too generic in {} (delimiter-only). Use a larger unique anchor with nearby code context.",
+                "Edit {}: old_string is too generic in {} (delimiter-only). Use a larger unique anchor with nearby code context.{}",
                 i + 1,
-                context_label
+                context_label,
+                target_hint
             ));
         }
     }
@@ -876,6 +889,14 @@ pub(crate) fn apply_edits_with_context(
                 continue;
             }
             MatchRange::Many(count) => {
+                if let Some((start, end)) = resolve_ambiguous_match_near_target(
+                    &new_content,
+                    &edit.old_string,
+                    context_label,
+                ) {
+                    new_content.replace_range(start..end, &edit.new_string);
+                    continue;
+                }
                 let contexts = match_contexts_for_error(&new_content, &edit.old_string, 2);
                 let target_hint =
                     target_line_disambiguation_hint(&new_content, &edit.old_string, context_label);
@@ -903,6 +924,13 @@ pub(crate) fn apply_edits_with_context(
                     continue;
                 }
                 MatchRange::Many(count) => {
+                    if let Some((start, end)) =
+                        resolve_ambiguous_match_near_target(&new_content, &crlf_old, context_label)
+                    {
+                        let replacement = edit.new_string.replace('\n', "\r\n");
+                        new_content.replace_range(start..end, &replacement);
+                        continue;
+                    }
                     let contexts = match_contexts_for_error(&new_content, &crlf_old, 2);
                     let target_hint =
                         target_line_disambiguation_hint(&new_content, &crlf_old, context_label);
@@ -930,6 +958,14 @@ pub(crate) fn apply_edits_with_context(
                     continue;
                 }
                 MatchRange::Many(count) => {
+                    if let Some((start, end)) = resolve_ambiguous_match_near_target(
+                        &new_content,
+                        trimmed_old,
+                        context_label,
+                    ) {
+                        new_content.replace_range(start..end, &edit.new_string);
+                        continue;
+                    }
                     let contexts = match_contexts_for_error(&new_content, trimmed_old, 2);
                     let target_hint =
                         target_line_disambiguation_hint(&new_content, trimmed_old, context_label);
@@ -948,12 +984,14 @@ pub(crate) fn apply_edits_with_context(
             }
         }
 
+        let target_hint = target_anchor_hint_for_not_found(&new_content, context_label);
         return Err(anyhow::anyhow!(
-            "Edit {}: old_string not found in {}. The LLM may have made an error.\nSearched for: {:?}{}",
+            "Edit {}: old_string not found in {}. The LLM may have made an error.\nSearched for: {:?}{}{}",
             i + 1,
             context_label,
             truncate_for_error(&edit.old_string),
-            target_excerpt
+            target_excerpt,
+            target_hint
         ));
     }
 
@@ -1092,6 +1130,34 @@ fn match_contexts_for_error(content: &str, needle: &str, max_matches: usize) -> 
     out
 }
 
+fn resolve_ambiguous_match_near_target(
+    content: &str,
+    needle: &str,
+    context_label: &str,
+) -> Option<(usize, usize)> {
+    let target_line = context_label_target_line(context_label)?;
+    let mut matches = content
+        .match_indices(needle)
+        .take(128)
+        .map(|(start, matched)| {
+            let line = byte_offset_to_line_number(content, start);
+            let dist = line.abs_diff(target_line);
+            (start, start + matched.len(), dist)
+        })
+        .collect::<Vec<_>>();
+    if matches.len() < 2 {
+        return None;
+    }
+
+    matches.sort_by_key(|(_, _, dist)| *dist);
+    let best = matches[0];
+    let second = matches[1];
+    if best.2 < second.2 {
+        return Some((best.0, best.1));
+    }
+    None
+}
+
 fn appears_exactly_once(content: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
@@ -1143,6 +1209,31 @@ fn target_line_disambiguation_hint(content: &str, needle: &str, context_label: &
         out.push_str("\n```");
     }
     out
+}
+
+fn target_anchor_hint_for_not_found(content: &str, context_label: &str) -> String {
+    let Some(target_line) = context_label_target_line(context_label) else {
+        return String::new();
+    };
+
+    if let Some(anchor) = suggest_unique_anchor_near_line(content, target_line) {
+        return format!(
+            "\n\nSuggested unique old_string anchor near target line {}:\n```\n{}\n```",
+            target_line, anchor
+        );
+    }
+
+    let Some(snippet) = snippet_around_line_for_error(content, target_line, 2) else {
+        return String::new();
+    };
+    if snippet.trim().is_empty() {
+        return String::new();
+    }
+
+    format!(
+        "\n\nTarget vicinity around line {} (copy a verbatim old_string from here):\n```\n{}\n```",
+        target_line, snippet
+    )
 }
 
 pub(crate) fn normalize_generated_content(
@@ -1456,7 +1547,9 @@ pub async fn generate_multi_file_fix_with_model(
             } else {
                 format!("file {}", file_path.display())
             };
-            if let Err(err) = validate_edits_for_apply(&file_edit_json.edits, &context) {
+            if let Err(err) =
+                validate_edits_for_apply(&file_edit_json.edits, &context, Some(&file_input.content))
+            {
                 apply_error = Some(err);
                 break;
             }
@@ -2343,12 +2436,56 @@ fn second() {\n\
     }
 
     #[test]
+    fn test_apply_edits_disambiguates_duplicate_anchor_by_target_line() {
+        let content = "\
+fn first() {\n\
+    let span = value;\n\
+}\n\
+\n\
+fn second() {\n\
+    let span = value;\n\
+}\n";
+        let edits = vec![EditOp {
+            old_string: "    let span = value;".to_string(),
+            new_string: "    let span = next_value;".to_string(),
+        }];
+        let updated =
+            apply_edits_with_context(content, &edits, "file (target around line 6)").unwrap();
+        let first_idx = updated.find("fn first() {").expect("missing first fn");
+        let second_idx = updated.find("fn second() {").expect("missing second fn");
+        let next_idx = updated.find("next_value").expect("missing replacement");
+        assert!(next_idx > second_idx, "{}", updated);
+        let first_block = &updated[first_idx..second_idx];
+        assert!(first_block.contains("span = value;"), "{}", updated);
+        assert_eq!(updated.matches("next_value").count(), 1, "{}", updated);
+    }
+
+    #[test]
+    fn test_apply_edits_disambiguation_requires_unique_closest_match() {
+        let content = "\
+fn a() {\n\
+    let marker = value;\n\
+}\n\
+\n\
+fn b() {\n\
+    let marker = value;\n\
+}\n";
+        let edits = vec![EditOp {
+            old_string: "    let marker = value;".to_string(),
+            new_string: "    let marker = next_value;".to_string(),
+        }];
+        let err =
+            apply_edits_with_context(content, &edits, "file (target around line 4)").unwrap_err();
+        assert!(err.to_string().contains("matches 2 times"), "{}", err);
+    }
+
+    #[test]
     fn test_validate_edits_rejects_placeholder_ellipsis() {
         let edits = vec![EditOp {
             old_string: "if (ready) { doThing(); ... }".to_string(),
             new_string: "if (ready) { doThing(); }".to_string(),
         }];
-        let err = validate_edits_for_apply(&edits, "file").unwrap_err();
+        let err = validate_edits_for_apply(&edits, "file", None).unwrap_err();
         assert!(err.to_string().to_ascii_lowercase().contains("placeholder"));
     }
 
@@ -2358,7 +2495,7 @@ fn second() {\n\
             old_string: "const copy = { ...obj, ok: true };".to_string(),
             new_string: "const copy = { ...obj, ok: false };".to_string(),
         }];
-        validate_edits_for_apply(&edits, "file").unwrap();
+        validate_edits_for_apply(&edits, "file", None).unwrap();
     }
 
     #[test]
@@ -2367,8 +2504,25 @@ fn second() {\n\
             old_string: "}".to_string(),
             new_string: "};".to_string(),
         }];
-        let err = validate_edits_for_apply(&edits, "file").unwrap_err();
+        let err = validate_edits_for_apply(&edits, "file", None).unwrap_err();
         assert!(err.to_string().to_ascii_lowercase().contains("too generic"));
+    }
+
+    #[test]
+    fn test_validate_edits_placeholder_includes_target_hint() {
+        let edits = vec![EditOp {
+            old_string: "...\nvalue".to_string(),
+            new_string: "next\nvalue".to_string(),
+        }];
+        let content = "fn sample() {\n    let value = 1;\n}\n";
+        let err = validate_edits_for_apply(&edits, "file (target around line 2)", Some(content))
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("target line 2") || text.contains("Target vicinity around line 2"),
+            "{}",
+            text
+        );
     }
 
     #[test]

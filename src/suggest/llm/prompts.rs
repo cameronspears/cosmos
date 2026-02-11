@@ -9,6 +9,9 @@ const EDIT_RULES: &str = r#"EDIT RULES:
 - Preserve indentation exactly (spaces/tabs matter)
 - Apply edits in order; each must be unique at application time
 - No line numbers in old_string/new_string
+- No placeholders or ellipses in old_string (never use `...` or `…`)
+- old_string cannot be delimiter-only (forbidden: just braces/tags/commas)
+- Prefer anchors with a nearby identifier/string literal so uniqueness is deterministic
 
 SURGICAL EDITS:
 - Smallest possible change that fixes the issue
@@ -210,7 +213,7 @@ use super::review::FixContext;
 
 /// Shared review output format
 const REVIEW_OUTPUT: &str = r#"OUTPUT (JSON):
-{"summary": "Brief assessment", "pass": true, "findings": [
+{"summary": "Brief assessment", "findings": [
   {"file": "path.rs", "line": 42, "severity": "critical|warning|suggestion", "category": "bug", "title": "Short title", "description": "Plain English explanation", "recommended": true}
 ]}
 
@@ -276,7 +279,7 @@ pub fn review_system_prompt(
         format!(
             r#"RE-REVIEW #{iteration}. Verify fixes work correctly.
 
-PREVIOUSLY FIXED:
+PREVIOUSLY ADDRESSED (may still need follow-up):
 {fixed_list}
 
 VERIFY: 1) Issues actually fixed? 2) New bugs introduced?
@@ -285,7 +288,7 @@ DO NOT REPORT: architecture, infra, unrelated code, style, scope creep
 RECOMMENDED true: fix is broken or introduced clear bug
 RECOMMENDED false: refactoring, nice-to-have, theoretical
 
-After {iteration} rounds, PASS if reasonable. Perfect is enemy of good.
+Do not lower quality standards due to iteration count. If a blocking issue remains, report it.
 
 {review_output}"#,
             iteration = iteration,
@@ -323,7 +326,7 @@ Fix ROOT CAUSE, not symptoms. If finding seems wrong, make smallest safe change.
         format!(
             r#"Fix attempt #{iteration}. Previous fixes didn't fully resolve issues.
 
-PREVIOUSLY FIXED:
+PREVIOUSLY ADDRESSED (may still need follow-up):
 {fixed_list}
 
 Think deeper:
@@ -410,6 +413,22 @@ mod prompt_tests {
         assert!(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Reject unsupported impact claims"),
             "FAST_GROUNDED_SUGGESTIONS_SYSTEM should explicitly reject unsupported impact claims"
+        );
+    }
+
+    #[test]
+    fn edit_rules_include_anchor_guardrails() {
+        assert!(
+            EDIT_RULES.contains("No placeholders or ellipses"),
+            "EDIT_RULES should forbid placeholder anchors"
+        );
+        assert!(
+            EDIT_RULES.contains("delimiter-only"),
+            "EDIT_RULES should reject delimiter-only anchors"
+        );
+        assert!(
+            EDIT_RULES.contains("nearby identifier/string literal"),
+            "EDIT_RULES should encourage deterministic unique anchors"
         );
     }
 }

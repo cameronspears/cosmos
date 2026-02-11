@@ -16,7 +16,8 @@ use cosmos_tui::lab::sandbox::SandboxSession;
 use cosmos_tui::suggest::llm::{
     build_fix_preview_from_validated_suggestion, implement_validated_suggestion_with_harness,
     record_harness_finalization_outcome, run_fast_grounded_with_gate,
-    ImplementationFinalizationStatus, ImplementationHarnessConfig, SuggestionQualityGateConfig,
+    ImplementationFinalizationStatus, ImplementationHarnessConfig, ImplementationHarnessRunContext,
+    ImplementationReviewModel, ImplementationRunDiagnostics, SuggestionQualityGateConfig,
 };
 use cosmos_tui::suggest::{
     Priority, Suggestion, SuggestionEvidenceRef, SuggestionKind, SuggestionSource,
@@ -174,6 +175,24 @@ struct ImplementArgs {
     /// Limit how many enabled repos are used from the corpus manifest.
     #[arg(long)]
     max_repos: Option<usize>,
+    /// Adversarial reviewer model for harness review gate (lab only).
+    #[arg(long, value_enum, default_value_t = ImplementReviewModelArg::Smart)]
+    review_model: ImplementReviewModelArg,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ImplementReviewModelArg {
+    Speed,
+    Smart,
+}
+
+impl From<ImplementReviewModelArg> for ImplementationReviewModel {
+    fn from(value: ImplementReviewModelArg) -> Self {
+        match value {
+            ImplementReviewModelArg::Speed => ImplementationReviewModel::Speed,
+            ImplementReviewModelArg::Smart => ImplementationReviewModel::Smart,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +329,18 @@ struct ImplementRepoReport {
     #[serde(default)]
     quick_check_command: Option<String>,
     #[serde(default)]
+    quick_check_passed_cases: usize,
+    #[serde(default)]
+    quick_check_failed_cases: usize,
+    #[serde(default)]
+    quick_check_unavailable_cases: usize,
+    #[serde(default)]
+    independent_review_required_count: usize,
+    #[serde(default)]
+    independent_review_executed_count: usize,
+    #[serde(default)]
+    independent_review_miss_count: usize,
+    #[serde(default)]
     failure_reason_histogram: HashMap<String, usize>,
     #[serde(default)]
     top_failure_clusters: Vec<FailureCluster>,
@@ -341,6 +372,12 @@ struct ImplementReport {
     syntax_failure_after_pass_rate: Option<f64>,
     #[serde(default)]
     mutation_on_failure_rate: Option<f64>,
+    #[serde(default)]
+    independent_review_required_count: usize,
+    #[serde(default)]
+    independent_review_executed_count: usize,
+    #[serde(default)]
+    independent_review_miss_count: usize,
     #[serde(default)]
     failure_reason_histogram: HashMap<String, usize>,
     #[serde(default)]
@@ -758,12 +795,23 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
     let sandbox_env = SandboxSession::env_overrides();
     let mut notes = Vec::new();
     let fake_mode = fake_implement_enabled();
+    let shadow_gate_blocking = implement_shadow_gates_blocking_enabled();
     let default_sample_size = args.sample_size.max(1);
     let mut repo_reports = Vec::new();
 
     println!("Implement Run ID: {}", run_id);
     println!("Fake mode: {}", fake_mode);
     println!("Default sample size: {}", default_sample_size);
+    println!("Adversarial review model: {:?}", args.review_model);
+    notes.push(format!("Adversarial review model: {:?}", args.review_model));
+    notes.push(format!(
+        "Shadow gate mode: {}",
+        if shadow_gate_blocking {
+            "blocking"
+        } else {
+            "advisory"
+        }
+    ));
 
     #[derive(Debug, Clone)]
     struct ImplementTarget {
@@ -935,6 +983,12 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                     mutation_on_failure_rate: None,
                     quick_check_detected: false,
                     quick_check_command: None,
+                    quick_check_passed_cases: 0,
+                    quick_check_failed_cases: 0,
+                    quick_check_unavailable_cases: 0,
+                    independent_review_required_count: 0,
+                    independent_review_executed_count: 0,
+                    independent_review_miss_count: 0,
                     failure_reason_histogram: HashMap::new(),
                     top_failure_clusters: Vec::new(),
                     results: Vec::new(),
@@ -1066,6 +1120,13 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
         let mut reason_histogram: HashMap<String, usize> = HashMap::new();
         let mut quick_check_detected = false;
         let mut quick_check_command: Option<String> = None;
+        let mut quick_check_passed_cases = 0usize;
+        let mut quick_check_failed_cases = 0usize;
+        let mut quick_check_unavailable_cases = 0usize;
+        let mut independent_review_required_count = 0usize;
+        let mut independent_review_executed_count = 0usize;
+        let mut independent_review_miss_count = 0usize;
+        let mut finalization_telemetry_error_count = 0usize;
 
         for (idx, suggestion) in sampled.into_iter().enumerate() {
             let case_run_id = format!("{}-case-{}", repo_run_id, idx + 1);
@@ -1158,12 +1219,14 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                     },
                 })
             } else {
+                let mut harness_config = ImplementationHarnessConfig::lab_strict();
+                harness_config.adversarial_review_model = args.review_model.into();
                 implement_validated_suggestion_with_harness(
                     case_sandbox.path(),
                     &suggestion,
                     &preview,
                     None,
-                    ImplementationHarnessConfig::lab_strict(),
+                    harness_config,
                 )
                 .await
             };
@@ -1219,7 +1282,7 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                     } else {
                         repo_has_uncommitted_mutations(case_sandbox.path())
                     };
-                    let _ = record_harness_finalization_outcome(
+                    if let Err(error) = record_harness_finalization_outcome(
                         case_sandbox.path(),
                         &mut result.diagnostics,
                         ImplementationFinalizationStatus::FailedBeforeFinalize,
@@ -1228,7 +1291,17 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                                 .to_string(),
                         ),
                         Some(mutation_on_failure),
-                    );
+                        ImplementationHarnessRunContext::Lab,
+                        Some(&cosmos_repo),
+                    ) {
+                        finalization_telemetry_error_count =
+                            finalization_telemetry_error_count.saturating_add(1);
+                        repo_notes.push(format!(
+                            "Failed to write harness finalization telemetry for case {}: {}",
+                            idx + 1,
+                            error
+                        ));
+                    }
                     if let Some(source_report) = result.diagnostics.report_path.clone() {
                         let repo_id_label = target
                             .repo_id
@@ -1273,6 +1346,31 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                     }
                     total_ms_sum += result.diagnostics.total_ms;
                     total_cost_sum += result.diagnostics.total_cost_usd;
+                    if let Some(last_attempt) = result.diagnostics.attempts.last() {
+                        match last_attempt.quick_check_status {
+                            cosmos_tui::suggest::llm::ImplementationQuickCheckStatus::Passed => {
+                                quick_check_passed_cases += 1;
+                            }
+                            cosmos_tui::suggest::llm::ImplementationQuickCheckStatus::Failed => {
+                                quick_check_failed_cases += 1;
+                            }
+                            cosmos_tui::suggest::llm::ImplementationQuickCheckStatus::Unavailable => {
+                                quick_check_unavailable_cases += 1;
+                            }
+                        }
+                    }
+                    if same_model_review_requires_independent(&result.diagnostics) {
+                        independent_review_required_count += 1;
+                        if diagnostics_has_independent_review(&result.diagnostics) {
+                            independent_review_executed_count += 1;
+                        } else {
+                            independent_review_miss_count += 1;
+                            repo_notes.push(format!(
+                                "Case {} passed with same-model review but no independent second-opinion review call was recorded",
+                                idx + 1
+                            ));
+                        }
+                    }
 
                     for attempt in &result.diagnostics.attempts {
                         if let Some(cmd) = attempt
@@ -1401,15 +1499,72 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
             Some(mutation_on_failure_count as f64 / executed_count as f64)
         };
 
-        let repo_passed = implement_gate_passes(
-            pass_rate,
-            first_attempt_pass_rate,
-            avg_total_cost_usd,
-            avg_total_ms,
-            residual_blocking_rate,
-            syntax_failure_after_pass_rate,
-            mutation_on_failure_rate,
-        );
+        let mut repo_passed = if executed_count == 0 {
+            repo_notes.push(
+                "No validated suggestions were sampled for this repo; excluded from repo-level gate evaluation"
+                    .to_string(),
+            );
+            true
+        } else {
+            if executed_count < MIN_REPO_FIRST_ATTEMPT_GATE_SAMPLE_SIZE {
+                repo_notes.push(format!(
+                    "First-attempt gate waived for this repo ({} executed case(s) < {})",
+                    executed_count, MIN_REPO_FIRST_ATTEMPT_GATE_SAMPLE_SIZE
+                ));
+            }
+            implement_repo_gate_passes(
+                executed_count,
+                pass_rate,
+                first_attempt_pass_rate,
+                avg_total_cost_usd,
+                avg_total_ms,
+                residual_blocking_rate,
+                syntax_failure_after_pass_rate,
+                mutation_on_failure_rate,
+            )
+        };
+        if executed_count > 0 && !quick_check_detected {
+            repo_notes.push(format!(
+                "No quick-check command was detected for one or more executed cases; quick-check detectability gate failed ({})",
+                if shadow_gate_blocking {
+                    "blocking"
+                } else {
+                    "advisory shadow gate"
+                }
+            ));
+            if shadow_gate_blocking {
+                repo_passed = false;
+            }
+        }
+        if independent_review_miss_count > 0 {
+            repo_notes.push(format!(
+                "Independent second-opinion review was required for {} same-model pass case(s) but missing in {} case(s) ({})",
+                independent_review_required_count,
+                independent_review_miss_count,
+                if shadow_gate_blocking {
+                    "blocking"
+                } else {
+                    "advisory shadow gate"
+                }
+            ));
+            if shadow_gate_blocking {
+                repo_passed = false;
+            }
+        }
+        if finalization_telemetry_error_count > 0 {
+            repo_notes.push(format!(
+                "Harness telemetry/report finalization failed in {} case(s) ({})",
+                finalization_telemetry_error_count,
+                if args.enforce {
+                    "blocking"
+                } else {
+                    "advisory; set --enforce to fail"
+                }
+            ));
+            if args.enforce {
+                repo_passed = false;
+            }
+        }
 
         let top_failure_clusters = top_failure_clusters(&reason_histogram, 3);
 
@@ -1433,6 +1588,12 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
             mutation_on_failure_rate,
             quick_check_detected,
             quick_check_command,
+            quick_check_passed_cases,
+            quick_check_failed_cases,
+            quick_check_unavailable_cases,
+            independent_review_required_count,
+            independent_review_executed_count,
+            independent_review_miss_count,
             failure_reason_histogram: reason_histogram,
             top_failure_clusters,
             results,
@@ -1504,6 +1665,18 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
                 .count()
         })
         .sum();
+    let independent_review_required_count: usize = repo_reports
+        .iter()
+        .map(|report| report.independent_review_required_count)
+        .sum();
+    let independent_review_executed_count: usize = repo_reports
+        .iter()
+        .map(|report| report.independent_review_executed_count)
+        .sum();
+    let independent_review_miss_count: usize = repo_reports
+        .iter()
+        .map(|report| report.independent_review_miss_count)
+        .sum();
 
     let avg_total_ms = if executed_count == 0 {
         None
@@ -1550,9 +1723,18 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
         syntax_failure_after_pass_rate,
         mutation_on_failure_rate,
     );
+    let independent_review_gate_passed = independent_review_miss_count == 0;
+    if !independent_review_gate_passed {
+        notes.push(format!(
+            "Independent second-opinion gate failed: {} same-model pass case(s) required independent review, {} were recorded",
+            independent_review_required_count, independent_review_executed_count
+        ));
+    }
 
     let all_repos_passed = repo_reports.iter().all(|report| report.passed);
-    let passed = gate_passed && all_repos_passed;
+    let passed = gate_passed
+        && all_repos_passed
+        && (independent_review_gate_passed || !shadow_gate_blocking);
 
     if !all_repos_passed {
         notes.push("At least one repo-level implement gate failed".to_string());
@@ -1578,6 +1760,9 @@ async fn run_implement(args: ImplementArgs) -> Result<()> {
         residual_blocking_rate,
         syntax_failure_after_pass_rate,
         mutation_on_failure_rate,
+        independent_review_required_count,
+        independent_review_executed_count,
+        independent_review_miss_count,
         failure_reason_histogram: global_reason_histogram,
         top_failure_clusters: overall_top_failure_clusters,
         repo_reports,
@@ -1661,6 +1846,36 @@ fn top_failure_clusters(
         .collect()
 }
 
+fn same_model_review_requires_independent(diagnostics: &ImplementationRunDiagnostics) -> bool {
+    diagnostics.passed
+        && diagnostics.attempts.iter().any(|attempt| {
+            attempt.llm_calls.iter().any(|call| {
+                matches!(call.kind.as_str(), "review" | "review_fix" | "rereview")
+                    && call.model == diagnostics.model
+            })
+        })
+}
+
+fn diagnostics_has_independent_review(diagnostics: &ImplementationRunDiagnostics) -> bool {
+    diagnostics.attempts.iter().any(|attempt| {
+        attempt
+            .llm_calls
+            .iter()
+            .any(|call| call.kind == "independent_review")
+    })
+}
+
+fn implement_shadow_gates_blocking_enabled() -> bool {
+    std::env::var("COSMOS_IMPLEMENT_SHADOW_GATES_BLOCKING")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn implement_gate_passes(
     pass_rate: Option<f64>,
     first_attempt_pass_rate: Option<f64>,
@@ -1672,6 +1887,28 @@ fn implement_gate_passes(
 ) -> bool {
     pass_rate.unwrap_or(0.0) >= 0.90
         && first_attempt_pass_rate.unwrap_or(0.0) >= 0.70
+        && avg_total_cost_usd.unwrap_or(f64::MAX) <= 0.015
+        && avg_total_ms.unwrap_or(f64::MAX) <= 35_000.0
+        && residual_blocking_rate.unwrap_or(1.0) == 0.0
+        && syntax_failure_after_pass_rate.unwrap_or(1.0) == 0.0
+        && mutation_on_failure_rate.unwrap_or(1.0) == 0.0
+}
+
+const MIN_REPO_FIRST_ATTEMPT_GATE_SAMPLE_SIZE: usize = 5;
+
+fn implement_repo_gate_passes(
+    executed_count: usize,
+    pass_rate: Option<f64>,
+    first_attempt_pass_rate: Option<f64>,
+    avg_total_cost_usd: Option<f64>,
+    avg_total_ms: Option<f64>,
+    residual_blocking_rate: Option<f64>,
+    syntax_failure_after_pass_rate: Option<f64>,
+    mutation_on_failure_rate: Option<f64>,
+) -> bool {
+    pass_rate.unwrap_or(0.0) >= 0.90
+        && (executed_count < MIN_REPO_FIRST_ATTEMPT_GATE_SAMPLE_SIZE
+            || first_attempt_pass_rate.unwrap_or(0.0) >= 0.70)
         && avg_total_cost_usd.unwrap_or(f64::MAX) <= 0.015
         && avg_total_ms.unwrap_or(f64::MAX) <= 35_000.0
         && residual_blocking_rate.unwrap_or(1.0) == 0.0
@@ -2602,6 +2839,40 @@ mod tests {
     }
 
     #[test]
+    fn repo_gate_waives_first_attempt_threshold_on_tiny_samples() {
+        assert!(implement_repo_gate_passes(
+            2,
+            Some(1.0),
+            Some(0.5),
+            Some(0.01),
+            Some(30_000.0),
+            Some(0.0),
+            Some(0.0),
+            Some(0.0)
+        ));
+        assert!(!implement_repo_gate_passes(
+            2,
+            Some(0.5),
+            Some(0.5),
+            Some(0.01),
+            Some(30_000.0),
+            Some(0.0),
+            Some(0.0),
+            Some(0.0)
+        ));
+        assert!(!implement_repo_gate_passes(
+            MIN_REPO_FIRST_ATTEMPT_GATE_SAMPLE_SIZE,
+            Some(1.0),
+            Some(0.5),
+            Some(0.01),
+            Some(30_000.0),
+            Some(0.0),
+            Some(0.0),
+            Some(0.0)
+        ));
+    }
+
+    #[test]
     fn js_package_manager_detection_prefers_lockfiles_in_expected_order() {
         let root = tempdir().unwrap();
         std::fs::write(root.path().join("pnpm-lock.yaml"), "").unwrap();
@@ -3052,6 +3323,7 @@ edition = "2021"
             corpus_root: None,
             sync: true,
             max_repos: None,
+            review_model: ImplementReviewModelArg::Smart,
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();

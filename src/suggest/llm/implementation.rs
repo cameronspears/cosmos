@@ -5,7 +5,7 @@ use super::fix::{
 };
 use super::models::{merge_usage, Model, Usage};
 use super::review::{
-    fix_review_findings_with_model, verify_changes_bounded, FixContext, ReviewFinding,
+    fix_review_findings_with_model, verify_changes_bounded_with_model, FixContext, ReviewFinding,
 };
 use crate::cache::{Cache, ImplementationHarnessRecord};
 use crate::git_ops;
@@ -36,6 +36,7 @@ const REASON_BLOCKING_REVIEW_RESIDUAL: &str = "blocking_review_residual";
 const REASON_PLAIN_LANGUAGE_FAILURE: &str = "plain_language_failure";
 const REASON_NON_EMPTY_DIFF: &str = "non_empty_diff_violation";
 const REASON_BUDGET_EXCEEDED: &str = "budget_exceeded";
+const NOTE_QUICK_CHECK_FINGERPRINT_PREFIX: &str = "quick_check_failure_fingerprint:";
 const BINARY_FILE_EXTENSIONS: &[&str] = &[
     "7z", "avi", "bmp", "class", "db", "dll", "dylib", "exe", "gif", "gz", "ico", "jar", "jpeg",
     "jpg", "mov", "mp3", "mp4", "ogg", "otf", "pdf", "png", "so", "sqlite", "tar", "tgz", "ttf",
@@ -79,15 +80,57 @@ pub struct ImplementationHarnessConfig {
     pub require_quick_check_detectable: bool,
     pub fail_on_reduced_confidence: bool,
     pub quick_check_fix_requires_in_scope_error: bool,
+    #[serde(default = "default_require_independent_review_on_pass")]
+    pub require_independent_review_on_pass: bool,
+    #[serde(default)]
+    pub adversarial_review_model: ImplementationReviewModel,
 }
 
 fn default_max_auto_syntax_fix_loops() -> usize {
     1
 }
 
+fn default_require_independent_review_on_pass() -> bool {
+    true
+}
+
 impl Default for ImplementationHarnessConfig {
     fn default() -> Self {
         Self::interactive_strict()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplementationReviewModel {
+    #[default]
+    Speed,
+    Smart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplementationHarnessRunContext {
+    #[default]
+    Interactive,
+    Lab,
+}
+
+impl ImplementationHarnessRunContext {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Lab => "lab",
+        }
+    }
+}
+
+impl ImplementationReviewModel {
+    fn as_model(self) -> Model {
+        match self {
+            ImplementationReviewModel::Speed => Model::Speed,
+            ImplementationReviewModel::Smart => Model::Smart,
+        }
     }
 }
 
@@ -109,6 +152,8 @@ impl ImplementationHarnessConfig {
             require_quick_check_detectable: false,
             fail_on_reduced_confidence: false,
             quick_check_fix_requires_in_scope_error: true,
+            require_independent_review_on_pass: true,
+            adversarial_review_model: ImplementationReviewModel::Speed,
         }
     }
 
@@ -119,12 +164,14 @@ impl ImplementationHarnessConfig {
         // loop when it is close to done.
         config.max_total_ms = 60_000;
         config.max_total_cost_usd = 0.030;
-        config.max_auto_review_fix_loops = 3;
+        config.max_auto_review_fix_loops = 4;
         // In lab/CI we prefer doing a bit more repair *within* attempt 1 to improve
         // first-attempt pass rate and avoid costly multi-attempt runs.
-        config.max_auto_quick_check_fix_loops = 2;
+        config.max_auto_quick_check_fix_loops = 3;
         config.require_quick_check_detectable = true;
         config.fail_on_reduced_confidence = true;
+        // Lab strict defaults to an independent reviewer model family for stronger adversarial checks.
+        config.adversarial_review_model = ImplementationReviewModel::Smart;
         config
     }
 }
@@ -142,15 +189,20 @@ const MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_RATIO: f64 = 0.15;
 // Conservative buffer to avoid starting an LLM call when we're so close to the budget cap that
 // normal token variance would likely overspend. The harness would rather stop and explain why
 // than silently exceed its configured budget.
-const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MIN: f64 = 0.0005;
-const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MAX: f64 = 0.004;
-const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_RATIO: f64 = 0.08;
+const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MIN: f64 = 0.00015;
+const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MAX: f64 = 0.003;
+const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_RATIO: f64 = 0.02;
+// Allow a tiny overrun margin for provider-side accounting/rounding jitter so we don't
+// fail otherwise-good attempts on noise-level differences.
+const BUDGET_COST_OVERRUN_TOLERANCE_USD: f64 = 0.00025;
 const BUDGET_TIMEOUT_SLACK_MS: u64 = 250;
 const MAX_GENERATION_TIMEOUT_MS: u64 = 35_000;
 const MAX_REVIEW_TIMEOUT_MS: u64 = 25_000;
 const MAX_FIX_TIMEOUT_MS: u64 = 25_000;
 const MIN_MEANINGFUL_ATTEMPT_MS: u64 = MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_MIN * 3;
-const MIN_MEANINGFUL_ATTEMPT_COST_USD: f64 = MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MIN * 3.0;
+// Late attempts need enough budget for at least one real generation+gate step.
+// Smaller caps create "guaranteed budget failures" where a single call exceeds the cap.
+const MIN_MEANINGFUL_ATTEMPT_COST_USD: f64 = 0.0025;
 
 impl ImplementationBudget {
     fn min_remaining_ms_buffer(&self) -> u64 {
@@ -167,11 +219,13 @@ impl ImplementationBudget {
                     "Stopped to respect the configured time budget ({}ms elapsed; limit {}ms)",
                     elapsed_ms, self.max_total_ms
                 ),
+                action: default_action_for_fail_reason("budget", REASON_BUDGET_EXCEEDED)
+                    .to_string(),
             });
         }
 
         let cost_usd = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
-        if cost_usd >= self.max_total_cost_usd {
+        if cost_usd >= (self.max_total_cost_usd + BUDGET_COST_OVERRUN_TOLERANCE_USD) {
             return Some(ImplementationFailReason {
                 code: REASON_BUDGET_EXCEEDED.to_string(),
                 gate: "budget".to_string(),
@@ -179,6 +233,8 @@ impl ImplementationBudget {
                     "Stopped to respect the configured cost budget (${:0.4} spent; limit ${:0.4})",
                     cost_usd, self.max_total_cost_usd
                 ),
+                action: default_action_for_fail_reason("budget", REASON_BUDGET_EXCEEDED)
+                    .to_string(),
             });
         }
 
@@ -228,6 +284,8 @@ impl ImplementationBudget {
                     "Stopped to respect the configured time budget ({}ms remaining; limit {}ms)",
                     remaining_ms, self.max_total_ms
                 ),
+                action: default_action_for_fail_reason("budget", REASON_BUDGET_EXCEEDED)
+                    .to_string(),
             });
         }
 
@@ -241,11 +299,54 @@ impl ImplementationBudget {
                     "Stopped to respect the configured cost budget (${:0.4} remaining; limit ${:0.4})",
                     remaining_cost, self.max_total_cost_usd
                 ),
+                action: default_action_for_fail_reason("budget", REASON_BUDGET_EXCEEDED)
+                    .to_string(),
             });
         }
 
         None
     }
+}
+
+fn reserve_budget_for_quick_check_repair(
+    budget: &ImplementationBudget,
+    usage: &Option<Usage>,
+    reserve_review_calls: u64,
+) -> Option<ImplementationFailReason> {
+    if let Some(reason) = budget.guard_before_llm_call(usage) {
+        return Some(reason);
+    }
+
+    let calls = reserve_review_calls.max(1);
+    let remaining_ms = budget.remaining_ms();
+    let reserve_ms = MAX_REVIEW_TIMEOUT_MS.saturating_mul(calls);
+    if remaining_ms < reserve_ms {
+        return Some(ImplementationFailReason {
+            code: REASON_BUDGET_EXCEEDED.to_string(),
+            gate: "budget".to_string(),
+            message: format!(
+                "Stopped to preserve review budget before quick-check auto-fix ({}ms remaining; need at least {}ms for review+rereview)",
+                remaining_ms, reserve_ms
+            ),
+            action: default_action_for_fail_reason("budget", REASON_BUDGET_EXCEEDED).to_string(),
+        });
+    }
+
+    let remaining_cost = budget.remaining_cost_usd(usage);
+    let reserve_cost = budget.min_remaining_cost_buffer_usd() * calls as f64;
+    if remaining_cost < reserve_cost {
+        return Some(ImplementationFailReason {
+            code: REASON_BUDGET_EXCEEDED.to_string(),
+            gate: "budget".to_string(),
+            message: format!(
+                "Stopped to preserve review budget before quick-check auto-fix (${:.4} remaining; need at least ${:.4} for review+rereview)",
+                remaining_cost, reserve_cost
+            ),
+            action: default_action_for_fail_reason("budget", REASON_BUDGET_EXCEEDED).to_string(),
+        });
+    }
+
+    None
 }
 
 fn attempt_budget_weights(max_attempts: usize) -> Vec<f64> {
@@ -254,24 +355,23 @@ fn attempt_budget_weights(max_attempts: usize) -> Vec<f64> {
         return vec![1.0];
     }
     if max_attempts == 2 {
-        // Reserve a meaningful second attempt while prioritizing first-attempt success.
-        return vec![0.75, 0.25];
+        // Keep a strong first attempt while preserving a real fallback attempt.
+        return vec![0.80, 0.20];
     }
     if max_attempts == 3 {
-        return vec![0.65, 0.25, 0.10];
+        return vec![0.70, 0.20, 0.10];
     }
 
     let mut weights = vec![0.0; max_attempts];
-    weights[0] = 0.65;
-    weights[1] = 0.25;
-    weights[2] = 0.08;
-    let tail = max_attempts.saturating_sub(3);
+    weights[0] = 0.70;
+    weights[1] = 0.20;
+    let tail = max_attempts.saturating_sub(2);
     if tail == 0 {
         return weights;
     }
-    let per = 0.02 / tail as f64;
+    let per = 0.10 / tail as f64;
     for idx in 0..tail {
-        weights[idx + 3] = per;
+        weights[idx + 2] = per;
     }
     weights
 }
@@ -308,6 +408,78 @@ fn compute_attempt_budget_caps(
     (attempt_ms, attempt_cost)
 }
 
+fn default_action_for_fail_reason(gate: &str, code: &str) -> &'static str {
+    match code {
+        REASON_BUDGET_EXCEEDED => {
+            "Rerun apply with a smaller scoped change or a higher budget for this run."
+        }
+        REASON_QUICK_CHECK_FAILED => {
+            "Fix the quick-check error in the scoped file and rerun apply."
+        }
+        REASON_QUICK_CHECK_UNAVAILABLE => {
+            "Install or enable the required quick-check tool for this repo, then rerun apply."
+        }
+        REASON_SCOPE_VIOLATION => {
+            "Regenerate the fix so it only edits files in the validated scope."
+        }
+        REASON_SYNTAX_VIOLATION => "Fix parse/syntax errors in changed files and rerun apply.",
+        REASON_DIFF_BUDGET_VIOLATION => {
+            "Reduce changed files/lines to stay within scope and rerun apply."
+        }
+        REASON_BLOCKING_REVIEW_RESIDUAL => {
+            "Address blocking review findings in scope and rerun apply."
+        }
+        REASON_PLAIN_LANGUAGE_FAILURE => {
+            "Rewrite the user-facing summary in plain language and rerun apply."
+        }
+        REASON_NON_EMPTY_DIFF => "Generate at least one in-scope file change and rerun apply.",
+        _ if gate == "quick_check" => "Resolve the quick-check issue in scope and rerun apply.",
+        _ => "Review the failure details and rerun apply.",
+    }
+}
+
+fn normalize_fail_reason_message(gate: &str, code: &str, message: &str) -> String {
+    let detail = message.trim();
+    let plain_prefix = match code {
+        REASON_BUDGET_EXCEEDED => {
+            "Cosmos stopped before applying changes because the run budget was exhausted"
+        }
+        REASON_QUICK_CHECK_FAILED => {
+            "Cosmos could not apply this change because project quick checks failed"
+        }
+        REASON_QUICK_CHECK_UNAVAILABLE => {
+            "Cosmos could not run project quick checks in this environment"
+        }
+        REASON_SCOPE_VIOLATION => {
+            "Cosmos stopped because the proposed edit went outside the validated scope"
+        }
+        REASON_SYNTAX_VIOLATION => {
+            "Cosmos stopped because the proposed edit introduced a syntax problem"
+        }
+        REASON_DIFF_BUDGET_VIOLATION => {
+            "Cosmos stopped because the proposed edit exceeded size limits"
+        }
+        REASON_BLOCKING_REVIEW_RESIDUAL => "Cosmos stopped because blocking review issues remained",
+        REASON_PLAIN_LANGUAGE_FAILURE => {
+            "Cosmos stopped because the user-facing description was not plain language"
+        }
+        _ if gate == "review" => "Cosmos stopped because review checks did not pass",
+        _ if gate == "quick_check" => "Cosmos stopped because project quick checks did not pass",
+        _ => "Cosmos stopped before applying changes",
+    };
+
+    if detail.is_empty() {
+        return format!("{}.", plain_prefix);
+    }
+    if detail
+        .to_ascii_lowercase()
+        .starts_with(&plain_prefix.to_ascii_lowercase())
+    {
+        return detail.to_string();
+    }
+    format!("{}. {}", plain_prefix, detail)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ImplementationFinalizationStatus {
@@ -331,6 +503,8 @@ pub struct ImplementationFailReason {
     pub code: String,
     pub gate: String,
     pub message: String,
+    #[serde(default)]
+    pub action: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +522,8 @@ pub struct ImplementationCommandOutcome {
 pub struct ImplementationLlmCallRecord {
     /// Logical stage in the harness attempt ("generation", "review", "review_fix", etc.)
     pub kind: String,
+    #[serde(default)]
+    pub independence_role: Option<String>,
     pub model: String,
     pub timeout_ms: u64,
     #[serde(default)]
@@ -848,9 +1024,8 @@ fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Opti
                 || lower.contains("0 failed")
                 || lower.contains("no errors");
 
+            let is_exit_wrapper = lower.contains("command failed") || lower.contains("elifecycle");
             let high_signal = lower.starts_with("fail")
-                || lower.contains("command failed")
-                || lower.contains("elifecycle")
                 || lower.contains("npm err!")
                 || lower.contains("yarn err!")
                 || lower.contains("err!")
@@ -871,6 +1046,9 @@ fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Opti
             if is_passing {
                 score -= 4;
             }
+            if is_exit_wrapper {
+                score -= 3;
+            }
             if high_signal {
                 score += 10;
             } else if medium_signal {
@@ -882,7 +1060,7 @@ fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Opti
                 best = Some(line);
             }
 
-            if high_signal && !is_passing {
+            if high_signal && !is_passing && !is_exit_wrapper {
                 break;
             }
         }
@@ -932,6 +1110,39 @@ fn quick_check_failure_fingerprint(summary: &str) -> String {
         last_was_space = false;
     }
     out.trim().to_string()
+}
+
+fn quick_check_repair_hint_from_summary(summary: &str) -> Option<String> {
+    let lower = summary.to_ascii_lowercase();
+    if lower.contains("error[e0277]") && lower.contains("`?` operator can only be used") {
+        return Some(
+            "Rust E0277 hint: remove `?` in functions that do not return `Result`/`Option`, or change the function return type to support `?`."
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn note_quick_check_failure_fingerprint(notes: &mut Vec<String>, summary: Option<&str>) {
+    let Some(summary) = summary else {
+        return;
+    };
+    let fingerprint = quick_check_failure_fingerprint(summary);
+    if fingerprint.is_empty() {
+        return;
+    }
+    notes.push(format!(
+        "{}{}",
+        NOTE_QUICK_CHECK_FINGERPRINT_PREFIX, fingerprint
+    ));
+}
+
+fn extract_prefixed_note_value<'a>(notes: &'a [String], prefix: &str) -> Option<&'a str> {
+    notes
+        .iter()
+        .rev()
+        .find_map(|note| note.strip_prefix(prefix).map(str::trim))
+        .filter(|value| !value.is_empty())
 }
 
 fn extract_size_limit_exceeded(outcome: &ImplementationCommandOutcome) -> Vec<(String, u32)> {
@@ -1425,6 +1636,7 @@ fn format_quick_check_repair_modifier(
     outcome: &ImplementationCommandOutcome,
     target: &Path,
     target_context_excerpt: Option<&str>,
+    repair_hint: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
     if let Some(existing) = existing {
@@ -1470,6 +1682,12 @@ fn format_quick_check_repair_modifier(
             .map(|excerpt| format!("- Quick-check output (truncated):\n{}", excerpt))
             .unwrap_or_default(),
     ));
+    if let Some(hint) = repair_hint {
+        let hint = hint.trim();
+        if !hint.is_empty() {
+            parts.push(format!("Compiler-specific hint:\n- {}", hint));
+        }
+    }
     if let Some(excerpt) = target_context_excerpt {
         let excerpt = excerpt.trim();
         if !excerpt.is_empty() {
@@ -1542,7 +1760,29 @@ fn feedback_reasons_for_next_attempt(diag: &ImplementationAttemptDiagnostics) ->
         }
     }
 
+    if let Some(fingerprint) =
+        extract_prefixed_note_value(&diag.notes, NOTE_QUICK_CHECK_FINGERPRINT_PREFIX)
+    {
+        out.push(format!(
+            "The previous quick-check failure repeated the same fingerprint ({}). Use a different in-scope repair approach.",
+            fingerprint
+        ));
+    }
+
     dedup_preserve_order(out)
+}
+
+fn attempt_quick_check_failure_fingerprint(
+    diag: &ImplementationAttemptDiagnostics,
+) -> Option<String> {
+    if let Some(summary) = diag.quick_check_failure_summary.as_deref() {
+        let fingerprint = quick_check_failure_fingerprint(summary);
+        if !fingerprint.is_empty() {
+            return Some(fingerprint);
+        }
+    }
+    extract_prefixed_note_value(&diag.notes, NOTE_QUICK_CHECK_FINGERPRINT_PREFIX)
+        .map(str::to_string)
 }
 
 fn push_gate(
@@ -1583,12 +1823,14 @@ fn push_fail_reason(
     code: &str,
     message: impl Into<String>,
 ) {
-    let msg = message.into();
+    let msg = normalize_fail_reason_message(gate, code, &message.into());
+    let action = default_action_for_fail_reason(gate, code).to_string();
     fail_reasons.push(msg.clone());
     fail_reason_records.push(ImplementationFailReason {
         code: code.to_string(),
         gate: gate.to_string(),
         message: msg,
+        action,
     });
 }
 
@@ -1600,6 +1842,16 @@ fn ensure_implementation_model(model: Model) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn ensure_adversarial_review_model(model: Model) -> anyhow::Result<()> {
+    match model {
+        Model::Speed | Model::Smart => Ok(()),
+        _ => Err(anyhow::anyhow!(
+            "Adversarial review model '{}' is not allowed",
+            model.id()
+        )),
+    }
 }
 
 pub async fn implement_validated_suggestion_with_harness(
@@ -1655,6 +1907,7 @@ where
     let mut attempts = Vec::new();
     let mut pass_payload: Option<AttemptPassPayload> = None;
     let mut feedback_reasons: Vec<String> = Vec::new();
+    let mut last_quick_check_failure_fingerprint: Option<String> = None;
     let mut reduced_confidence = false;
     let allowed_files: HashSet<PathBuf> = suggestion
         .affected_files()
@@ -1723,8 +1976,25 @@ where
             config.max_attempts.max(1),
             &attempt.diagnostics,
         );
+        let current_quick_check_failure_fingerprint =
+            attempt_quick_check_failure_fingerprint(&attempt.diagnostics);
+        let repeated_quick_check_failure = current_quick_check_failure_fingerprint
+            .as_deref()
+            .map(|fp| last_quick_check_failure_fingerprint.as_deref() == Some(fp))
+            .unwrap_or(false);
+        if let Some(fp) = current_quick_check_failure_fingerprint {
+            last_quick_check_failure_fingerprint = Some(fp);
+        }
         if attempt.pass_payload.is_some() {
             pass_payload = attempt.pass_payload;
+            attempts.push(attempt.diagnostics);
+            break;
+        }
+        if repeated_quick_check_failure {
+            feedback_reasons.push(
+                "Quick checks kept failing for the same reason across attempts, so Cosmos stopped to avoid repeating low-value retries."
+                    .to_string(),
+            );
             attempts.push(attempt.diagnostics);
             break;
         }
@@ -2495,6 +2765,7 @@ async fn run_attempt(
                     Ok(Ok(value)) => {
                         llm_calls.push(ImplementationLlmCallRecord {
                             kind: "syntax_repair".to_string(),
+                            independence_role: Some("implementation".to_string()),
                             model: IMPLEMENTATION_MODEL.id().to_string(),
                             timeout_ms: value
                                 .speed_failover
@@ -2522,6 +2793,7 @@ async fn run_attempt(
                         }
                         llm_calls.push(ImplementationLlmCallRecord {
                             kind: "syntax_repair".to_string(),
+                            independence_role: Some("implementation".to_string()),
                             model: IMPLEMENTATION_MODEL.id().to_string(),
                             timeout_ms: speed_failover
                                 .as_ref()
@@ -2545,6 +2817,7 @@ async fn run_attempt(
                     Err(_) => {
                         llm_calls.push(ImplementationLlmCallRecord {
                             kind: "syntax_repair".to_string(),
+                            independence_role: Some("implementation".to_string()),
                             model: IMPLEMENTATION_MODEL.id().to_string(),
                             timeout_ms: repair_timeout_ms,
                             speed_failover: None,
@@ -2745,6 +3018,10 @@ async fn run_attempt(
     if let Some(outcome) = quick_outcome.clone() {
         if quick_status == ImplementationQuickCheckStatus::Failed {
             quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+            note_quick_check_failure_fingerprint(
+                &mut notes,
+                quick_check_failure_summary.as_deref(),
+            );
         } else {
             quick_check_failure_summary = None;
         }
@@ -2759,10 +3036,30 @@ async fn run_attempt(
         let remaining_loops = config
             .max_auto_quick_check_fix_loops
             .saturating_sub(quick_check_fix_loops);
+        if let Some(reason) = reserve_budget_for_quick_check_repair(&attempt_budget, &usage, 2) {
+            notes.push("budget_exceeded".to_string());
+            push_fail_reason(
+                &mut fail_reasons,
+                &mut fail_reason_records,
+                &reason.gate,
+                &reason.code,
+                reason.message.clone(),
+            );
+            push_gate(
+                &mut gates,
+                "budget",
+                false,
+                reason.message,
+                Some(REASON_BUDGET_EXCEEDED),
+            );
+        }
         let mut previous_failure_fingerprint = quick_check_failure_summary
             .as_deref()
             .map(quick_check_failure_fingerprint);
         for _ in 0..remaining_loops {
+            if !fail_reasons.is_empty() {
+                break;
+            }
             let Some(outcome) = quick_outcome.as_ref() else {
                 break;
             };
@@ -2790,9 +3087,9 @@ async fn run_attempt(
             quick_check_fix_loops = quick_check_fix_loops.saturating_add(1);
             notes.push(format!("quick_check_fix_loop_{}", quick_check_fix_loops));
 
-            // Deterministic fast-path: some JS repos fail quick checks solely due to formatting
-            // (Prettier). When that happens, run Prettier on the in-scope target file instead of
-            // spending LLM budget guessing the formatting rules.
+            // Deterministic JS fast-paths: prefer local tool fixes (Prettier/ESLint --fix)
+            // before spending LLM budget on likely formatting/lint-only failures.
+            let mut repaired_by_tool = false;
             if is_prettier_formatting_failure(outcome) {
                 let prettier_timeout_ms = 15_000.min(
                     attempt_budget
@@ -2810,50 +3107,7 @@ async fn run_attempt(
                                 "failed"
                             }
                         ));
-                        if prettier_outcome.success {
-                            final_changed_files =
-                                files_changed_set.iter().cloned().collect::<Vec<_>>();
-                            final_changed_files.sort();
-                            if let Err(err) = syntax_gate(sandbox.path(), &final_changed_files) {
-                                push_fail_reason(
-                                    &mut fail_reasons,
-                                    &mut fail_reason_records,
-                                    "syntax",
-                                    REASON_SYNTAX_VIOLATION,
-                                    err,
-                                );
-                                break;
-                            }
-
-                            let (status, command, outcome) = run_quick_checks(
-                                sandbox.path(),
-                                Some(repo_root),
-                                &mut notes,
-                                config.quick_checks_mode,
-                                config.quick_check_timeout_ms.min(
-                                    attempt_budget
-                                        .remaining_ms()
-                                        .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
-                                        .max(1),
-                                ),
-                            )?;
-                            quick_status = status;
-                            quick_command = command;
-                            quick_outcome = outcome;
-                            if let Some(outcome) = quick_outcome.clone() {
-                                if quick_status == ImplementationQuickCheckStatus::Failed {
-                                    quick_check_failure_summary =
-                                        summarize_quick_check_failure(&outcome);
-                                } else {
-                                    quick_check_failure_summary = None;
-                                }
-                                quick_check_outcomes.push(outcome);
-                            }
-                            if quick_status == ImplementationQuickCheckStatus::Failed {
-                                continue;
-                            }
-                            break;
-                        }
+                        repaired_by_tool = prettier_outcome.success;
                     }
                     Err(err) => {
                         notes.push(format!(
@@ -2862,6 +3116,85 @@ async fn run_attempt(
                         ));
                     }
                 }
+            }
+            if !repaired_by_tool && is_eslint_fixable_failure(outcome) {
+                let eslint_timeout_ms = 15_000.min(
+                    attempt_budget
+                        .remaining_ms()
+                        .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
+                        .max(1),
+                );
+                match run_eslint_fix(sandbox.path(), &target, eslint_timeout_ms) {
+                    Ok(eslint_outcome) => {
+                        notes.push(format!(
+                            "quick_check_eslint_fix_{}",
+                            if eslint_outcome.success {
+                                "ok"
+                            } else {
+                                "failed"
+                            }
+                        ));
+                        repaired_by_tool = eslint_outcome.success;
+                    }
+                    Err(err) => {
+                        notes.push(format!(
+                            "quick_check_eslint_fix_failed: {}",
+                            truncate(&err.to_string(), 180)
+                        ));
+                    }
+                }
+            }
+            if repaired_by_tool {
+                files_changed_set.insert(target.clone());
+                generated
+                    .modified_areas_by_file
+                    .entry(target.clone())
+                    .or_default();
+
+                final_changed_files = files_changed_set.iter().cloned().collect::<Vec<_>>();
+                final_changed_files.sort();
+                if let Err(err) = syntax_gate(sandbox.path(), &final_changed_files) {
+                    push_fail_reason(
+                        &mut fail_reasons,
+                        &mut fail_reason_records,
+                        "syntax",
+                        REASON_SYNTAX_VIOLATION,
+                        err,
+                    );
+                    break;
+                }
+
+                let (status, command, outcome) = run_quick_checks(
+                    sandbox.path(),
+                    Some(repo_root),
+                    &mut notes,
+                    config.quick_checks_mode,
+                    config.quick_check_timeout_ms.min(
+                        attempt_budget
+                            .remaining_ms()
+                            .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
+                            .max(1),
+                    ),
+                )?;
+                quick_status = status;
+                quick_command = command;
+                quick_outcome = outcome;
+                if let Some(outcome) = quick_outcome.clone() {
+                    if quick_status == ImplementationQuickCheckStatus::Failed {
+                        quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+                        note_quick_check_failure_fingerprint(
+                            &mut notes,
+                            quick_check_failure_summary.as_deref(),
+                        );
+                    } else {
+                        quick_check_failure_summary = None;
+                    }
+                    quick_check_outcomes.push(outcome);
+                }
+                if quick_status == ImplementationQuickCheckStatus::Failed {
+                    continue;
+                }
+                break;
             }
 
             if let Some(reason) = attempt_budget.guard_before_llm_call(&usage) {
@@ -2916,12 +3249,19 @@ async fn run_attempt(
                 &target,
                 &current_content,
             );
+            let repair_hint =
+                quick_check_repair_hint_from_summary(error_summary).unwrap_or_default();
             repair_preview.modifier = Some(format_quick_check_repair_modifier(
                 feedback_preview.modifier.as_deref(),
                 error_summary,
                 outcome,
                 &target,
                 target_context_excerpt.as_deref(),
+                if repair_hint.is_empty() {
+                    None
+                } else {
+                    Some(repair_hint.as_str())
+                },
             ));
             if !is_new_file {
                 if let Some((_, ln, _col)) =
@@ -2967,6 +3307,7 @@ async fn run_attempt(
                 Ok(Ok(value)) => {
                     llm_calls.push(ImplementationLlmCallRecord {
                         kind: "quick_check_repair".to_string(),
+                        independence_role: Some("implementation".to_string()),
                         model: IMPLEMENTATION_MODEL.id().to_string(),
                         timeout_ms: value
                             .speed_failover
@@ -2994,6 +3335,7 @@ async fn run_attempt(
                     }
                     llm_calls.push(ImplementationLlmCallRecord {
                         kind: "quick_check_repair".to_string(),
+                        independence_role: Some("implementation".to_string()),
                         model: IMPLEMENTATION_MODEL.id().to_string(),
                         timeout_ms: speed_failover
                             .as_ref()
@@ -3017,6 +3359,7 @@ async fn run_attempt(
                 Err(_) => {
                     llm_calls.push(ImplementationLlmCallRecord {
                         kind: "quick_check_repair".to_string(),
+                        independence_role: Some("implementation".to_string()),
                         model: IMPLEMENTATION_MODEL.id().to_string(),
                         timeout_ms: repair_timeout_ms,
                         speed_failover: None,
@@ -3115,6 +3458,10 @@ async fn run_attempt(
             if let Some(outcome) = quick_outcome.clone() {
                 if quick_status == ImplementationQuickCheckStatus::Failed {
                     quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+                    note_quick_check_failure_fingerprint(
+                        &mut notes,
+                        quick_check_failure_summary.as_deref(),
+                    );
                 } else {
                     quick_check_failure_summary = None;
                 }
@@ -3235,6 +3582,8 @@ async fn run_attempt(
         quick_status,
         quick_command.as_deref(),
         blocking_severities,
+        config.adversarial_review_model.as_model(),
+        config.require_independent_review_on_pass,
         config.max_auto_review_fix_loops,
         &attempt_budget,
         &mut usage,
@@ -3573,6 +3922,10 @@ async fn run_attempt(
     if let Some(outcome) = quick_outcome.clone() {
         if quick_status == ImplementationQuickCheckStatus::Failed {
             quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+            note_quick_check_failure_fingerprint(
+                &mut notes,
+                quick_check_failure_summary.as_deref(),
+            );
         } else {
             quick_check_failure_summary = None;
         }
@@ -3586,10 +3939,30 @@ async fn run_attempt(
         && remaining_quick_check_fix_loops > 0
         && fail_reasons.is_empty();
     if eligible_for_quick_check_repair {
+        if let Some(reason) = reserve_budget_for_quick_check_repair(&attempt_budget, &usage, 2) {
+            notes.push("budget_exceeded".to_string());
+            push_fail_reason(
+                &mut fail_reasons,
+                &mut fail_reason_records,
+                &reason.gate,
+                &reason.code,
+                reason.message.clone(),
+            );
+            push_gate(
+                &mut gates,
+                "budget",
+                false,
+                reason.message,
+                Some(REASON_BUDGET_EXCEEDED),
+            );
+        }
         let mut previous_failure_fingerprint = quick_check_failure_summary
             .as_deref()
             .map(quick_check_failure_fingerprint);
         for _ in 0..remaining_quick_check_fix_loops {
+            if !fail_reasons.is_empty() {
+                break;
+            }
             let Some(outcome) = quick_outcome.as_ref() else {
                 break;
             };
@@ -3617,7 +3990,7 @@ async fn run_attempt(
             quick_check_fix_loops = quick_check_fix_loops.saturating_add(1);
             notes.push(format!("quick_check_fix_loop_{}", quick_check_fix_loops));
 
-            let mut repaired_by_prettier = false;
+            let mut repaired_by_tool = false;
             if is_prettier_formatting_failure(outcome) {
                 let prettier_timeout_ms = 15_000.min(
                     attempt_budget
@@ -3636,7 +4009,7 @@ async fn run_attempt(
                             }
                         ));
                         if prettier_outcome.success {
-                            repaired_by_prettier = true;
+                            repaired_by_tool = true;
                             files_changed_set.insert(target.clone());
                             generated
                                 .modified_areas_by_file
@@ -3652,8 +4025,42 @@ async fn run_attempt(
                     }
                 }
             }
+            if !repaired_by_tool && is_eslint_fixable_failure(outcome) {
+                let eslint_timeout_ms = 15_000.min(
+                    attempt_budget
+                        .remaining_ms()
+                        .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
+                        .max(1),
+                );
+                match run_eslint_fix(sandbox.path(), &target, eslint_timeout_ms) {
+                    Ok(eslint_outcome) => {
+                        notes.push(format!(
+                            "quick_check_eslint_fix_{}",
+                            if eslint_outcome.success {
+                                "ok"
+                            } else {
+                                "failed"
+                            }
+                        ));
+                        if eslint_outcome.success {
+                            repaired_by_tool = true;
+                            files_changed_set.insert(target.clone());
+                            generated
+                                .modified_areas_by_file
+                                .entry(target.clone())
+                                .or_default();
+                        }
+                    }
+                    Err(err) => {
+                        notes.push(format!(
+                            "quick_check_eslint_fix_failed: {}",
+                            truncate(&err.to_string(), 180)
+                        ));
+                    }
+                }
+            }
 
-            if !repaired_by_prettier {
+            if !repaired_by_tool {
                 if let Some(reason) = attempt_budget.guard_before_llm_call(&usage) {
                     notes.push("budget_exceeded".to_string());
                     push_fail_reason(
@@ -3711,12 +4118,19 @@ async fn run_attempt(
                     &target,
                     &current_content,
                 );
+                let repair_hint =
+                    quick_check_repair_hint_from_summary(error_summary).unwrap_or_default();
                 repair_preview.modifier = Some(format_quick_check_repair_modifier(
                     feedback_preview.modifier.as_deref(),
                     error_summary,
                     outcome,
                     &target,
                     target_context_excerpt.as_deref(),
+                    if repair_hint.is_empty() {
+                        None
+                    } else {
+                        Some(repair_hint.as_str())
+                    },
                 ));
                 if !is_new_file {
                     if let Some((_, ln, _col)) =
@@ -3763,6 +4177,7 @@ async fn run_attempt(
                     Ok(Ok(value)) => {
                         llm_calls.push(ImplementationLlmCallRecord {
                             kind: "quick_check_repair".to_string(),
+                            independence_role: Some("implementation".to_string()),
                             model: IMPLEMENTATION_MODEL.id().to_string(),
                             timeout_ms: value
                                 .speed_failover
@@ -3790,6 +4205,7 @@ async fn run_attempt(
                         }
                         llm_calls.push(ImplementationLlmCallRecord {
                             kind: "quick_check_repair".to_string(),
+                            independence_role: Some("implementation".to_string()),
                             model: IMPLEMENTATION_MODEL.id().to_string(),
                             timeout_ms: speed_failover
                                 .as_ref()
@@ -3813,6 +4229,7 @@ async fn run_attempt(
                     Err(_) => {
                         llm_calls.push(ImplementationLlmCallRecord {
                             kind: "quick_check_repair".to_string(),
+                            independence_role: Some("implementation".to_string()),
                             model: IMPLEMENTATION_MODEL.id().to_string(),
                             timeout_ms: repair_timeout_ms,
                             speed_failover: None,
@@ -3913,6 +4330,10 @@ async fn run_attempt(
             if let Some(outcome) = quick_outcome.clone() {
                 if quick_status == ImplementationQuickCheckStatus::Failed {
                     quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+                    note_quick_check_failure_fingerprint(
+                        &mut notes,
+                        quick_check_failure_summary.as_deref(),
+                    );
                 } else {
                     quick_check_failure_summary = None;
                 }
@@ -3948,6 +4369,8 @@ async fn run_attempt(
                 quick_status,
                 quick_command.as_deref(),
                 blocking_severities,
+                config.adversarial_review_model.as_model(),
+                config.require_independent_review_on_pass,
                 config.max_auto_review_fix_loops,
                 &attempt_budget,
                 &mut usage,
@@ -4040,6 +4463,10 @@ async fn run_attempt(
             if let Some(outcome) = quick_outcome.clone() {
                 if quick_status == ImplementationQuickCheckStatus::Failed {
                     quick_check_failure_summary = summarize_quick_check_failure(&outcome);
+                    note_quick_check_failure_fingerprint(
+                        &mut notes,
+                        quick_check_failure_summary.as_deref(),
+                    );
                 } else {
                     quick_check_failure_summary = None;
                 }
@@ -4374,6 +4801,7 @@ async fn generate_attempt_candidate(
             Ok(value) => {
                 llm_calls.push(ImplementationLlmCallRecord {
                     kind: "generation".to_string(),
+                    independence_role: Some("implementation".to_string()),
                     model: IMPLEMENTATION_MODEL.id().to_string(),
                     timeout_ms: value
                         .speed_failover
@@ -4395,6 +4823,7 @@ async fn generate_attempt_candidate(
                     });
                 llm_calls.push(ImplementationLlmCallRecord {
                     kind: "generation".to_string(),
+                    independence_role: Some("implementation".to_string()),
                     model: IMPLEMENTATION_MODEL.id().to_string(),
                     timeout_ms: speed_failover
                         .as_ref()
@@ -4458,6 +4887,7 @@ async fn generate_attempt_candidate(
         Ok(value) => {
             llm_calls.push(ImplementationLlmCallRecord {
                 kind: "generation".to_string(),
+                independence_role: Some("implementation".to_string()),
                 model: IMPLEMENTATION_MODEL.id().to_string(),
                 timeout_ms: value
                     .speed_failover
@@ -4479,6 +4909,7 @@ async fn generate_attempt_candidate(
                 });
             llm_calls.push(ImplementationLlmCallRecord {
                 kind: "generation".to_string(),
+                independence_role: Some("implementation".to_string()),
                 model: IMPLEMENTATION_MODEL.id().to_string(),
                 timeout_ms: speed_failover
                     .as_ref()
@@ -4835,6 +5266,8 @@ async fn run_review_gate(
     quick_check_status: ImplementationQuickCheckStatus,
     quick_check_command: Option<&str>,
     blocking_severities: &HashSet<String>,
+    review_model: Model,
+    require_independent_review_on_pass: bool,
     max_fix_loops: usize,
     budget: &ImplementationBudget,
     usage: &mut Option<Usage>,
@@ -4854,6 +5287,15 @@ async fn run_review_gate(
         build_files_with_content(sandbox_root, old_contents, changed_files)
             .map_err(ReviewGateError::Failed)?;
     let mut iteration = 1u32;
+    let review_fix_context = FixContext {
+        problem_summary: suggestion.summary.clone(),
+        outcome: suggestion
+            .detail
+            .clone()
+            .unwrap_or_else(|| suggestion.summary.clone()),
+        description: description.to_string(),
+        modified_areas: Vec::new(),
+    };
 
     let mut snapshot_blocking = |current_blocking: &[ReviewFinding]| {
         *blocking_remaining = current_blocking.len();
@@ -4878,21 +5320,17 @@ async fn run_review_gate(
     let review_timeout_ms = budget
         .timeout_ms_for_next_llm_call()
         .min(MAX_REVIEW_TIMEOUT_MS);
+    ensure_adversarial_review_model(review_model)
+        .map_err(|e| ReviewGateError::Failed(format!("Review model policy check failed: {}", e)))?;
+
     let review = tokio::time::timeout(
         Duration::from_millis(review_timeout_ms),
-        verify_changes_bounded(
+        verify_changes_bounded_with_model(
             &files_with_content,
             iteration,
             fixed_titles,
-            Some(&FixContext {
-                problem_summary: suggestion.summary.clone(),
-                outcome: suggestion
-                    .detail
-                    .clone()
-                    .unwrap_or_else(|| suggestion.summary.clone()),
-                description: description.to_string(),
-                modified_areas: Vec::new(),
-            }),
+            Some(&review_fix_context),
+            review_model,
             review_timeout_ms,
         ),
     )
@@ -4901,7 +5339,8 @@ async fn run_review_gate(
         Ok(Ok(value)) => {
             llm_calls.push(ImplementationLlmCallRecord {
                 kind: "review".to_string(),
-                model: IMPLEMENTATION_MODEL.id().to_string(),
+                independence_role: Some("adversarial".to_string()),
+                model: review_model.id().to_string(),
                 timeout_ms: value
                     .speed_failover
                     .as_ref()
@@ -4922,7 +5361,8 @@ async fn run_review_gate(
                 });
             llm_calls.push(ImplementationLlmCallRecord {
                 kind: "review".to_string(),
-                model: IMPLEMENTATION_MODEL.id().to_string(),
+                independence_role: Some("adversarial".to_string()),
+                model: review_model.id().to_string(),
                 timeout_ms: speed_failover
                     .as_ref()
                     .map(|d| d.total_timeout_ms)
@@ -4938,7 +5378,8 @@ async fn run_review_gate(
         Err(_) => {
             llm_calls.push(ImplementationLlmCallRecord {
                 kind: "review".to_string(),
-                model: IMPLEMENTATION_MODEL.id().to_string(),
+                independence_role: Some("adversarial".to_string()),
+                model: review_model.id().to_string(),
                 timeout_ms: review_timeout_ms,
                 speed_failover: None,
                 error: Some(format!("Timed out after {}ms", review_timeout_ms)),
@@ -4951,6 +5392,8 @@ async fn run_review_gate(
                     "Stopped to respect the configured time budget (review timed out after {}ms; limit {}ms)",
                     review_timeout_ms, budget.max_total_ms
                 ),
+                action: default_action_for_fail_reason("budget", REASON_BUDGET_EXCEEDED)
+                    .to_string(),
             }));
         }
     };
@@ -5003,8 +5446,8 @@ async fn run_review_gate(
                 ReviewGateError::Failed(format!("Failed reading {}: {}", path.display(), e))
             })?;
             let original = old_contents.get(&path).map(String::as_str);
-            ensure_implementation_model(IMPLEMENTATION_MODEL).map_err(|e| {
-                ReviewGateError::Failed(format!("Implementation model policy check failed: {}", e))
+            ensure_adversarial_review_model(review_model).map_err(|e| {
+                ReviewGateError::Failed(format!("Review model policy check failed: {}", e))
             })?;
             let fix_timeout_ms = budget
                 .timeout_ms_for_next_llm_call()
@@ -5019,7 +5462,7 @@ async fn run_review_gate(
                     repo_memory.clone(),
                     *review_iterations as u32,
                     fixed_titles,
-                    IMPLEMENTATION_MODEL,
+                    review_model,
                     fix_timeout_ms,
                 ),
             )
@@ -5028,7 +5471,8 @@ async fn run_review_gate(
                 Ok(Ok(value)) => {
                     llm_calls.push(ImplementationLlmCallRecord {
                         kind: "review_fix".to_string(),
-                        model: IMPLEMENTATION_MODEL.id().to_string(),
+                        independence_role: Some("adversarial".to_string()),
+                        model: review_model.id().to_string(),
                         timeout_ms: value
                             .speed_failover
                             .as_ref()
@@ -5055,7 +5499,8 @@ async fn run_review_gate(
                     }
                     llm_calls.push(ImplementationLlmCallRecord {
                         kind: "review_fix".to_string(),
-                        model: IMPLEMENTATION_MODEL.id().to_string(),
+                        independence_role: Some("adversarial".to_string()),
+                        model: review_model.id().to_string(),
                         timeout_ms: speed_failover
                             .as_ref()
                             .map(|d| d.total_timeout_ms)
@@ -5085,7 +5530,8 @@ async fn run_review_gate(
                 Err(_) => {
                     llm_calls.push(ImplementationLlmCallRecord {
                         kind: "review_fix".to_string(),
-                        model: IMPLEMENTATION_MODEL.id().to_string(),
+                        independence_role: Some("adversarial".to_string()),
+                        model: review_model.id().to_string(),
                         timeout_ms: fix_timeout_ms,
                         speed_failover: None,
                         error: Some(format!("Timed out after {}ms", fix_timeout_ms)),
@@ -5098,6 +5544,8 @@ async fn run_review_gate(
                             "Stopped to respect the configured time budget (review auto-fix timed out after {}ms; limit {}ms)",
                             fix_timeout_ms, budget.max_total_ms
                         ),
+                        action: default_action_for_fail_reason("budget", REASON_BUDGET_EXCEEDED)
+                            .to_string(),
                     }));
                 }
             };
@@ -5133,11 +5581,12 @@ async fn run_review_gate(
             .min(MAX_REVIEW_TIMEOUT_MS);
         let rereview = tokio::time::timeout(
             Duration::from_millis(rereview_timeout_ms),
-            verify_changes_bounded(
+            verify_changes_bounded_with_model(
                 &files_with_content,
                 iteration,
                 fixed_titles,
                 None,
+                review_model,
                 rereview_timeout_ms,
             ),
         )
@@ -5146,7 +5595,8 @@ async fn run_review_gate(
             Ok(Ok(value)) => {
                 llm_calls.push(ImplementationLlmCallRecord {
                     kind: "rereview".to_string(),
-                    model: IMPLEMENTATION_MODEL.id().to_string(),
+                    independence_role: Some("adversarial".to_string()),
+                    model: review_model.id().to_string(),
                     timeout_ms: value
                         .speed_failover
                         .as_ref()
@@ -5167,7 +5617,8 @@ async fn run_review_gate(
                     });
                 llm_calls.push(ImplementationLlmCallRecord {
                     kind: "rereview".to_string(),
-                    model: IMPLEMENTATION_MODEL.id().to_string(),
+                    independence_role: Some("adversarial".to_string()),
+                    model: review_model.id().to_string(),
                     timeout_ms: speed_failover
                         .as_ref()
                         .map(|d| d.total_timeout_ms)
@@ -5183,7 +5634,8 @@ async fn run_review_gate(
             Err(_) => {
                 llm_calls.push(ImplementationLlmCallRecord {
                     kind: "rereview".to_string(),
-                    model: IMPLEMENTATION_MODEL.id().to_string(),
+                    independence_role: Some("adversarial".to_string()),
+                    model: review_model.id().to_string(),
                     timeout_ms: rereview_timeout_ms,
                     speed_failover: None,
                     error: Some(format!("Timed out after {}ms", rereview_timeout_ms)),
@@ -5196,6 +5648,8 @@ async fn run_review_gate(
                         "Stopped to respect the configured time budget (re-review timed out after {}ms; limit {}ms)",
                         rereview_timeout_ms, budget.max_total_ms
                     ),
+                    action: default_action_for_fail_reason("budget", REASON_BUDGET_EXCEEDED)
+                        .to_string(),
                 }));
             }
         };
@@ -5211,6 +5665,123 @@ async fn run_review_gate(
                 .unwrap_or(false)
         {
             blocking.retain(|finding| !is_probable_compile_error_false_positive(&finding.title));
+        }
+    }
+
+    // If the same model family did implementation and review, require one final independent
+    // pass using Smart before declaring success. This reduces same-model blind spots while
+    // keeping the gate deterministic and bounded.
+    if blocking.is_empty()
+        && require_independent_review_on_pass
+        && review_model == IMPLEMENTATION_MODEL
+    {
+        let independent_model = Model::Smart;
+        ensure_adversarial_review_model(independent_model).map_err(|e| {
+            ReviewGateError::Failed(format!("Review model policy check failed: {}", e))
+        })?;
+        if let Some(reason) = budget.guard_before_llm_call(&*usage) {
+            snapshot_blocking(&[]);
+            return Err(ReviewGateError::BudgetExceeded(reason));
+        }
+        let independent_timeout_ms = budget
+            .timeout_ms_for_next_llm_call()
+            .min(MAX_REVIEW_TIMEOUT_MS);
+        let independent_review = tokio::time::timeout(
+            Duration::from_millis(independent_timeout_ms),
+            verify_changes_bounded_with_model(
+                &files_with_content,
+                iteration + 1,
+                fixed_titles,
+                Some(&review_fix_context),
+                independent_model,
+                independent_timeout_ms,
+            ),
+        )
+        .await;
+        *review_iterations += 1;
+        let independent_review = match independent_review {
+            Ok(Ok(value)) => {
+                llm_calls.push(ImplementationLlmCallRecord {
+                    kind: "independent_review".to_string(),
+                    independence_role: Some("independent_second_opinion".to_string()),
+                    model: independent_model.id().to_string(),
+                    timeout_ms: value
+                        .speed_failover
+                        .as_ref()
+                        .map(|d| d.total_timeout_ms)
+                        .unwrap_or(independent_timeout_ms),
+                    speed_failover: value.speed_failover.clone(),
+                    error: None,
+                });
+                value
+            }
+            Ok(Err(err)) => {
+                let speed_failover = err
+                    .downcast_ref::<SpeedFailoverError>()
+                    .map(|e| e.diagnostics.clone())
+                    .or_else(|| {
+                        err.downcast_ref::<FixGenerationErrorWithUsage>()
+                            .and_then(|e| e.speed_failover.clone())
+                    });
+                llm_calls.push(ImplementationLlmCallRecord {
+                    kind: "independent_review".to_string(),
+                    independence_role: Some("independent_second_opinion".to_string()),
+                    model: independent_model.id().to_string(),
+                    timeout_ms: speed_failover
+                        .as_ref()
+                        .map(|d| d.total_timeout_ms)
+                        .unwrap_or(independent_timeout_ms),
+                    speed_failover,
+                    error: Some(truncate(&err.to_string(), 240)),
+                });
+                return Err(ReviewGateError::Failed(format!(
+                    "Independent adversarial review failed: {}",
+                    truncate(&err.to_string(), 180)
+                )));
+            }
+            Err(_) => {
+                llm_calls.push(ImplementationLlmCallRecord {
+                    kind: "independent_review".to_string(),
+                    independence_role: Some("independent_second_opinion".to_string()),
+                    model: independent_model.id().to_string(),
+                    timeout_ms: independent_timeout_ms,
+                    speed_failover: None,
+                    error: Some(format!("Timed out after {}ms", independent_timeout_ms)),
+                });
+                snapshot_blocking(&[]);
+                return Err(ReviewGateError::BudgetExceeded(ImplementationFailReason {
+                    code: REASON_BUDGET_EXCEEDED.to_string(),
+                    gate: "budget".to_string(),
+                    message: format!(
+                        "Stopped to respect the configured time budget (independent review timed out after {}ms; limit {}ms)",
+                        independent_timeout_ms, budget.max_total_ms
+                    ),
+                    action: default_action_for_fail_reason("budget", REASON_BUDGET_EXCEEDED)
+                        .to_string(),
+                }));
+            }
+        };
+        *usage = merge_usage(usage.take(), independent_review.usage.clone());
+        if let Some(reason) = budget.exhausted(&*usage) {
+            snapshot_blocking(&[]);
+            return Err(ReviewGateError::BudgetExceeded(reason));
+        }
+        let mut independent_blocking =
+            blocking_findings(&independent_review.findings, blocking_severities);
+        if quick_check_status == ImplementationQuickCheckStatus::Passed
+            && quick_check_command
+                .map(|cmd| cmd.contains("cargo check"))
+                .unwrap_or(false)
+        {
+            independent_blocking
+                .retain(|finding| !is_probable_compile_error_false_positive(&finding.title));
+        }
+        if !independent_blocking.is_empty() {
+            snapshot_blocking(&independent_blocking);
+            return Err(ReviewGateError::Failed(format!(
+                "Independent adversarial review found {} blocking finding(s)",
+                independent_blocking.len()
+            )));
         }
     }
 
@@ -5932,6 +6503,16 @@ fn is_prettier_formatting_failure(outcome: &ImplementationCommandOutcome) -> boo
         && (combined.contains("--write") || combined.contains("code style"))
 }
 
+fn is_eslint_fixable_failure(outcome: &ImplementationCommandOutcome) -> bool {
+    let stderr = strip_ansi_sequences(&outcome.stderr_tail);
+    let stdout = strip_ansi_sequences(&outcome.stdout_tail);
+    let combined = format!("{}\n{}", stderr, stdout).to_ascii_lowercase();
+
+    combined.contains("eslint")
+        && (combined.contains("potentially fixable with the `--fix` option")
+            || combined.contains("potentially fixable with the --fix option"))
+}
+
 fn run_prettier_write(
     repo_root: &Path,
     target: &Path,
@@ -5967,6 +6548,43 @@ fn run_prettier_write(
         })?;
     Ok(ImplementationCommandOutcome {
         command: format!("prettier --write {}", target.display()),
+        duration_ms: start.elapsed().as_millis() as u64,
+        success: !output.timed_out && output.status.map(|s| s.success()).unwrap_or(false),
+        timed_out: output.timed_out,
+        exit_code: output.status.and_then(|s| s.code()),
+        stdout_tail: tail_chars(&output.stdout, MAX_COMMAND_OUTPUT_TAIL_CHARS),
+        stderr_tail: tail_chars(&output.stderr, MAX_COMMAND_OUTPUT_TAIL_CHARS),
+    })
+}
+
+fn run_eslint_fix(
+    repo_root: &Path,
+    target: &Path,
+    timeout_ms: u64,
+) -> anyhow::Result<ImplementationCommandOutcome> {
+    let eslint_candidates = [
+        repo_root.join("node_modules").join(".bin").join("eslint"),
+        repo_root
+            .join("node_modules")
+            .join(".bin")
+            .join("eslint.cmd"),
+    ];
+    let eslint = eslint_candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .ok_or_else(|| anyhow::anyhow!("ESLint binary not found under node_modules/.bin"))?;
+
+    let mut cmd = Command::new(eslint);
+    cmd.current_dir(repo_root).arg("--fix").arg(target);
+    for (k, v) in SandboxSession::env_overrides() {
+        cmd.env(k, v);
+    }
+
+    let start = std::time::Instant::now();
+    let output = run_command_with_timeout(&mut cmd, Duration::from_millis(timeout_ms))
+        .map_err(|e| anyhow::anyhow!("Failed to run eslint --fix {}: {}", target.display(), e))?;
+    Ok(ImplementationCommandOutcome {
+        command: format!("eslint --fix {}", target.display()),
         duration_ms: start.elapsed().as_millis() as u64,
         success: !output.timed_out && output.status.map(|s| s.success()).unwrap_or(false),
         timed_out: output.timed_out,
@@ -6142,6 +6760,8 @@ pub fn record_harness_finalization_outcome(
     status: ImplementationFinalizationStatus,
     detail: Option<String>,
     mutation_on_failure: Option<bool>,
+    run_context: ImplementationHarnessRunContext,
+    telemetry_repo_root: Option<&Path>,
 ) -> anyhow::Result<()> {
     diagnostics.finalization = ImplementationFinalizationDiagnostics {
         status,
@@ -6150,13 +6770,24 @@ pub fn record_harness_finalization_outcome(
     };
     let report_path = write_harness_report(repo_root, diagnostics)?;
     diagnostics.report_path = Some(report_path);
-    append_harness_telemetry(repo_root, diagnostics)?;
+    let telemetry_root = telemetry_repo_root.unwrap_or(repo_root);
+    append_harness_telemetry(telemetry_root, diagnostics, run_context)?;
     Ok(())
+}
+
+fn diagnostics_has_independent_review(diagnostics: &ImplementationRunDiagnostics) -> bool {
+    diagnostics.attempts.iter().any(|attempt| {
+        attempt
+            .llm_calls
+            .iter()
+            .any(|call| call.kind == "independent_review")
+    })
 }
 
 fn append_harness_telemetry(
     repo_root: &Path,
     diagnostics: &ImplementationRunDiagnostics,
+    run_context: ImplementationHarnessRunContext,
 ) -> anyhow::Result<()> {
     let cache = Cache::new(repo_root);
     let quick_status = diagnostics
@@ -6177,7 +6808,7 @@ fn append_harness_telemetry(
         .next_back()
         .unwrap_or(0);
     let record = ImplementationHarnessRecord {
-        schema_version: 2,
+        schema_version: 3,
         timestamp: Utc::now(),
         run_id: diagnostics.run_id.clone(),
         suggestion_id: diagnostics.suggestion_id.clone(),
@@ -6191,8 +6822,12 @@ fn append_harness_telemetry(
         report_path: diagnostics.report_path.clone(),
         finalization_status: finalization_status_label(diagnostics.finalization.status).to_string(),
         mutation_on_failure: diagnostics.finalization.mutation_on_failure,
+        run_context: run_context.as_str().to_string(),
+        independent_review_executed: diagnostics_has_independent_review(diagnostics),
     };
-    let _ = cache.append_implementation_harness(&record);
+    cache
+        .append_implementation_harness(&record)
+        .map_err(|e| anyhow::anyhow!("Failed to append implementation harness telemetry: {}", e))?;
     Ok(())
 }
 
@@ -6360,8 +6995,20 @@ diff --git a/a.rs b/a.rs
         let lab = ImplementationHarnessConfig::lab_strict();
         assert!(!interactive.require_quick_check_detectable);
         assert!(lab.require_quick_check_detectable);
+        assert_eq!(
+            interactive.adversarial_review_model,
+            ImplementationReviewModel::Speed
+        );
+        assert_eq!(
+            lab.adversarial_review_model,
+            ImplementationReviewModel::Smart
+        );
+        assert!(interactive.require_independent_review_on_pass);
+        assert!(lab.require_independent_review_on_pass);
         assert_eq!(interactive.max_auto_review_fix_loops, 2);
-        assert_eq!(lab.max_auto_review_fix_loops, 3);
+        assert_eq!(lab.max_auto_review_fix_loops, 4);
+        assert_eq!(interactive.max_auto_quick_check_fix_loops, 1);
+        assert_eq!(lab.max_auto_quick_check_fix_loops, 3);
         assert!(quick_check_passes_policy(
             ImplementationQuickCheckStatus::Unavailable,
             &interactive
@@ -6370,6 +7017,13 @@ diff --git a/a.rs b/a.rs
             ImplementationQuickCheckStatus::Unavailable,
             &lab
         ));
+    }
+
+    #[test]
+    fn adversarial_review_model_policy_allows_speed_and_smart_only() {
+        assert!(ensure_adversarial_review_model(Model::Speed).is_ok());
+        assert!(ensure_adversarial_review_model(Model::Smart).is_ok());
+        assert!(ensure_adversarial_review_model(Model::Balanced).is_err());
     }
 
     #[test]
@@ -6567,10 +7221,22 @@ diff --git a/a.rs b/a.rs
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].gate, "quick_check");
         assert_eq!(records[0].code, REASON_QUICK_CHECK_UNAVAILABLE);
+        assert!(!records[0].action.trim().is_empty());
+        assert!(records[0]
+            .action
+            .contains("Install or enable the required quick-check tool"));
         assert_eq!(
             gates[0].reason_code.as_deref(),
             Some(REASON_QUICK_CHECK_UNAVAILABLE)
         );
+    }
+
+    #[test]
+    fn quick_check_repair_hint_extracts_rust_e0277() {
+        let summary = "Quick check failed (cargo check): error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option`";
+        let hint = quick_check_repair_hint_from_summary(summary).expect("expected hint");
+        assert!(hint.contains("Rust E0277 hint"));
+        assert!(hint.contains("remove `?`"));
     }
 
     #[test]
@@ -6678,6 +7344,29 @@ ELIFECYCLE Command failed with exit code 1.\n"
     }
 
     #[test]
+    fn eslint_fixable_failure_detector_matches_common_eslint_output() {
+        let outcome = ImplementationCommandOutcome {
+            command: "pnpm test:lint".to_string(),
+            duration_ms: 0,
+            success: false,
+            timed_out: false,
+            exit_code: Some(1),
+            stdout_tail: "\
+/tmp/repo\n\
+> eslint .\n\
+/tmp/repo/index.js\n\
+  20:3  error  `const` declaration outside top-level scope  prefer-let/prefer-let\n\
+\n\
+✖ 1 problem (1 error, 0 warnings)\n\
+  1 error and 0 warnings potentially fixable with the `--fix` option.\n\
+ELIFECYCLE Command failed with exit code 1.\n"
+                .to_string(),
+            stderr_tail: String::new(),
+        };
+        assert!(is_eslint_fixable_failure(&outcome));
+    }
+
+    #[test]
     fn quick_check_error_path_extraction_handles_multiple_formats_and_rejects_traversal() {
         let outcome = ImplementationCommandOutcome {
             command: "pnpm type-check".to_string(),
@@ -6769,6 +7458,32 @@ ELIFECYCLE Command failed with exit code 1.\n"
     }
 
     #[test]
+    fn budget_exhausted_allows_small_cost_overrun_tolerance() {
+        let budget = ImplementationBudget {
+            started_at: std::time::Instant::now(),
+            max_total_ms: u64::MAX,
+            max_total_cost_usd: 0.01,
+        };
+        let within_tolerance = Usage {
+            cost: Some(0.0102),
+            ..Usage::default()
+        };
+        assert!(
+            budget.exhausted(&Some(within_tolerance)).is_none(),
+            "small accounting jitter should not hard-fail budget gate"
+        );
+
+        let beyond_tolerance = Usage {
+            cost: Some(0.0103),
+            ..Usage::default()
+        };
+        assert!(
+            budget.exhausted(&Some(beyond_tolerance)).is_some(),
+            "material overrun should still fail budget gate"
+        );
+    }
+
+    #[test]
     fn quick_check_failure_fingerprint_normalizes_numbers() {
         let a = "Quick check failed (cargo check --locked): src/error.rs:471:39 error[E0277]";
         let b = "Quick check failed (cargo check --locked): src/error.rs:473:21 error[E0277]";
@@ -6807,7 +7522,7 @@ ELIFECYCLE Command failed with exit code 1.\n"
         );
 
         let usage_below_buffer = Some(Usage {
-            cost: Some(0.00565), // remaining 0.00045
+            cost: Some(0.00602), // remaining 0.00008
             ..Usage::default()
         });
         assert!(
@@ -6868,8 +7583,8 @@ ELIFECYCLE Command failed with exit code 1.\n"
         });
         let (_ms2, cost2) = compute_attempt_budget_caps(&global_budget, &usage_so_far, 2, &weights);
         assert!(
-            (cost2 - 0.004285714285714286).abs() < 1e-12,
-            "expected attempt2 cost cap ~0.004285714285714286, got {}",
+            (cost2 - 0.004).abs() < 1e-12,
+            "expected attempt2 cost cap ~0.004, got {}",
             cost2
         );
     }
@@ -6892,7 +7607,7 @@ ELIFECYCLE Command failed with exit code 1.\n"
 
         // Late-attempt budget should still preserve a meaningful slice.
         assert!(
-            (attempt_cost - 0.00168).abs() < 1e-9,
+            (attempt_cost - 0.0021).abs() < 1e-9,
             "attempt_cost={}",
             attempt_cost
         );
