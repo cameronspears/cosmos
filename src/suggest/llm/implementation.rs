@@ -135,17 +135,27 @@ struct ImplementationBudget {
     max_total_cost_usd: f64,
 }
 
-const MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL: u64 = 6_000;
+const MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_MIN: u64 = 1_200;
+const MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_MAX: u64 = 6_000;
+const MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_RATIO: f64 = 0.15;
 // Conservative buffer to avoid starting an LLM call when we're so close to the budget cap that
 // normal token variance would likely overspend. The harness would rather stop and explain why
 // than silently exceed its configured budget.
-const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL: f64 = 0.004;
+const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MIN: f64 = 0.001;
+const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MAX: f64 = 0.004;
+const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_RATIO: f64 = 0.15;
 const BUDGET_TIMEOUT_SLACK_MS: u64 = 250;
 const MAX_GENERATION_TIMEOUT_MS: u64 = 35_000;
 const MAX_REVIEW_TIMEOUT_MS: u64 = 25_000;
 const MAX_FIX_TIMEOUT_MS: u64 = 25_000;
+const MIN_MEANINGFUL_ATTEMPT_MS: u64 = MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_MIN * 3;
+const MIN_MEANINGFUL_ATTEMPT_COST_USD: f64 = MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MIN * 3.0;
 
 impl ImplementationBudget {
+    fn min_remaining_ms_buffer(&self) -> u64 {
+        ((self.max_total_ms as f64) * MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_RATIO) as u64
+    }
+
     fn exhausted(&self, usage: &Option<Usage>) -> Option<ImplementationFailReason> {
         let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
         if elapsed_ms >= self.max_total_ms {
@@ -184,6 +194,13 @@ impl ImplementationBudget {
         (self.max_total_cost_usd - cost_usd).max(0.0)
     }
 
+    fn min_remaining_cost_buffer_usd(&self) -> f64 {
+        (self.max_total_cost_usd * MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_RATIO).clamp(
+            MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MIN,
+            MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MAX,
+        )
+    }
+
     fn timeout_ms_for_next_llm_call(&self) -> u64 {
         self.remaining_ms()
             .saturating_sub(BUDGET_TIMEOUT_SLACK_MS)
@@ -198,7 +215,11 @@ impl ImplementationBudget {
         }
 
         let remaining_ms = self.remaining_ms();
-        if remaining_ms < MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL {
+        let min_ms_buffer = self.min_remaining_ms_buffer().clamp(
+            MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_MIN,
+            MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_MAX,
+        );
+        if remaining_ms < min_ms_buffer {
             return Some(ImplementationFailReason {
                 code: REASON_BUDGET_EXCEEDED.to_string(),
                 gate: "budget".to_string(),
@@ -210,7 +231,8 @@ impl ImplementationBudget {
         }
 
         let remaining_cost = self.remaining_cost_usd(usage);
-        if remaining_cost < MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL {
+        let min_cost_buffer = self.min_remaining_cost_buffer_usd();
+        if remaining_cost < min_cost_buffer {
             return Some(ImplementationFailReason {
                 code: REASON_BUDGET_EXCEEDED.to_string(),
                 gate: "budget".to_string(),
@@ -268,9 +290,13 @@ fn compute_attempt_budget_caps(
         (weights[idx] / remaining_weight_sum).clamp(0.0, 1.0)
     };
 
-    let attempt_ms = ((remaining_ms as f64) * ratio).floor() as u64;
+    let min_ms_target = remaining_ms.min(MIN_MEANINGFUL_ATTEMPT_MS);
+    let attempt_ms = (((remaining_ms as f64) * ratio).floor() as u64).max(min_ms_target);
     let attempt_ms = attempt_ms.clamp(1, remaining_ms);
-    let attempt_cost = (remaining_cost * ratio).max(0.0);
+    let min_cost_target = remaining_cost.min(MIN_MEANINGFUL_ATTEMPT_COST_USD);
+    let attempt_cost = (remaining_cost * ratio)
+        .max(min_cost_target)
+        .min(remaining_cost);
     (attempt_ms, attempt_cost)
 }
 
@@ -846,6 +872,36 @@ fn summarize_quick_check_failure(outcome: &ImplementationCommandOutcome) -> Opti
         ));
     }
     None
+}
+
+fn quick_check_failure_fingerprint(summary: &str) -> String {
+    // Normalize volatile line/column and spacing noise so we can detect when repeated
+    // auto-repair loops are failing for the same underlying reason.
+    let mut out = String::with_capacity(summary.len());
+    let mut in_digits = false;
+    let mut last_was_space = false;
+    for ch in summary.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+                in_digits = true;
+                last_was_space = false;
+            }
+            continue;
+        }
+        in_digits = false;
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+            continue;
+        }
+        out.push(lower);
+        last_was_space = false;
+    }
+    out.trim().to_string()
 }
 
 fn extract_size_limit_exceeded(outcome: &ImplementationCommandOutcome) -> Vec<(String, u32)> {
@@ -2611,6 +2667,9 @@ async fn run_attempt(
         let remaining_loops = config
             .max_auto_quick_check_fix_loops
             .saturating_sub(quick_check_fix_loops);
+        let mut previous_failure_fingerprint = quick_check_failure_summary
+            .as_deref()
+            .map(quick_check_failure_fingerprint);
         for _ in 0..remaining_loops {
             let Some(outcome) = quick_outcome.as_ref() else {
                 break;
@@ -2963,6 +3022,16 @@ async fn run_attempt(
                 quick_check_outcomes.push(outcome);
             }
             if quick_status == ImplementationQuickCheckStatus::Failed {
+                let current_fingerprint = quick_check_failure_summary
+                    .as_deref()
+                    .map(quick_check_failure_fingerprint);
+                if current_fingerprint.is_some()
+                    && previous_failure_fingerprint.as_ref() == current_fingerprint.as_ref()
+                {
+                    notes.push("quick_check_repair_stopped_no_progress".to_string());
+                    break;
+                }
+                previous_failure_fingerprint = current_fingerprint;
                 continue;
             }
 
@@ -3418,6 +3487,9 @@ async fn run_attempt(
         && remaining_quick_check_fix_loops > 0
         && fail_reasons.is_empty();
     if eligible_for_quick_check_repair {
+        let mut previous_failure_fingerprint = quick_check_failure_summary
+            .as_deref()
+            .map(quick_check_failure_fingerprint);
         for _ in 0..remaining_quick_check_fix_loops {
             let Some(outcome) = quick_outcome.as_ref() else {
                 break;
@@ -3741,6 +3813,16 @@ async fn run_attempt(
                 quick_check_outcomes.push(outcome);
             }
             if quick_status == ImplementationQuickCheckStatus::Failed {
+                let current_fingerprint = quick_check_failure_summary
+                    .as_deref()
+                    .map(quick_check_failure_fingerprint);
+                if current_fingerprint.is_some()
+                    && previous_failure_fingerprint.as_ref() == current_fingerprint.as_ref()
+                {
+                    notes.push("quick_check_repair_stopped_no_progress".to_string());
+                    break;
+                }
+                previous_failure_fingerprint = current_fingerprint;
                 continue;
             }
 
@@ -6263,6 +6345,70 @@ ELIFECYCLE Command failed with exit code 1.\n\
     }
 
     #[test]
+    fn quick_check_failure_fingerprint_normalizes_numbers() {
+        let a = "Quick check failed (cargo check --locked): src/error.rs:471:39 error[E0277]";
+        let b = "Quick check failed (cargo check --locked): src/error.rs:473:21 error[E0277]";
+        assert_eq!(
+            quick_check_failure_fingerprint(a),
+            quick_check_failure_fingerprint(b)
+        );
+    }
+
+    #[test]
+    fn budget_guard_cost_buffer_scales_for_small_attempt_budget() {
+        let budget = ImplementationBudget {
+            started_at: std::time::Instant::now(),
+            max_total_ms: u64::MAX,
+            max_total_cost_usd: 0.0061,
+        };
+
+        // Small attempt budgets should use the minimum buffer ($0.001), not the old fixed $0.004.
+        assert!(
+            (budget.min_remaining_cost_buffer_usd() - 0.001).abs() < f64::EPSILON,
+            "buffer={}",
+            budget.min_remaining_cost_buffer_usd()
+        );
+
+        let usage_with_headroom = Some(Usage {
+            cost: Some(0.0022), // remaining 0.0039
+            ..Usage::default()
+        });
+        assert!(
+            budget.guard_before_llm_call(&usage_with_headroom).is_none(),
+            "guard should allow a call with meaningful remaining budget"
+        );
+
+        let usage_below_buffer = Some(Usage {
+            cost: Some(0.0052), // remaining 0.0009
+            ..Usage::default()
+        });
+        assert!(
+            budget.guard_before_llm_call(&usage_below_buffer).is_some(),
+            "guard should stop once remaining budget falls below minimum buffer"
+        );
+    }
+
+    #[test]
+    fn budget_guard_time_buffer_scales_for_small_attempt_budget() {
+        let budget = ImplementationBudget {
+            started_at: std::time::Instant::now(),
+            max_total_ms: 5_500,
+            max_total_cost_usd: 1.0,
+        };
+
+        // Small attempt budgets should not use a fixed 6000ms minimum.
+        assert!(
+            budget.min_remaining_ms_buffer().clamp(
+                MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_MIN,
+                MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_MAX
+            ) < MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_MAX
+        );
+
+        // With no elapsed time there should be enough remaining time to allow a call.
+        assert!(budget.guard_before_llm_call(&None).is_none());
+    }
+
+    #[test]
     fn attempt_budget_weights_sum_to_one_for_common_profiles() {
         for attempts in [1usize, 2, 3, 4, 6] {
             let weights = attempt_budget_weights(attempts);
@@ -6298,5 +6444,31 @@ ELIFECYCLE Command failed with exit code 1.\n\
             "expected attempt2 cost cap 0.004, got {}",
             cost2
         );
+    }
+
+    #[test]
+    fn compute_attempt_budget_caps_enforces_meaningful_floor_for_late_attempts() {
+        let global_budget = ImplementationBudget {
+            started_at: std::time::Instant::now(),
+            max_total_ms: 10_000,
+            max_total_cost_usd: 0.02,
+        };
+        let weights = attempt_budget_weights(4);
+        let usage_so_far = Some(Usage {
+            cost: Some(0.0179), // remaining = 0.0021
+            ..Usage::default()
+        });
+
+        let (attempt_ms, attempt_cost) =
+            compute_attempt_budget_caps(&global_budget, &usage_so_far, 3, &weights);
+
+        // Cost floor should use all remaining budget when it is below the meaningful minimum.
+        assert!(
+            (attempt_cost - 0.0021).abs() < 1e-9,
+            "attempt_cost={}",
+            attempt_cost
+        );
+        // Time floor should keep late attempts meaningful (not near-zero).
+        assert!(attempt_ms >= MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_MIN);
     }
 }

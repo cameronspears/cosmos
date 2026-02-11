@@ -60,7 +60,10 @@ Python guardrails:
 // We intentionally prefer focused excerpts over full-file dumps to keep token usage bounded.
 const MAX_FIX_EXCERPT_CHARS: usize = 20000;
 const MAX_MULTI_FILE_EXCERPT_CHARS: usize = 60000;
-const MAX_EDIT_REPAIR_ATTEMPTS: usize = 3;
+// Keep internal edit-apply retries bounded and cheap. The harness itself already retries
+// whole attempts with feedback and strict gates, so large internal loops here can bypass
+// practical per-attempt budget expectations.
+const MAX_EDIT_REPAIR_ATTEMPTS: usize = 2;
 
 const MAX_FIX_RESPONSE_TOKENS_SPEED: u32 = 4096;
 const MAX_MULTI_FILE_FIX_RESPONSE_TOKENS_SPEED: u32 = 6144;
@@ -347,7 +350,9 @@ fn is_retryable_edit_apply_error(message: &str) -> bool {
         && (msg.contains("not found")
             || msg.contains("matches")
             || msg.contains("must be unique")
-            || msg.contains("empty for non-empty"))
+            || msg.contains("empty for non-empty")
+            || msg.contains("placeholder")
+            || msg.contains("ellipsis"))
 }
 
 fn searched_for_fragment(message: &str) -> Option<String> {
@@ -371,6 +376,10 @@ pub(crate) fn format_edit_apply_repair_guidance(message: &str, code_block_label:
         bullets
             .push("Avoid anchors like `</div>`, `</motion.div>`, `{}` blocks, or single braces.");
         bullets.push("If you need to change multiple occurrences, return multiple edits with different unique `old_string` values.");
+    } else if msg.contains("placeholder") || msg.contains("ellipsis") {
+        bullets.push("Your `old_string` contained placeholder text and cannot match real code.");
+        bullets.push("Do not use ellipses (`...` or `…`) or shortened snippets in `old_string`.");
+        bullets.push("Copy `old_string` verbatim from the code block with exact indentation.");
     } else if msg.contains("not found") {
         bullets.push("Your `old_string` does not exist verbatim in the code block.");
         bullets.push("Copy/paste the exact text from the code block, including indentation and line endings.");
@@ -650,6 +659,19 @@ pub async fn generate_fix_content_with_model(
         let context_label = anchor_line
             .map(|line| format!("file (target around line {})", line))
             .unwrap_or_else(|| "file".to_string());
+        if let Err(err) = validate_edits_for_apply(&edits, &context_label) {
+            let message = err.to_string();
+            if attempt < MAX_EDIT_REPAIR_ATTEMPTS.max(1) && is_retryable_edit_apply_error(&message)
+            {
+                last_apply_err = Some(message);
+                continue;
+            }
+            return Err(anyhow::Error::new(FixGenerationErrorWithUsage {
+                message,
+                usage: combined_usage.clone(),
+                speed_failover,
+            }));
+        }
 
         match apply_edits_with_context(content, &edits, &context_label) {
             Ok(new_content) => {
@@ -728,8 +750,72 @@ pub(crate) fn truncate_for_error(s: &str) -> String {
     if s.chars().count() <= MAX_CHARS {
         s.to_string()
     } else {
-        format!("{}...", s.chars().take(MAX_CHARS).collect::<String>())
+        format!(
+            "{} [truncated]",
+            s.chars().take(MAX_CHARS).collect::<String>()
+        )
     }
+}
+
+fn old_string_looks_like_placeholder(old_string: &str) -> bool {
+    let text = old_string.trim();
+    if text.is_empty() {
+        return false;
+    }
+
+    // Reject common ellipsis placeholders while allowing real spread/rest syntax such
+    // as `...args` and `...obj` that may appear in legitimate code.
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut idx = 0usize;
+    while idx < len {
+        let (is_placeholder, start, end) =
+            if idx + 2 < len && chars[idx] == '.' && chars[idx + 1] == '.' && chars[idx + 2] == '.'
+            {
+                (true, idx, idx + 3)
+            } else if chars[idx] == '…' {
+                (true, idx, idx + 1)
+            } else {
+                (false, 0, 0)
+            };
+        if !is_placeholder {
+            idx += 1;
+            continue;
+        }
+
+        let prev = if start == 0 {
+            None
+        } else {
+            Some(chars[start - 1])
+        };
+        let next = if end >= len { None } else { Some(chars[end]) };
+        let prev_is_ident = prev
+            .map(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+            .unwrap_or(false);
+        let next_is_ident = next
+            .map(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+            .unwrap_or(false);
+
+        if !(prev_is_ident || next_is_ident) {
+            return true;
+        }
+        idx = end;
+    }
+
+    false
+}
+
+fn validate_edits_for_apply(edits: &[EditOp], context_label: &str) -> anyhow::Result<()> {
+    for (i, edit) in edits.iter().enumerate() {
+        if old_string_looks_like_placeholder(&edit.old_string) {
+            return Err(anyhow::anyhow!(
+                "Edit {}: old_string contains placeholder ellipsis in {}. Copy exact code; do not use `...` or `…`.",
+                i + 1,
+                context_label
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn apply_edits_with_context(
@@ -1285,6 +1371,10 @@ pub async fn generate_multi_file_fix_with_model(
             } else {
                 format!("file {}", file_path.display())
             };
+            if let Err(err) = validate_edits_for_apply(&file_edit_json.edits, &context) {
+                apply_error = Some(err);
+                break;
+            }
             let new_content =
                 match apply_edits_with_context(&new_content, &file_edit_json.edits, &context) {
                     Ok(value) => value,
@@ -2144,6 +2234,40 @@ mod tests {
         let updated = apply_edits_with_context(content, &edits, "file").unwrap();
         assert!(updated.contains("let b = 3;"));
         assert!(updated.contains("\r\n"));
+    }
+
+    #[test]
+    fn test_validate_edits_rejects_placeholder_ellipsis() {
+        let edits = vec![EditOp {
+            old_string: "if (ready) { doThing(); ... }".to_string(),
+            new_string: "if (ready) { doThing(); }".to_string(),
+        }];
+        let err = validate_edits_for_apply(&edits, "file").unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("placeholder"));
+    }
+
+    #[test]
+    fn test_validate_edits_allows_spread_operator_old_string() {
+        let edits = vec![EditOp {
+            old_string: "const copy = { ...obj, ok: true };".to_string(),
+            new_string: "const copy = { ...obj, ok: false };".to_string(),
+        }];
+        validate_edits_for_apply(&edits, "file").unwrap();
+    }
+
+    #[test]
+    fn test_is_retryable_edit_apply_error_for_placeholder_message() {
+        assert!(is_retryable_edit_apply_error(
+            "Edit 1: old_string contains placeholder ellipsis in file"
+        ));
+    }
+
+    #[test]
+    fn test_truncate_for_error_marks_truncation_without_ellipsis() {
+        let long = "a".repeat(140);
+        let truncated = truncate_for_error(&long);
+        assert!(truncated.ends_with(" [truncated]"), "{}", truncated);
+        assert!(!truncated.ends_with("..."), "{}", truncated);
     }
 
     #[test]
