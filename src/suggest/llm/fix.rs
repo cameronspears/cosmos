@@ -2046,7 +2046,7 @@ VERIFY:
         if let Ok(fallback_response) = call_llm_agentic(
             FIX_PREVIEW_AGENTIC_SYSTEM,
             &fallback_user,
-            Model::Balanced,
+            Model::Smart,
             repo_root,
             false,
             4,

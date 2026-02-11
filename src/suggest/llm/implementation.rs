@@ -1845,7 +1845,7 @@ fn ensure_implementation_model(model: Model) -> anyhow::Result<()> {
 }
 
 fn ensure_adversarial_review_model(model: Model) -> anyhow::Result<()> {
-    const ALLOWED: &[Model] = &[Model::Speed, Model::Balanced, Model::Smart];
+    const ALLOWED: &[Model] = &[Model::Speed, Model::Smart];
     if ALLOWED.contains(&model) {
         Ok(())
     } else {
@@ -5685,7 +5685,7 @@ async fn run_review_gate(
     {
         let mut independent_review = None;
         let mut independent_error: Option<String> = None;
-        let independent_models = [Model::Smart, Model::Balanced];
+        let independent_models = [Model::Smart];
         for independent_model in independent_models {
             ensure_adversarial_review_model(independent_model).map_err(|e| {
                 ReviewGateError::Failed(format!("Review model policy check failed: {}", e))
@@ -5754,12 +5754,11 @@ async fn run_review_gate(
                         error: Some(truncate(&err_text, 240)),
                     });
                     independent_error = Some(err_text.clone());
-                    // Provider/schema incompatibility can be model-specific; retry once with a
-                    // second independent model before failing the attempt.
-                    if is_response_format_schema_error_text(&err_text)
-                        && independent_model != Model::Balanced
-                    {
-                        continue;
+                    if is_response_format_schema_error_text(&err_text) {
+                        independent_error = Some(format!(
+                            "Provider rejected structured output schema for independent review model {}",
+                            independent_model.id()
+                        ));
                     }
                 }
                 Err(_) => {
@@ -6916,7 +6915,6 @@ diff --git a/a.rs b/a.rs
     #[test]
     fn model_policy_rejects_non_speed_model() {
         assert!(ensure_implementation_model(Model::Smart).is_err());
-        assert!(ensure_implementation_model(Model::Balanced).is_err());
         assert!(ensure_implementation_model(Model::Speed).is_ok());
     }
 
@@ -7056,10 +7054,9 @@ diff --git a/a.rs b/a.rs
     }
 
     #[test]
-    fn adversarial_review_model_policy_allows_speed_smart_and_balanced() {
+    fn adversarial_review_model_policy_allows_speed_and_smart_only() {
         assert!(ensure_adversarial_review_model(Model::Speed).is_ok());
         assert!(ensure_adversarial_review_model(Model::Smart).is_ok());
-        assert!(ensure_adversarial_review_model(Model::Balanced).is_ok());
     }
 
     #[test]

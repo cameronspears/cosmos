@@ -5,8 +5,6 @@ use serde::Deserialize;
 pub enum Model {
     /// Speed tier - fast, cheap model for summaries and classification (gpt-oss-120b)
     Speed,
-    /// Balanced tier - deep reasoning at medium cost for questions/previews (gpt-5.2-codex)
-    Balanced,
     /// Smart tier - best reasoning for code generation (gpt-5.2)
     Smart,
 }
@@ -15,11 +13,7 @@ pub enum Model {
 const MODEL_MAX_TOKENS: u32 = 16384;
 
 /// Models we allow to use JSON formatting / structured outputs.
-const JSON_FORMAT_MODELS: [&str; 3] = [
-    "openai/gpt-oss-120b",
-    "openai/gpt-5.2:nitro",
-    "openai/gpt-5.2-codex:nitro",
-];
+const JSON_FORMAT_MODELS: [&str; 2] = ["openai/gpt-oss-120b", "openai/gpt-5.2:nitro"];
 
 fn supports_json_format(model_id: &str) -> bool {
     JSON_FORMAT_MODELS.contains(&model_id)
@@ -29,7 +23,6 @@ impl Model {
     pub fn id(&self) -> &'static str {
         match self {
             Model::Speed => "openai/gpt-oss-120b",
-            Model::Balanced => "openai/gpt-5.2-codex:nitro",
             Model::Smart => "openai/gpt-5.2:nitro",
         }
     }
@@ -52,7 +45,6 @@ impl Model {
     pub fn reasoning_effort(&self) -> Option<&'static str> {
         match self {
             Model::Speed => Some("low"),
-            Model::Balanced => Some("high"),
             Model::Smart => Some("xhigh"),
         }
     }
@@ -109,7 +101,6 @@ mod tests {
     #[test]
     fn test_model_ids() {
         assert!(Model::Speed.id().contains("gpt"));
-        assert!(Model::Balanced.id().contains("gpt-5.2-codex"));
         assert!(Model::Smart.id().contains("gpt-5.2"));
     }
 
@@ -122,7 +113,6 @@ mod tests {
     #[test]
     fn test_model_supports_json_mode() {
         assert!(Model::Speed.supports_json_mode());
-        assert!(Model::Balanced.supports_json_mode());
         assert!(Model::Smart.supports_json_mode());
     }
 
@@ -130,14 +120,12 @@ mod tests {
     fn test_supports_json_format_allowlist() {
         assert!(supports_json_format("openai/gpt-oss-120b"));
         assert!(supports_json_format("openai/gpt-5.2:nitro"));
-        assert!(supports_json_format("openai/gpt-5.2-codex:nitro"));
         assert!(!supports_json_format("openai/gpt-4o"));
     }
 
     #[test]
     fn test_reasoning_effort_by_model() {
         assert_eq!(Model::Speed.reasoning_effort(), Some("low"));
-        assert_eq!(Model::Balanced.reasoning_effort(), Some("high"));
         assert_eq!(Model::Smart.reasoning_effort(), Some("xhigh"));
     }
 

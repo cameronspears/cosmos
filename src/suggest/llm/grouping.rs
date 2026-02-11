@@ -94,7 +94,7 @@ pub async fn classify_grouping_candidates(
     } = call_llm_structured::<GroupingAiResponse>(
         GROUPING_CLASSIFY_SYSTEM,
         &user,
-        Model::Balanced,
+        Model::Smart,
         "grouping_classification",
         grouping_ai_response_schema(),
     )

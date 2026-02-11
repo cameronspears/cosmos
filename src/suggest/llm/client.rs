@@ -1848,7 +1848,7 @@ mod tests {
 
     #[test]
     fn test_provider_requires_parameters_only_with_response_format() {
-        let provider = provider_config_for_model(Model::Balanced, &None);
+        let provider = provider_config_for_model(Model::Smart, &None);
         let value = serde_json::to_value(provider).unwrap();
         assert!(value.get("require_parameters").is_none());
 
@@ -1856,7 +1856,7 @@ mod tests {
             format_type: "json_object".to_string(),
             json_schema: None,
         });
-        let provider = provider_config_for_model(Model::Balanced, &response_format);
+        let provider = provider_config_for_model(Model::Smart, &response_format);
         let value = serde_json::to_value(provider).unwrap();
         assert_eq!(
             value.get("require_parameters").and_then(|v| v.as_bool()),

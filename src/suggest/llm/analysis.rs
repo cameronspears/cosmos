@@ -177,7 +177,7 @@ QUESTION:
         question
     );
 
-    let response = call_llm_with_usage(ASK_QUESTION_SYSTEM, &user, Model::Balanced, false).await?;
+    let response = call_llm_with_usage(ASK_QUESTION_SYSTEM, &user, Model::Smart, false).await?;
     Ok((response.content, response.usage))
 }
 

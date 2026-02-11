@@ -3266,7 +3266,7 @@ mod tests {
             true,
             vec![
                 ("review", "openai/gpt-oss-120b"),
-                ("independent_review", "openai/gpt-oss-20b"),
+                ("independent_review", "openai/gpt-5.2:nitro"),
             ],
         );
         assert!(same_model_review_requires_independent(&with_second_opinion));
@@ -3275,7 +3275,7 @@ mod tests {
         let cross_model_review = test_run_diagnostics(
             "openai/gpt-oss-120b",
             true,
-            vec![("review", "openai/gpt-oss-20b")],
+            vec![("review", "openai/gpt-5.2:nitro")],
         );
         assert!(!same_model_review_requires_independent(&cross_model_review));
         assert!(!diagnostics_has_independent_review(&cross_model_review));
