@@ -420,6 +420,53 @@ fn add_line_numbers(content: &str) -> String {
         .join("\n")
 }
 
+fn line_window_excerpt(
+    content: &str,
+    line: usize,
+    _radius: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let numbered = add_line_numbers(content);
+    let snippet = truncate_content_around_line(&numbered, line.max(1), max_chars)
+        .unwrap_or_else(|| truncate_content(&numbered, max_chars));
+    if snippet.trim().is_empty() {
+        None
+    } else {
+        Some(snippet)
+    }
+}
+
+fn review_fix_finding_context_section(content: &str, findings: &[ReviewFinding]) -> Option<String> {
+    const MAX_SNIPPETS: usize = 4;
+    const SNIPPET_RADIUS_LINES: usize = 4;
+    const SNIPPET_MAX_CHARS: usize = 800;
+
+    let snippets = findings
+        .iter()
+        .filter_map(|finding| finding.line.map(|line| (finding, line.max(1) as usize)))
+        .take(MAX_SNIPPETS)
+        .filter_map(|(finding, line)| {
+            line_window_excerpt(content, line, SNIPPET_RADIUS_LINES, SNIPPET_MAX_CHARS).map(
+                |snippet| {
+                    format!(
+                        "- {} (line {}): {}\n```text\n{}\n```",
+                        finding.title, line, finding.description, snippet
+                    )
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if snippets.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "FINDING CONTEXT SNIPPETS (prefer copying anchors from these exact lines):\n{}",
+            snippets.join("\n\n")
+        ))
+    }
+}
+
 fn allocate_attempt_time_slices_ms(total_ms: u64, slots: usize) -> Vec<u64> {
     if slots == 0 {
         return Vec::new();
@@ -531,7 +578,7 @@ pub async fn fix_review_findings_with_model(
 
     let memory_section = format_repo_memory_section(repo_memory.as_deref(), "Repo conventions");
 
-    const MAX_REVIEW_FIX_EXCERPT_CHARS: usize = 12_000;
+    const MAX_REVIEW_FIX_EXCERPT_CHARS: usize = 18_000;
     let anchor_line = findings
         .iter()
         .filter_map(|f| f.line)
@@ -562,10 +609,13 @@ pub async fn fix_review_findings_with_model(
     };
 
     let current_section = build_code_section("CURRENT CODE", content);
+    let finding_context_section =
+        review_fix_finding_context_section(content, findings).unwrap_or_default();
     let user = format!(
-        "File: {}\n\nFINDINGS TO FIX:\n{}\n{}{}\n{}\n\nFix all listed findings. Think carefully about edge cases.",
+        "File: {}\n\nFINDINGS TO FIX:\n{}\n\n{}\n{}{}\n{}\n\nFix all listed findings. Think carefully about edge cases.",
         path.display(),
         findings_text.join("\n\n"),
+        finding_context_section,
         memory_section,
         original_section,
         current_section
@@ -668,4 +718,43 @@ pub async fn fix_review_findings_with_model(
     }
 
     Err(anyhow::anyhow!("Failed to apply review fix edits"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_fix_finding_context_section_includes_line_anchored_snippets() {
+        let content = "fn a() {\n    let x = 1;\n    println!(\"{}\", x);\n}\n";
+        let findings = vec![ReviewFinding {
+            file: "src/lib.rs".to_string(),
+            line: Some(2),
+            severity: "warning".to_string(),
+            category: "bug".to_string(),
+            title: "Missing validation".to_string(),
+            description: "Value should be validated before use.".to_string(),
+            recommended: true,
+        }];
+
+        let section =
+            review_fix_finding_context_section(content, &findings).expect("context section");
+        assert!(section.contains("Missing validation"));
+        assert!(section.contains("2|     let x = 1;"), "{}", section);
+    }
+
+    #[test]
+    fn review_fix_finding_context_section_omits_findings_without_lines() {
+        let content = "fn a() {}\n";
+        let findings = vec![ReviewFinding {
+            file: "src/lib.rs".to_string(),
+            line: None,
+            severity: "warning".to_string(),
+            category: "bug".to_string(),
+            title: "No line".to_string(),
+            description: "No line available.".to_string(),
+            recommended: true,
+        }];
+        assert!(review_fix_finding_context_section(content, &findings).is_none());
+    }
 }

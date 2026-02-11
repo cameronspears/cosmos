@@ -119,6 +119,7 @@ impl ImplementationHarnessConfig {
         // loop when it is close to done.
         config.max_total_ms = 60_000;
         config.max_total_cost_usd = 0.030;
+        config.max_auto_review_fix_loops = 3;
         // In lab/CI we prefer doing a bit more repair *within* attempt 1 to improve
         // first-attempt pass rate and avoid costly multi-attempt runs.
         config.max_auto_quick_check_fix_loops = 2;
@@ -143,7 +144,7 @@ const MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_RATIO: f64 = 0.15;
 // than silently exceed its configured budget.
 const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MIN: f64 = 0.0005;
 const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MAX: f64 = 0.004;
-const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_RATIO: f64 = 0.10;
+const MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_RATIO: f64 = 0.08;
 const BUDGET_TIMEOUT_SLACK_MS: u64 = 250;
 const MAX_GENERATION_TIMEOUT_MS: u64 = 35_000;
 const MAX_REVIEW_TIMEOUT_MS: u64 = 25_000;
@@ -2254,6 +2255,34 @@ async fn run_attempt(
     }
     let mut repo_changes = collect_repo_changes(sandbox.path())?;
     repo_changes.files.sort();
+    let out_of_scope_files = repo_changes
+        .files
+        .iter()
+        .filter(|path| !allowed_files.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !out_of_scope_files.is_empty() {
+        match revert_out_of_scope_changes(sandbox.path(), &repo_changes, &out_of_scope_files) {
+            Ok(()) => {
+                notes.push(format!(
+                    "reverted_out_of_scope_files: {}",
+                    out_of_scope_files
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                repo_changes = collect_repo_changes(sandbox.path())?;
+                repo_changes.files.sort();
+            }
+            Err(err) => {
+                notes.push(format!(
+                    "revert_out_of_scope_failed: {}",
+                    truncate(&err.to_string(), 180)
+                ));
+            }
+        }
+    }
     let scope_ok = deterministic_scope_gate(&repo_changes.files, allowed_files);
     push_gate(
         &mut gates,
@@ -4504,6 +4533,83 @@ fn collect_repo_changes(repo_root: &Path) -> anyhow::Result<RepoChanges> {
     })
 }
 
+fn revert_out_of_scope_changes(
+    repo_root: &Path,
+    repo_changes: &RepoChanges,
+    out_of_scope_files: &[PathBuf],
+) -> anyhow::Result<()> {
+    if out_of_scope_files.is_empty() {
+        return Ok(());
+    }
+
+    for path in out_of_scope_files {
+        let resolved = resolve_repo_path_allow_new(repo_root, path)
+            .map_err(|e| anyhow::anyhow!("Unsafe out-of-scope file {}: {}", path.display(), e))?;
+
+        if repo_changes.untracked.contains(path) {
+            if !resolved.absolute.exists() {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&resolved.absolute).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed reading metadata for out-of-scope file {}: {}",
+                    path.display(),
+                    e
+                )
+            })?;
+            if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+                std::fs::remove_dir_all(&resolved.absolute).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed removing out-of-scope directory {}: {}",
+                        path.display(),
+                        e
+                    )
+                })?;
+            } else {
+                std::fs::remove_file(&resolved.absolute).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed removing out-of-scope file {}: {}",
+                        path.display(),
+                        e
+                    )
+                })?;
+            }
+            continue;
+        }
+
+        let mut cmd = Command::new("git");
+        cmd.current_dir(repo_root)
+            .arg("checkout")
+            .arg("--")
+            .arg(path);
+        for (k, v) in SandboxSession::env_overrides() {
+            cmd.env(k, v);
+        }
+        let output = run_command_with_timeout(&mut cmd, Duration::from_secs(15)).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed restoring out-of-scope file {}: {}",
+                path.display(),
+                e
+            )
+        })?;
+        if output.timed_out {
+            return Err(anyhow::anyhow!(
+                "Timed out restoring out-of-scope file {}",
+                path.display()
+            ));
+        }
+        if !output.status.map(|s| s.success()).unwrap_or(false) {
+            return Err(anyhow::anyhow!(
+                "Failed restoring out-of-scope file {}: {}",
+                path.display(),
+                truncate(&format!("{}\n{}", output.stderr, output.stdout), 180)
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn normalize_repo_change_path(path: &str) -> Option<PathBuf> {
     let trimmed = path.trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == "./" {
@@ -6101,6 +6207,7 @@ fn finalization_status_label(status: ImplementationFinalizationStatus) -> &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command as StdCommand;
     use tempfile::tempdir;
 
     #[test]
@@ -6177,6 +6284,45 @@ diff --git a/a.rs b/a.rs
     }
 
     #[test]
+    fn revert_out_of_scope_changes_restores_repo_state() {
+        let root = tempdir().unwrap();
+        run_git(root.path(), &["init"]);
+        run_git(root.path(), &["config", "user.email", "cosmos@example.com"]);
+        run_git(root.path(), &["config", "user.name", "Cosmos"]);
+
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/allowed.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.path().join("src/extra.rs"), "pub fn b() {}\n").unwrap();
+        run_git(root.path(), &["add", "."]);
+        run_git(root.path(), &["commit", "-m", "init"]);
+
+        std::fs::write(
+            root.path().join("src/allowed.rs"),
+            "pub fn a() { println!(\"x\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/extra.rs"),
+            "pub fn b() { println!(\"y\"); }\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("scratch.txt"), "tmp\n").unwrap();
+
+        let mut changes = collect_repo_changes(root.path()).expect("collect changes");
+        changes.files.sort();
+        assert!(changes.files.contains(&PathBuf::from("src/allowed.rs")));
+        assert!(changes.files.contains(&PathBuf::from("src/extra.rs")));
+        assert!(changes.files.contains(&PathBuf::from("scratch.txt")));
+
+        let out_of_scope = vec![PathBuf::from("src/extra.rs"), PathBuf::from("scratch.txt")];
+        revert_out_of_scope_changes(root.path(), &changes, &out_of_scope).expect("revert");
+
+        let mut after = collect_repo_changes(root.path()).expect("collect after");
+        after.files.sort();
+        assert_eq!(after.files, vec![PathBuf::from("src/allowed.rs")]);
+    }
+
+    #[test]
     fn syntax_gate_rejects_parse_broken_outputs() {
         let root = tempdir().unwrap();
         std::fs::write(root.path().join("broken.rs"), "fn broken( {").unwrap();
@@ -6214,6 +6360,8 @@ diff --git a/a.rs b/a.rs
         let lab = ImplementationHarnessConfig::lab_strict();
         assert!(!interactive.require_quick_check_detectable);
         assert!(lab.require_quick_check_detectable);
+        assert_eq!(interactive.max_auto_review_fix_loops, 2);
+        assert_eq!(lab.max_auto_review_fix_loops, 3);
         assert!(quick_check_passes_policy(
             ImplementationQuickCheckStatus::Unavailable,
             &interactive
@@ -6639,7 +6787,10 @@ ELIFECYCLE Command failed with exit code 1.\n"
         };
 
         // Small attempt budgets should scale below the old fixed $0.004 floor.
-        let expected_buffer = 0.0061 * MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_RATIO;
+        let expected_buffer = (0.0061 * MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_RATIO).clamp(
+            MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MIN,
+            MIN_REMAINING_BUDGET_USD_FOR_LLM_CALL_MAX,
+        );
         assert!(
             (budget.min_remaining_cost_buffer_usd() - expected_buffer).abs() < f64::EPSILON,
             "buffer={}",
@@ -6656,7 +6807,7 @@ ELIFECYCLE Command failed with exit code 1.\n"
         );
 
         let usage_below_buffer = Some(Usage {
-            cost: Some(0.00555), // remaining 0.00055
+            cost: Some(0.00565), // remaining 0.00045
             ..Usage::default()
         });
         assert!(
@@ -6747,5 +6898,19 @@ ELIFECYCLE Command failed with exit code 1.\n"
         );
         // Time floor should keep late attempts meaningful (not near-zero).
         assert!(attempt_ms >= MIN_REMAINING_BUDGET_MS_FOR_LLM_CALL_MIN);
+    }
+
+    fn run_git(repo_root: &Path, args: &[&str]) {
+        let status = StdCommand::new("git")
+            .current_dir(repo_root)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(
+            status.success(),
+            "git {:?} failed with status {:?}",
+            args,
+            status
+        );
     }
 }
