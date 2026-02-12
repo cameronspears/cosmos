@@ -1,0 +1,25 @@
+[package]
+name = "cosmos-ui"
+version = "0.7.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+tokio.workspace = true
+futures.workspace = true
+uuid.workspace = true
+unicode-width.workspace = true
+cosmos-core = { path = "../cosmos-core" }
+cosmos-engine = { path = "../cosmos-engine" }
+cosmos-adapters = { path = "../cosmos-adapters" }
+
+[dev-dependencies]
+tempfile.workspace = true
+git2.workspace = true

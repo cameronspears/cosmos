@@ -1,28 +1,33 @@
-[package]
-name = "cosmos-tui"
-version = "0.6.1"
+[workspace]
+members = [
+  "crates/cosmos-app",
+  "crates/cosmos-ui",
+  "crates/cosmos-core",
+  "crates/cosmos-engine",
+  "crates/cosmos-adapters",
+]
+resolver = "2"
+
+[workspace.package]
 edition = "2021"
-rust-version = "1.88"
-description = "A contemplative vibe coding companion for your codebase"
 license = "MIT"
 repository = "https://github.com/cameronspears/cosmos"
-keywords = ["tui", "git", "cli", "ai", "vibe-coding"]
-categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.88"
 
-[dependencies]
+[workspace.dependencies]
+anyhow = "1"
 ratatui = "0.29"
 crossterm = "0.28"
 git2 = { version = "0.19", default-features = false }
 walkdir = "2"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
-anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 futures = "0.3"
 dirs = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -35,59 +40,8 @@ tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-go = "0.23"
 
-# Unicode text width for proper terminal display
 unicode-width = "0.2"
-
-# Parallel processing for faster indexing
 rayon = "1.10"
 fs2 = "0.4.3"
 url = "2"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
-
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["linux-native"] }
-
-
-[[bin]]
-name = "cosmos"
-path = "src/main.rs"
-
-[[bench]]
-name = "perf_core"
-harness = false
-
-[dev-dependencies]
 tempfile = "3"
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
-
-# ============================================================================
-# Release Profile Optimizations
-# ============================================================================
-
-# Default release profile with ThinLTO - good balance of performance and compile time
-[profile.release]
-lto = "thin"
-codegen-units = 8
-opt-level = 3
-strip = "debuginfo"
-
-# Maximum optimization profile for distribution builds
-# Build with: cargo build --profile release-dist
-[profile.release-dist]
-inherits = "release"
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
-
-# Development profile with some optimizations for testing performance
-# Build with: cargo build --profile dev-fast
-[profile.dev-fast]
-inherits = "dev"
-opt-level = 1
-debug = true

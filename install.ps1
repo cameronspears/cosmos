@@ -88,7 +88,7 @@ if ($LASTEXITCODE -eq 0) {
     $installSuccess = $true
 } else {
     Write-Warn "crates.io install failed, trying from GitHub..."
-    & $cargoCmd install --git "https://github.com/$REPO" --locked --profile release-dist 2>&1
+    & $cargoCmd install --git "https://github.com/$REPO" --package cosmos-tui --locked --profile release-dist 2>&1
     if ($LASTEXITCODE -eq 0) {
         $installSuccess = $true
     }

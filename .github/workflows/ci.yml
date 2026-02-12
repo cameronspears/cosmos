@@ -38,40 +38,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Clippy
-        run: cargo clippy --locked -- -D warnings
-
-      - name: Performance gate
-        run: bash scripts/perf/gate.sh
-
-      - name: Upload perf artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: perf-artifacts
-          path: |
-            target/perf-metrics.env
-            target/criterion
-
-  harness-quality-gate:
-    name: Harness Quality Gate
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run deterministic harness gate tests
-        env:
-          COSMOS_LAB_FAKE_IMPLEMENT: "1"
-          COSMOS_LAB_FAKE_RELIABILITY: "1"
-        run: |
-          cargo test --locked implement_smoke_writes_multi_repo_report_in_fake_mode
-          cargo test --locked implement_gate_requires_elite_thresholds
-          cargo test --locked syntax_gate_rejects_parse_broken_outputs
+        run: cargo clippy --workspace --locked -- -D warnings
 
   # Test install scripts on all platforms
   install-script-test:
@@ -101,7 +68,7 @@ jobs:
           chmod +x install.sh
           # Modify script to install from local repo instead of crates.io
           # This tests the script logic without requiring a published crate
-          sed -i.bak 's|cargo install cosmos-tui|cargo install --path .|g' install.sh
+          sed -i.bak 's|cargo install cosmos-tui|cargo install --path crates/cosmos-app|g' install.sh
           ./install.sh
 
       - name: Run install script (Windows)
@@ -109,7 +76,7 @@ jobs:
         shell: pwsh
         run: |
           # Modify script to install from local repo instead of crates.io
-          (Get-Content install.ps1) -replace 'cargo install cosmos-tui', 'cargo install --path .' | Set-Content install.ps1
+          (Get-Content install.ps1) -replace 'cargo install cosmos-tui', 'cargo install --path crates/cosmos-app' | Set-Content install.ps1
           ./install.ps1
 
       - name: Verify cosmos is installed

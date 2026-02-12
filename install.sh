@@ -98,7 +98,7 @@ if cargo install cosmos-tui --profile release-dist 2>&1; then
 else
     # If crates.io install fails, try from git
     print_warning "crates.io install failed, trying from GitHub..."
-    cargo install --git "https://github.com/$REPO" --locked --profile release-dist
+    cargo install --git "https://github.com/$REPO" --package cosmos-tui --locked --profile release-dist
     print_success "cosmos installed successfully!"
 fi
 
