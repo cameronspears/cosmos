@@ -80,6 +80,12 @@ pub async fn run_tui(
 
     // Check if we have API access
     let ai_enabled = suggest::llm::is_available();
+    if !ai_enabled {
+        app.open_api_key_overlay(Some(
+            "No OpenRouter API key configured yet. Paste your key to start AI suggestions."
+                .to_string(),
+        ));
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  SMART SUMMARY CACHING
@@ -408,66 +414,12 @@ pub async fn run_tui(
             });
         } else {
             // Phase 2 only: All summaries cached - generate suggestions directly with cached glossary
-            app.loading = LoadingState::GeneratingSuggestions;
-
-            let index_clone = index.clone();
-            let context_clone = context.clone();
-            let tx_suggestions = tx.clone();
-            let cache_clone_path = repo_path.clone();
-            let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
-            let summaries_for_suggestions = app.llm_summaries.clone();
-            let glossary_clone = app.glossary.clone();
-
-            if !glossary_clone.is_empty() {
-                app.show_toast(&format!(
-                    "{} glossary terms · generating suggestions",
-                    glossary_clone.len()
-                ));
-            }
-
-            let repo_root = cache_clone_path.clone();
-            background::spawn_background(tx.clone(), "suggestions_generation", async move {
-                let stage_start = std::time::Instant::now();
-                let mem = if repo_memory_context.trim().is_empty() {
-                    None
-                } else {
-                    Some(repo_memory_context)
-                };
-                let gate_config = suggest::llm::SuggestionQualityGateConfig::default();
-                let run = suggest::llm::run_fast_grounded_with_gate_with_progress(
-                    &repo_root,
-                    &index_clone,
-                    &context_clone,
-                    mem,
-                    Some(&summaries_for_suggestions),
-                    gate_config,
-                    |attempt_index, attempt_count, gate, diagnostics| {
-                        let _ =
-                            tx_suggestions.send(BackgroundMessage::SuggestionsRefinementProgress {
-                                attempt_index,
-                                attempt_count,
-                                gate: gate.clone(),
-                                diagnostics: diagnostics.clone(),
-                            });
-                    },
-                )
-                .await;
-
-                match run {
-                    Ok(result) => {
-                        let _ = tx_suggestions.send(BackgroundMessage::SuggestionsRefined {
-                            suggestions: result.suggestions,
-                            usage: result.usage,
-                            diagnostics: result.diagnostics,
-                            duration_ms: stage_start.elapsed().as_millis() as u64,
-                        });
-                    }
-                    Err(e) => {
-                        let _ =
-                            tx_suggestions.send(BackgroundMessage::SuggestionsError(e.to_string()));
-                    }
-                }
-            });
+            let _ = background::request_suggestions_refresh(
+                &mut app,
+                tx.clone(),
+                repo_path.clone(),
+                "Startup",
+            );
         }
     }
 

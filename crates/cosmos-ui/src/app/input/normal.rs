@@ -720,6 +720,27 @@ fn llm_available_for_apply() -> bool {
     }
 }
 
+fn prompt_api_key_setup(app: &mut App, reason: &str) {
+    app.open_api_key_overlay(Some(reason.to_string()));
+    app.show_toast(crate::ui::openrouter_setup_toast_copy());
+}
+
+fn refresh_suggestions_now(app: &mut App, ctx: &RuntimeContext, reason: &str) {
+    if !crate::app::background::request_suggestions_refresh(
+        app,
+        ctx.tx.clone(),
+        ctx.repo_path.clone(),
+        reason,
+    ) {
+        if !suggest::llm::is_available() {
+            prompt_api_key_setup(
+                app,
+                "No API key configured yet. Add your OpenRouter key to continue.",
+            );
+        }
+    }
+}
+
 /// Handle key events in normal mode (no special input active)
 pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> Result<()> {
     match key.code {
@@ -810,7 +831,10 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                 let suggestion = app.selected_suggestion().cloned();
                                 if let Some(suggestion) = suggestion {
                                     if !llm_available_for_apply() {
-                                        app.show_toast("Run: cosmos --setup");
+                                        prompt_api_key_setup(
+                                            app,
+                                            "No API key configured yet. Add your OpenRouter key to continue.",
+                                        );
                                     } else {
                                         match open_apply_plan_for_suggestion(app, &suggestion) {
                                             Ok(()) => {}
@@ -994,16 +1018,29 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
             if app.workflow_step != WorkflowStep::Suggestions {
                 // Silently ignore during workflow
             } else if !suggest::llm::is_available() {
-                app.show_toast("Run: cosmos --setup");
+                prompt_api_key_setup(
+                    app,
+                    "No API key configured yet. Add your OpenRouter key to ask questions.",
+                );
             } else {
                 app.start_question();
             }
+        }
+        KeyCode::Char('k') => {
+            app.open_api_key_overlay(None);
         }
         KeyCode::Char('u') => {
             // Undo the last applied change (restore from git)
             match app.undo_last_pending_change() {
                 Ok(()) => app.show_toast("Change undone"),
                 Err(e) => app.show_toast(&e),
+            }
+        }
+        KeyCode::Char('r') => {
+            if app.active_panel == ActivePanel::Suggestions
+                && app.workflow_step == WorkflowStep::Suggestions
+            {
+                refresh_suggestions_now(app, ctx, "Manual refresh");
             }
         }
         KeyCode::Char('R') => {
@@ -1208,6 +1245,55 @@ mod tests {
             .unwrap_or_default();
         assert!(toast.contains("still refining"));
         assert_eq!(app.workflow_step, WorkflowStep::Suggestions);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn k_opens_api_key_overlay() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_api_key_overlay_test_{}", nanos));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files: HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: Some("deadbeef".to_string()),
+        };
+        let suggestions = SuggestionEngine::new(index.clone());
+        let context = WorkContext {
+            branch: "main".to_string(),
+            uncommitted_files: Vec::new(),
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 0,
+            repo_root: root.clone(),
+        };
+        let mut app = App::new(index.clone(), suggestions, context);
+        app.active_panel = ActivePanel::Suggestions;
+        app.workflow_step = WorkflowStep::Suggestions;
+
+        let (tx, _rx) = mpsc::channel();
+        let ctx = crate::app::RuntimeContext {
+            index: &index,
+            repo_path: &root,
+            tx: &tx,
+        };
+
+        handle_normal_mode(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(matches!(app.overlay, Overlay::ApiKeySetup { .. }));
+
         let _ = std::fs::remove_dir_all(root);
     }
 

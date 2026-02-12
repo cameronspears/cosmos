@@ -4,7 +4,33 @@ use crate::app::messages::BackgroundMessage;
 use crate::app::RuntimeContext;
 use crate::ui::{App, LoadingState, Overlay};
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+const OPENROUTER_KEYS_URL: &str = "https://openrouter.ai/settings/keys";
+const OPENROUTER_CREDITS_URL: &str = "https://openrouter.ai/settings/credits";
+
+fn normalize_api_key_input(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let unquoted = trimmed.trim_matches(|c| c == '"' || c == '\'' || c == '`');
+    unquoted.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn open_openrouter_link(app: &mut App, url: &str, label: &str) {
+    match crate::git_ops::open_url(url) {
+        Ok(()) => app.show_toast(&format!(
+            "Opened OpenRouter {} page in your browser.",
+            label
+        )),
+        Err(_) => app.show_toast(&format!(
+            "Couldn't open browser. Visit {} to open OpenRouter {} page.",
+            url, label
+        )),
+    }
+}
+
+fn has_control_or_command(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) || modifiers.contains(KeyModifiers::SUPER)
+}
 
 /// Handle key events when an overlay is active
 pub(super) fn handle_overlay_input(
@@ -14,6 +40,105 @@ pub(super) fn handle_overlay_input(
 ) -> Result<()> {
     // Handle overlay mode
     if app.overlay != Overlay::None {
+        // Handle API key setup overlay
+        if let Overlay::ApiKeySetup { .. } = &app.overlay {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.close_overlay();
+                    app.show_toast("API key setup canceled.");
+                }
+                KeyCode::Char('k') if has_control_or_command(key.modifiers) => {
+                    open_openrouter_link(app, OPENROUTER_KEYS_URL, "keys");
+                }
+                KeyCode::Char('b') if has_control_or_command(key.modifiers) => {
+                    open_openrouter_link(app, OPENROUTER_CREDITS_URL, "credits");
+                }
+                KeyCode::Backspace => {
+                    if let Overlay::ApiKeySetup {
+                        input,
+                        error,
+                        save_armed,
+                    } = &mut app.overlay
+                    {
+                        input.pop();
+                        *error = None;
+                        *save_armed = false;
+                    }
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    if let Overlay::ApiKeySetup {
+                        input,
+                        error,
+                        save_armed,
+                    } = &mut app.overlay
+                    {
+                        input.push(c);
+                        *error = None;
+                        *save_armed = false;
+                    }
+                }
+                KeyCode::Enter => {
+                    let (candidate, save_armed) = match &app.overlay {
+                        Overlay::ApiKeySetup {
+                            input, save_armed, ..
+                        } => (normalize_api_key_input(input), *save_armed),
+                        _ => (String::new(), false),
+                    };
+
+                    if candidate.is_empty() {
+                        if let Overlay::ApiKeySetup { error, .. } = &mut app.overlay {
+                            *error = Some("Paste an OpenRouter API key to continue.".to_string());
+                        }
+                        return Ok(());
+                    }
+
+                    if !save_armed && !crate::config::Config::validate_api_key_format(&candidate) {
+                        if let Overlay::ApiKeySetup {
+                            error, save_armed, ..
+                        } = &mut app.overlay
+                        {
+                            *save_armed = true;
+                            *error = Some(
+                                "This key does not start with sk-. Press Enter again to save anyway, or keep editing."
+                                    .to_string(),
+                            );
+                        }
+                        return Ok(());
+                    }
+
+                    let mut cfg = crate::config::Config::load();
+                    match cfg.set_api_key(&candidate) {
+                        Ok(()) => {
+                            app.close_overlay();
+                            crate::app::background::spawn_balance_refresh(ctx.tx.clone());
+                            let refreshed = crate::app::background::request_suggestions_refresh(
+                                app,
+                                ctx.tx.clone(),
+                                ctx.repo_path.clone(),
+                                "API key saved",
+                            );
+                            if !refreshed {
+                                app.show_toast(
+                                    "API key saved. Press r in Suggestions to refresh analysis.",
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if let Overlay::ApiKeySetup {
+                                error, save_armed, ..
+                            } = &mut app.overlay
+                            {
+                                *error = Some(e);
+                                *save_armed = false;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         // Handle Apply Plan overlay
         if let Overlay::ApplyPlan { .. } = &app.overlay {
             match key.code {
@@ -275,4 +400,21 @@ pub(super) fn handle_overlay_input(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_api_key_input;
+
+    #[test]
+    fn normalize_api_key_input_trims_quotes_and_whitespace() {
+        let input = "  \" sk-or-v1-abcd1234 \n\"  ";
+        assert_eq!(normalize_api_key_input(input), "sk-or-v1-abcd1234");
+    }
+
+    #[test]
+    fn normalize_api_key_input_leaves_clean_key_unchanged() {
+        let input = "sk-or-v1-clean-key";
+        assert_eq!(normalize_api_key_input(input), "sk-or-v1-clean-key");
+    }
 }

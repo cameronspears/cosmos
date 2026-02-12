@@ -100,6 +100,12 @@ pub enum Overlay {
         path: PathBuf,
         scroll: usize,
     },
+    /// API key entry overlay (in-TUI BYOK setup)
+    ApiKeySetup {
+        input: String,
+        error: Option<String>,
+        save_armed: bool,
+    },
     /// Apply plan preview - explicit scope/intent gate before mutation
     ApplyPlan {
         suggestion_id: uuid::Uuid,

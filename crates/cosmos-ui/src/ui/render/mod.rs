@@ -17,8 +17,8 @@ use footer::render_footer;
 use header::render_header;
 use main::render_main;
 use overlays::{
-    render_apply_plan, render_file_detail, render_help, render_reset_overlay, render_startup_check,
-    render_update_overlay, render_welcome,
+    render_api_key_overlay, render_apply_plan, render_file_detail, render_help,
+    render_reset_overlay, render_startup_check, render_update_overlay, render_welcome,
 };
 use toast::render_toast;
 
@@ -52,6 +52,13 @@ pub fn render(frame: &mut Frame, app: &App) {
             if let Some(file_index) = app.index.files.get(path) {
                 render_file_detail(frame, path, file_index, app.get_llm_summary(path), *scroll);
             }
+        }
+        Overlay::ApiKeySetup {
+            input,
+            error,
+            save_armed,
+        } => {
+            render_api_key_overlay(frame, input, error.as_deref(), *save_armed);
         }
         Overlay::ApplyPlan {
             preview,

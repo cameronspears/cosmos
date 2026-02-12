@@ -567,119 +567,147 @@ fn render_suggestions_content<'a>(
         let summaries_incomplete =
             app.needs_summary_generation && !app.summary_failed_files.is_empty();
 
+        let border_style = Style::default().fg(Theme::GREY_700);
+        let card_width = inner_width.saturating_sub(12).clamp(26, 40);
+        let rule_width = card_width + 2;
+        let row_width = card_width;
+
+        let center_row = |text: &str| -> String {
+            let clipped: String = text.chars().take(row_width).collect();
+            let len = clipped.chars().count();
+            if len >= row_width {
+                return clipped;
+            }
+            let left = (row_width - len) / 2;
+            let right = row_width - len - left;
+            format!("{}{}{}", " ".repeat(left), clipped, " ".repeat(right))
+        };
+
         lines.push(Line::from(vec![
-            Span::styled("    ╭", Style::default().fg(Theme::GREY_700)),
-            Span::styled(
-                "──────────────────────────────────",
-                Style::default().fg(Theme::GREY_700),
-            ),
-            Span::styled("╮", Style::default().fg(Theme::GREY_700)),
+            Span::styled("    ╭", border_style),
+            Span::styled("─".repeat(rule_width), border_style),
+            Span::styled("╮", border_style),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("    │", Style::default().fg(Theme::GREY_700)),
-            Span::styled("                                  ", Style::default()),
-            Span::styled("│", Style::default().fg(Theme::GREY_700)),
+            Span::styled("    │ ", border_style),
+            Span::styled(" ".repeat(row_width), Style::default()),
+            Span::styled(" │", border_style),
         ]));
 
         if summaries_incomplete {
             lines.push(Line::from(vec![
-                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
-                Span::styled("       ! ", Style::default().fg(Theme::YELLOW)),
-                Span::styled("Summaries incomplete", Style::default().fg(Theme::GREY_300)),
-                Span::styled("      │", Style::default().fg(Theme::GREY_700)),
+                Span::styled("    │ ", border_style),
+                Span::styled(
+                    center_row("Summaries incomplete"),
+                    Style::default().fg(Theme::YELLOW),
+                ),
+                Span::styled(" │", border_style),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
+                Span::styled("    │ ", border_style),
                 Span::styled(
-                    format!("         {} file(s) failed", app.summary_failed_files.len()),
-                    Style::default().fg(Theme::GREY_500),
+                    center_row(&format!(
+                        "{} file(s) failed",
+                        app.summary_failed_files.len()
+                    )),
+                    Style::default().fg(Theme::GREY_400),
                 ),
-                Span::styled("      │", Style::default().fg(Theme::GREY_700)),
+                Span::styled(" │", border_style),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
+                Span::styled("    │ ", border_style),
                 Span::styled(
-                    "   Press R to open Reset Cosmos",
-                    Style::default().fg(Theme::GREY_500),
+                    center_row("Press R to open Reset Cosmos"),
+                    Style::default().fg(Theme::GREY_300),
                 ),
-                Span::styled("   │", Style::default().fg(Theme::GREY_700)),
+                Span::styled(" │", border_style),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
+                Span::styled("    │ ", border_style),
                 Span::styled(
-                    "   then restart to regenerate",
+                    center_row("Then restart to regenerate"),
                     Style::default().fg(Theme::GREY_500),
                 ),
-                Span::styled("       │", Style::default().fg(Theme::GREY_700)),
+                Span::styled(" │", border_style),
             ]));
         } else if app.suggestion_refinement_in_progress {
             lines.push(Line::from(vec![
-                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
-                Span::styled("       ↻ ", Style::default().fg(Theme::ACCENT)),
-                Span::styled("Refining suggestions", Style::default().fg(Theme::GREY_300)),
-                Span::styled("      │", Style::default().fg(Theme::GREY_700)),
+                Span::styled("    │ ", border_style),
+                Span::styled(
+                    center_row("Refining suggestions"),
+                    Style::default().fg(Theme::ACCENT),
+                ),
+                Span::styled(" │", border_style),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
+                Span::styled("    │ ", border_style),
                 Span::styled(
-                    format!(
-                        "         {} provisional suggestions in review",
+                    center_row(&format!(
+                        "{} provisional suggestions in review",
                         app.suggestion_provisional_count
-                    ),
+                    )),
                     Style::default().fg(Theme::GREY_500),
                 ),
-                Span::styled(" │", Style::default().fg(Theme::GREY_700)),
+                Span::styled(" │", border_style),
             ]));
         } else if has_ai {
             lines.push(Line::from(vec![
-                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
-                Span::styled("       + ", Style::default().fg(Theme::GREEN)),
-                Span::styled("No issues found", Style::default().fg(Theme::GREY_300)),
-                Span::styled("          │", Style::default().fg(Theme::GREY_700)),
+                Span::styled("    │ ", border_style),
+                Span::styled(
+                    center_row("No issues found"),
+                    Style::default().fg(Theme::GREY_300),
+                ),
+                Span::styled(" │", border_style),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
+                Span::styled("    │ ", border_style),
                 Span::styled(
-                    "         Nothing to suggest",
+                    center_row("Nothing to suggest"),
                     Style::default().fg(Theme::GREY_500),
                 ),
-                Span::styled("       │", Style::default().fg(Theme::GREY_700)),
+                Span::styled(" │", border_style),
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
-                Span::styled("       ☽ ", Style::default().fg(Theme::GREY_400)),
-                Span::styled("AI not configured", Style::default().fg(Theme::GREY_300)),
-                Span::styled("        │", Style::default().fg(Theme::GREY_700)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
-                Span::styled("                                  ", Style::default()),
-                Span::styled("│", Style::default().fg(Theme::GREY_700)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("    │", Style::default().fg(Theme::GREY_700)),
+                Span::styled("    │ ", border_style),
                 Span::styled(
-                    "   cosmos --setup    ",
+                    center_row("AI not configured"),
+                    Style::default().fg(Theme::GREY_200),
+                ),
+                Span::styled(" │", border_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("    │ ", border_style),
+                Span::styled(" ".repeat(row_width), Style::default()),
+                Span::styled(" │", border_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("    │ ", border_style),
+                Span::styled(
+                    center_row("Press k for setup guide"),
+                    Style::default().fg(Theme::GREY_300),
+                ),
+                Span::styled(" │", border_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("    │ ", border_style),
+                Span::styled(
+                    center_row("Suggestions unlock after setup"),
                     Style::default().fg(Theme::GREY_500),
                 ),
-                Span::styled("(BYOK)", Style::default().fg(Theme::GREY_600)),
-                Span::styled("   │", Style::default().fg(Theme::GREY_700)),
+                Span::styled(" │", border_style),
             ]));
         }
 
         lines.push(Line::from(vec![
-            Span::styled("    │", Style::default().fg(Theme::GREY_700)),
-            Span::styled("                                  ", Style::default()),
-            Span::styled("│", Style::default().fg(Theme::GREY_700)),
+            Span::styled("    │ ", border_style),
+            Span::styled(" ".repeat(row_width), Style::default()),
+            Span::styled(" │", border_style),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("    ╰", Style::default().fg(Theme::GREY_700)),
-            Span::styled(
-                "──────────────────────────────────",
-                Style::default().fg(Theme::GREY_700),
-            ),
-            Span::styled("╯", Style::default().fg(Theme::GREY_700)),
+            Span::styled("    ╰", border_style),
+            Span::styled("─".repeat(rule_width), border_style),
+            Span::styled("╯", border_style),
         ]));
 
         render_suggestion_diagnostics(lines, app, inner_width);

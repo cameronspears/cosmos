@@ -28,6 +28,7 @@ struct FooterCacheKey {
     ship_step: ShipStep,
     has_pending_changes: bool,
     has_update_available: bool,
+    ai_available: bool,
 }
 
 thread_local! {
@@ -172,6 +173,7 @@ pub(super) fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ship_step: app.ship_state.step,
         has_pending_changes: !app.pending_changes.is_empty(),
         has_update_available: app.update_available.is_some(),
+        ai_available: crate::suggest::llm::is_available(),
     };
 
     if let Some(cached_spans) = FOOTER_SPANS_CACHE.with(|cache| {
@@ -415,11 +417,16 @@ fn get_hint_buttons(app: &App) -> Vec<FooterButton> {
         }
         ActivePanel::Suggestions => match app.workflow_step {
             WorkflowStep::Suggestions => {
-                vec![
+                let mut hints = vec![
                     hint_button("i", "ask"),
+                    hint_button("r", "refresh"),
                     hint_button("x", "dismiss"),
                     hint_button("d", "diag"),
-                ]
+                ];
+                if !crate::suggest::llm::is_available() {
+                    hints.push(hint_button("k", "API key"));
+                }
+                hints
             }
             _ => vec![],
         },

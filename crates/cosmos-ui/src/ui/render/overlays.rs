@@ -83,9 +83,11 @@ pub(super) fn render_help(frame: &mut Frame, scroll: usize) {
     help_text.extend(section_start("Actions"));
     help_text.push(section_spacer());
     help_text.push(key_row("↵", "Open apply plan / confirm"));
+    help_text.push(key_row("r", "Refresh suggestions"));
     help_text.push(key_row("x", "Dismiss suggestion"));
     help_text.push(key_row("d", "Toggle diagnostics"));
     help_text.push(key_row("i", "Ask Cosmos"));
+    help_text.push(key_row("k", "Open OpenRouter setup guide"));
     help_text.push(key_row("?", "Show help"));
     help_text.push(key_row("q", "Quit"));
     help_text.push(section_spacer());
@@ -375,6 +377,224 @@ pub(super) fn render_file_detail(
             .style(Style::default().bg(Theme::GREY_900)),
     );
 
+    frame.render_widget(block, area);
+}
+
+pub(super) fn render_api_key_overlay(
+    frame: &mut Frame,
+    input: &str,
+    error: Option<&str>,
+    save_armed: bool,
+) {
+    let area = centered_rect(72, 56, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Connect OpenRouter to enable AI suggestions in Cosmos.",
+        Style::default()
+            .fg(Theme::WHITE)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        "  First time setup takes about a minute.",
+        Style::default().fg(Theme::GREY_400),
+    )]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  1) ", Style::default().fg(Theme::GREEN)),
+        Span::styled("Create/sign in", Style::default().fg(Theme::GREY_200)),
+        Span::styled(" and generate a key", Style::default().fg(Theme::GREY_400)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("      ", Style::default()),
+        Span::styled("Press ", Style::default().fg(Theme::GREY_500)),
+        Span::styled(
+            crate::ui::openrouter_keys_shortcut_display(),
+            Style::default().fg(Theme::GREY_400),
+        ),
+        Span::styled(" for OpenRouter keys", Style::default().fg(Theme::GREY_500)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  2) ", Style::default().fg(Theme::GREEN)),
+        Span::styled("Add credits", Style::default().fg(Theme::GREY_200)),
+        Span::styled(
+            " (required for model usage)",
+            Style::default().fg(Theme::GREY_400),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("      ", Style::default()),
+        Span::styled("Press ", Style::default().fg(Theme::GREY_500)),
+        Span::styled(
+            crate::ui::openrouter_credits_shortcut_display(),
+            Style::default().fg(Theme::GREY_400),
+        ),
+        Span::styled(
+            " for OpenRouter credits",
+            Style::default().fg(Theme::GREY_500),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  3) ", Style::default().fg(Theme::GREEN)),
+        Span::styled(
+            "Paste your API key below (it usually starts with ",
+            Style::default().fg(Theme::GREY_400),
+        ),
+        Span::styled("sk-", Style::default().fg(Theme::GREY_200)),
+        Span::styled(")", Style::default().fg(Theme::GREY_400)),
+    ]));
+    lines.push(Line::from(""));
+
+    let normalized_key: String = input
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let key_len = normalized_key.chars().count();
+    let has_sk_prefix = normalized_key.starts_with("sk-");
+    let mask = if key_len == 0 {
+        "█".to_string()
+    } else {
+        let hidden_count = if has_sk_prefix {
+            key_len.saturating_sub(3)
+        } else {
+            key_len
+        };
+        let shown = hidden_count.min(48);
+        let hidden = "•".repeat(shown);
+        if has_sk_prefix {
+            format!("sk-{}█", hidden)
+        } else {
+            format!("{}█", hidden)
+        }
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(mask, Style::default().fg(Theme::WHITE)),
+    ]));
+    lines.push(Line::from(""));
+
+    if save_armed {
+        lines.push(Line::from(vec![
+            Span::styled("  Press ", Style::default().fg(Theme::GREY_300)),
+            Span::styled(
+                " Enter ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREEN),
+            ),
+            Span::styled(
+                " again to save this key anyway.",
+                Style::default().fg(Theme::YELLOW),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  Press ", Style::default().fg(Theme::GREY_300)),
+            Span::styled(
+                " Enter ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREEN),
+            ),
+            Span::styled(
+                " to save key and refresh suggestions.",
+                Style::default().fg(Theme::GREY_300),
+            ),
+        ]));
+    }
+
+    if key_len > 0 {
+        let prefix_status = if has_sk_prefix {
+            "prefix sk- detected"
+        } else {
+            "prefix sk- not detected"
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Key check: ", Style::default().fg(Theme::GREY_500)),
+            Span::styled(
+                format!("{}, {} chars entered.", prefix_status, key_len),
+                Style::default().fg(Theme::GREY_300),
+            ),
+        ]));
+        if !has_sk_prefix {
+            lines.push(Line::from(vec![
+                Span::styled("  ! ", Style::default().fg(Theme::YELLOW)),
+                Span::styled(
+                    "OpenRouter keys usually start with sk-",
+                    Style::default().fg(Theme::GREY_300),
+                ),
+            ]));
+        }
+    }
+
+    if let Some(message) = error {
+        lines.push(Line::from(""));
+        for line in wrap_text(message, area.width.saturating_sub(10) as usize) {
+            lines.push(Line::from(vec![
+                Span::styled("  ! ", Style::default().fg(Theme::YELLOW)),
+                Span::styled(line, Style::default().fg(Theme::GREY_200)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Cosmos stores your key in your system credential store.",
+        Style::default().fg(Theme::GREY_500),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        "  Data use: selected snippets + file paths may be sent to OpenRouter.",
+        Style::default().fg(Theme::GREY_500),
+    )]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  ───────────────────────────────────────────────────────────────",
+        Style::default().fg(Theme::GREY_600),
+    )]));
+    let enter_label = if save_armed {
+        " save anyway "
+    } else {
+        " save + refresh "
+    };
+    lines.push(Line::from(vec![
+        Span::styled("   ", Style::default()),
+        Span::styled(
+            " Enter ",
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREEN),
+        ),
+        Span::styled(enter_label, Style::default().fg(Theme::GREY_300)),
+        Span::styled(
+            crate::ui::openrouter_keys_shortcut_chip(),
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+        ),
+        Span::styled(" keys  ", Style::default().fg(Theme::GREY_400)),
+        Span::styled(
+            crate::ui::openrouter_credits_shortcut_chip(),
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+        ),
+        Span::styled(" credits  ", Style::default().fg(Theme::GREY_400)),
+        Span::styled(
+            " Backspace ",
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+        ),
+        Span::styled(" delete  ", Style::default().fg(Theme::GREY_400)),
+        Span::styled(
+            " Esc ",
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+        ),
+        Span::styled(" cancel", Style::default().fg(Theme::GREY_400)),
+    ]));
+
+    let block = Paragraph::new(lines).block(
+        Block::default()
+            .title(" API Key Setup ")
+            .title_style(Style::default().fg(Theme::GREY_100))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Theme::GREY_400))
+            .style(Style::default().bg(Theme::GREY_900)),
+    );
     frame.render_widget(block, area);
 }
 

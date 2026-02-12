@@ -29,6 +29,46 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tree::{build_file_tree, build_grouped_tree};
 
+pub fn openrouter_keys_shortcut_display() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "control + k"
+    } else {
+        "Ctrl + k"
+    }
+}
+
+pub fn openrouter_credits_shortcut_display() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "control + b"
+    } else {
+        "Ctrl + b"
+    }
+}
+
+pub fn openrouter_keys_shortcut_chip() -> &'static str {
+    if cfg!(target_os = "macos") {
+        " control+k "
+    } else {
+        " Ctrl+k "
+    }
+}
+
+pub fn openrouter_credits_shortcut_chip() -> &'static str {
+    if cfg!(target_os = "macos") {
+        " control+b "
+    } else {
+        " Ctrl+b "
+    }
+}
+
+pub fn openrouter_setup_toast_copy() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "OpenRouter setup required. Press control + k for keys, control + b for credits, then press Enter."
+    } else {
+        "OpenRouter setup required. Press Ctrl + k for keys, Ctrl + b for credits, then press Enter."
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  APP STATE
 // ═══════════════════════════════════════════════════════════════════════════
@@ -816,6 +856,15 @@ impl App {
     /// Close overlay
     pub fn close_overlay(&mut self) {
         self.overlay = Overlay::None;
+    }
+
+    /// Open in-TUI API key setup overlay.
+    pub fn open_api_key_overlay(&mut self, error: Option<String>) {
+        self.overlay = Overlay::ApiKeySetup {
+            input: String::new(),
+            error,
+            save_armed: false,
+        };
     }
 
     /// Open pre-apply plan overlay with explicit scope and intent.

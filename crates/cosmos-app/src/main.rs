@@ -9,7 +9,7 @@ use anyhow::Result;
 use clap::Parser;
 use cosmos_ui::context::WorkContext;
 use cosmos_ui::index::CodebaseIndex;
-use cosmos_ui::{app, cache, config, git_ops, github, keyring, onboarding, suggest};
+use cosmos_ui::{app, cache, config, git_ops, github, keyring, suggest};
 use std::path::{Path, PathBuf};
 use suggest::SuggestionEngine;
 
@@ -48,31 +48,6 @@ async fn main() -> Result<()> {
     // Handle --github-login flag
     if args.github_login {
         return github_login().await;
-    }
-
-    // Check if onboarding is needed (missing API key or GitHub auth)
-    if onboarding::needs_onboarding() {
-        onboarding::run_onboarding()
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-        // Setup completed, verify API key is accessible
-        let mut config = config::Config::load();
-        match config.get_api_key() {
-            Some(_) => {
-                eprintln!("  + API key verified and ready to use");
-                eprintln!();
-            }
-            None => {
-                eprintln!("  ! Warning: API key was saved but cannot be read back.");
-                eprintln!("  ! This may be due to keychain access issues.");
-                eprintln!("  ! Workaround: Set OPENROUTER_API_KEY environment variable.");
-                eprintln!();
-                eprintln!("  Press Enter to continue...");
-                let mut _input = String::new();
-                let _ = std::io::stdin().read_line(&mut _input);
-            }
-        }
     }
 
     let path = args.path.canonicalize()?;

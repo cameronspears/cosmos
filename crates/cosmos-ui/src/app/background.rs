@@ -26,6 +26,143 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
+fn is_api_key_error(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("no api key configured")
+        || lowered.contains("invalid api key")
+        || (lowered.contains("openrouter") && lowered.contains("api key"))
+        || lowered.contains("run 'cosmos --setup'")
+}
+
+fn maybe_prompt_api_key_overlay(app: &mut App, message: &str) -> bool {
+    if !is_api_key_error(message) {
+        return false;
+    }
+    let detail = if message.to_ascii_lowercase().contains("invalid api key") {
+        "OpenRouter rejected this API key. Paste a valid key to continue."
+    } else {
+        "Cosmos needs an OpenRouter API key to run AI actions."
+    };
+    app.open_api_key_overlay(Some(detail.to_string()));
+    app.show_toast(crate::ui::openrouter_setup_toast_copy());
+    true
+}
+
+fn spawn_suggestions_generation(
+    tx: mpsc::Sender<BackgroundMessage>,
+    repo_root: PathBuf,
+    index: crate::index::CodebaseIndex,
+    context: crate::context::WorkContext,
+    repo_memory_context: String,
+    summaries_for_suggestions: std::collections::HashMap<PathBuf, String>,
+) {
+    let tx_suggestions = tx.clone();
+    spawn_background(tx.clone(), "suggestions_generation", async move {
+        let stage_start = std::time::Instant::now();
+        let mem = if repo_memory_context.trim().is_empty() {
+            None
+        } else {
+            Some(repo_memory_context)
+        };
+        let gate_config = suggest::llm::SuggestionQualityGateConfig::default();
+        let run = suggest::llm::run_fast_grounded_with_gate_with_progress(
+            &repo_root,
+            &index,
+            &context,
+            mem,
+            Some(&summaries_for_suggestions),
+            gate_config,
+            |attempt_index, attempt_count, gate, diagnostics| {
+                let _ = tx_suggestions.send(BackgroundMessage::SuggestionsRefinementProgress {
+                    attempt_index,
+                    attempt_count,
+                    gate: gate.clone(),
+                    diagnostics: diagnostics.clone(),
+                });
+            },
+        )
+        .await;
+
+        match run {
+            Ok(result) => {
+                let _ = tx_suggestions.send(BackgroundMessage::SuggestionsRefined {
+                    suggestions: result.suggestions,
+                    usage: result.usage,
+                    diagnostics: result.diagnostics,
+                    duration_ms: stage_start.elapsed().as_millis() as u64,
+                });
+            }
+            Err(e) => {
+                let _ = tx_suggestions.send(BackgroundMessage::SuggestionsError(e.to_string()));
+            }
+        }
+    });
+}
+
+pub fn request_suggestions_refresh(
+    app: &mut App,
+    tx: mpsc::Sender<BackgroundMessage>,
+    repo_root: PathBuf,
+    reason: &str,
+) -> bool {
+    if !suggest::llm::is_available() {
+        return false;
+    }
+
+    if app.loading == LoadingState::GeneratingSuggestions {
+        app.show_toast("Suggestions are already regenerating...");
+        return false;
+    }
+
+    if app.needs_summary_generation {
+        if app.summary_progress.is_some() {
+            app.pending_suggestions_on_init = true;
+            app.show_toast("Summaries still generating. Suggestions will refresh automatically.");
+            return false;
+        }
+        if !app.summary_failed_files.is_empty() {
+            app.show_toast(&format!(
+                "Summaries incomplete: {} files failed. Open Reset Cosmos (R), clear summaries, then restart Cosmos.{}",
+                app.summary_failed_files.len(),
+                failed_files_hint(&app.summary_failed_files)
+            ));
+            return false;
+        }
+    }
+
+    app.loading = LoadingState::GeneratingSuggestions;
+    app.last_suggestion_error = None;
+    app.suggestion_refinement_in_progress = true;
+    app.suggestion_provisional_count = 0;
+    app.suggestion_validated_count = 0;
+    app.suggestion_rejected_count = 0;
+    app.clear_apply_confirm();
+
+    if app.glossary.is_empty() {
+        app.show_toast(&format!("{} · generating suggestions...", reason));
+    } else {
+        app.show_toast(&format!(
+            "{} · {} glossary terms · generating suggestions...",
+            reason,
+            app.glossary.len()
+        ));
+    }
+
+    let index = app.index.clone();
+    let context = app.context.clone();
+    let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
+    let summaries_for_suggestions = app.llm_summaries.clone();
+    spawn_suggestions_generation(
+        tx,
+        repo_root,
+        index,
+        context,
+        repo_memory_context,
+        summaries_for_suggestions,
+    );
+    true
+}
+
 pub fn drain_messages(
     app: &mut App,
     rx: &mpsc::Receiver<BackgroundMessage>,
@@ -168,7 +305,9 @@ pub fn drain_messages(
                 } else {
                     app.loading = LoadingState::None;
                 }
-                app.show_toast(&format!("Suggestions error: {}", truncate(&e, 80)));
+                if !maybe_prompt_api_key_overlay(app, &e) {
+                    app.show_toast(&format!("Suggestions error: {}", truncate(&e, 80)));
+                }
                 app.last_suggestion_error = Some(e);
                 app.suggestion_refinement_in_progress = false;
                 app.clear_apply_confirm();
@@ -220,68 +359,12 @@ pub fn drain_messages(
                         );
                         app.show_toast(&message);
                     } else if ai_enabled {
-                        let index_clone = app.index.clone();
-                        let context_clone = app.context.clone();
-                        let tx_suggestions = ctx.tx.clone();
-                        let cache_clone_path = ctx.repo_path.clone();
-                        let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
-                        let summaries_for_suggestions = app.llm_summaries.clone();
-                        let glossary_clone = app.glossary.clone();
-
-                        app.loading = LoadingState::GeneratingSuggestions;
-                        if failed_count == 0 {
-                            app.show_toast(&format!(
-                                "{} terms in glossary · generating suggestions...",
-                                glossary_clone.len()
-                            ));
-                        }
-
-                        let repo_root = cache_clone_path.clone();
-                        spawn_background(ctx.tx.clone(), "suggestions_generation", async move {
-                            let stage_start = std::time::Instant::now();
-                            let mem = if repo_memory_context.trim().is_empty() {
-                                None
-                            } else {
-                                Some(repo_memory_context)
-                            };
-                            let gate_config = suggest::llm::SuggestionQualityGateConfig::default();
-                            let run = suggest::llm::run_fast_grounded_with_gate_with_progress(
-                                &repo_root,
-                                &index_clone,
-                                &context_clone,
-                                mem,
-                                Some(&summaries_for_suggestions),
-                                gate_config,
-                                |attempt_index, attempt_count, gate, diagnostics| {
-                                    let _ = tx_suggestions.send(
-                                        BackgroundMessage::SuggestionsRefinementProgress {
-                                            attempt_index,
-                                            attempt_count,
-                                            gate: gate.clone(),
-                                            diagnostics: diagnostics.clone(),
-                                        },
-                                    );
-                                },
-                            )
-                            .await;
-
-                            match run {
-                                Ok(result) => {
-                                    let _ = tx_suggestions.send(
-                                        BackgroundMessage::SuggestionsRefined {
-                                            suggestions: result.suggestions,
-                                            usage: result.usage,
-                                            diagnostics: result.diagnostics,
-                                            duration_ms: stage_start.elapsed().as_millis() as u64,
-                                        },
-                                    );
-                                }
-                                Err(e) => {
-                                    let _ = tx_suggestions
-                                        .send(BackgroundMessage::SuggestionsError(e.to_string()));
-                                }
-                            }
-                        });
+                        let _ = request_suggestions_refresh(
+                            app,
+                            ctx.tx.clone(),
+                            ctx.repo_path.clone(),
+                            "Summaries ready",
+                        );
                     } else {
                         app.loading = LoadingState::None;
                         if failed_count > 0 {
@@ -420,7 +503,9 @@ pub fn drain_messages(
                 app.loading = LoadingState::None;
                 app.workflow_step = WorkflowStep::Suggestions;
                 app.verify_state = ui::VerifyState::default();
-                app.show_toast(&format!("Preview error: {}", truncate(&e, 80)));
+                if !maybe_prompt_api_key_overlay(app, &e) {
+                    app.show_toast(&format!("Preview error: {}", truncate(&e, 80)));
+                }
             }
             BackgroundMessage::ApplyHarnessProgress {
                 attempt_index,
@@ -582,7 +667,9 @@ pub fn drain_messages(
                 app.workflow_step = WorkflowStep::Suggestions;
                 app.verify_state = ui::VerifyState::default();
                 app.clear_apply_confirm();
-                app.show_toast(&format!("Apply failed: {}", truncate(&e, 80)));
+                if !maybe_prompt_api_key_overlay(app, &e) {
+                    app.show_toast(&format!("Apply failed: {}", truncate(&e, 80)));
+                }
             }
             BackgroundMessage::ShipProgress(step) => {
                 // Handle workflow mode
@@ -635,8 +722,11 @@ pub fn drain_messages(
                     app.review_state.fixing = false;
                 }
 
-                // Verification failures are explicit and require manual override in Review.
-                if e.contains("verification failed") || e.contains("Re-verification failed") {
+                if maybe_prompt_api_key_overlay(app, &e) {
+                    // Key prompt handles the user-visible guidance.
+                } else if e.contains("verification failed") || e.contains("Re-verification failed")
+                {
+                    // Verification failures are explicit and require manual override in Review.
                     app.review_state.reviewing = false;
                     app.review_state.verification_failed = true;
                     app.review_state.verification_error = Some(truncate(&e, 200).to_string());
