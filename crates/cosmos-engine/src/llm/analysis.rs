@@ -74,8 +74,13 @@ const STRETCH_PHASE_MAX_COST_USD: f64 = 0.012;
 const STRETCH_PHASE_MIN_REMAINING_VALIDATION_MS: u64 = 6_000;
 const SUMMARY_MIN_WORDS: usize = 5;
 const SUMMARY_MIN_CHARS: usize = 24;
+const DIVERSITY_DOMINANT_TOPIC_RATIO_MAX: f64 = 0.60;
+const DIVERSITY_MIN_UNIQUE_TOPICS: usize = 4;
+const DIVERSITY_DOMINANT_FILE_RATIO_MAX: f64 = 0.60;
+const DIVERSITY_MIN_UNIQUE_FILES: usize = 4;
+const DIVERSITY_FILE_BALANCE_PER_FILE_CAP: usize = 3;
 const DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE: f32 = 0.45;
-const DEFAULT_MAX_SMART_REWRITES_PER_RUN: usize = 4;
+const DEFAULT_MAX_SMART_REWRITES_PER_RUN: usize = 8;
 const SMART_REWRITE_READINESS_UPPER_BOUND: f32 = 0.60;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -248,6 +253,14 @@ pub struct SuggestionDiagnostics {
     pub overclaim_rewrite_count: usize,
     pub overclaim_rewrite_validated_count: usize,
     pub smart_rewrite_count: usize,
+    pub deterministic_auto_validated_count: usize,
+    pub semantic_dedup_dropped_count: usize,
+    pub file_balance_dropped_count: usize,
+    pub speculative_impact_dropped_count: usize,
+    pub dominant_topic_ratio: f64,
+    pub unique_topic_count: usize,
+    pub dominant_file_ratio: f64,
+    pub unique_file_count: usize,
     pub readiness_filtered_count: usize,
     pub readiness_score_mean: f64,
     pub regeneration_attempts: usize,
@@ -277,7 +290,7 @@ impl Default for SuggestionQualityGateConfig {
             max_smart_rewrites_per_run: DEFAULT_MAX_SMART_REWRITES_PER_RUN,
             max_suggest_cost_usd: 0.035,
             max_suggest_ms: SUGGEST_GATE_BUDGET_MS,
-            max_attempts: 1,
+            max_attempts: 2,
         }
     }
 }
@@ -289,6 +302,14 @@ pub struct SuggestionGateSnapshot {
     pub pending_count: usize,
     pub suggest_total_ms: u64,
     pub suggest_total_cost_usd: f64,
+    #[serde(default)]
+    pub dominant_topic_ratio: f64,
+    #[serde(default)]
+    pub unique_topic_count: usize,
+    #[serde(default)]
+    pub dominant_file_ratio: f64,
+    #[serde(default)]
+    pub unique_file_count: usize,
     pub passed: bool,
     #[serde(default)]
     pub fail_reasons: Vec<String>,
@@ -834,6 +855,7 @@ struct ValidationRejectionStats {
     transport_recovered_count: usize,
     overclaim_rewrite_count: usize,
     overclaim_rewrite_validated_count: usize,
+    deterministic_auto_validated: usize,
     deadline_exceeded: bool,
 }
 
@@ -852,6 +874,10 @@ fn build_validation_rejection_histogram(
         ),
         ("validator_transport".to_string(), stats.validator_transport),
         ("validator_other".to_string(), stats.validator_other),
+        (
+            "deterministic_auto_validated".to_string(),
+            stats.deterministic_auto_validated,
+        ),
     ])
 }
 
@@ -1180,6 +1206,219 @@ fn dedupe_and_cap_grounded_suggestions(
     unique
 }
 
+#[derive(Debug, Clone, Default)]
+struct SuggestionDiversityMetrics {
+    dominant_topic_ratio: f64,
+    unique_topic_count: usize,
+    dominant_file_ratio: f64,
+    unique_file_count: usize,
+}
+
+fn normalize_similarity_token(raw: &str) -> Option<String> {
+    let mut token = raw.trim().to_ascii_lowercase();
+    if token.len() < 3 || token.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    let stop_words = [
+        "the", "and", "for", "with", "from", "that", "this", "these", "those", "are", "was",
+        "were", "will", "can", "could", "should", "would", "into", "after", "before", "about",
+        "across", "without", "while", "when", "where", "which", "there", "their", "them", "then",
+        "than", "because", "using", "used", "just", "only", "into", "onto", "each", "more", "most",
+        "some", "many", "much", "very", "also", "does", "doesnt", "dont", "did", "has", "have",
+        "had", "its", "itself", "it", "our", "your", "you", "users", "user", "app", "code", "flow",
+        "path", "issue", "issues", "problem", "problems",
+    ];
+    if stop_words.contains(&token.as_str()) {
+        return None;
+    }
+
+    for suffix in ["ing", "ed", "es", "s"] {
+        if token.len() > 5 && token.ends_with(suffix) {
+            token.truncate(token.len() - suffix.len());
+            break;
+        }
+    }
+
+    if token.len() < 3 {
+        return None;
+    }
+
+    Some(token)
+}
+
+fn collect_similarity_tokens(text: &str) -> HashSet<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter_map(normalize_similarity_token)
+        .collect()
+}
+
+fn collect_topic_tokens(text: &str) -> Vec<String> {
+    let generic_topic_tokens = [
+        "error", "errors", "fail", "failure", "silent", "silently", "ignore", "ignored", "catch",
+        "block", "return", "value",
+    ];
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
+        let Some(token) = normalize_similarity_token(raw) else {
+            continue;
+        };
+        if generic_topic_tokens.contains(&token.as_str()) {
+            continue;
+        }
+        if seen.insert(token.clone()) {
+            out.push(token);
+        }
+        if out.len() >= 3 {
+            break;
+        }
+    }
+    out
+}
+
+fn suggestion_topic_key(suggestion: &Suggestion) -> String {
+    let text = format!(
+        "{} {}",
+        suggestion.summary,
+        suggestion.detail.as_deref().unwrap_or("")
+    );
+    let tokens = collect_topic_tokens(&text);
+    if tokens.is_empty() {
+        format!(
+            "{}:{}",
+            format!("{:?}", suggestion.kind).to_ascii_lowercase(),
+            suggestion.file.display()
+        )
+    } else {
+        format!(
+            "{}:{}",
+            format!("{:?}", suggestion.kind).to_ascii_lowercase(),
+            tokens.join("_")
+        )
+    }
+}
+
+fn suggestion_similarity_tokens(suggestion: &Suggestion) -> HashSet<String> {
+    collect_similarity_tokens(&format!(
+        "{} {}",
+        suggestion.summary,
+        suggestion.detail.as_deref().unwrap_or("")
+    ))
+}
+
+fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let intersection = a.intersection(b).count();
+    let union = a.len() + b.len() - intersection;
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+fn overlap_coefficient(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let intersection = a.intersection(b).count();
+    let min_size = a.len().min(b.len());
+    if min_size == 0 {
+        0.0
+    } else {
+        intersection as f64 / min_size as f64
+    }
+}
+
+fn suggestions_semantically_overlap(a: &Suggestion, b: &Suggestion) -> bool {
+    if a.file == b.file {
+        if let (Some(a_line), Some(b_line)) = (a.line, b.line) {
+            if a_line.abs_diff(b_line) <= 4 {
+                return true;
+            }
+        }
+    }
+
+    let a_tokens = suggestion_similarity_tokens(a);
+    let b_tokens = suggestion_similarity_tokens(b);
+    let similarity = jaccard_similarity(&a_tokens, &b_tokens);
+    let overlap_count = a_tokens.intersection(&b_tokens).count();
+    let overlap_score = overlap_coefficient(&a_tokens, &b_tokens);
+
+    if similarity >= 0.84 {
+        return true;
+    }
+    if a.kind == b.kind && similarity >= 0.66 {
+        return true;
+    }
+    if a.kind == b.kind && overlap_count >= 4 && overlap_score >= 0.5 {
+        return true;
+    }
+    if a.file == b.file && similarity >= 0.58 {
+        return true;
+    }
+    false
+}
+
+fn semantic_dedupe_validated_suggestions(
+    mut validated: Vec<Suggestion>,
+) -> (Vec<Suggestion>, usize) {
+    validated.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| b.confidence.cmp(&a.confidence))
+            .then_with(|| {
+                b.implementation_readiness_score
+                    .partial_cmp(&a.implementation_readiness_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+
+    let mut deduped = Vec::new();
+    let mut dropped = 0usize;
+    for suggestion in validated {
+        if deduped
+            .iter()
+            .any(|existing| suggestions_semantically_overlap(existing, &suggestion))
+        {
+            dropped += 1;
+            continue;
+        }
+        deduped.push(suggestion);
+    }
+
+    (deduped, dropped)
+}
+
+fn compute_suggestion_diversity_metrics(suggestions: &[Suggestion]) -> SuggestionDiversityMetrics {
+    if suggestions.is_empty() {
+        return SuggestionDiversityMetrics::default();
+    }
+
+    let mut topic_counts: HashMap<String, usize> = HashMap::new();
+    let mut file_counts: HashMap<PathBuf, usize> = HashMap::new();
+    for suggestion in suggestions {
+        *topic_counts
+            .entry(suggestion_topic_key(suggestion))
+            .or_insert(0) += 1;
+        *file_counts.entry(suggestion.file.clone()).or_insert(0) += 1;
+    }
+
+    let dominant_topic_count = topic_counts.values().copied().max().unwrap_or(0);
+    let dominant_file_count = file_counts.values().copied().max().unwrap_or(0);
+    SuggestionDiversityMetrics {
+        dominant_topic_ratio: dominant_topic_count as f64 / suggestions.len() as f64,
+        unique_topic_count: topic_counts.len(),
+        dominant_file_ratio: dominant_file_count as f64 / suggestions.len() as f64,
+        unique_file_count: file_counts.len(),
+    }
+}
+
 fn evidence_strength_score(suggestion: &Suggestion) -> f32 {
     let mut score = 0.20f32;
     if !suggestion.evidence_refs.is_empty() {
@@ -1280,8 +1519,225 @@ fn has_overclaim_wording(suggestion: &Suggestion) -> bool {
         "might fail",
         "in production",
         "customer",
+        "campaign reach",
+        "reducing trust",
+        "reduced trust",
+        "slower user",
+        "resource leak",
+        "memory leak",
+        "lock up",
+        "freeze forever",
+        "stuck forever",
     ];
     markers.iter().any(|marker| text.contains(marker))
+}
+
+fn has_speculative_impact_language(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "memory leak",
+        "memory growth",
+        "slow down",
+        "slows down",
+        "slowing",
+        "slower user",
+        "lock up",
+        "locked up",
+        "freeze forever",
+        "stuck forever",
+        "timeouts",
+        "time-outs",
+        "campaign reach",
+        "marketing targeting",
+        "targeting",
+        "outreach",
+        "privacy concerns",
+        "campaign effectiveness",
+        "missed marketing",
+        "important alert emails",
+        "users may",
+        "users might",
+        "users think",
+        "confusion",
+        "frustrate users",
+        "smooth experience",
+        "engagement",
+        "trust",
+        "annoyance",
+        "annoying",
+        "potentially",
+        "crash",
+        "crashes",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn extract_metric_label(snippet: &str) -> Option<&'static str> {
+    let lower = snippet.to_ascii_lowercase();
+    if lower.contains("largest-contentful-paint") || lower.contains("lcp") {
+        Some("LCP")
+    } else if lower.contains("layout-shift") || lower.contains("cls") {
+        Some("CLS")
+    } else if lower.contains("first-contentful-paint") || lower.contains("fcp") {
+        Some("FCP")
+    } else if lower.contains("ttfb") || lower.contains("navigationtiming") {
+        Some("TTFB")
+    } else if lower.contains("inp") || lower.contains("durationthreshold") {
+        Some("INP")
+    } else {
+        None
+    }
+}
+
+fn conservative_summary_from_evidence(snippet: &str) -> Option<String> {
+    let lower = snippet.to_ascii_lowercase();
+    let has_catch = snippet_contains_empty_catch(snippet) || lower.contains("catch");
+
+    if has_catch
+        && (lower.contains("performanceobserver")
+            || lower.contains("largest-contentful-paint")
+            || lower.contains("layout-shift")
+            || lower.contains("first-contentful-paint")
+            || lower.contains("ttfb")
+            || lower.contains("inp"))
+    {
+        if let Some(metric) = extract_metric_label(snippet) {
+            return Some(format!(
+                "{metric} telemetry can be missing when this error path is silently ignored."
+            ));
+        }
+        return Some(
+            "Performance telemetry can be missing when this error path is silently ignored."
+                .to_string(),
+        );
+    }
+
+    if lower.contains("kv not configured")
+        && lower.contains("status: 'skipped'")
+        && lower.contains("reason: 'kv not configured'")
+    {
+        return Some(
+            "Requests are skipped when key-value storage is not configured, so this endpoint cannot serve cached data."
+                .to_string(),
+        );
+    }
+
+    if lower.contains("dump_alert_audience_set") || lower.contains("marketing:dump_alert:audience")
+    {
+        if lower.contains("srem(") {
+            return Some(
+                "Audience unsubscribe state can drift when this cache update fails silently."
+                    .to_string(),
+            );
+        }
+        if lower.contains("sadd(") {
+            return Some(
+                "Audience membership state can drift when this cache update fails silently."
+                    .to_string(),
+            );
+        }
+    }
+
+    if lower.contains("lock") && lower.contains(".del(") && has_catch {
+        return Some(
+            "Lock cleanup failures can leave stale locks until timeout, delaying later jobs."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+fn trim_speculative_impact_clause(summary: &str) -> String {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let connectors = [
+        " causing ",
+        " leading to ",
+        " resulting in ",
+        " so that ",
+        " so users ",
+        " so teams ",
+    ];
+    let mut cut_at: Option<usize> = None;
+    for connector in connectors {
+        if let Some(idx) = lower.find(connector) {
+            cut_at = Some(cut_at.map(|current| current.min(idx)).unwrap_or(idx));
+        }
+    }
+    if cut_at.is_none() {
+        if let Some(idx) = trimmed.find(", so ") {
+            cut_at = Some(idx);
+        } else if let Some(idx) = trimmed.find(", which ") {
+            cut_at = Some(idx);
+        }
+    }
+
+    let core = cut_at
+        .map(|idx| trimmed[..idx].trim())
+        .unwrap_or(trimmed)
+        .trim_end_matches(['.', ',', ';', ':'])
+        .trim();
+    if core.is_empty() {
+        return String::new();
+    }
+    format!("{core}.")
+}
+
+fn filter_speculative_impact_suggestions(suggestions: Vec<Suggestion>) -> (Vec<Suggestion>, usize) {
+    if suggestions.is_empty() {
+        return (suggestions, 0);
+    }
+
+    let mut kept = Vec::with_capacity(suggestions.len());
+    let mut dropped = 0usize;
+    for mut suggestion in suggestions {
+        if !has_speculative_impact_language(&suggestion.summary) {
+            kept.push(suggestion);
+            continue;
+        }
+
+        if let Some(snippet) = suggestion.evidence.as_deref() {
+            if let Some(rewritten) = conservative_summary_from_evidence(snippet) {
+                suggestion.summary = normalize_grounded_summary(
+                    &rewritten,
+                    suggestion.detail.as_deref().unwrap_or(""),
+                    suggestion.line.unwrap_or_default(),
+                );
+                kept.push(suggestion);
+                continue;
+            }
+
+            let grounded = claim_tokens_grounded_in_snippet(snippet, &suggestion.summary);
+            if grounded && !has_overclaim_wording(&suggestion) {
+                kept.push(suggestion);
+                continue;
+            }
+
+            let trimmed = trim_speculative_impact_clause(&suggestion.summary);
+            if !trimmed.is_empty() {
+                let normalized = normalize_grounded_summary(
+                    &trimmed,
+                    suggestion.detail.as_deref().unwrap_or(""),
+                    suggestion.line.unwrap_or_default(),
+                );
+                if !has_speculative_impact_language(&normalized) {
+                    suggestion.summary = normalized;
+                    kept.push(suggestion);
+                    continue;
+                }
+            }
+        }
+
+        dropped += 1;
+    }
+
+    (kept, dropped)
 }
 
 fn build_implementation_sketch(suggestion: &Suggestion) -> String {
@@ -1870,6 +2326,45 @@ fn finalize_validated_suggestions(mut validated: Vec<Suggestion>) -> Vec<Suggest
     validated
 }
 
+fn balance_suggestions_across_files(
+    suggestions: Vec<Suggestion>,
+    per_file_cap: usize,
+    min_count: usize,
+) -> (Vec<Suggestion>, usize) {
+    if suggestions.is_empty() || per_file_cap == 0 {
+        return (suggestions, 0);
+    }
+
+    let original_len = suggestions.len();
+    let mut per_file_counts: HashMap<PathBuf, usize> = HashMap::new();
+    let mut balanced = Vec::with_capacity(original_len);
+    let mut overflow = Vec::new();
+
+    for suggestion in suggestions {
+        let file = suggestion.file.clone();
+        let count = per_file_counts.entry(file).or_insert(0);
+        if *count < per_file_cap {
+            *count += 1;
+            balanced.push(suggestion);
+        } else {
+            overflow.push(suggestion);
+        }
+    }
+
+    let target_min_count = min_count.min(original_len);
+    if balanced.len() < target_min_count {
+        for suggestion in overflow {
+            if balanced.len() >= target_min_count {
+                break;
+            }
+            balanced.push(suggestion);
+        }
+    }
+
+    let dropped = original_len.saturating_sub(balanced.len());
+    (balanced, dropped)
+}
+
 fn grounded_suggestion_schema(pack_len: usize) -> serde_json::Value {
     let max_evidence_id = pack_len.saturating_sub(1);
     serde_json::json!({
@@ -1946,6 +2441,9 @@ fn format_grounded_user_prompt(
         user.push('\n');
     }
     user.push_str(count_hint);
+    user.push_str(
+        "\nPrefer high-signal variety across product flows and files. Avoid concentrating suggestions in one file unless the evidence pack is genuinely narrow.",
+    );
     user.push_str("\n\nEVIDENCE PACK (internal grounding only):\n");
     for item in items {
         user.push_str(&format!(
@@ -1961,6 +2459,7 @@ fn format_grounded_user_prompt(
 async fn call_grounded_suggestions_with_fallback(
     system: &str,
     user: &str,
+    model: Model,
     schema_name: &str,
     schema: serde_json::Value,
     max_tokens: u32,
@@ -1969,7 +2468,7 @@ async fn call_grounded_suggestions_with_fallback(
     let primary = call_llm_structured_with_provider::<FastGroundedResponseJson>(
         system,
         user,
-        Model::Speed,
+        model,
         schema_name,
         schema.clone(),
         super::client::provider_cerebras_fp16(),
@@ -1984,7 +2483,7 @@ async fn call_grounded_suggestions_with_fallback(
             let fallback = call_llm_structured_limited::<FastGroundedResponseJson>(
                 system,
                 user,
-                Model::Speed,
+                model,
                 schema_name,
                 schema,
                 max_tokens,
@@ -2007,6 +2506,7 @@ async fn call_grounded_suggestions_with_fallback(
 async fn call_validation_structured_with_fallback<T>(
     system: &str,
     user: &str,
+    model: Model,
     schema_name: &str,
     schema: serde_json::Value,
     max_tokens: u32,
@@ -2022,7 +2522,7 @@ where
     let primary = call_llm_structured_with_provider::<T>(
         system,
         user,
-        Model::Speed,
+        model,
         schema_name,
         schema.clone(),
         super::client::provider_cerebras_fp16(),
@@ -2043,7 +2543,7 @@ where
             let fallback = call_llm_structured_limited::<T>(
                 system,
                 user,
-                Model::Speed,
+                model,
                 schema_name,
                 schema,
                 max_tokens,
@@ -2066,6 +2566,7 @@ where
 async fn validate_suggestion_with_model_budget(
     suggestion: &Suggestion,
     memory_section: &str,
+    validation_model: Model,
     max_tokens: u32,
     timeout_ms: u64,
 ) -> anyhow::Result<(
@@ -2102,6 +2603,7 @@ Return JSON:
     let response = call_validation_structured_with_fallback::<SuggestionValidationJson>(
         system,
         &user,
+        validation_model,
         "suggestion_validation",
         suggestion_validation_schema(),
         max_tokens,
@@ -2282,6 +2784,7 @@ fn map_batch_validation_response(
 async fn validate_suggestions_batch_with_model_budget(
     chunk: &[(usize, Suggestion, usize)],
     memory_section: &str,
+    validation_model: Model,
     max_tokens: u32,
     timeout_ms: u64,
 ) -> anyhow::Result<(Vec<BatchValidationDecision>, Option<Usage>)> {
@@ -2326,6 +2829,7 @@ Return JSON:
     let response = call_validation_structured_with_fallback::<SuggestionBatchValidationJson>(
         system,
         &user,
+        validation_model,
         "suggestion_batch_validation",
         suggestion_batch_validation_schema(chunk.len().saturating_sub(1)),
         max_tokens,
@@ -2342,6 +2846,7 @@ Return JSON:
 async fn try_overclaim_rewrite_revalidation(
     suggestion: &Suggestion,
     memory_section: &str,
+    validation_model: Model,
     validation_deadline: std::time::Instant,
 ) -> Option<(
     Suggestion,
@@ -2379,6 +2884,7 @@ async fn try_overclaim_rewrite_revalidation(
     let validation = validate_suggestion_with_model_budget(
         &rewritten,
         memory_section,
+        validation_model,
         OVERCLAIM_REVALIDATE_MAX_TOKENS,
         timeout_ms,
     )
@@ -2419,6 +2925,7 @@ async fn apply_selective_smart_rewrites(
     memory_section: &str,
     min_implementation_readiness_score: f32,
     max_smart_rewrites_per_run: usize,
+    validation_model: Model,
     validation_deadline: std::time::Instant,
 ) -> (Vec<Suggestion>, usize, Option<Usage>) {
     if validated.is_empty() || max_smart_rewrites_per_run == 0 {
@@ -2462,6 +2969,7 @@ async fn apply_selective_smart_rewrites(
         let revalidated = validate_suggestion_with_model_budget(
             &rewritten,
             memory_section,
+            validation_model,
             OVERCLAIM_REVALIDATE_MAX_TOKENS,
             validate_timeout_ms,
         )
@@ -2490,6 +2998,7 @@ async fn apply_selective_smart_rewrites(
 async fn run_validation_attempts(
     chunk: Vec<(usize, Suggestion, usize)>,
     memory_section: &str,
+    validation_model: Model,
     validation_deadline: std::time::Instant,
     per_call_timeout_ms: u64,
 ) -> Vec<ValidationOutcome> {
@@ -2528,6 +3037,7 @@ async fn run_validation_attempts(
                 validate_suggestions_batch_with_model_budget(
                     &chunk,
                     memory_section,
+                    validation_model,
                     batch_tokens,
                     batch_timeout_ms,
                 ),
@@ -2597,6 +3107,7 @@ async fn run_validation_attempts(
                     validate_suggestion_with_model_budget(
                         &suggestion,
                         &memory_section,
+                        validation_model,
                         VALIDATOR_MAX_TOKENS,
                         timeout_ms,
                     ),
@@ -2791,6 +3302,73 @@ fn has_high_speculation_impact_language(text: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
+fn snippet_identifier_tokens(snippet: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    for line in snippet.lines() {
+        let code = if let Some((_, rest)) = line.split_once('|') {
+            rest
+        } else {
+            line
+        };
+        for raw in code.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
+            if let Some(token) = normalize_similarity_token(raw) {
+                tokens.insert(token);
+            }
+        }
+    }
+    tokens
+}
+
+fn claim_specific_tokens(text: &str) -> HashSet<String> {
+    let generic_claim_tokens = [
+        "error",
+        "errors",
+        "silent",
+        "silently",
+        "ignore",
+        "ignored",
+        "swallow",
+        "swallowed",
+        "log",
+        "logged",
+        "logging",
+        "catch",
+        "exception",
+        "exceptions",
+        "failure",
+        "failures",
+        "hidden",
+        "reported",
+        "reporting",
+        "block",
+        "empty",
+        "not",
+        "failur",
+        "ignor",
+        "logg",
+    ];
+    collect_similarity_tokens(text)
+        .into_iter()
+        .filter(|token| !generic_claim_tokens.contains(&token.as_str()))
+        .collect()
+}
+
+fn claim_tokens_grounded_in_snippet(snippet: &str, claim_text: &str) -> bool {
+    let claim_tokens = claim_specific_tokens(claim_text);
+    if claim_tokens.is_empty() {
+        return true;
+    }
+
+    let snippet_tokens = snippet_identifier_tokens(snippet);
+    if snippet_tokens.is_empty() {
+        return false;
+    }
+
+    let overlap = claim_tokens.intersection(&snippet_tokens).count();
+    let overlap_ratio = overlap as f64 / claim_tokens.len() as f64;
+    overlap >= 1 && overlap_ratio >= 0.40
+}
+
 fn deterministic_auto_validation_reason(suggestion: &Suggestion) -> Option<String> {
     let snippet = suggestion.evidence.as_deref()?;
     if !snippet_contains_empty_catch(snippet) {
@@ -2806,10 +3384,15 @@ fn deterministic_auto_validation_reason(suggestion: &Suggestion) -> Option<Strin
     if has_high_speculation_impact_language(summary) {
         return None;
     }
+    if has_overclaim_wording(suggestion) {
+        return None;
+    }
+    if !claim_tokens_grounded_in_snippet(snippet, &combined) {
+        return None;
+    }
 
     Some(
-        "Deterministic validation: snippet shows an empty catch block and summary describes silent error handling."
-            .to_string(),
+        "Deterministic validation: snippet shows an empty catch block, summary describes silent handling, and claim terms are grounded in snippet tokens.".to_string(),
     )
 }
 
@@ -2861,6 +3444,7 @@ fn accept_validated_suggestion(
 async fn validate_batch_suggestions(
     batch: Vec<Suggestion>,
     memory_section: &str,
+    validation_model: Model,
     cache: &crate::cache::Cache,
     run_id: &str,
     validated: &mut Vec<Suggestion>,
@@ -2916,7 +3500,7 @@ async fn validate_batch_suggestions(
             }
 
             if let Some(reason) = deterministic_auto_validation_reason(&suggestion) {
-                let _ = accept_validated_suggestion(
+                if accept_validated_suggestion(
                     cache,
                     run_id,
                     suggestion,
@@ -2925,7 +3509,9 @@ async fn validate_batch_suggestions(
                     used_evidence_ids,
                     rejected_count,
                     rejection_stats,
-                );
+                ) {
+                    rejection_stats.deterministic_auto_validated += 1;
+                }
                 continue;
             }
             chunk.push((idx, suggestion, attempts));
@@ -2938,6 +3524,7 @@ async fn validate_batch_suggestions(
         let outcomes = run_validation_attempts(
             chunk,
             memory_section,
+            validation_model,
             validation_deadline,
             VALIDATOR_TIMEOUT_MS,
         )
@@ -2975,6 +3562,7 @@ async fn validate_batch_suggestions(
                         )) = try_overclaim_rewrite_revalidation(
                             &suggestion,
                             memory_section,
+                            validation_model,
                             validation_deadline,
                         )
                         .await
@@ -3056,6 +3644,7 @@ async fn validate_batch_suggestions(
             let retry_outcomes = run_validation_attempts(
                 retry_chunk,
                 memory_section,
+                validation_model,
                 validation_deadline,
                 VALIDATOR_RETRY_TIMEOUT_MS,
             )
@@ -3097,6 +3686,7 @@ async fn validate_batch_suggestions(
                             )) = try_overclaim_rewrite_revalidation(
                                 &suggestion,
                                 memory_section,
+                                validation_model,
                                 validation_deadline,
                             )
                             .await
@@ -3185,6 +3775,7 @@ pub async fn analyze_codebase_fast_grounded(
     context: &WorkContext,
     repo_memory: Option<String>,
     summaries: Option<&HashMap<PathBuf, String>>,
+    generation_model: Model,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
     let run_id = Uuid::new_v4().to_string();
     let overall_start = std::time::Instant::now();
@@ -3226,6 +3817,7 @@ pub async fn analyze_codebase_fast_grounded(
                 request_min, request_max
             ),
         ),
+        generation_model,
         "fast_grounded_suggestions_primary",
         schema.clone(),
         PRIMARY_REQUEST_MAX_TOKENS,
@@ -3291,6 +3883,7 @@ pub async fn analyze_codebase_fast_grounded(
                     request_count, unused_hint
                 ),
             ),
+            generation_model,
             "fast_grounded_suggestions_topup",
             schema.clone(),
             TOPUP_REQUEST_MAX_TOKENS,
@@ -3334,6 +3927,7 @@ pub async fn analyze_codebase_fast_grounded(
                     FAST_GROUNDED_FINAL_TARGET_MAX
                 ),
             ),
+            generation_model,
             "fast_grounded_mapping_rescue",
             schema.clone(),
             PRIMARY_REQUEST_MAX_TOKENS,
@@ -3371,7 +3965,7 @@ pub async fn analyze_codebase_fast_grounded(
 
     let diagnostics = SuggestionDiagnostics {
         run_id,
-        model: Model::Speed.id().to_string(),
+        model: generation_model.id().to_string(),
         iterations: 1,
         tool_calls: 0,
         tool_names: Vec::new(),
@@ -3428,6 +4022,14 @@ pub async fn analyze_codebase_fast_grounded(
         overclaim_rewrite_count: 0,
         overclaim_rewrite_validated_count: 0,
         smart_rewrite_count: 0,
+        deterministic_auto_validated_count: 0,
+        semantic_dedup_dropped_count: 0,
+        file_balance_dropped_count: 0,
+        speculative_impact_dropped_count: 0,
+        dominant_topic_ratio: 0.0,
+        unique_topic_count: 0,
+        dominant_file_ratio: 0.0,
+        unique_file_count: 0,
         readiness_filtered_count: 0,
         readiness_score_mean: 0.0,
         regeneration_attempts: 0,
@@ -3446,6 +4048,8 @@ pub async fn refine_grounded_suggestions(
     context: &WorkContext,
     repo_memory: Option<String>,
     summaries: Option<&HashMap<PathBuf, String>>,
+    generation_model: Model,
+    validation_model: Model,
     provisional: Vec<Suggestion>,
     min_implementation_readiness_score: f32,
     max_smart_rewrites_per_run: usize,
@@ -3461,6 +4065,14 @@ pub async fn refine_grounded_suggestions(
         diagnostics.validation_transport_recovered_count = 0;
         diagnostics.regen_stopped_validation_budget = false;
         diagnostics.smart_rewrite_count = 0;
+        diagnostics.deterministic_auto_validated_count = 0;
+        diagnostics.semantic_dedup_dropped_count = 0;
+        diagnostics.file_balance_dropped_count = 0;
+        diagnostics.speculative_impact_dropped_count = 0;
+        diagnostics.dominant_topic_ratio = 0.0;
+        diagnostics.unique_topic_count = 0;
+        diagnostics.dominant_file_ratio = 0.0;
+        diagnostics.unique_file_count = 0;
         diagnostics.readiness_filtered_count = 0;
         diagnostics.readiness_score_mean = 0.0;
         diagnostics.notes = Vec::new();
@@ -3492,6 +4104,7 @@ pub async fn refine_grounded_suggestions(
     let batch_usage = validate_batch_suggestions(
         provisional.clone(),
         &memory_section,
+        validation_model,
         &cache,
         &diagnostics.run_id,
         &mut validated,
@@ -3596,6 +4209,7 @@ pub async fn refine_grounded_suggestions(
         let regen_response = call_grounded_suggestions_with_fallback(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM,
             &user,
+            generation_model,
             "fast_grounded_regeneration",
             schema,
             REGEN_REQUEST_MAX_TOKENS,
@@ -3623,6 +4237,7 @@ pub async fn refine_grounded_suggestions(
         let batch_usage = validate_batch_suggestions(
             regenerated,
             &memory_section,
+            validation_model,
             &cache,
             &diagnostics.run_id,
             &mut validated,
@@ -3637,17 +4252,29 @@ pub async fn refine_grounded_suggestions(
     }
 
     let validated = finalize_validated_suggestions(validated);
+    let (semantic_deduped, semantic_dedup_dropped_count) =
+        semantic_dedupe_validated_suggestions(validated);
     let (readiness_filtered, readiness_filtered_count, readiness_score_mean) =
-        apply_readiness_filter(validated, min_implementation_readiness_score);
+        apply_readiness_filter(semantic_deduped, min_implementation_readiness_score);
     let (validated, smart_rewrite_count, smart_rewrite_usage) = apply_selective_smart_rewrites(
         readiness_filtered,
         &memory_section,
         min_implementation_readiness_score,
         max_smart_rewrites_per_run,
+        validation_model,
         validation_deadline,
     )
     .await;
     usage = merge_usage(usage, smart_rewrite_usage);
+    let (impact_filtered, speculative_impact_dropped_count) =
+        filter_speculative_impact_suggestions(validated);
+    let impact_filtered_len = impact_filtered.len();
+    let (validated, file_balance_dropped_count) = balance_suggestions_across_files(
+        impact_filtered,
+        DIVERSITY_FILE_BALANCE_PER_FILE_CAP,
+        FAST_GROUNDED_FINAL_TARGET_MIN.min(impact_filtered_len),
+    );
+    let diversity_metrics = compute_suggestion_diversity_metrics(&validated);
     let refinement_ms = refine_start.elapsed().as_millis() as u64;
     diagnostics.batch_verify_ms = refinement_ms;
     diagnostics.llm_ms += refinement_ms;
@@ -3675,6 +4302,14 @@ pub async fn refine_grounded_suggestions(
     diagnostics.overclaim_rewrite_validated_count =
         rejection_stats.overclaim_rewrite_validated_count;
     diagnostics.smart_rewrite_count = smart_rewrite_count;
+    diagnostics.deterministic_auto_validated_count = rejection_stats.deterministic_auto_validated;
+    diagnostics.semantic_dedup_dropped_count = semantic_dedup_dropped_count;
+    diagnostics.file_balance_dropped_count = file_balance_dropped_count;
+    diagnostics.speculative_impact_dropped_count = speculative_impact_dropped_count;
+    diagnostics.dominant_topic_ratio = diversity_metrics.dominant_topic_ratio;
+    diagnostics.unique_topic_count = diversity_metrics.unique_topic_count;
+    diagnostics.dominant_file_ratio = diversity_metrics.dominant_file_ratio;
+    diagnostics.unique_file_count = diversity_metrics.unique_file_count;
     diagnostics.readiness_filtered_count = readiness_filtered_count;
     diagnostics.readiness_score_mean = readiness_score_mean;
     diagnostics.regeneration_attempts = regeneration_attempts;
@@ -3687,6 +4322,50 @@ pub async fn refine_grounded_suggestions(
         diagnostics.notes.push(format!(
             "readiness_filtered:{}",
             diagnostics.readiness_filtered_count
+        ));
+    }
+    if diagnostics.semantic_dedup_dropped_count > 0 {
+        diagnostics.notes.push(format!(
+            "semantic_dedup_dropped:{}",
+            diagnostics.semantic_dedup_dropped_count
+        ));
+    }
+    if diagnostics.file_balance_dropped_count > 0 {
+        diagnostics.notes.push(format!(
+            "file_balance_dropped:{}",
+            diagnostics.file_balance_dropped_count
+        ));
+    }
+    if diagnostics.speculative_impact_dropped_count > 0 {
+        diagnostics.notes.push(format!(
+            "speculative_impact_dropped:{}",
+            diagnostics.speculative_impact_dropped_count
+        ));
+    }
+    if diagnostics.dominant_topic_ratio > DIVERSITY_DOMINANT_TOPIC_RATIO_MAX {
+        diagnostics.notes.push(format!(
+            "dominant_topic_ratio:{:.2}",
+            diagnostics.dominant_topic_ratio
+        ));
+    }
+    let min_unique_topics = DIVERSITY_MIN_UNIQUE_TOPICS.min(validated.len().max(1));
+    if diagnostics.unique_topic_count < min_unique_topics {
+        diagnostics.notes.push(format!(
+            "unique_topic_count:{} below {}",
+            diagnostics.unique_topic_count, min_unique_topics
+        ));
+    }
+    if diagnostics.dominant_file_ratio > DIVERSITY_DOMINANT_FILE_RATIO_MAX {
+        diagnostics.notes.push(format!(
+            "dominant_file_ratio:{:.2}",
+            diagnostics.dominant_file_ratio
+        ));
+    }
+    let min_unique_files = DIVERSITY_MIN_UNIQUE_FILES.min(validated.len().max(1));
+    if diagnostics.unique_file_count < min_unique_files {
+        diagnostics.notes.push(format!(
+            "unique_file_count:{} below {}",
+            diagnostics.unique_file_count, min_unique_files
         ));
     }
     if validated.len() < hard_target {
@@ -3739,6 +4418,9 @@ fn build_gate_snapshot(
                 < config.min_implementation_readiness_score
         })
         .count();
+    let diversity_metrics = compute_suggestion_diversity_metrics(suggestions);
+    let min_unique_topics = DIVERSITY_MIN_UNIQUE_TOPICS.min(final_count.max(1));
+    let min_unique_files = DIVERSITY_MIN_UNIQUE_FILES.min(final_count.max(1));
 
     let mut fail_reasons = Vec::new();
     if final_count < config.min_final_count {
@@ -3761,6 +4443,30 @@ fn build_gate_snapshot(
     }
     if pending_count > 0 {
         fail_reasons.push(format!("pending_count {} > 0", pending_count));
+    }
+    if diversity_metrics.dominant_topic_ratio > DIVERSITY_DOMINANT_TOPIC_RATIO_MAX {
+        fail_reasons.push(format!(
+            "dominant_topic_ratio {:.3} above {:.3}",
+            diversity_metrics.dominant_topic_ratio, DIVERSITY_DOMINANT_TOPIC_RATIO_MAX
+        ));
+    }
+    if diversity_metrics.unique_topic_count < min_unique_topics {
+        fail_reasons.push(format!(
+            "unique_topic_count {} below {}",
+            diversity_metrics.unique_topic_count, min_unique_topics
+        ));
+    }
+    if diversity_metrics.dominant_file_ratio > DIVERSITY_DOMINANT_FILE_RATIO_MAX {
+        fail_reasons.push(format!(
+            "dominant_file_ratio {:.3} above {:.3}",
+            diversity_metrics.dominant_file_ratio, DIVERSITY_DOMINANT_FILE_RATIO_MAX
+        ));
+    }
+    if diversity_metrics.unique_file_count < min_unique_files {
+        fail_reasons.push(format!(
+            "unique_file_count {} below {}",
+            diversity_metrics.unique_file_count, min_unique_files
+        ));
     }
     if below_readiness_count > 0 {
         fail_reasons.push(format!(
@@ -3787,6 +4493,10 @@ fn build_gate_snapshot(
         pending_count,
         suggest_total_ms,
         suggest_total_cost_usd,
+        dominant_topic_ratio: diversity_metrics.dominant_topic_ratio,
+        unique_topic_count: diversity_metrics.unique_topic_count,
+        dominant_file_ratio: diversity_metrics.dominant_file_ratio,
+        unique_file_count: diversity_metrics.unique_file_count,
         passed: fail_reasons.is_empty(),
         fail_reasons,
     }
@@ -3799,6 +4509,10 @@ fn gate_snapshot_is_better(
     let cand_key = (
         candidate.passed as u8,
         candidate.displayed_valid_ratio,
+        -(candidate.dominant_topic_ratio),
+        candidate.unique_topic_count,
+        -(candidate.dominant_file_ratio),
+        candidate.unique_file_count,
         candidate.final_count,
         -candidate.suggest_total_cost_usd,
         -(candidate.suggest_total_ms as f64),
@@ -3806,6 +4520,10 @@ fn gate_snapshot_is_better(
     let curr_key = (
         current.passed as u8,
         current.displayed_valid_ratio,
+        -(current.dominant_topic_ratio),
+        current.unique_topic_count,
+        -(current.dominant_file_ratio),
+        current.unique_file_count,
         current.final_count,
         -current.suggest_total_cost_usd,
         -(current.suggest_total_ms as f64),
@@ -3828,6 +4546,22 @@ fn should_retry_after_gate_miss(
     gate.final_count < config.min_final_count
         || gate.displayed_valid_ratio < config.min_displayed_valid_ratio
         || gate.pending_count > 0
+        || gate
+            .fail_reasons
+            .iter()
+            .any(|reason| reason.starts_with("dominant_topic_ratio"))
+        || gate
+            .fail_reasons
+            .iter()
+            .any(|reason| reason.starts_with("unique_topic_count"))
+        || gate
+            .fail_reasons
+            .iter()
+            .any(|reason| reason.starts_with("dominant_file_ratio"))
+        || gate
+            .fail_reasons
+            .iter()
+            .any(|reason| reason.starts_with("unique_file_count"))
         || gate
             .fail_reasons
             .iter()
@@ -3872,6 +4606,7 @@ where
     let mut best_result: Option<GatedSuggestionRunResult> = None;
     let mut last_error: Option<anyhow::Error> = None;
     let mut attempts_executed = 0usize;
+    let mut next_attempt_model = Model::Speed;
 
     for attempt_index in 1..=max_attempts {
         if attempt_index > 1 {
@@ -3882,6 +4617,11 @@ where
                 break;
             }
         }
+        let attempt_model = if attempt_index == 1 {
+            Model::Speed
+        } else {
+            next_attempt_model
+        };
         let attempt_start = std::time::Instant::now();
 
         let analyze = analyze_codebase_fast_grounded(
@@ -3890,6 +4630,7 @@ where
             context,
             repo_memory.clone(),
             summaries,
+            attempt_model,
         )
         .await;
         let (provisional, usage_a, diagnostics) = match analyze {
@@ -3906,6 +4647,8 @@ where
             context,
             repo_memory.clone(),
             summaries,
+            attempt_model,
+            attempt_model,
             provisional,
             gate_config.min_implementation_readiness_score,
             gate_config.max_smart_rewrites_per_run,
@@ -3942,6 +4685,11 @@ where
         }
 
         on_progress(attempt_index, max_attempts, &gate, &diagnostics);
+        let auto_validation_overused = diagnostics.provisional_count > 0
+            && diagnostics
+                .deterministic_auto_validated_count
+                .saturating_mul(2)
+                >= diagnostics.provisional_count;
 
         let candidate = GatedSuggestionRunResult {
             suggestions,
@@ -3963,6 +4711,28 @@ where
         }
 
         if attempt_index < max_attempts {
+            let diversity_gate_failed = gate
+                .fail_reasons
+                .iter()
+                .any(|reason| reason.starts_with("dominant_topic_ratio"))
+                || gate
+                    .fail_reasons
+                    .iter()
+                    .any(|reason| reason.starts_with("unique_topic_count"))
+                || gate
+                    .fail_reasons
+                    .iter()
+                    .any(|reason| reason.starts_with("dominant_file_ratio"))
+                || gate
+                    .fail_reasons
+                    .iter()
+                    .any(|reason| reason.starts_with("unique_file_count"));
+            next_attempt_model = if diversity_gate_failed || auto_validation_overused {
+                Model::Smart
+            } else {
+                Model::Speed
+            };
+
             let remaining_budget_ms = gate_config
                 .max_suggest_ms
                 .saturating_sub(overall_start.elapsed().as_millis() as u64);
@@ -4877,6 +5647,10 @@ mod grounded_parser_tests {
             pending_count: 0,
             suggest_total_ms: 20_000,
             suggest_total_cost_usd: 0.012,
+            dominant_topic_ratio: 0.40,
+            unique_topic_count: 6,
+            dominant_file_ratio: 0.40,
+            unique_file_count: 6,
             passed: true,
             fail_reasons: Vec::new(),
         };
@@ -4886,6 +5660,10 @@ mod grounded_parser_tests {
             pending_count: 0,
             suggest_total_ms: 15_000,
             suggest_total_cost_usd: 0.010,
+            dominant_topic_ratio: 0.90,
+            unique_topic_count: 1,
+            dominant_file_ratio: 0.90,
+            unique_file_count: 1,
             passed: false,
             fail_reasons: vec!["count".to_string()],
         };
@@ -5001,6 +5779,157 @@ mod grounded_parser_tests {
     }
 
     #[test]
+    fn deterministic_auto_validation_rejects_unanchored_impact_claims() {
+        let suggestion =
+            test_suggestion("Failed lock releases can leave stale locks that block future jobs.")
+                .with_detail(
+                    "A catch block is empty, so lock cleanup failures are hidden.".to_string(),
+                )
+                .with_evidence(
+                    " 10| try {\n 11|   runTask();\n 12| } catch (error) {\n 13| }\n".to_string(),
+                )
+                .with_evidence_refs(vec![SuggestionEvidenceRef {
+                    snippet_id: 9,
+                    file: PathBuf::from("src/a.ts"),
+                    line: 12,
+                }]);
+
+        let reason = deterministic_auto_validation_reason(&suggestion);
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn semantic_dedupe_drops_near_duplicate_topics() {
+        let first = test_suggestion(
+            "Failed lock releases are silently ignored, leaving stale locks behind.",
+        )
+        .with_detail("Lock-release delete errors are hidden and can block later jobs.".to_string())
+        .with_validation_state(SuggestionValidationState::Validated);
+
+        let second =
+            test_suggestion("Stale locks may remain after release failures and block future jobs.")
+                .with_detail("Release lock errors are swallowed without logging.".to_string())
+                .with_validation_state(SuggestionValidationState::Validated);
+
+        let third =
+            test_suggestion("Adding users to the email audience can fail, causing missed alerts.")
+                .with_detail(
+                    "Audience add failures increment errors and users are skipped for this sync."
+                        .to_string(),
+                )
+                .with_validation_state(SuggestionValidationState::Validated);
+
+        let (deduped, dropped) = semantic_dedupe_validated_suggestions(vec![first, second, third]);
+        assert_eq!(dropped, 1);
+        assert_eq!(deduped.len(), 2);
+
+        let diversity = compute_suggestion_diversity_metrics(&deduped);
+        assert!(diversity.unique_topic_count >= 2);
+        assert!(diversity.dominant_topic_ratio <= 0.5);
+    }
+
+    #[test]
+    fn file_balance_caps_dominant_file_when_alternatives_exist() {
+        let mut suggestions = Vec::new();
+        for i in 0..5 {
+            let mut s = test_suggestion(&format!("Primary flow issue {}", i))
+                .with_validation_state(SuggestionValidationState::Validated);
+            s.file = PathBuf::from("src/primary.ts");
+            suggestions.push(s);
+        }
+        for i in 0..5 {
+            let mut s = test_suggestion(&format!("Secondary flow issue {}", i))
+                .with_validation_state(SuggestionValidationState::Validated);
+            s.file = PathBuf::from(format!("src/secondary_{}.ts", i));
+            suggestions.push(s);
+        }
+
+        let (balanced, dropped) = balance_suggestions_across_files(suggestions, 3, 8);
+        assert_eq!(balanced.len(), 8);
+        assert_eq!(dropped, 2);
+        let dominant_file_count = balanced
+            .iter()
+            .filter(|s| s.file == PathBuf::from("src/primary.ts"))
+            .count();
+        assert_eq!(dominant_file_count, 3);
+    }
+
+    #[test]
+    fn speculative_impact_filter_rewrites_ungrounded_memory_claims() {
+        let speculative = test_suggestion(
+            "Leaked observers may cause memory growth, slowing the browser over time.",
+        )
+        .with_detail("Disconnect errors are ignored in cleanup.".to_string())
+        .with_evidence(
+            " 10| const po = new PerformanceObserver(() => {});\n 11| try {\n 12|   po.disconnect();\n 13| } catch {}\n"
+                .to_string(),
+        )
+        .with_validation_state(SuggestionValidationState::Validated);
+        let grounded =
+            test_suggestion("Metric updates can fail silently, so monitoring data is missing.")
+                .with_detail("Empty catch blocks can suppress metric errors.".to_string())
+                .with_evidence(" 20| try {\n 21|   sendMetric();\n 22| } catch {}\n".to_string())
+                .with_validation_state(SuggestionValidationState::Validated);
+
+        let (filtered, dropped) =
+            filter_speculative_impact_suggestions(vec![speculative, grounded.clone()]);
+        assert_eq!(dropped, 0);
+        assert_eq!(filtered.len(), 2);
+        let rewritten = filtered
+            .iter()
+            .find(|s| s.summary.to_ascii_lowercase().contains("telemetry"))
+            .expect("expected conservative telemetry rewrite");
+        assert!(!rewritten
+            .summary
+            .to_ascii_lowercase()
+            .contains("memory growth"));
+    }
+
+    #[test]
+    fn speculative_impact_filter_rewrites_audience_claims_to_data_drift() {
+        let audience = test_suggestion(
+            "Users may miss important alerts because audience updates fail, reducing campaign reach.",
+        )
+        .with_detail("Audience set writes are best-effort.".to_string())
+        .with_evidence(
+            " 50| try {\n 51|   await redis.sadd(DUMP_ALERT_AUDIENCE_SET, userEmail);\n 52| } catch {}\n"
+                .to_string(),
+        )
+        .with_validation_state(SuggestionValidationState::Validated);
+
+        let (filtered, dropped) = filter_speculative_impact_suggestions(vec![audience]);
+        assert_eq!(dropped, 0);
+        assert_eq!(filtered.len(), 1);
+        let summary = filtered[0].summary.to_ascii_lowercase();
+        assert!(summary.contains("audience"));
+        assert!(summary.contains("drift"));
+        assert!(!summary.contains("campaign reach"));
+    }
+
+    #[test]
+    fn gate_snapshot_fails_when_file_concentration_is_too_high() {
+        let config = SuggestionQualityGateConfig::default();
+        let mut suggestions = Vec::new();
+        for i in 0..config.min_final_count {
+            let mut suggestion = test_suggestion(&format!("Distinct issue {}", i))
+                .with_validation_state(SuggestionValidationState::Validated);
+            suggestion.file = PathBuf::from("src/one_file.ts");
+            suggestions.push(suggestion);
+        }
+
+        let gate = build_gate_snapshot(&config, &suggestions, 10_000, 0.01);
+        assert!(!gate.passed);
+        assert!(gate
+            .fail_reasons
+            .iter()
+            .any(|reason| reason.starts_with("dominant_file_ratio")));
+        assert!(gate
+            .fail_reasons
+            .iter()
+            .any(|reason| reason.starts_with("unique_file_count")));
+    }
+
+    #[test]
     fn parse_validation_state_accepts_common_synonyms() {
         let (state, class) = parse_validation_state("supported_by_evidence");
         assert_eq!(state, SuggestionValidationState::Validated);
@@ -5035,6 +5964,10 @@ mod grounded_parser_tests {
             pending_count: 0,
             suggest_total_ms: config.max_suggest_ms + 100,
             suggest_total_cost_usd: config.max_suggest_cost_usd + 0.001,
+            dominant_topic_ratio: 0.30,
+            unique_topic_count: config.min_final_count,
+            dominant_file_ratio: 0.30,
+            unique_file_count: config.min_final_count,
             passed: false,
             fail_reasons: vec!["cost".to_string(), "latency".to_string()],
         };

@@ -101,6 +101,7 @@ RULES:
 - `evidence_refs` must contain exactly one item per suggestion.
 - Do NOT write "EVIDENCE 0" (or similar) inside `summary`/`detail`.
 - Avoid duplicates: prefer unique evidence references across suggestions unless necessary.
+- Spread suggestions across files/flows when possible; avoid putting more than 3 suggestions on one file unless the evidence pack is narrow.
 - Prefer diversity: bugs, reliability, performance, refactoring.
 - Keep claims local: only what can be confirmed from the snippet."#;
 
