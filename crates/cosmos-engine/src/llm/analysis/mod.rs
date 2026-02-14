@@ -44,10 +44,14 @@ const FAST_GROUNDED_VALIDATED_HARD_TARGET: usize = 10;
 const FAST_GROUNDED_VALIDATED_STRETCH_TARGET: usize = 15;
 const FAST_GROUNDED_PROVISIONAL_TARGET_MIN: usize = 18;
 const FAST_GROUNDED_PROVISIONAL_TARGET_MAX: usize = 24;
-const FAST_EVIDENCE_SOURCE_PATTERN_MAX: usize = 12;
-const FAST_EVIDENCE_SOURCE_HOTSPOT_MAX: usize = 8;
-const FAST_EVIDENCE_SOURCE_CORE_MAX: usize = 8;
+const FAST_EVIDENCE_SOURCE_PATTERN_MAX: usize = 14;
+const FAST_EVIDENCE_SOURCE_HOTSPOT_MAX: usize = 10;
+const FAST_EVIDENCE_SOURCE_CORE_MAX: usize = 10;
 const FAST_EVIDENCE_KIND_GOD_MODULE_MAX: usize = 4;
+const FAST_EVIDENCE_PER_FILE_MAX: usize = 3;
+const FAST_EVIDENCE_ANCHORS_PER_FILE_MAX: usize = 3;
+const FAST_EVIDENCE_CHANGED_FILE_MAX: usize = 10;
+const FAST_EVIDENCE_NEIGHBOR_FILE_MAX: usize = 12;
 const REFINEMENT_HARD_PHASE_MAX_ATTEMPTS: usize = 3;
 const REFINEMENT_STRETCH_PHASE_MAX_ATTEMPTS: usize = 1;
 const GENERATION_TOPUP_MAX_CALLS: usize = 2;
@@ -435,12 +439,112 @@ fn best_function_anchor(file: &cosmos_core::index::FileIndex) -> usize {
         .unwrap_or(1)
 }
 
+fn is_test_like_path(path: &Path) -> bool {
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    normalized.contains("/tests/")
+        || normalized.contains("/test/")
+        || normalized.ends_with("_test.rs")
+        || normalized.ends_with(".test.ts")
+        || normalized.ends_with(".test.tsx")
+        || normalized.ends_with(".spec.ts")
+        || normalized.ends_with(".spec.tsx")
+        || normalized.ends_with(".test.js")
+        || normalized.ends_with(".spec.js")
+}
+
+fn is_test_like_snippet(snippet: &str) -> bool {
+    let lower = snippet.to_ascii_lowercase();
+    lower.contains("#[test]")
+        || lower.contains("mod tests")
+        || lower.contains("fn test_")
+        || lower.contains("assert!(")
+        || lower.contains("assert_eq!(")
+        || lower.contains("assert_ne!(")
+}
+
+fn should_skip_evidence(path: &Path, snippet: &str) -> bool {
+    is_test_like_path(path) || is_test_like_snippet(snippet)
+}
+
+fn exploratory_anchor_lines(file: &cosmos_core::index::FileIndex, max: usize) -> Vec<usize> {
+    let max = max.max(1);
+    let mut anchors: Vec<usize> = Vec::new();
+
+    let mut symbols: Vec<_> = file
+        .symbols
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SymbolKind::Function
+                    | SymbolKind::Method
+                    | SymbolKind::Struct
+                    | SymbolKind::Enum
+                    | SymbolKind::Class
+            )
+        })
+        .collect();
+
+    symbols.sort_by(|a, b| {
+        b.complexity
+            .partial_cmp(&a.complexity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.line_count().cmp(&a.line_count()))
+            .then_with(|| a.line.cmp(&b.line))
+    });
+
+    for symbol in symbols {
+        let line = symbol.line.max(1);
+        if !anchors.contains(&line) {
+            anchors.push(line);
+        }
+        if anchors.len() >= max {
+            return anchors;
+        }
+    }
+
+    let fallback = best_function_anchor(file).max(1);
+    if !anchors.contains(&fallback) {
+        anchors.push(fallback);
+    }
+
+    if file.loc > GOD_MODULE_LOC_THRESHOLD {
+        let middle = (file.loc / 2).max(1);
+        if !anchors.contains(&middle) {
+            anchors.push(middle);
+        }
+    }
+
+    let tail = file.loc.saturating_sub(20).max(1);
+    if !anchors.contains(&tail) {
+        anchors.push(tail);
+    }
+
+    anchors.truncate(max);
+    anchors
+}
+
 fn build_evidence_pack(
     repo_root: &Path,
     index: &CodebaseIndex,
     context: &WorkContext,
 ) -> (Vec<EvidenceItem>, EvidencePackStats) {
     let changed: HashSet<PathBuf> = context.all_changed_files().into_iter().cloned().collect();
+    let mut changed_in_index: Vec<(PathBuf, &cosmos_core::index::FileIndex)> = changed
+        .iter()
+        .filter_map(|path| index.files.get(path).map(|file| (path.clone(), file)))
+        .collect();
+    changed_in_index.sort_by(|(a_path, a_file), (b_path, b_file)| {
+        b_file
+            .complexity
+            .partial_cmp(&a_file.complexity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b_file.loc.cmp(&a_file.loc))
+            .then_with(|| a_path.cmp(b_path))
+    });
     let mut candidates: Vec<EvidenceCandidate> = Vec::new();
 
     // Patterns (high-signal, deterministic ranking with reliability weighting)
@@ -449,13 +553,17 @@ fn build_evidence_pack(
             let Some(rel_file) = normalize_repo_relative(repo_root, &p.file) else {
                 continue;
             };
+            if matches!(
+                p.kind,
+                PatternKind::MissingErrorHandling | PatternKind::TodoMarker
+            ) {
+                continue;
+            }
             let reliability = p.reliability;
             let severity = p.kind.severity();
             let pattern_bonus = match p.kind {
-                PatternKind::MissingErrorHandling => 0.4,
                 PatternKind::PotentialResourceLeak => 0.35,
                 PatternKind::GodModule => -0.35,
-                PatternKind::TodoMarker => -0.2,
                 _ => 0.0,
             };
             let changed_boost = if changed.contains(&rel_file) {
@@ -479,6 +587,9 @@ fn build_evidence_pack(
             };
 
             if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
+                if should_skip_evidence(&rel_file, &snippet) {
+                    continue;
+                }
                 candidates.push(EvidenceCandidate {
                     score,
                     source_priority: source_priority(EvidenceSource::Pattern),
@@ -514,31 +625,44 @@ fn build_evidence_pack(
         let Some(rel_file) = normalize_repo_relative(repo_root, &f.path) else {
             continue;
         };
-        let anchor = best_function_anchor(f).max(1);
-        if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
-            let changed_boost = if changed.contains(&rel_file) {
-                0.2
-            } else {
-                0.0
-            };
-            let score = 2.1 + (f.complexity / 60.0).min(1.0) + changed_boost;
-            candidates.push(EvidenceCandidate {
-                score,
-                source_priority: source_priority(EvidenceSource::Hotspot),
-                severity: PatternSeverity::High,
-                item: EvidenceItem {
-                    id: 0,
-                    file: rel_file,
-                    line: anchor,
-                    snippet,
-                    why_interesting: format!(
-                        "Hotspot file (complexity {:.1}, {} LOC)",
-                        f.complexity, f.loc
-                    ),
-                    source: EvidenceSource::Hotspot,
-                    pattern_kind: None,
-                },
-            });
+        if is_test_like_path(&rel_file) {
+            continue;
+        }
+        for (anchor_rank, anchor) in exploratory_anchor_lines(f, FAST_EVIDENCE_ANCHORS_PER_FILE_MAX)
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
+                if should_skip_evidence(&rel_file, &snippet) {
+                    continue;
+                }
+                let changed_boost = if changed.contains(&rel_file) {
+                    0.2
+                } else {
+                    0.0
+                };
+                let score = 2.1 + (f.complexity / 60.0).min(1.0) + changed_boost
+                    - (anchor_rank as f64 * 0.10);
+                candidates.push(EvidenceCandidate {
+                    score,
+                    source_priority: source_priority(EvidenceSource::Hotspot),
+                    severity: PatternSeverity::High,
+                    item: EvidenceItem {
+                        id: 0,
+                        file: rel_file.clone(),
+                        line: anchor,
+                        snippet,
+                        why_interesting: format!(
+                            "Hotspot sample {} (complexity {:.1}, {} LOC)",
+                            anchor_rank + 1,
+                            f.complexity,
+                            f.loc
+                        ),
+                        source: EvidenceSource::Hotspot,
+                        pattern_kind: None,
+                    },
+                });
+            }
         }
     }
 
@@ -559,24 +683,133 @@ fn build_evidence_pack(
         let Some(rel_file) = normalize_repo_relative(repo_root, &f.path) else {
             continue;
         };
-        let anchor = f
-            .symbols
-            .iter()
-            .find(|s| {
-                matches!(
-                    s.kind,
-                    SymbolKind::Function | SymbolKind::Struct | SymbolKind::Enum
-                )
+        if is_test_like_path(&rel_file) {
+            continue;
+        }
+        for (anchor_rank, anchor) in exploratory_anchor_lines(f, 2).into_iter().enumerate() {
+            if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
+                if should_skip_evidence(&rel_file, &snippet) {
+                    continue;
+                }
+                let changed_boost = if changed.contains(&rel_file) {
+                    0.15
+                } else {
+                    0.0
+                };
+                let score = 1.7 + (f.summary.used_by.len() as f64 / 25.0).min(1.0) + changed_boost
+                    - (anchor_rank as f64 * 0.08);
+                candidates.push(EvidenceCandidate {
+                    score,
+                    source_priority: source_priority(EvidenceSource::Core),
+                    severity: PatternSeverity::Medium,
+                    item: EvidenceItem {
+                        id: 0,
+                        file: rel_file.clone(),
+                        line: anchor.max(1),
+                        snippet,
+                        why_interesting: format!(
+                            "Core file sample {} used by {} other files",
+                            anchor_rank + 1,
+                            f.summary.used_by.len()
+                        ),
+                        source: EvidenceSource::Core,
+                        pattern_kind: None,
+                    },
+                });
+            }
+        }
+    }
+
+    // Changed-file exploration: include multiple anchors in actively edited files,
+    // even if they don't trip static pattern thresholds.
+    for (rel_file, file) in changed_in_index.iter().take(FAST_EVIDENCE_CHANGED_FILE_MAX) {
+        if is_test_like_path(rel_file) {
+            continue;
+        }
+        for (anchor_rank, anchor) in
+            exploratory_anchor_lines(file, FAST_EVIDENCE_ANCHORS_PER_FILE_MAX)
+                .into_iter()
+                .enumerate()
+        {
+            if let Some(snippet) = read_snippet_around_line(repo_root, rel_file, anchor) {
+                if should_skip_evidence(rel_file, &snippet) {
+                    continue;
+                }
+                let score =
+                    2.0 + (file.complexity / 70.0).min(1.0) + ((file.loc as f64) / 1200.0).min(0.3)
+                        - (anchor_rank as f64 * 0.10);
+                candidates.push(EvidenceCandidate {
+                    score,
+                    source_priority: source_priority(EvidenceSource::Hotspot),
+                    severity: PatternSeverity::High,
+                    item: EvidenceItem {
+                        id: 0,
+                        file: rel_file.clone(),
+                        line: anchor,
+                        snippet,
+                        why_interesting: format!(
+                            "Changed-file sample {} (complexity {:.1}, {} LOC)",
+                            anchor_rank + 1,
+                            file.complexity,
+                            file.loc
+                        ),
+                        source: EvidenceSource::Hotspot,
+                        pattern_kind: None,
+                    },
+                });
+            }
+        }
+    }
+
+    // Neighbor exploration: sample files directly connected to changed files
+    // to broaden context across call/dependency boundaries.
+    let mut neighbor_paths: HashSet<PathBuf> = HashSet::new();
+    for (_path, file) in &changed_in_index {
+        for dep in &file.summary.depends_on {
+            neighbor_paths.insert(dep.clone());
+        }
+        for used_by in &file.summary.used_by {
+            neighbor_paths.insert(used_by.clone());
+        }
+    }
+    for changed_path in &changed {
+        neighbor_paths.remove(changed_path);
+    }
+
+    let mut neighbor_files: Vec<(PathBuf, &cosmos_core::index::FileIndex)> = neighbor_paths
+        .into_iter()
+        .filter_map(|path| index.files.get(&path).map(|file| (path, file)))
+        .collect();
+    neighbor_files.sort_by(|(a_path, a_file), (b_path, b_file)| {
+        b_file
+            .summary
+            .used_by
+            .len()
+            .cmp(&a_file.summary.used_by.len())
+            .then_with(|| {
+                b_file
+                    .complexity
+                    .partial_cmp(&a_file.complexity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|s| s.line)
-            .unwrap_or(1);
+            .then_with(|| a_path.cmp(b_path))
+    });
+
+    for (rel_file, file) in neighbor_files
+        .into_iter()
+        .take(FAST_EVIDENCE_NEIGHBOR_FILE_MAX)
+    {
+        if is_test_like_path(&rel_file) {
+            continue;
+        }
+        let anchor = best_function_anchor(file).max(1);
         if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
-            let changed_boost = if changed.contains(&rel_file) {
-                0.15
-            } else {
-                0.0
-            };
-            let score = 1.7 + (f.summary.used_by.len() as f64 / 25.0).min(1.0) + changed_boost;
+            if should_skip_evidence(&rel_file, &snippet) {
+                continue;
+            }
+            let score = 1.8
+                + (file.summary.used_by.len() as f64 / 20.0).min(1.0)
+                + (file.complexity / 80.0).min(0.8);
             candidates.push(EvidenceCandidate {
                 score,
                 source_priority: source_priority(EvidenceSource::Core),
@@ -584,12 +817,10 @@ fn build_evidence_pack(
                 item: EvidenceItem {
                     id: 0,
                     file: rel_file,
-                    line: anchor.max(1),
+                    line: anchor,
                     snippet,
-                    why_interesting: format!(
-                        "Core file used by {} other files",
-                        f.summary.used_by.len()
-                    ),
+                    why_interesting: "Neighbor of changed code (dependency/call boundary sample)"
+                        .to_string(),
                     source: EvidenceSource::Core,
                     pattern_kind: None,
                 },
@@ -614,8 +845,14 @@ fn build_evidence_pack(
             let Some(rel_file) = normalize_repo_relative(repo_root, &f.path) else {
                 continue;
             };
+            if is_test_like_path(&rel_file) {
+                continue;
+            }
             let anchor = best_function_anchor(f).max(1);
             if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
+                if should_skip_evidence(&rel_file, &snippet) {
+                    continue;
+                }
                 let score =
                     0.8 + (f.complexity / 40.0).min(1.0) + ((f.loc as f64) / 600.0).min(1.0) * 0.2;
                 candidates.push(EvidenceCandidate {
@@ -652,11 +889,16 @@ fn build_evidence_pack(
     let mut seen: HashSet<(PathBuf, usize)> = HashSet::new();
     let mut out: Vec<EvidenceItem> = Vec::new();
     let mut source_counts: HashMap<EvidenceSource, usize> = HashMap::new();
+    let mut file_counts: HashMap<PathBuf, usize> = HashMap::new();
     let mut god_module_count = 0usize;
 
     for candidate in &candidates {
         let key = (candidate.item.file.clone(), candidate.item.line);
         if seen.contains(&key) {
+            continue;
+        }
+        if file_counts.get(&candidate.item.file).copied().unwrap_or(0) >= FAST_EVIDENCE_PER_FILE_MAX
+        {
             continue;
         }
         if source_counts
@@ -676,6 +918,7 @@ fn build_evidence_pack(
             god_module_count += 1;
         }
         *source_counts.entry(candidate.item.source).or_insert(0) += 1;
+        *file_counts.entry(candidate.item.file.clone()).or_insert(0) += 1;
         seen.insert(key);
         out.push(candidate.item.clone());
         if out.len() >= FAST_EVIDENCE_PACK_MAX_ITEMS {
@@ -690,6 +933,11 @@ fn build_evidence_pack(
             if out.len() >= FAST_EVIDENCE_PACK_MAX_ITEMS || seen.contains(&key) {
                 continue;
             }
+            if file_counts.get(&candidate.item.file).copied().unwrap_or(0)
+                >= FAST_EVIDENCE_PER_FILE_MAX
+            {
+                continue;
+            }
             if candidate.item.pattern_kind == Some(PatternKind::GodModule)
                 && god_module_count >= FAST_EVIDENCE_KIND_GOD_MODULE_MAX
             {
@@ -698,6 +946,7 @@ fn build_evidence_pack(
             if candidate.item.pattern_kind == Some(PatternKind::GodModule) {
                 god_module_count += 1;
             }
+            *file_counts.entry(candidate.item.file.clone()).or_insert(0) += 1;
             seen.insert(key);
             out.push(candidate.item.clone());
         }
@@ -996,13 +1245,41 @@ fn reconcile_validation_from_reason(
     reject_class: Option<ValidationRejectClass>,
     reason: &str,
 ) -> (SuggestionValidationState, Option<ValidationRejectClass>) {
+    let lower = reason.to_ascii_lowercase();
+    if state == SuggestionValidationState::Validated
+        && [
+            "not support",
+            "does not support",
+            "cannot support",
+            "insufficient",
+            "contradict",
+            "beyond evidence",
+            "assumption",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        let class = if [
+            "insufficient",
+            "not enough evidence",
+            "cannot verify",
+            "unclear from evidence",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        {
+            ValidationRejectClass::InsufficientEvidence
+        } else {
+            ValidationRejectClass::Contradicted
+        };
+        return (SuggestionValidationState::Rejected, Some(class));
+    }
+
     if !(state == SuggestionValidationState::Rejected
         && matches!(reject_class, Some(ValidationRejectClass::Other)))
     {
         return (state, reject_class);
     }
-
-    let lower = reason.to_ascii_lowercase();
     let has_negative_marker = [
         "not support",
         "does not support",

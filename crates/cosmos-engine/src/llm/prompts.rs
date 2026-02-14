@@ -53,7 +53,7 @@ TASK:
 
 WRITE GREAT SUGGESTIONS:
 - `summary` is what the user sees. The reader is non-technical.
-- Write for someone building an app or website, not for engineers.
+- Write for someone building a product or tool, not for engineers.
 - `summary` must answer two things:
   1) What goes wrong for the person using the product.
   2) Why that matters in real life (lost sign-ins, failed saves, slower app, crashes, trust/support cost).
@@ -61,8 +61,8 @@ WRITE GREAT SUGGESTIONS:
 - Start with the concrete failure/outcome, then add impact.
   - Good: "Checkout confirmation emails can fail silently, leaving people unsure their order succeeded."
   - Good: "The app can miss layout-shift metrics, so teams lose visibility into jittery page behavior."
-- Avoid formulaic templates like "When someone ..." and "This matters because ...".
-- Mention concrete product moments (like sign-in, upload, save, checkout), not vague wording.
+- Recommended shape when natural: "When someone <action>, <visible outcome>. This matters because <real-world impact>."
+- Mention concrete product moments (like sign-in, upload, save, checkout, build, or deploy), not vague wording.
 - Avoid vague wording like "hidden errors", "issues happen", or "things break"; name exactly what fails.
 - Avoid unexplained jargon in `summary`. If evidence is technical, translate it:
   - token -> sign-in key
@@ -82,6 +82,7 @@ WRITE GREAT SUGGESTIONS:
 - Use distinct `evidence_id` values across suggestions; avoid reusing IDs until you have at least 10 suggestions.
 - Reject unsupported impact claims immediately instead of softening with assumptions.
 - Reject speculative outcomes (for example: inferred user-facing rollback behavior, audience effects, or unsaved-state claims) unless explicitly shown.
+- Ignore test-only evidence (unit tests, test helpers, assertion-only snippets) unless it directly proves a runtime defect.
 
 OUTPUT (JSON object only):
 {

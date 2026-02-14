@@ -744,7 +744,7 @@ fn render_suggestions_content<'a>(
         };
 
         let (confidence_label, confidence_style) = match suggestion.confidence {
-            Confidence::High => ("verified", Style::default().fg(Theme::GREEN)),
+            Confidence::High => ("high-confidence", Style::default().fg(Theme::GREEN)),
             Confidence::Medium => ("likely", Style::default().fg(Theme::YELLOW)),
             Confidence::Low => ("uncertain", Style::default().fg(Theme::GREY_500)),
         };
