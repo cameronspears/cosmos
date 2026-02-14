@@ -16,7 +16,7 @@ fn normalize_api_key_input(raw: &str) -> String {
 }
 
 fn open_openrouter_link(app: &mut App, url: &str, label: &str) {
-    match crate::git_ops::open_url(url) {
+    match cosmos_adapters::git_ops::open_url(url) {
         Ok(()) => app.show_toast(&format!(
             "Opened OpenRouter {} page in your browser.",
             label
@@ -92,7 +92,9 @@ pub(super) fn handle_overlay_input(
                         return Ok(());
                     }
 
-                    if !save_armed && !crate::config::Config::validate_api_key_format(&candidate) {
+                    if !save_armed
+                        && !cosmos_adapters::config::Config::validate_api_key_format(&candidate)
+                    {
                         if let Overlay::ApiKeySetup {
                             error, save_armed, ..
                         } = &mut app.overlay
@@ -106,7 +108,7 @@ pub(super) fn handle_overlay_input(
                         return Ok(());
                     }
 
-                    let mut cfg = crate::config::Config::load();
+                    let mut cfg = cosmos_adapters::config::Config::load();
                     match cfg.set_api_key(&candidate) {
                         Ok(()) => {
                             app.close_overlay();
@@ -158,7 +160,7 @@ pub(super) fn handle_overlay_input(
                 }
                 KeyCode::Char('y') | KeyCode::Enter => {
                     app.apply_plan_set_confirm(true);
-                    let cache = crate::cache::Cache::new(&app.repo_path);
+                    let cache = cosmos_adapters::cache::Cache::new(&app.repo_path);
                     if !cache.has_seen_data_notice() {
                         let _ = cache.mark_data_notice_seen();
                     }
@@ -197,7 +199,7 @@ pub(super) fn handle_overlay_input(
                     let tx_reset = ctx.tx.clone();
                     let repo_path = app.repo_path.clone();
                     background::spawn_background(ctx.tx.clone(), "reset_cosmos", async move {
-                        match crate::cache::reset_cosmos(&repo_path, &selected).await {
+                        match cosmos_adapters::cache::reset_cosmos(&repo_path, &selected).await {
                             Ok(_) => {
                                 let _ = tx_reset
                                     .send(BackgroundMessage::ResetComplete { options: selected });
@@ -237,7 +239,7 @@ pub(super) fn handle_overlay_input(
                     let tx = ctx.tx.clone();
                     let repo_path = app.repo_path.clone();
                     background::spawn_background(ctx.tx.clone(), "discard_changes", async move {
-                        match crate::git_ops::discard_all_changes(&repo_path) {
+                        match cosmos_adapters::git_ops::discard_all_changes(&repo_path) {
                             Ok(()) => {
                                 let _ = tx.send(BackgroundMessage::DiscardComplete);
                             }
@@ -254,7 +256,7 @@ pub(super) fn handle_overlay_input(
                     let tx = ctx.tx.clone();
                     let repo_path = app.repo_path.clone();
                     background::spawn_background(ctx.tx.clone(), "discard_changes", async move {
-                        match crate::git_ops::discard_all_changes(&repo_path) {
+                        match cosmos_adapters::git_ops::discard_all_changes(&repo_path) {
                             Ok(()) => {
                                 let _ = tx.send(BackgroundMessage::DiscardComplete);
                             }
@@ -280,7 +282,7 @@ pub(super) fn handle_overlay_input(
                     let tx = ctx.tx.clone();
                     let repo_path = app.repo_path.clone();
                     background::spawn_background(ctx.tx.clone(), "stash_changes", async move {
-                        match crate::git_ops::stash_changes(&repo_path) {
+                        match cosmos_adapters::git_ops::stash_changes(&repo_path) {
                             Ok(message) => {
                                 let _ = tx.send(BackgroundMessage::StashComplete { message });
                             }
@@ -338,7 +340,7 @@ pub(super) fn handle_overlay_input(
                         background::spawn_background(ctx.tx.clone(), "run_update", async move {
                             // self_update is blocking, so we run it in spawn_blocking
                             let result = tokio::task::spawn_blocking(move || {
-                                crate::update::run_update(&target, move |percent| {
+                                cosmos_adapters::update::run_update(&target, move |percent| {
                                     let _ = tx_update
                                         .send(BackgroundMessage::UpdateProgress { percent });
                                 })

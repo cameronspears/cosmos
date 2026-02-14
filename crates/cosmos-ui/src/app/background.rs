@@ -14,12 +14,11 @@
 
 use crate::app::messages::BackgroundMessage;
 use crate::app::RuntimeContext;
-use crate::cache;
-use crate::suggest;
 use crate::ui;
 use crate::ui::{App, LoadingState, WorkflowStep};
-use crate::util::truncate;
 use chrono::Utc;
+use cosmos_adapters::cache;
+use cosmos_adapters::util::truncate;
 use futures::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -51,8 +50,8 @@ fn maybe_prompt_api_key_overlay(app: &mut App, message: &str) -> bool {
 fn spawn_suggestions_generation(
     tx: mpsc::Sender<BackgroundMessage>,
     repo_root: PathBuf,
-    index: crate::index::CodebaseIndex,
-    context: crate::context::WorkContext,
+    index: cosmos_core::index::CodebaseIndex,
+    context: cosmos_core::context::WorkContext,
     repo_memory_context: String,
     summaries_for_suggestions: std::collections::HashMap<PathBuf, String>,
 ) {
@@ -64,8 +63,8 @@ fn spawn_suggestions_generation(
         } else {
             Some(repo_memory_context)
         };
-        let gate_config = suggest::llm::SuggestionQualityGateConfig::default();
-        let run = suggest::llm::run_fast_grounded_with_gate_with_progress(
+        let gate_config = cosmos_engine::llm::SuggestionQualityGateConfig::default();
+        let run = cosmos_engine::llm::run_fast_grounded_with_gate_with_progress(
             &repo_root,
             &index,
             &context,
@@ -105,7 +104,7 @@ pub fn request_suggestions_refresh(
     repo_root: PathBuf,
     reason: &str,
 ) -> bool {
-    if !suggest::llm::is_available() {
+    if !cosmos_engine::llm::is_available() {
         return false;
     }
 
@@ -245,7 +244,8 @@ pub fn drain_messages(
                 let validated_count = suggestions
                     .iter()
                     .filter(|s| {
-                        s.validation_state == crate::suggest::SuggestionValidationState::Validated
+                        s.validation_state
+                            == cosmos_core::suggest::SuggestionValidationState::Validated
                     })
                     .count();
                 let count = suggestions.len();
@@ -347,7 +347,7 @@ pub fn drain_messages(
                     app.pending_suggestions_on_init = false;
 
                     // Check if AI is still available
-                    let ai_enabled = suggest::llm::is_available();
+                    let ai_enabled = cosmos_engine::llm::is_available();
 
                     // Strict summary gate: do not generate suggestions until summaries are complete.
                     if failed_count > 0 {
@@ -450,12 +450,12 @@ pub fn drain_messages(
                 app.loading = LoadingState::None;
                 let (tokens, cost) = track_usage(app, usage.as_ref(), ctx);
                 let gate = match preview.verification_state {
-                    crate::suggest::VerificationState::Verified => "verified",
-                    crate::suggest::VerificationState::Contradicted => "contradicted",
-                    crate::suggest::VerificationState::InsufficientEvidence => {
+                    cosmos_core::suggest::VerificationState::Verified => "verified",
+                    cosmos_core::suggest::VerificationState::Contradicted => "contradicted",
+                    cosmos_core::suggest::VerificationState::InsufficientEvidence => {
                         "insufficient_evidence"
                     }
-                    crate::suggest::VerificationState::Unverified => "unverified",
+                    cosmos_core::suggest::VerificationState::Unverified => "unverified",
                 };
                 record_pipeline_metric(
                     app,
@@ -464,7 +464,7 @@ pub fn drain_messages(
                     tokens,
                     cost,
                     gate,
-                    preview.verification_state == crate::suggest::VerificationState::Verified,
+                    preview.verification_state == cosmos_core::suggest::VerificationState::Verified,
                 );
                 if let (Some(run_id), Some(suggestion_id)) = (
                     app.current_suggestion_run_id.clone(),
@@ -601,9 +601,10 @@ pub fn drain_messages(
                     .iter()
                     .map(|(path, _diff)| {
                         // Get original from git HEAD (empty string for new files)
-                        let original = crate::git_ops::read_file_from_head(&app.repo_path, path)
-                            .unwrap_or(None)
-                            .unwrap_or_default();
+                        let original =
+                            cosmos_adapters::git_ops::read_file_from_head(&app.repo_path, path)
+                                .unwrap_or(None)
+                                .unwrap_or_default();
                         let full_path = app.repo_path.join(path);
                         let new_content = std::fs::read_to_string(&full_path).unwrap_or_default();
                         (path.clone(), original, new_content)
@@ -627,7 +628,7 @@ pub fn drain_messages(
                     let tx_verify = ctx.tx.clone();
 
                     // Build fix context so the reviewer knows what the fix was supposed to do
-                    let fix_context = suggest::llm::FixContext {
+                    let fix_context = cosmos_engine::llm::FixContext {
                         problem_summary: problem_summary.clone(),
                         outcome: outcome.clone(),
                         description: description.clone(),
@@ -636,7 +637,7 @@ pub fn drain_messages(
 
                     spawn_background(ctx.tx.clone(), "verification", async move {
                         let review_start = std::time::Instant::now();
-                        match suggest::llm::verify_changes(
+                        match cosmos_engine::llm::verify_changes(
                             &files_with_content,
                             1,
                             &[],
@@ -697,8 +698,8 @@ pub fn drain_messages(
             }
             BackgroundMessage::ResetComplete { options } => {
                 app.loading = LoadingState::None;
-                if options.contains(&crate::cache::ResetOption::QuestionCache) {
-                    app.question_cache = crate::cache::QuestionCache::default();
+                if options.contains(&cosmos_adapters::cache::ResetOption::QuestionCache) {
+                    app.question_cache = cosmos_adapters::cache::QuestionCache::default();
                 }
                 let labels: Vec<&str> = options.iter().map(|o| o.label()).collect();
                 if labels.is_empty() {
@@ -839,7 +840,8 @@ pub fn drain_messages(
                     }
 
                     let rel_path = path.to_string_lossy().to_string();
-                    if let Err(e) = crate::git_ops::stage_file(&app.repo_path, &rel_path) {
+                    if let Err(e) = cosmos_adapters::git_ops::stage_file(&app.repo_path, &rel_path)
+                    {
                         app.review_state.fixing = false;
                         app.loading = LoadingState::None;
                         app.show_toast(&format!(
@@ -888,7 +890,7 @@ pub fn drain_messages(
                     let review_start = std::time::Instant::now();
                     // For re-reviews, we pass None for fix_context since we're now
                     // verifying the fix to the reviewer's findings, not the original fix
-                    match suggest::llm::verify_changes(
+                    match cosmos_engine::llm::verify_changes(
                         &files_with_content,
                         iteration,
                         &fixed_titles,
@@ -939,7 +941,7 @@ pub fn drain_messages(
 
 fn track_usage(
     app: &mut App,
-    usage: Option<&suggest::llm::Usage>,
+    usage: Option<&cosmos_engine::llm::Usage>,
     ctx: &RuntimeContext,
 ) -> (u32, f64) {
     let Some(usage) = usage else {
@@ -1026,7 +1028,7 @@ fn failed_files_hint(files: &[PathBuf]) -> String {
 /// Spawn a background task to fetch the wallet balance
 pub fn spawn_balance_refresh(tx: mpsc::Sender<BackgroundMessage>) {
     spawn_background(tx.clone(), "balance_fetch", async move {
-        if let Ok(balance) = suggest::llm::fetch_account_balance().await {
+        if let Ok(balance) = cosmos_engine::llm::fetch_account_balance().await {
             let _ = tx.send(BackgroundMessage::WalletBalanceUpdated { balance });
         }
         // Silently ignore errors - balance display is optional

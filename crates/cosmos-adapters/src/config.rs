@@ -10,8 +10,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// Legacy field for migration - API key is now stored in system keychain
-    pub openrouter_api_key: Option<String>,
     /// Anonymous per-install identifier used for OpenRouter request stickiness.
     /// Cosmos may send selected code snippets + file paths to OpenRouter to generate/validate AI output.
     pub openrouter_user_id: Option<String>,
@@ -99,31 +97,6 @@ impl Config {
                 keyring::warn_keychain_error_once("API key", &err);
             }
         }
-
-        // DEPRECATED: Legacy migration of plaintext API keys from config file.
-        // This code path exists to migrate users who stored keys in config before
-        // keychain support was added. Once migrated, the plaintext key is removed.
-        // TODO: Remove this migration code after 2026-06-01 (6 months from keychain release)
-        if let Some(key) = self.openrouter_api_key.clone() {
-            eprintln!("  Migrating API key from config file to system keychain...");
-            match keyring::set_api_key(&key) {
-                Ok(()) => {
-                    // Verify migration succeeded
-                    if let Ok(Some(stored)) = keyring::get_api_key() {
-                        if stored == key {
-                            self.openrouter_api_key = None;
-                            let _ = self.save();
-                            eprintln!("  + API key migrated successfully.");
-                        }
-                    }
-                }
-                Err(err) => {
-                    eprintln!("  Warning: Failed to migrate API key to keychain: {}", err);
-                }
-            }
-            return Some(key);
-        }
-
         None
     }
 
@@ -141,11 +114,7 @@ impl Config {
 
         // Verify the write succeeded by reading it back
         match keyring::get_api_key() {
-            Ok(Some(stored_key)) if stored_key == key => {
-                // Successfully verified - clear any legacy plaintext key from config
-                self.openrouter_api_key = None;
-                self.save()
-            }
+            Ok(Some(stored_key)) if stored_key == key => self.save(),
             Ok(Some(_)) => Err(format!(
                 "API key verification failed: stored key doesn't match in {}. \
                      You can set the OPENROUTER_API_KEY environment variable instead.",
@@ -177,8 +146,7 @@ impl Config {
                 keyring::warn_keychain_error_once("API key", &err);
             }
         }
-        // Legacy: check for plaintext key in config (will be migrated on get_api_key)
-        self.openrouter_api_key.is_some()
+        false
     }
 
     /// Validate API key format (should start with sk-)
@@ -294,6 +262,6 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        assert!(config.openrouter_api_key.is_none());
+        assert!(config.openrouter_user_id.is_none());
     }
 }

@@ -7,11 +7,12 @@
 
 use anyhow::Result;
 use clap::Parser;
-use cosmos_ui::context::WorkContext;
-use cosmos_ui::index::CodebaseIndex;
-use cosmos_ui::{app, cache, config, git_ops, github, keyring, suggest};
+use cosmos_adapters::{cache, config, git_ops, github, keyring};
+use cosmos_core::context::WorkContext;
+use cosmos_core::index::CodebaseIndex;
+use cosmos_core::suggest::SuggestionEngine;
+use cosmos_ui::app;
 use std::path::{Path, PathBuf};
-use suggest::SuggestionEngine;
 
 #[derive(Parser, Debug)]
 #[command(

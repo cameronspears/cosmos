@@ -1,10 +1,9 @@
 use crate::app::background;
 use crate::app::messages::BackgroundMessage;
 use crate::app::RuntimeContext;
-use crate::suggest;
 use crate::ui::{App, LoadingState};
-use crate::util::{hash_bytes, hash_str, resolve_repo_path_allow_new};
 use anyhow::Result;
+use cosmos_adapters::util::{hash_bytes, hash_str, resolve_repo_path_allow_new};
 use crossterm::event::{KeyCode, KeyEvent};
 use std::path::PathBuf;
 
@@ -130,7 +129,7 @@ fn submit_question(app: &mut App, ctx: &RuntimeContext) -> Result<()> {
         } else {
             Some(repo_memory_context)
         };
-        match suggest::llm::ask_question(&index_clone, &context_clone, &question, mem).await {
+        match cosmos_engine::llm::ask_question(&index_clone, &context_clone, &question, mem).await {
             Ok((answer, usage)) => {
                 // Send response with cache metadata for storage
                 let _ = tx_question.send(BackgroundMessage::QuestionResponseWithCache {
@@ -151,9 +150,9 @@ fn submit_question(app: &mut App, ctx: &RuntimeContext) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::WorkContext;
-    use crate::index::CodebaseIndex;
-    use crate::suggest::SuggestionEngine;
+    use cosmos_core::context::WorkContext;
+    use cosmos_core::index::CodebaseIndex;
+    use cosmos_core::suggest::SuggestionEngine;
     use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 

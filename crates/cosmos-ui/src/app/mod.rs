@@ -10,7 +10,7 @@ pub mod runtime;
 
 pub use runtime::run_tui;
 
-use crate::index::CodebaseIndex;
+use cosmos_core::index::CodebaseIndex;
 use std::path::PathBuf;
 use std::sync::mpsc;
 

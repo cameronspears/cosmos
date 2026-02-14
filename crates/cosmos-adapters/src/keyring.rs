@@ -16,12 +16,6 @@ use std::sync::{Mutex, OnceLock};
 const KEYRING_SERVICE: &str = "cosmos-credentials";
 const KEYRING_USERNAME: &str = "default";
 
-/// Legacy service names for migration
-const LEGACY_API_KEY_SERVICE: &str = "cosmos";
-const LEGACY_API_KEY_USERNAME: &str = "openrouter_api_key";
-const LEGACY_GITHUB_SERVICE: &str = "cosmos-github";
-const LEGACY_GITHUB_USERNAME: &str = "github_token";
-
 /// All credentials stored in a single keychain entry
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StoredCredentials {
@@ -36,7 +30,6 @@ type KeyringResult<T> = Result<T, String>;
 #[derive(Debug, Default)]
 struct CredentialsCache {
     cached: Option<KeyringResult<StoredCredentials>>,
-    migration_attempted: bool,
 }
 
 static CREDENTIALS_CACHE: OnceLock<Mutex<CredentialsCache>> = OnceLock::new();
@@ -85,14 +78,6 @@ pub fn credentials_store_label() -> &'static str {
 
 fn keyring_entry() -> Result<Entry, keyring::Error> {
     Entry::new(KEYRING_SERVICE, KEYRING_USERNAME)
-}
-
-fn legacy_api_key_entry() -> Result<Entry, keyring::Error> {
-    Entry::new(LEGACY_API_KEY_SERVICE, LEGACY_API_KEY_USERNAME)
-}
-
-fn legacy_github_entry() -> Result<Entry, keyring::Error> {
-    Entry::new(LEGACY_GITHUB_SERVICE, LEGACY_GITHUB_USERNAME)
 }
 
 fn fallback_credentials_path() -> KeyringResult<PathBuf> {
@@ -236,38 +221,7 @@ fn write_credentials(creds: &StoredCredentials) -> KeyringResult<()> {
     Ok(())
 }
 
-/// Attempt to migrate credentials from legacy separate keychain entries
-fn migrate_legacy_credentials(creds: &mut StoredCredentials) -> bool {
-    let mut migrated = false;
-
-    // Migrate legacy API key if we don't have one
-    if creds.openrouter_api_key.is_none() {
-        if let Ok(entry) = legacy_api_key_entry() {
-            if let Ok(key) = entry.get_password() {
-                creds.openrouter_api_key = Some(key);
-                migrated = true;
-                // Delete legacy entry after successful read
-                let _ = entry.delete_credential();
-            }
-        }
-    }
-
-    // Migrate legacy GitHub token if we don't have one
-    if creds.github_token.is_none() {
-        if let Ok(entry) = legacy_github_entry() {
-            if let Ok(token) = entry.get_password() {
-                creds.github_token = Some(token);
-                migrated = true;
-                // Delete legacy entry after successful read
-                let _ = entry.delete_credential();
-            }
-        }
-    }
-
-    migrated
-}
-
-/// Read credentials with caching and automatic migration
+/// Read credentials with caching
 fn read_credentials_cached() -> KeyringResult<StoredCredentials> {
     let cache = credentials_cache();
     let mut guard = match cache.lock() {
@@ -280,21 +234,7 @@ fn read_credentials_cached() -> KeyringResult<StoredCredentials> {
         return result.clone();
     }
 
-    // Read from keychain
-    let mut creds = read_credentials_uncached()?;
-
-    // Attempt migration from legacy entries (only once)
-    if !guard.migration_attempted {
-        guard.migration_attempted = true;
-        if !keyring_disabled() && migrate_legacy_credentials(&mut creds) {
-            // Save migrated credentials
-            if let Err(e) = write_credentials(&creds) {
-                eprintln!("  Warning: Failed to save migrated credentials: {}", e);
-            } else {
-                eprintln!("  + Migrated credentials to unified keychain entry");
-            }
-        }
-    }
+    let creds = read_credentials_uncached()?;
 
     guard.cached = Some(Ok(creds.clone()));
     Ok(creds)
@@ -318,7 +258,6 @@ fn reset_for_tests() {
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.cached = None;
-    guard.migration_attempted = false;
     KEYRING_ERROR_WARNED.store(false, Ordering::Relaxed);
 }
 

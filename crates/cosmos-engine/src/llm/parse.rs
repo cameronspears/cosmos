@@ -174,7 +174,7 @@ fn extract_json_object(response: &str) -> Option<&str> {
 
 /// Normalize a path string to repo-relative format (wrapper around cache::normalize_summary_path)
 fn normalize_path_str(raw: &str, root: &Path) -> PathBuf {
-    crate::cache::normalize_summary_path(&PathBuf::from(raw.trim()), root)
+    cosmos_adapters::cache::normalize_summary_path(&PathBuf::from(raw.trim()), root)
 }
 
 pub(crate) fn parse_summaries_response(

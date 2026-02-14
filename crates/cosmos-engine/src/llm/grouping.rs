@@ -1,9 +1,9 @@
 use super::client::{call_llm_structured, StructuredResponse};
 use super::models::{Model, Usage};
 use super::prompts::GROUPING_CLASSIFY_SYSTEM;
-use crate::cache::normalize_summary_path;
-use crate::grouping::Layer;
-use crate::index::{CodebaseIndex, Language};
+use cosmos_adapters::cache::normalize_summary_path;
+use cosmos_core::grouping::Layer;
+use cosmos_core::index::{CodebaseIndex, Language};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -121,7 +121,7 @@ pub async fn classify_grouping_candidates(
     Ok((suggestions, usage))
 }
 
-fn build_file_context(path: &std::path::Path, file: &crate::index::FileIndex) -> FileContext {
+fn build_file_context(path: &std::path::Path, file: &cosmos_core::index::FileIndex) -> FileContext {
     let exports = file.summary.exports.iter().take(6).cloned().collect();
     let symbols = file
         .symbols

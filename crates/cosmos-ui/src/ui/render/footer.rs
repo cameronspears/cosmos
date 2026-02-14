@@ -173,7 +173,7 @@ pub(super) fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         ship_step: app.ship_state.step,
         has_pending_changes: !app.pending_changes.is_empty(),
         has_update_available: app.update_available.is_some(),
-        ai_available: crate::suggest::llm::is_available(),
+        ai_available: cosmos_engine::llm::is_available(),
     };
 
     if let Some(cached_spans) = FOOTER_SPANS_CACHE.with(|cache| {
@@ -423,7 +423,7 @@ fn get_hint_buttons(app: &App) -> Vec<FooterButton> {
                     hint_button("x", "dismiss"),
                     hint_button("d", "diag"),
                 ];
-                if !crate::suggest::llm::is_available() {
+                if !cosmos_engine::llm::is_available() {
                     hints.push(hint_button("k", "API key"));
                 }
                 hints

@@ -9,17 +9,16 @@
 
 use crate::app::messages::BackgroundMessage;
 use crate::app::{background, input, RuntimeContext};
-use crate::cache;
-use crate::context::WorkContext;
-use crate::git_ops;
-use crate::grouping::{Confidence, Layer, LayerOverride};
-use crate::index::CodebaseIndex;
-use crate::suggest;
-use crate::suggest::llm::grouping as grouping_llm;
-use crate::suggest::SuggestionEngine;
 use crate::ui;
 use crate::ui::{App, LoadingState};
 use anyhow::Result;
+use cosmos_adapters::cache;
+use cosmos_adapters::git_ops;
+use cosmos_core::context::WorkContext;
+use cosmos_core::grouping::{Confidence, Layer, LayerOverride};
+use cosmos_core::index::CodebaseIndex;
+use cosmos_core::suggest::SuggestionEngine;
+use cosmos_engine::llm::grouping as grouping_llm;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
@@ -79,7 +78,7 @@ pub async fn run_tui(
     }
 
     // Check if we have API access
-    let ai_enabled = suggest::llm::is_available();
+    let ai_enabled = cosmos_engine::llm::is_available();
     if !ai_enabled {
         app.open_api_key_overlay(Some(
             "No OpenRouter API key configured yet. Paste your key to start AI suggestions."
@@ -103,7 +102,8 @@ pub async fn run_tui(
     if grouping_ai_enabled {
         let overrides = cached_grouping_overrides(&app.grouping, &grouping_ai_cache, &file_hashes);
         if !overrides.is_empty() {
-            let grouping = crate::grouping::generate_grouping_with_overrides(&index, &overrides);
+            let grouping =
+                cosmos_core::grouping::generate_grouping_with_overrides(&index, &overrides);
             app.apply_grouping_update(grouping);
         }
     }
@@ -128,7 +128,7 @@ pub async fn run_tui(
     }
 
     // Discover project context (for better quality summaries)
-    let project_context = suggest::llm::discover_project_context(&index);
+    let project_context = cosmos_engine::llm::discover_project_context(&index);
     llm_cache.set_project_context(project_context.clone());
 
     // Find files that need new/updated summaries
@@ -156,7 +156,7 @@ pub async fn run_tui(
         let tx_update = tx.clone();
         background::spawn_background(tx.clone(), "version_check", async move {
             // Check for updates (silently fail if network unavailable)
-            if let Ok(Some(update_info)) = crate::update::check_for_update().await {
+            if let Ok(Some(update_info)) = cosmos_adapters::update::check_for_update().await {
                 let _ = tx_update.send(BackgroundMessage::UpdateAvailable {
                     latest_version: update_info.latest_version,
                 });
@@ -195,7 +195,7 @@ pub async fn run_tui(
                 let mut grouping_cache = cache.load_grouping_ai_cache().unwrap_or_default();
                 let _ = grouping_cache.normalize_paths(&index_clone.root);
 
-                let mut total_usage = suggest::llm::Usage::default();
+                let mut total_usage = cosmos_engine::llm::Usage::default();
                 let mut saw_usage = false;
 
                 for chunk in candidates
@@ -242,8 +242,10 @@ pub async fn run_tui(
                 let usage = if saw_usage { Some(total_usage) } else { None };
 
                 if !overrides.is_empty() {
-                    let grouping =
-                        crate::grouping::generate_grouping_with_overrides(&index_clone, &overrides);
+                    let grouping = cosmos_core::grouping::generate_grouping_with_overrides(
+                        &index_clone,
+                        &overrides,
+                    );
                     let _ = tx_grouping.send(BackgroundMessage::GroupingEnhanced {
                         grouping,
                         updated_files: overrides.len(),
@@ -291,7 +293,7 @@ pub async fn run_tui(
 
             // Prioritize files for generation
             let (high_priority, medium_priority, low_priority) =
-                suggest::llm::prioritize_files_for_summary(
+                cosmos_engine::llm::prioritize_files_for_summary(
                     &index_clone2,
                     &context_clone2,
                     &files_needing_summary,
@@ -319,7 +321,7 @@ pub async fn run_tui(
                 let mut glossary = cache.load_glossary().unwrap_or_default();
 
                 let mut all_summaries = HashMap::new();
-                let mut total_usage = suggest::llm::Usage::default();
+                let mut total_usage = cosmos_engine::llm::Usage::default();
                 let mut completed_count = 0usize;
                 let mut failed_files: Vec<PathBuf> = Vec::new();
 
@@ -335,13 +337,13 @@ pub async fn run_tui(
                         continue;
                     }
 
-                    let batch_size = suggest::llm::SUMMARY_BATCH_SIZE;
+                    let batch_size = cosmos_engine::llm::SUMMARY_BATCH_SIZE;
                     let batches: Vec<_> = files.chunks(batch_size).collect();
 
                     // Process batches sequentially (llm.rs handles internal parallelism)
                     for batch in batches {
                         let batch_files: Vec<PathBuf> = batch.to_vec();
-                        match suggest::llm::generate_summaries_for_files(
+                        match cosmos_engine::llm::generate_summaries_for_files(
                             &index_clone2,
                             batch,
                             &project_context,
@@ -562,7 +564,7 @@ fn run_loop<B: Backend>(
 }
 
 fn cached_grouping_overrides(
-    grouping: &crate::grouping::CodebaseGrouping,
+    grouping: &cosmos_core::grouping::CodebaseGrouping,
     cache: &cache::GroupingAiCache,
     file_hashes: &HashMap<PathBuf, String>,
 ) -> HashMap<PathBuf, LayerOverride> {
@@ -603,7 +605,7 @@ fn cached_grouping_overrides(
 }
 
 fn select_grouping_ai_candidates(
-    grouping: &crate::grouping::CodebaseGrouping,
+    grouping: &cosmos_core::grouping::CodebaseGrouping,
     cache: &cache::GroupingAiCache,
     file_hashes: &HashMap<PathBuf, String>,
     max_files: usize,

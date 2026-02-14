@@ -14,4 +14,6 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
+cosmos-adapters = { path = "../cosmos-adapters" }
+cosmos-core = { path = "../cosmos-core" }
 cosmos-ui = { path = "../cosmos-ui" }

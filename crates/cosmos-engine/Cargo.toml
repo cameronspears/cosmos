@@ -12,16 +12,11 @@ anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 futures.workspace = true
 regex.workspace = true
 uuid.workspace = true
-git2.workspace = true
-rayon.workspace = true
-url.workspace = true
-walkdir.workspace = true
 cosmos-core = { path = "../cosmos-core" }
 cosmos-adapters = { path = "../cosmos-adapters" }
 

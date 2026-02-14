@@ -299,7 +299,7 @@ fn render_grouped_tree<'a>(
     is_active: bool,
     visible_height: usize,
 ) {
-    use crate::grouping::GroupedEntryKind;
+    use cosmos_core::grouping::GroupedEntryKind;
 
     let tree = &app.grouped_tree;
     let indices = &app.filtered_grouped_indices;
@@ -513,7 +513,7 @@ fn render_suggestions_content<'a>(
     visible_height: usize,
     inner_width: usize,
 ) {
-    use crate::suggest::{Confidence, Priority};
+    use cosmos_core::suggest::{Confidence, Priority};
 
     let suggestions = app.suggestions.active_suggestions();
 
@@ -563,7 +563,7 @@ fn render_suggestions_content<'a>(
     }
 
     if suggestions.is_empty() {
-        let has_ai = crate::suggest::llm::is_available();
+        let has_ai = cosmos_engine::llm::is_available();
         let summaries_incomplete =
             app.needs_summary_generation && !app.summary_failed_files.is_empty();
 

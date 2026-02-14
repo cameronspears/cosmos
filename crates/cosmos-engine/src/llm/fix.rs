@@ -7,7 +7,7 @@ use super::models::{merge_usage, Model, Usage};
 use super::parse::{truncate_content, truncate_content_around_line};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{fix_content_system, multi_file_fix_system, FIX_PREVIEW_AGENTIC_SYSTEM};
-use crate::suggest::Suggestion;
+use cosmos_core::suggest::Suggestion;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
@@ -1655,7 +1655,7 @@ pub struct FixPreview {
     /// Whether the issue was verified to exist in the code
     pub verified: bool,
     /// Explicit verification contract result.
-    pub verification_state: crate::suggest::VerificationState,
+    pub verification_state: cosmos_core::suggest::VerificationState,
 
     // ─── User-facing fields (non-technical) ───────────────────────────────
     /// Friendly topic name for non-technical users (e.g. "Batch Processing")
@@ -1733,7 +1733,7 @@ pub fn build_fix_preview_from_validated_suggestion(suggestion: &Suggestion) -> F
 
     FixPreview {
         verified: true,
-        verification_state: crate::suggest::VerificationState::Verified,
+        verification_state: cosmos_core::suggest::VerificationState::Verified,
         friendly_title: suggestion.kind.label().to_string(),
         problem_summary: suggestion.summary.clone(),
         outcome,
@@ -1838,17 +1838,17 @@ fn default_scope() -> String {
 fn parse_verification_state(
     verification_state: &str,
     verified_fallback: bool,
-) -> crate::suggest::VerificationState {
+) -> cosmos_core::suggest::VerificationState {
     match verification_state.trim().to_lowercase().as_str() {
-        "verified" => crate::suggest::VerificationState::Verified,
-        "contradicted" => crate::suggest::VerificationState::Contradicted,
-        "insufficient_evidence" => crate::suggest::VerificationState::InsufficientEvidence,
+        "verified" => cosmos_core::suggest::VerificationState::Verified,
+        "contradicted" => cosmos_core::suggest::VerificationState::Contradicted,
+        "insufficient_evidence" => cosmos_core::suggest::VerificationState::InsufficientEvidence,
         // Backward compatibility for older responses that only include `verified`
         _ => {
             if verified_fallback {
-                crate::suggest::VerificationState::Verified
+                cosmos_core::suggest::VerificationState::Verified
             } else {
-                crate::suggest::VerificationState::Contradicted
+                cosmos_core::suggest::VerificationState::Contradicted
             }
         }
     }
@@ -1863,7 +1863,7 @@ fn fix_preview_from_json(parsed: FixPreviewJson, modifier: Option<&str>) -> FixP
     };
 
     FixPreview {
-        verified: verification_state == crate::suggest::VerificationState::Verified,
+        verified: verification_state == cosmos_core::suggest::VerificationState::Verified,
         verification_state,
         friendly_title: if parsed.friendly_title.is_empty() {
             "Issue".to_string()
@@ -2052,7 +2052,7 @@ VERIFY:
     let mut preview = fix_preview_from_json(parsed, modifier);
     let mut usage = response.usage;
 
-    if preview.verification_state == crate::suggest::VerificationState::Contradicted {
+    if preview.verification_state == cosmos_core::suggest::VerificationState::Contradicted {
         // One bounded fallback pass with broader context to reduce false contradictions.
         let (fallback_start, fallback_end, fallback_code) = render_excerpt(target_line, 120, 160);
         let fallback_user = build_user_prompt(fallback_start, fallback_end, &fallback_code, true);
@@ -2343,13 +2343,13 @@ fn is_stopword(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::suggest::{Priority, SuggestionEvidenceRef, SuggestionKind, SuggestionSource};
+    use cosmos_core::suggest::{Priority, SuggestionEvidenceRef, SuggestionKind, SuggestionSource};
     use std::path::{Path, PathBuf};
 
     fn sample_preview(evidence_line: Option<u32>) -> FixPreview {
         FixPreview {
             verified: true,
-            verification_state: crate::suggest::VerificationState::Verified,
+            verification_state: cosmos_core::suggest::VerificationState::Verified,
             friendly_title: "Issue".to_string(),
             problem_summary: "Problem".to_string(),
             outcome: "Outcome".to_string(),

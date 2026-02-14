@@ -1,5 +1,5 @@
 use super::models::{Model, Usage};
-use crate::config::Config;
+use cosmos_adapters::config::Config;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,

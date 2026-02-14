@@ -13,8 +13,8 @@
 //!
 //! For critical data, callers should explicitly handle errors.
 
-use crate::index::CodebaseIndex;
 use chrono::{DateTime, Duration, Utc};
+use cosmos_core::index::CodebaseIndex;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -25,7 +25,6 @@ use std::time::{Duration as StdDuration, Instant};
 
 const CACHE_DIR: &str = ".cosmos";
 const CACHE_LAYOUT_V2_DIR: &str = "v2";
-const LEGACY_ARCHIVE_PREFIX: &str = "v1-archive-";
 const INDEX_CACHE_FILE: &str = "index.json";
 const INDEX_META_FILE: &str = "index.meta.json";
 const SUGGESTIONS_CACHE_FILE: &str = "suggestions.json";
@@ -408,7 +407,7 @@ const GROUPING_AI_CACHE_DAYS: i64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupingAiEntry {
-    pub layer: crate::grouping::Layer,
+    pub layer: cosmos_core::grouping::Layer,
     pub confidence: f64,
     pub file_hash: String,
     pub generated_at: DateTime<Utc>,
@@ -710,17 +709,14 @@ impl Cache {
     pub fn new(project_root: &Path) -> Self {
         let cache_root = project_root.join(CACHE_DIR);
         let cache_dir = cache_root.join(CACHE_LAYOUT_V2_DIR);
-        let cache = Self {
+        Self {
             cache_root,
             cache_dir,
-        };
-        let _ = cache.migrate_legacy_layout();
-        cache
+        }
     }
 
     /// Ensure the cache directory exists
     fn ensure_dir(&self) -> anyhow::Result<()> {
-        self.migrate_legacy_layout()?;
         if !self.cache_root.exists() {
             fs::create_dir_all(&self.cache_root)?;
         }
@@ -754,47 +750,6 @@ impl Cache {
         }
 
         append_ignore_entry(&gitignore_path, ".cosmos/")?;
-        Ok(())
-    }
-
-    fn migrate_legacy_layout(&self) -> anyhow::Result<()> {
-        if !self.cache_root.exists() {
-            return Ok(());
-        }
-
-        let mut legacy_entries = Vec::new();
-        for entry in fs::read_dir(&self.cache_root)? {
-            let entry = entry?;
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-
-            if name == CACHE_LAYOUT_V2_DIR || name.starts_with(LEGACY_ARCHIVE_PREFIX) {
-                continue;
-            }
-            legacy_entries.push(path);
-        }
-
-        if legacy_entries.is_empty() {
-            return Ok(());
-        }
-
-        let archive_name = format!(
-            "{}{}",
-            LEGACY_ARCHIVE_PREFIX,
-            Utc::now().format("%Y%m%d-%H%M%S")
-        );
-        let archive_dir = self.cache_root.join(archive_name);
-        fs::create_dir_all(&archive_dir)?;
-
-        for old_path in legacy_entries {
-            let Some(file_name) = old_path.file_name() else {
-                continue;
-            };
-            let archived_path = archive_dir.join(file_name);
-            move_path(&old_path, &archived_path)?;
-        }
-
         Ok(())
     }
 
@@ -1220,28 +1175,6 @@ fn append_ignore_entry(path: &Path, entry: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn move_path(from: &Path, to: &Path) -> anyhow::Result<()> {
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            if from.is_dir() {
-                fs::create_dir_all(to)?;
-                for entry in fs::read_dir(from)? {
-                    let entry = entry?;
-                    let src = entry.path();
-                    let dst = to.join(entry.file_name());
-                    move_path(&src, &dst)?;
-                }
-                fs::remove_dir_all(from)?;
-            } else {
-                fs::copy(from, to)?;
-                fs::remove_file(from)?;
-            }
-            Ok(())
-        }
-    }
-}
-
 /// Reset selected Cosmos cache files for the given repository.
 pub async fn reset_cosmos(
     repo_root: &Path,
@@ -1256,7 +1189,7 @@ fn is_index_cache_valid(root: &Path, index: &CodebaseIndex) -> bool {
     // This avoids a full filesystem walk when the repo hasn't changed
     if let Some(cached_head) = &index.git_head {
         if let Some(current_head) = get_current_git_head(root) {
-            if cached_head == &current_head && !crate::index::has_uncommitted_changes(root) {
+            if cached_head == &current_head && !cosmos_core::index::has_uncommitted_changes(root) {
                 // Git HEAD matches and no uncommitted changes - cache is valid
                 return true;
             }
@@ -1276,7 +1209,8 @@ fn is_index_cache_valid(root: &Path, index: &CodebaseIndex) -> bool {
 fn is_index_meta_valid(root: &Path, meta: &IndexMeta) -> bool {
     if let Some(cached_head) = &meta.git_head {
         if let Some(current_head) = get_current_git_head(root) {
-            return cached_head == &current_head && !crate::index::has_uncommitted_changes(root);
+            return cached_head == &current_head
+                && !cosmos_core::index::has_uncommitted_changes(root);
         }
     }
     false
@@ -1324,8 +1258,8 @@ fn compute_current_hashes(root: &Path) -> anyhow::Result<HashMap<PathBuf, String
         }
 
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let language = crate::index::Language::from_extension(ext);
-        if language == crate::index::Language::Unknown {
+        let language = cosmos_core::index::Language::from_extension(ext);
+        if language == cosmos_core::index::Language::Unknown {
             continue;
         }
 
@@ -1333,7 +1267,7 @@ fn compute_current_hashes(root: &Path) -> anyhow::Result<HashMap<PathBuf, String
             Ok(m) => m,
             Err(_) => continue,
         };
-        if metadata.len() > crate::index::MAX_INDEX_FILE_BYTES {
+        if metadata.len() > cosmos_core::index::MAX_INDEX_FILE_BYTES {
             continue;
         }
 
@@ -1341,7 +1275,7 @@ fn compute_current_hashes(root: &Path) -> anyhow::Result<HashMap<PathBuf, String
             Ok(b) => b,
             Err(_) => continue,
         };
-        if bytes.len() as u64 > crate::index::MAX_INDEX_FILE_BYTES {
+        if bytes.len() as u64 > cosmos_core::index::MAX_INDEX_FILE_BYTES {
             continue;
         }
 
@@ -1753,51 +1687,6 @@ mod tests {
         assert_eq!(recent[1].run_id, "run-2");
         assert_eq!(recent[0].run_context, "lab");
         assert_eq!(recent[1].schema_version, 4);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn cache_new_archives_legacy_layout_into_v1_archive_and_uses_v2() {
-        let mut root = std::env::temp_dir();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        root.push(format!("cosmos_cache_layout_migration_test_{}", nanos));
-        fs::create_dir_all(root.join(CACHE_DIR)).unwrap();
-
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&root)
-            .output()
-            .expect("git init should run");
-
-        // Seed legacy layout at .cosmos root.
-        fs::write(root.join(CACHE_DIR).join("index.json"), "{}").unwrap();
-
-        let cache = Cache::new(&root);
-        let _ = cache.mark_welcome_seen();
-
-        assert!(root
-            .join(CACHE_DIR)
-            .join(CACHE_LAYOUT_V2_DIR)
-            .join(WELCOME_SEEN_FILE)
-            .exists());
-
-        let archives: Vec<_> = fs::read_dir(root.join(CACHE_DIR))
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .filter(|name| name.starts_with(LEGACY_ARCHIVE_PREFIX))
-            .collect();
-        assert_eq!(archives.len(), 1);
-
-        assert!(root
-            .join(CACHE_DIR)
-            .join(&archives[0])
-            .join("index.json")
-            .exists());
 
         let _ = fs::remove_dir_all(&root);
     }

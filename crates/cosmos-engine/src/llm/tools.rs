@@ -3,7 +3,7 @@
 //! Philosophy: Support top-down exploration that's naturally token-efficient.
 //! Specialized tools enforce efficient patterns; shell is fallback for edge cases.
 
-use crate::util::{resolve_repo_path_allow_new, run_command_with_timeout};
+use cosmos_adapters::util::{resolve_repo_path_allow_new, run_command_with_timeout};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;

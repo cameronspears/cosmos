@@ -2,9 +2,9 @@ use super::agentic::{call_llm_agentic, schema_to_response_format};
 use super::models::{Model, Usage};
 use super::parse::{parse_summaries_and_terms_response, SummariesAndTerms};
 use super::prompts::SUMMARY_BATCH_SYSTEM;
-use crate::cache::DomainGlossary;
-use crate::context::WorkContext;
-use crate::index::{CodebaseIndex, SymbolKind};
+use cosmos_adapters::cache::DomainGlossary;
+use cosmos_core::context::WorkContext;
+use cosmos_core::index::{CodebaseIndex, SymbolKind};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -559,7 +559,7 @@ fn build_batch_context(index: &CodebaseIndex, files: &[PathBuf], project_context
             let exports: Vec<_> = file_index
                 .symbols
                 .iter()
-                .filter(|s| s.visibility == crate::index::Visibility::Public)
+                .filter(|s| s.visibility == cosmos_core::index::Visibility::Public)
                 .take(10)
                 .map(|s| s.name.as_str())
                 .collect();

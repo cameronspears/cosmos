@@ -1,4 +1,4 @@
-use crate::index::{CodebaseIndex, FlatTreeEntry};
+use cosmos_core::index::{CodebaseIndex, FlatTreeEntry};
 use std::path::PathBuf;
 
 /// Build a flat file tree for display with sorting
@@ -86,10 +86,10 @@ pub(super) fn build_file_tree(index: &CodebaseIndex) -> Vec<FlatTreeEntry> {
 
 /// Build a grouped tree for display
 pub(super) fn build_grouped_tree(
-    grouping: &crate::grouping::CodebaseGrouping,
+    grouping: &cosmos_core::grouping::CodebaseGrouping,
     index: &CodebaseIndex,
-) -> Vec<crate::grouping::GroupedTreeEntry> {
-    use crate::grouping::{GroupedTreeEntry, Layer};
+) -> Vec<cosmos_core::grouping::GroupedTreeEntry> {
+    use cosmos_core::grouping::{GroupedTreeEntry, Layer};
 
     let mut entries = Vec::new();
 
@@ -154,7 +154,7 @@ pub(super) fn build_grouped_tree(
                             .unwrap_or(' ');
 
                         // Use contextual display name for generic files
-                        let name = crate::grouping::display_name_with_context(file_path);
+                        let name = cosmos_core::grouping::display_name_with_context(file_path);
 
                         entries.push(GroupedTreeEntry::file(&name, file_path.clone(), priority));
                     }
@@ -188,7 +188,7 @@ pub(super) fn build_grouped_tree(
                         .unwrap_or(' ');
 
                     // Use contextual display name
-                    let name = crate::grouping::display_name_with_context(file_path);
+                    let name = cosmos_core::grouping::display_name_with_context(file_path);
 
                     entries.push(GroupedTreeEntry::file(&name, file_path.clone(), priority));
                 }

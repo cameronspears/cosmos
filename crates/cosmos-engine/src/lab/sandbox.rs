@@ -1,5 +1,5 @@
-use crate::util::run_command_with_timeout;
 use anyhow::{anyhow, Context, Result};
+use cosmos_adapters::util::run_command_with_timeout;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;

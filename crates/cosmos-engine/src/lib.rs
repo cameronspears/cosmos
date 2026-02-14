@@ -14,43 +14,6 @@ use uuid::Uuid;
 pub mod lab;
 pub mod llm;
 
-// Compatibility re-exports for migrated modules that still expect old crate paths.
-pub mod cache {
-    pub use cosmos_adapters::cache::*;
-}
-
-pub mod config {
-    pub use cosmos_adapters::config::*;
-}
-
-pub mod context {
-    pub use cosmos_core::context::*;
-}
-
-pub mod git_ops {
-    pub use cosmos_adapters::git_ops::*;
-}
-
-pub mod grouping {
-    pub use cosmos_core::grouping::*;
-}
-
-pub mod index {
-    pub use cosmos_core::index::*;
-}
-
-pub mod suggest {
-    pub use cosmos_core::suggest::*;
-
-    pub mod llm {
-        pub use crate::llm::*;
-    }
-}
-
-pub mod util {
-    pub use cosmos_adapters::util::*;
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct CosmosEngine;
 
