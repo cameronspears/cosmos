@@ -1740,6 +1740,9 @@ fn has_speculative_impact_language(text: &str) -> bool {
         "trust",
         "annoyance",
         "annoying",
+        "memory growth",
+        "memory bloat",
+        "slowing the browser",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -2146,7 +2149,7 @@ fn should_run_generation_topup(
 }
 
 fn generation_topup_request_count(deficit: usize) -> usize {
-    deficit.saturating_add(4).clamp(6, 14)
+    deficit.saturating_add(3).clamp(4, 10)
 }
 
 fn regeneration_needed(validated_count: usize) -> usize {
