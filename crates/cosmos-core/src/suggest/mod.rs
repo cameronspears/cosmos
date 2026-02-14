@@ -260,6 +260,42 @@ pub struct SuggestionEngine {
 }
 
 impl SuggestionEngine {
+    fn update_suggestion<F>(&mut self, id: Uuid, mut update: F)
+    where
+        F: FnMut(&mut Suggestion),
+    {
+        if let Some(suggestion) = self.suggestions.iter_mut().find(|s| s.id == id) {
+            update(suggestion);
+        }
+    }
+
+    fn sort_by_priority_desc(&mut self) {
+        self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
+    }
+
+    fn kind_weight(kind: SuggestionKind) -> i64 {
+        match kind {
+            SuggestionKind::BugFix => 40,
+            SuggestionKind::Refactoring => 30,
+            SuggestionKind::Optimization => 25,
+            SuggestionKind::Testing => 20,
+            SuggestionKind::Quality => 15,
+            SuggestionKind::Documentation => 10,
+            SuggestionKind::Improvement => 10,
+            SuggestionKind::Feature => 0,
+        }
+    }
+
+    fn evidence_penalty(
+        suggestion: &Suggestion,
+        contradicted_evidence_counts: Option<&std::collections::HashMap<usize, usize>>,
+    ) -> usize {
+        let evidence_id = suggestion.evidence_refs.first().map(|r| r.snippet_id);
+        evidence_id
+            .and_then(|id| contradicted_evidence_counts.and_then(|m| m.get(&id).copied()))
+            .unwrap_or(0)
+    }
+
     /// Create a new suggestion engine from a codebase index
     ///
     /// Starts empty - LLM suggestions are generated separately.
@@ -281,29 +317,23 @@ impl SuggestionEngine {
 
     /// Mark a suggestion as applied
     pub fn mark_applied(&mut self, id: Uuid) {
-        if let Some(s) = self.suggestions.iter_mut().find(|s| s.id == id) {
-            s.applied = true;
-        }
+        self.update_suggestion(id, |s| s.applied = true);
     }
 
     /// Dismiss a suggestion for the current session.
     pub fn mark_dismissed(&mut self, id: Uuid) {
-        if let Some(s) = self.suggestions.iter_mut().find(|s| s.id == id) {
-            s.dismissed = true;
-        }
+        self.update_suggestion(id, |s| s.dismissed = true);
     }
 
     /// Mark a suggestion as not applied (used for undo).
     pub fn unmark_applied(&mut self, id: Uuid) {
-        if let Some(s) = self.suggestions.iter_mut().find(|s| s.id == id) {
-            s.applied = false;
-        }
+        self.update_suggestion(id, |s| s.applied = false);
     }
 
     /// Add a suggestion from LLM
     pub fn add_llm_suggestion(&mut self, suggestion: Suggestion) {
         self.suggestions.push(suggestion);
-        self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
+        self.sort_by_priority_desc();
     }
 
     /// Replace provisional LLM suggestions with refined suggestions.
@@ -313,7 +343,7 @@ impl SuggestionEngine {
         self.suggestions
             .retain(|s| s.source != SuggestionSource::LlmDeep || s.applied);
         self.suggestions.append(&mut suggestions);
-        self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
+        self.sort_by_priority_desc();
     }
 
     /// Sort suggestions by priority first, then confidence and contradiction history,
@@ -342,19 +372,6 @@ impl SuggestionEngine {
             blast.remove(c);
         }
 
-        let kind_weight = |k: SuggestionKind| -> i64 {
-            match k {
-                SuggestionKind::BugFix => 40,
-                SuggestionKind::Refactoring => 30,
-                SuggestionKind::Optimization => 25,
-                SuggestionKind::Testing => 20,
-                SuggestionKind::Quality => 15,
-                SuggestionKind::Documentation => 10,
-                SuggestionKind::Improvement => 10,
-                SuggestionKind::Feature => 0,
-            }
-        };
-
         self.suggestions.sort_by(|a, b| {
             // Priority is the primary sort criterion
             let pri = b.priority.cmp(&a.priority);
@@ -369,20 +386,14 @@ impl SuggestionEngine {
             }
 
             // Suggestions tied to recently contradicted evidence are demoted.
-            let evidence_penalty = |s: &Suggestion| -> usize {
-                let evidence_id = s.evidence_refs.first().map(|r| r.snippet_id);
-                evidence_id
-                    .and_then(|id| contradicted_evidence_counts.and_then(|m| m.get(&id).copied()))
-                    .unwrap_or(0)
-            };
-            let a_penalty = evidence_penalty(a);
-            let b_penalty = evidence_penalty(b);
+            let a_penalty = Self::evidence_penalty(a, contradicted_evidence_counts);
+            let b_penalty = Self::evidence_penalty(b, contradicted_evidence_counts);
             if a_penalty != b_penalty {
                 return a_penalty.cmp(&b_penalty);
             }
 
             // Then kind weight
-            let kw = kind_weight(b.kind).cmp(&kind_weight(a.kind));
+            let kw = Self::kind_weight(b.kind).cmp(&Self::kind_weight(a.kind));
             if kw != std::cmp::Ordering::Equal {
                 return kw;
             }
