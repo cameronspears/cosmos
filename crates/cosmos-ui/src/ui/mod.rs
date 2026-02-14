@@ -1,6 +1,6 @@
 //! Cosmos UI module.
 //!
-//! Renders a terminal interface with header, main content, and footer.
+//! Renders a dual-panel terminal interface with header, main content, and footer.
 //! See `render/mod.rs` for the layout implementation.
 
 pub mod helpers;
@@ -9,22 +9,25 @@ pub mod theme;
 pub mod types;
 
 mod render;
+mod tree;
 
 pub use render::render;
 
 // Re-export all types for backward compatibility
 pub use types::{
-    AskCosmosState, FileChange, InputMode, LoadingState, Overlay, PendingChange, ReviewFileContent,
-    ReviewState, ShipState, ShipStep, Toast, ToastKind, VerifyState, WorkflowStep, SPINNER_FRAMES,
+    ActivePanel, AskCosmosState, FileChange, InputMode, LoadingState, Overlay, PendingChange,
+    ReviewFileContent, ReviewState, ShipState, ShipStep, Toast, ToastKind, VerifyState, ViewMode,
+    WorkflowStep, SPINNER_FRAMES,
 };
 
-use crate::context::WorkContext;
-use crate::index::CodebaseIndex;
-use crate::suggest::{Suggestion, SuggestionEngine};
+use cosmos_core::context::WorkContext;
+use cosmos_core::index::{CodebaseIndex, FlatTreeEntry};
+use cosmos_core::suggest::{Suggestion, SuggestionEngine};
 use helpers::lowercase_first;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use tree::{build_file_tree, build_grouped_tree};
 
 pub fn openrouter_keys_shortcut_display() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -70,6 +73,25 @@ pub fn openrouter_setup_toast_copy() -> &'static str {
 //  APP STATE
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[derive(Debug, Clone)]
+struct FlatSearchEntry {
+    name_lower: String,
+    path_lower: String,
+}
+
+#[derive(Debug, Clone)]
+struct GroupedSearchEntry {
+    name_lower: String,
+    path_lower: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GroupingSearchFile {
+    layer: cosmos_core::grouping::Layer,
+    name_lower: String,
+    path_lower: String,
+}
+
 /// Main application state for Cosmos
 pub struct App {
     // Core data
@@ -78,14 +100,19 @@ pub struct App {
     pub context: WorkContext,
 
     // UI state
+    pub active_panel: ActivePanel,
+    pub project_scroll: usize,
+    pub project_selected: usize,
     pub suggestion_scroll: usize,
     pub suggestion_selected: usize,
     pub overlay: Overlay,
     pub toast: Option<Toast>,
     pub should_quit: bool,
 
-    // Input state
+    // Search and sort state
     pub input_mode: InputMode,
+    pub search_query: String,
+    pub view_mode: ViewMode,
 
     // Question input (ask cosmos)
     pub question_input: String,
@@ -100,13 +127,13 @@ pub struct App {
     pub llm_summaries: std::collections::HashMap<PathBuf, String>,
 
     // Personal repo memory (local)
-    pub repo_memory: crate::cache::RepoMemory,
+    pub repo_memory: cosmos_adapters::cache::RepoMemory,
 
     // Domain glossary (auto-extracted terminology)
-    pub glossary: crate::cache::DomainGlossary,
+    pub glossary: cosmos_adapters::cache::DomainGlossary,
 
     // Question answer cache
-    pub question_cache: crate::cache::QuestionCache,
+    pub question_cache: cosmos_adapters::cache::QuestionCache,
 
     // Cost tracking
     pub session_cost: f64,            // Total USD spent this session
@@ -122,7 +149,18 @@ pub struct App {
     /// Files that failed summary generation (for retry visibility)
     pub summary_failed_files: Vec<PathBuf>,
 
+    // Cached data for display
+    pub file_tree: Vec<FlatTreeEntry>,
+    pub filtered_tree_indices: Vec<usize>,
+    flat_search_entries: Vec<FlatSearchEntry>,
     pub repo_path: PathBuf,
+
+    // Grouped view data
+    pub grouping: cosmos_core::grouping::CodebaseGrouping,
+    pub grouped_tree: Vec<cosmos_core::grouping::GroupedTreeEntry>,
+    pub filtered_grouped_indices: Vec<usize>,
+    grouped_search_entries: Vec<GroupedSearchEntry>,
+    grouping_search_files: Vec<GroupingSearchFile>,
 
     // Pending changes for batch commit workflow
     pub pending_changes: Vec<PendingChange>,
@@ -148,7 +186,7 @@ pub struct App {
     /// Last time we surfaced a git refresh error
     pub git_refresh_error_at: Option<Instant>,
     /// Diagnostics from the most recent suggestion run
-    pub last_suggestion_diagnostics: Option<crate::suggest::llm::SuggestionDiagnostics>,
+    pub last_suggestion_diagnostics: Option<cosmos_engine::llm::SuggestionDiagnostics>,
     /// Last suggestion error message (full, untruncated)
     pub last_suggestion_error: Option<String>,
     /// Show verbose suggestion diagnostics in the UI.
@@ -189,27 +227,42 @@ pub struct App {
 impl App {
     /// Create a new Cosmos app
     pub fn new(index: CodebaseIndex, suggestions: SuggestionEngine, context: WorkContext) -> Self {
+        let file_tree = build_file_tree(&index);
+        let flat_search_entries = build_flat_search_entries(&file_tree);
+        let filtered_tree_indices = (0..file_tree.len()).collect();
         let repo_path = index.root.clone();
+
+        // Generate grouping for the codebase
+        let grouping = index.generate_grouping();
+        let grouped_tree = build_grouped_tree(&grouping, &index);
+        let grouped_search_entries = build_grouped_search_entries(&grouped_tree);
+        let filtered_grouped_indices = (0..grouped_tree.len()).collect();
+        let grouping_search_files = build_grouping_search_files(&grouping);
 
         Self {
             index,
             suggestions,
             context,
+            active_panel: ActivePanel::default(),
+            project_scroll: 0,
+            project_selected: 0,
             suggestion_scroll: 0,
             suggestion_selected: 0,
             overlay: Overlay::None,
             toast: None,
             should_quit: false,
             input_mode: InputMode::Normal,
+            search_query: String::new(),
+            view_mode: ViewMode::Grouped, // Default to grouped view
             question_input: String::new(),
             question_suggestions: Vec::new(),
             question_suggestion_selected: 0,
             loading: LoadingState::None,
             loading_frame: 0,
             llm_summaries: std::collections::HashMap::new(),
-            repo_memory: crate::cache::RepoMemory::default(),
-            glossary: crate::cache::DomainGlossary::default(),
-            question_cache: crate::cache::QuestionCache::default(),
+            repo_memory: cosmos_adapters::cache::RepoMemory::default(),
+            glossary: cosmos_adapters::cache::DomainGlossary::default(),
+            question_cache: cosmos_adapters::cache::QuestionCache::default(),
             session_cost: 0.0,
             session_tokens: 0,
             active_model: None,
@@ -217,7 +270,15 @@ impl App {
             needs_summary_generation: false,
             summary_progress: None,
             summary_failed_files: Vec::new(),
+            file_tree,
+            filtered_tree_indices,
+            flat_search_entries,
             repo_path,
+            grouping,
+            grouped_tree,
+            filtered_grouped_indices,
+            grouped_search_entries,
+            grouping_search_files,
             pending_changes: Vec::new(),
             cosmos_branch: None,
             cosmos_base_branch: None,
@@ -250,6 +311,22 @@ impl App {
         }
     }
 
+    /// Apply a new grouping and rebuild grouped trees.
+    pub fn apply_grouping_update(&mut self, grouping: cosmos_core::grouping::CodebaseGrouping) {
+        self.index.apply_grouping(&grouping);
+        self.grouping = grouping;
+        self.grouped_tree = build_grouped_tree(&self.grouping, &self.index);
+        self.grouped_search_entries = build_grouped_search_entries(&self.grouped_tree);
+        self.grouping_search_files = build_grouping_search_files(&self.grouping);
+        self.filtered_grouped_indices = (0..self.grouped_tree.len()).collect();
+
+        if self.project_selected >= self.filtered_grouped_indices.len() {
+            self.project_selected = self.filtered_grouped_indices.len().saturating_sub(1);
+        }
+        self.project_scroll = 0;
+        self.needs_redraw = true;
+    }
+
     /// Clear all pending changes (after commit)
     pub fn clear_pending_changes(&mut self) {
         self.pending_changes.clear();
@@ -272,7 +349,7 @@ impl App {
 
         // Restore all files from git HEAD
         for path in &files_to_restore {
-            if let Err(e) = crate::git_ops::restore_file(&self.repo_path, path) {
+            if let Err(e) = cosmos_adapters::git_ops::restore_file(&self.repo_path, path) {
                 // Put the change back since we couldn't fully undo
                 self.pending_changes.push(change);
                 return Err(format!("Failed to restore {}: {}", path.display(), e));
@@ -285,10 +362,12 @@ impl App {
         // If no more pending changes, return to original branch and suggestions step
         if self.pending_changes.is_empty() {
             if let Some(base_branch) = self.cosmos_base_branch.as_deref() {
-                let _ = crate::git_ops::checkout_branch(&self.repo_path, base_branch);
-            } else if let Ok(main_name) = crate::git_ops::get_main_branch_name(&self.repo_path) {
+                let _ = cosmos_adapters::git_ops::checkout_branch(&self.repo_path, base_branch);
+            } else if let Ok(main_name) =
+                cosmos_adapters::git_ops::get_main_branch_name(&self.repo_path)
+            {
                 // Fallback for older pending state that predates base-branch tracking.
-                let _ = crate::git_ops::checkout_branch(&self.repo_path, &main_name);
+                let _ = cosmos_adapters::git_ops::checkout_branch(&self.repo_path, &main_name);
             }
 
             // Clear cosmos branch tracking
@@ -321,6 +400,19 @@ impl App {
     /// Get LLM summary for a file
     pub fn get_llm_summary(&self, path: &Path) -> Option<&String> {
         self.llm_summaries.get(path)
+    }
+
+    /// Enter search mode
+    pub fn start_search(&mut self) {
+        self.input_mode = InputMode::Search;
+        self.search_query.clear();
+    }
+
+    /// Exit search mode
+    pub fn exit_search(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.search_query.clear();
+        self.apply_filter();
     }
 
     /// Enter question mode
@@ -396,34 +488,331 @@ impl App {
         }
     }
 
+    /// Add character to search query
+    pub fn search_push(&mut self, c: char) {
+        self.search_query.push(c);
+        self.apply_filter();
+    }
+
+    /// Remove last character from search query
+    pub fn search_pop(&mut self) {
+        self.search_query.pop();
+        self.apply_filter();
+    }
+
+    /// Set search query and re-apply filtering in one pass.
+    pub fn set_search_query(&mut self, query: &str) {
+        self.search_query.clear();
+        self.search_query.push_str(query);
+        self.apply_filter();
+    }
+
+    /// Apply search filter to file tree
+    fn apply_filter(&mut self) {
+        match self.view_mode {
+            ViewMode::Flat => self.apply_flat_filter(),
+            ViewMode::Grouped => self.apply_grouped_filter(),
+        }
+        self.project_scroll = 0;
+        self.needs_redraw = true;
+    }
+
+    fn apply_flat_filter(&mut self) {
+        if self.search_query.is_empty() {
+            self.filtered_tree_indices = (0..self.file_tree.len()).collect();
+        } else {
+            let query = self.search_query.to_lowercase();
+            self.filtered_tree_indices = self
+                .flat_search_entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry.name_lower.contains(&query) || entry.path_lower.contains(&query)
+                })
+                .map(|(idx, _)| idx)
+                .collect();
+        }
+
+        if self.project_selected >= self.filtered_tree_indices.len() {
+            self.project_selected = self.filtered_tree_indices.len().saturating_sub(1);
+        }
+    }
+
+    fn apply_grouped_filter(&mut self) {
+        if self.search_query.is_empty() {
+            self.filtered_grouped_indices = (0..self.grouped_tree.len()).collect();
+            if self.project_selected >= self.filtered_grouped_indices.len() {
+                self.project_selected = self.filtered_grouped_indices.len().saturating_sub(1);
+            }
+            return;
+        }
+
+        let query = self.search_query.to_lowercase();
+        let mut matching_layers: HashSet<cosmos_core::grouping::Layer> = HashSet::new();
+
+        for entry in &self.grouping_search_files {
+            if entry.name_lower.contains(&query) || entry.path_lower.contains(&query) {
+                matching_layers.insert(entry.layer);
+            }
+        }
+
+        for layer in &matching_layers {
+            if let Some(group) = self.grouping.groups.get_mut(layer) {
+                group.expanded = true;
+            }
+        }
+
+        self.rebuild_grouped_tree_cache();
+        self.filtered_grouped_indices = self.filter_grouped_indices(&query, &matching_layers);
+
+        if self.project_selected >= self.filtered_grouped_indices.len() {
+            self.project_selected = self.filtered_grouped_indices.len().saturating_sub(1);
+        }
+    }
+
+    /// Filter out grouped entries in a single pass.
+    fn filter_grouped_indices(
+        &self,
+        query: &str,
+        matching_layers: &HashSet<cosmos_core::grouping::Layer>,
+    ) -> Vec<usize> {
+        use cosmos_core::grouping::GroupedEntryKind;
+
+        let mut result = Vec::new();
+        let mut current_layer_matches = false;
+        let mut current_feature_idx: Option<usize> = None;
+        let mut current_feature_name_match = false;
+        let mut current_feature_emitted = false;
+
+        for (idx, entry) in self.grouped_tree.iter().enumerate() {
+            match &entry.kind {
+                GroupedEntryKind::Layer(layer) => {
+                    if let Some(feature_idx) = current_feature_idx.take() {
+                        if current_feature_name_match && !current_feature_emitted {
+                            result.push(feature_idx);
+                        }
+                    }
+                    current_layer_matches = matching_layers.contains(layer);
+                    current_feature_name_match = false;
+                    current_feature_emitted = false;
+
+                    if current_layer_matches {
+                        result.push(idx);
+                    }
+                }
+                GroupedEntryKind::Feature => {
+                    if let Some(feature_idx) = current_feature_idx.take() {
+                        if current_feature_name_match && !current_feature_emitted {
+                            result.push(feature_idx);
+                        }
+                    }
+                    if !current_layer_matches {
+                        current_feature_name_match = false;
+                        current_feature_emitted = false;
+                        continue;
+                    }
+                    current_feature_idx = Some(idx);
+                    current_feature_name_match =
+                        self.grouped_search_entries[idx].name_lower.contains(query);
+                    current_feature_emitted = false;
+                }
+                GroupedEntryKind::File => {
+                    if !current_layer_matches {
+                        continue;
+                    }
+
+                    let search = &self.grouped_search_entries[idx];
+                    let name_matches = search.name_lower.contains(query);
+                    let path_matches = search
+                        .path_lower
+                        .as_ref()
+                        .map(|p| p.contains(query))
+                        .unwrap_or(false);
+
+                    if name_matches || path_matches {
+                        if let Some(feature_idx) = current_feature_idx {
+                            if !current_feature_emitted {
+                                result.push(feature_idx);
+                                current_feature_emitted = true;
+                            }
+                        }
+                        result.push(idx);
+                    }
+                }
+            }
+        }
+
+        if let Some(feature_idx) = current_feature_idx {
+            if current_feature_name_match && !current_feature_emitted {
+                result.push(feature_idx);
+            }
+        }
+
+        result
+    }
+
+    /// Toggle between flat and grouped view modes
+    pub fn toggle_view_mode(&mut self) {
+        self.view_mode = self.view_mode.toggle();
+        self.project_selected = 0;
+        self.project_scroll = 0;
+        self.apply_filter();
+        self.show_toast(&format!("View: {}", self.view_mode.label()));
+    }
+
+    /// Toggle expand/collapse of the selected group in grouped view
+    pub fn toggle_group_expand(&mut self) {
+        if self.view_mode != ViewMode::Grouped {
+            return;
+        }
+
+        let selected_kind = self.current_grouped_entry().map(|entry| entry.kind.clone());
+        if let Some(kind) = selected_kind {
+            use cosmos_core::grouping::GroupedEntryKind;
+            match kind {
+                GroupedEntryKind::Layer(layer) => {
+                    if let Some(group) = self.grouping.groups.get_mut(&layer) {
+                        group.expanded = !group.expanded;
+                        self.rebuild_grouped_tree();
+                    }
+                }
+                GroupedEntryKind::Feature => {
+                    // For now, features are always expanded - could add feature collapse later
+                }
+                GroupedEntryKind::File => {
+                    // Files can't be expanded - show details instead
+                    self.show_file_detail();
+                }
+            }
+        }
+    }
+
+    /// Rebuild the grouped tree after a toggle
+    fn rebuild_grouped_tree(&mut self) {
+        self.rebuild_grouped_tree_cache();
+        self.apply_filter();
+    }
+
+    /// Page down (jump 10 items)
+    pub fn page_down(&mut self) {
+        let max = self.project_tree_len().saturating_sub(1);
+        self.project_selected = (self.project_selected + 10).min(max);
+        self.ensure_project_visible();
+    }
+
+    /// Page up (jump 10 items)
+    pub fn page_up(&mut self) {
+        self.project_selected = self.project_selected.saturating_sub(10);
+        self.ensure_project_visible();
+    }
+
+    /// Show file detail overlay for currently selected file
+    pub fn show_file_detail(&mut self) {
+        match self.view_mode {
+            ViewMode::Flat => {
+                if let Some(entry) = self.current_flat_entry() {
+                    self.overlay = Overlay::FileDetail {
+                        path: entry.path.clone(),
+                        scroll: 0,
+                    };
+                }
+            }
+            ViewMode::Grouped => {
+                if let Some(entry) = self.current_grouped_entry() {
+                    if let Some(path) = &entry.path {
+                        self.overlay = Overlay::FileDetail {
+                            path: path.clone(),
+                            scroll: 0,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
     /// Switch to the other panel
     pub fn toggle_panel(&mut self) {
-        // Single-pane UI: no secondary panel to switch to.
+        self.active_panel = match self.active_panel {
+            ActivePanel::Project => ActivePanel::Suggestions,
+            ActivePanel::Suggestions => ActivePanel::Project,
+        };
     }
 
-    /// Navigate down in suggestions.
+    /// Navigate down in the current panel
     pub fn navigate_down(&mut self) {
-        let previous = self.suggestion_selected;
-        let max = self
-            .suggestions
-            .active_suggestions()
-            .len()
-            .saturating_sub(1);
-        self.suggestion_selected = (self.suggestion_selected + 1).min(max);
-        if self.workflow_step == WorkflowStep::Suggestions && self.suggestion_selected != previous {
-            self.clear_apply_confirm();
+        match self.active_panel {
+            ActivePanel::Project => {
+                let max = self.project_tree_len().saturating_sub(1);
+                self.project_selected = (self.project_selected + 1).min(max);
+                self.ensure_project_visible();
+            }
+            ActivePanel::Suggestions => {
+                let previous = self.suggestion_selected;
+                let max = self
+                    .suggestions
+                    .active_suggestions()
+                    .len()
+                    .saturating_sub(1);
+                self.suggestion_selected = (self.suggestion_selected + 1).min(max);
+                if self.workflow_step == WorkflowStep::Suggestions
+                    && self.suggestion_selected != previous
+                {
+                    self.clear_apply_confirm();
+                }
+                self.ensure_suggestion_visible();
+            }
         }
-        self.ensure_suggestion_visible();
     }
 
-    /// Navigate up in suggestions.
+    /// Navigate up in the current panel
     pub fn navigate_up(&mut self) {
-        let previous = self.suggestion_selected;
-        self.suggestion_selected = self.suggestion_selected.saturating_sub(1);
-        if self.workflow_step == WorkflowStep::Suggestions && self.suggestion_selected != previous {
-            self.clear_apply_confirm();
+        match self.active_panel {
+            ActivePanel::Project => {
+                self.project_selected = self.project_selected.saturating_sub(1);
+                self.ensure_project_visible();
+            }
+            ActivePanel::Suggestions => {
+                let previous = self.suggestion_selected;
+                self.suggestion_selected = self.suggestion_selected.saturating_sub(1);
+                if self.workflow_step == WorkflowStep::Suggestions
+                    && self.suggestion_selected != previous
+                {
+                    self.clear_apply_confirm();
+                }
+                self.ensure_suggestion_visible();
+            }
         }
-        self.ensure_suggestion_visible();
+    }
+
+    /// Get the length of the current project tree based on view mode
+    fn project_tree_len(&self) -> usize {
+        match self.view_mode {
+            ViewMode::Flat => self.filtered_tree_indices.len(),
+            ViewMode::Grouped => self.filtered_grouped_indices.len(),
+        }
+    }
+
+    fn current_flat_entry(&self) -> Option<&FlatTreeEntry> {
+        let idx = *self.filtered_tree_indices.get(self.project_selected)?;
+        self.file_tree.get(idx)
+    }
+
+    fn current_grouped_entry(&self) -> Option<&cosmos_core::grouping::GroupedTreeEntry> {
+        let idx = *self.filtered_grouped_indices.get(self.project_selected)?;
+        self.grouped_tree.get(idx)
+    }
+
+    fn rebuild_grouped_tree_cache(&mut self) {
+        self.grouped_tree = build_grouped_tree(&self.grouping, &self.index);
+        self.grouped_search_entries = build_grouped_search_entries(&self.grouped_tree);
+    }
+
+    fn ensure_project_visible(&mut self) {
+        if self.project_selected < self.project_scroll {
+            self.project_scroll = self.project_selected;
+        } else if self.project_selected >= self.project_scroll + 15 {
+            self.project_scroll = self.project_selected.saturating_sub(14);
+        }
     }
 
     fn ensure_suggestion_visible(&mut self) {
@@ -484,7 +873,7 @@ impl App {
     pub fn open_apply_plan_overlay(
         &mut self,
         suggestion_id: uuid::Uuid,
-        preview: crate::suggest::llm::FixPreview,
+        preview: cosmos_engine::llm::FixPreview,
         affected_files: Vec<PathBuf>,
         show_data_notice: bool,
     ) {
@@ -621,7 +1010,7 @@ impl App {
 
     /// Open the reset cosmos overlay with default options selected
     pub fn open_reset_overlay(&mut self) {
-        use crate::cache::ResetOption;
+        use cosmos_adapters::cache::ResetOption;
 
         let defaults = ResetOption::defaults();
         let options: Vec<(ResetOption, bool)> = ResetOption::all()
@@ -663,7 +1052,7 @@ impl App {
     }
 
     /// Get the selected reset options (returns empty vec if not in reset overlay)
-    pub fn get_reset_selections(&self) -> Vec<crate::cache::ResetOption> {
+    pub fn get_reset_selections(&self) -> Vec<cosmos_adapters::cache::ResetOption> {
         if let Overlay::Reset { options, .. } = &self.overlay {
             options
                 .iter()
@@ -972,7 +1361,7 @@ impl App {
     /// Set the preview result in the Verify step
     pub fn set_verify_preview(
         &mut self,
-        preview: crate::suggest::llm::FixPreview,
+        preview: cosmos_engine::llm::FixPreview,
         file_hashes: std::collections::HashMap<PathBuf, String>,
     ) {
         if let Some(suggestion_id) = self.verify_state.suggestion_id {
@@ -1029,10 +1418,11 @@ impl App {
 
         // Check that all file hashes match
         for target in &all_files {
-            let resolved = match crate::util::resolve_repo_path_allow_new(repo_path, target) {
-                Ok(r) => r,
-                Err(_) => return false,
-            };
+            let resolved =
+                match cosmos_adapters::util::resolve_repo_path_allow_new(repo_path, target) {
+                    Ok(r) => r,
+                    Err(_) => return false,
+                };
 
             let bytes = match std::fs::read(&resolved.absolute) {
                 Ok(content) => content,
@@ -1040,7 +1430,7 @@ impl App {
                 Err(_) => return false,
             };
 
-            let current_hash = crate::util::hash_bytes(&bytes);
+            let current_hash = cosmos_adapters::util::hash_bytes(&bytes);
 
             match self.verify_state.preview_hashes.get(&resolved.relative) {
                 Some(cached_hash) if cached_hash == &current_hash => continue,
@@ -1101,7 +1491,7 @@ impl App {
     /// Set review findings from the adversarial reviewer
     pub fn set_review_findings(
         &mut self,
-        findings: Vec<crate::suggest::llm::ReviewFinding>,
+        findings: Vec<cosmos_engine::llm::ReviewFinding>,
         summary: String,
     ) {
         self.review_state.findings = findings.clone();
@@ -1176,7 +1566,7 @@ impl App {
     }
 
     /// Get selected findings for fixing
-    pub fn get_selected_review_findings(&self) -> Vec<crate::suggest::llm::ReviewFinding> {
+    pub fn get_selected_review_findings(&self) -> Vec<cosmos_engine::llm::ReviewFinding> {
         self.review_state
             .findings
             .iter()
@@ -1275,12 +1665,53 @@ impl App {
     }
 }
 
+fn build_flat_search_entries(tree: &[FlatTreeEntry]) -> Vec<FlatSearchEntry> {
+    tree.iter()
+        .map(|entry| FlatSearchEntry {
+            name_lower: entry.name.to_lowercase(),
+            path_lower: entry.path.to_string_lossy().to_lowercase(),
+        })
+        .collect()
+}
+
+fn build_grouped_search_entries(
+    tree: &[cosmos_core::grouping::GroupedTreeEntry],
+) -> Vec<GroupedSearchEntry> {
+    tree.iter()
+        .map(|entry| GroupedSearchEntry {
+            name_lower: entry.name.to_lowercase(),
+            path_lower: entry
+                .path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_lowercase()),
+        })
+        .collect()
+}
+
+fn build_grouping_search_files(
+    grouping: &cosmos_core::grouping::CodebaseGrouping,
+) -> Vec<GroupingSearchFile> {
+    grouping
+        .file_assignments
+        .iter()
+        .map(|(path, assignment)| GroupingSearchFile {
+            layer: assignment.layer,
+            name_lower: path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_lowercase(),
+            path_lower: path.to_string_lossy().to_lowercase(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::WorkContext;
-    use crate::index::CodebaseIndex;
-    use crate::suggest::SuggestionEngine;
+    use cosmos_core::context::WorkContext;
+    use cosmos_core::index::CodebaseIndex;
+    use cosmos_core::suggest::SuggestionEngine;
     use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 

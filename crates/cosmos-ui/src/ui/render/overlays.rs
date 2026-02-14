@@ -110,7 +110,7 @@ pub(super) fn render_help(frame: &mut Frame, scroll: usize) {
 pub(super) fn render_file_detail(
     frame: &mut Frame,
     path: &Path,
-    file_index: &crate::index::FileIndex,
+    file_index: &cosmos_core::index::FileIndex,
     llm_summary: Option<&String>,
     _scroll: usize,
 ) {
@@ -196,7 +196,7 @@ pub(super) fn render_file_detail(
         .filter(|s| {
             matches!(
                 s.kind,
-                crate::index::SymbolKind::Function | crate::index::SymbolKind::Method
+                cosmos_core::index::SymbolKind::Function | cosmos_core::index::SymbolKind::Method
             )
         })
         .count();
@@ -206,7 +206,7 @@ pub(super) fn render_file_detail(
         .filter(|s| {
             matches!(
                 s.kind,
-                crate::index::SymbolKind::Struct | crate::index::SymbolKind::Class
+                cosmos_core::index::SymbolKind::Struct | cosmos_core::index::SymbolKind::Class
             )
         })
         .count();
@@ -378,65 +378,66 @@ pub(super) fn render_api_key_overlay(
     let area = centered_rect(72, 56, frame.area());
     frame.render_widget(Clear, area);
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "  Connect OpenRouter to enable AI suggestions in Cosmos.",
-        Style::default()
-            .fg(Theme::WHITE)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    lines.push(Line::from(vec![Span::styled(
-        "  First time setup takes about a minute.",
-        Style::default().fg(Theme::GREY_400),
-    )]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  1) ", Style::default().fg(Theme::GREEN)),
-        Span::styled("Create/sign in", Style::default().fg(Theme::GREY_200)),
-        Span::styled(" and generate a key", Style::default().fg(Theme::GREY_400)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("      ", Style::default()),
-        Span::styled("Press ", Style::default().fg(Theme::GREY_500)),
-        Span::styled(
-            crate::ui::openrouter_keys_shortcut_display(),
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Connect OpenRouter to enable AI suggestions in Cosmos.",
+            Style::default()
+                .fg(Theme::WHITE)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![Span::styled(
+            "  First time setup takes about a minute.",
             Style::default().fg(Theme::GREY_400),
-        ),
-        Span::styled(" for OpenRouter keys", Style::default().fg(Theme::GREY_500)),
-    ]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  2) ", Style::default().fg(Theme::GREEN)),
-        Span::styled("Add credits", Style::default().fg(Theme::GREY_200)),
-        Span::styled(
-            " (required for model usage)",
-            Style::default().fg(Theme::GREY_400),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("      ", Style::default()),
-        Span::styled("Press ", Style::default().fg(Theme::GREY_500)),
-        Span::styled(
-            crate::ui::openrouter_credits_shortcut_display(),
-            Style::default().fg(Theme::GREY_400),
-        ),
-        Span::styled(
-            " for OpenRouter credits",
-            Style::default().fg(Theme::GREY_500),
-        ),
-    ]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  3) ", Style::default().fg(Theme::GREEN)),
-        Span::styled(
-            "Paste your API key below (it usually starts with ",
-            Style::default().fg(Theme::GREY_400),
-        ),
-        Span::styled("sk-", Style::default().fg(Theme::GREY_200)),
-        Span::styled(")", Style::default().fg(Theme::GREY_400)),
-    ]));
-    lines.push(Line::from(""));
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  1) ", Style::default().fg(Theme::GREEN)),
+            Span::styled("Create/sign in", Style::default().fg(Theme::GREY_200)),
+            Span::styled(" and generate a key", Style::default().fg(Theme::GREY_400)),
+        ]),
+        Line::from(vec![
+            Span::styled("      ", Style::default()),
+            Span::styled("Press ", Style::default().fg(Theme::GREY_500)),
+            Span::styled(
+                crate::ui::openrouter_keys_shortcut_display(),
+                Style::default().fg(Theme::GREY_400),
+            ),
+            Span::styled(" for OpenRouter keys", Style::default().fg(Theme::GREY_500)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  2) ", Style::default().fg(Theme::GREEN)),
+            Span::styled("Add credits", Style::default().fg(Theme::GREY_200)),
+            Span::styled(
+                " (required for model usage)",
+                Style::default().fg(Theme::GREY_400),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("      ", Style::default()),
+            Span::styled("Press ", Style::default().fg(Theme::GREY_500)),
+            Span::styled(
+                crate::ui::openrouter_credits_shortcut_display(),
+                Style::default().fg(Theme::GREY_400),
+            ),
+            Span::styled(
+                " for OpenRouter credits",
+                Style::default().fg(Theme::GREY_500),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  3) ", Style::default().fg(Theme::GREEN)),
+            Span::styled(
+                "Paste your API key below (it usually starts with ",
+                Style::default().fg(Theme::GREY_400),
+            ),
+            Span::styled("sk-", Style::default().fg(Theme::GREY_200)),
+            Span::styled(")", Style::default().fg(Theme::GREY_400)),
+        ]),
+        Line::from(""),
+    ];
 
     let normalized_key: String = input
         .trim()
@@ -589,7 +590,7 @@ pub(super) fn render_api_key_overlay(
 
 pub(super) fn render_apply_plan(
     frame: &mut Frame,
-    preview: &crate::suggest::llm::FixPreview,
+    preview: &cosmos_engine::llm::FixPreview,
     affected_files: &[PathBuf],
     confirm_apply: bool,
     show_technical_details: bool,
@@ -846,7 +847,7 @@ pub(super) fn render_apply_plan(
 
 pub(super) fn render_reset_overlay(
     frame: &mut Frame,
-    options: &[(crate::cache::ResetOption, bool)],
+    options: &[(cosmos_adapters::cache::ResetOption, bool)],
     selected: usize,
 ) {
     let area = centered_rect(55, 50, frame.area());

@@ -2,7 +2,7 @@
 //!
 //! Contains enums, structs, and their implementations for UI state management.
 
-use crate::suggest::llm::FixPreview;
+use cosmos_engine::llm::FixPreview;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -80,7 +80,7 @@ pub enum Overlay {
     /// Reset cosmos - selective cache/data reset
     Reset {
         /// List of (option, is_selected) pairs
-        options: Vec<(crate::cache::ResetOption, bool)>,
+        options: Vec<(cosmos_adapters::cache::ResetOption, bool)>,
         /// Currently focused option index
         selected: usize,
     },
@@ -196,7 +196,7 @@ pub struct ReviewFileContent {
 pub struct ReviewState {
     /// All files involved in this review cycle (multi-file aware)
     pub files: Vec<ReviewFileContent>,
-    pub findings: Vec<crate::suggest::llm::ReviewFinding>,
+    pub findings: Vec<cosmos_engine::llm::ReviewFinding>,
     pub selected: HashSet<usize>,
     pub cursor: usize,
     pub summary: String,
