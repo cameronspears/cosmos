@@ -15,9 +15,22 @@ Cosmos should reduce fear, lower the barrier to code quality, and make good engi
 - Developers who want a fast, practical second reviewer.
 - Small teams and solo maintainers who need confidence before shipping.
 
+## Default Model
+
+- Use `minimax/minimax-m2.5` through OpenRouter as Cosmos' default model for suggestion generation and ranking.
+
 ## Core Principles
 
-### 1) Plain Language First
+### 1) Keep It Simple
+
+In practice:
+- Deliver the smallest working solution that clearly helps the user.
+- When uncertain, simplify and remove code instead of adding complexity.
+- Avoid introducing new abstractions, branches, and special cases unless needed.
+- Prefer deleting unnecessary complexity over building more layers.
+- If complexity stays, keep it obvious and tightly scoped.
+
+### 2) Plain Language First
 
 Use words a regular person can understand on first read.
 
@@ -28,7 +41,7 @@ In practice:
   - What goes wrong for the user.
   - Why it matters in real life.
 
-### 2) User Impact Over Technical Cleverness
+### 3) User Impact Over Technical Cleverness
 
 The goal is not to sound smart. The goal is to help someone make a better product decision.
 
@@ -37,7 +50,7 @@ In practice:
 - Avoid vague findings that do not explain practical consequences.
 - Tie every recommendation to visible product behavior when possible.
 
-### 3) Human in Control
+### 4) Human in Control
 
 Cosmos advises and assists. The user decides.
 
@@ -46,7 +59,7 @@ In practice:
 - Show scope and intent before apply.
 - Keep workflows reversible with branch-based changes and undo paths.
 
-### 4) Safety Before Speed
+### 5) Safety Before Speed
 
 Fast is good. Safe is required.
 
@@ -55,7 +68,7 @@ In practice:
 - Prefer small, surgical edits over broad rewrites.
 - Review generated changes with an adversarial pass before shipping.
 
-### 5) Honest Confidence
+### 6) Honest Confidence
 
 Do not pretend certainty where there is none.
 
@@ -64,7 +77,7 @@ In practice:
 - Call out unknowns and assumptions.
 - Fail clearly instead of failing silently.
 
-### 6) Trust Through Transparency
+### 7) Trust Through Transparency
 
 Users should understand what Cosmos is doing and why.
 
@@ -73,7 +86,7 @@ In practice:
 - Surface meaningful diagnostics for failures.
 - Keep auditability through git-friendly changes and explicit workflow stages.
 
-### 7) Respect for User Data
+### 8) Respect for User Data
 
 Privacy is part of product quality.
 
@@ -82,7 +95,7 @@ In practice:
 - Be explicit about what is sent to AI services.
 - Minimize unnecessary data movement and retention.
 
-### 8) High Signal, Low Noise
+### 9) High Signal, Low Noise
 
 Attention is limited. Suggestions must earn their place.
 
