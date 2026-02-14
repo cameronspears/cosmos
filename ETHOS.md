@@ -104,6 +104,19 @@ In practice:
 - Avoid duplicates and repetitive phrasing.
 - Keep recommendation text concise, concrete, and actionable.
 
+## Suggested User Flow
+
+Cosmos should follow this simple flow:
+
+1. Suggest up to 10 items, sorted by criticality.
+2. Show a short plain-English summary for each item first.
+3. Let the user open one item for details.
+4. In details, include: why it matters and the exact code snippet that proves it.
+5. If user approves, show the exact minimal patch before applying.
+6. After applying, review the result with the user, then confirm before shipping.
+
+No hidden edits. No extra suggestions. No shipping without review confirmation.
+
 ## Writing Standard for Suggestions
 
 For user-facing suggestion summaries:
