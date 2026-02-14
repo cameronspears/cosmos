@@ -2,8 +2,7 @@ use crate::ui::helpers::{wrap_text, wrap_text_variable_width};
 use crate::ui::markdown;
 use crate::ui::theme::Theme;
 use crate::ui::{
-    ActivePanel, App, AskCosmosState, InputMode, LoadingState, ShipStep, ViewMode, WorkflowStep,
-    SPINNER_FRAMES,
+    App, AskCosmosState, InputMode, LoadingState, ShipStep, WorkflowStep, SPINNER_FRAMES,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -19,8 +18,7 @@ use std::hash::{Hash, Hasher};
 /// Cached main layout to avoid recomputing on every frame
 struct CachedMainLayout {
     area: Rect,
-    project_panel: Rect,
-    suggestions_panel: Rect,
+    content_panel: Rect,
 }
 
 struct CachedAskMarkdown {
@@ -35,18 +33,17 @@ thread_local! {
 }
 
 pub(super) fn render_main(frame: &mut Frame, area: Rect, app: &App) {
-    let (project_rect, suggestions_rect) = MAIN_LAYOUT_CACHE.with(|cache| {
+    let content_rect = MAIN_LAYOUT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
 
         // Reuse cached layout if area unchanged
         if let Some(cached) = cache.as_ref() {
             if cached.area == area {
-                return (cached.project_panel, cached.suggestions_panel);
+                return cached.content_panel;
             }
         }
 
-        // Recompute layout (only on resize)
-        // Add horizontal padding for breathing room
+        // Recompute layout (only on resize): single content pane with side padding.
         let padded = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -56,377 +53,27 @@ pub(super) fn render_main(frame: &mut Frame, area: Rect, app: &App) {
             ])
             .split(area);
 
-        // Split into two panels with gap
-        let panels = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(38), // Project tree
-                Constraint::Length(2),      // Gap between panels
-                Constraint::Percentage(62), // Suggestions (wider for wrapped text)
-            ])
-            .split(padded[1]);
-
-        let project_panel = panels[0];
-        let suggestions_panel = panels[2];
+        let content_panel = padded[1];
 
         // Cache the result
         *cache = Some(CachedMainLayout {
             area,
-            project_panel,
-            suggestions_panel,
+            content_panel,
         });
 
-        (project_panel, suggestions_panel)
+        content_panel
     });
 
-    render_project_panel(frame, project_rect, app);
-    render_suggestions_panel(frame, suggestions_rect, app);
-}
-
-fn render_project_panel(frame: &mut Frame, area: Rect, app: &App) {
-    let is_active = app.active_panel == ActivePanel::Project;
-    let is_searching = app.input_mode == InputMode::Search;
-
-    let border_style = if is_searching {
-        Style::default().fg(Theme::WHITE) // Bright border when searching
-    } else if is_active {
-        Style::default().fg(Theme::GREY_300) // Bright active border
-    } else {
-        Style::default().fg(Theme::GREY_600) // Visible inactive border
-    };
-
-    // Account for search bar if searching
-    let search_height = if is_searching || !app.search_query.is_empty() {
-        2
-    } else {
-        0
-    };
-    let visible_height = area.height.saturating_sub(4 + search_height as u16) as usize;
-
-    let mut lines = vec![];
-
-    // Search bar
-    if is_searching || !app.search_query.is_empty() {
-        let search_text = if is_searching {
-            format!(" / {}_", app.search_query)
-        } else {
-            format!(" / {} (Esc to clear)", app.search_query)
-        };
-        lines.push(Line::from(vec![Span::styled(
-            search_text,
-            Style::default().fg(Theme::WHITE),
-        )]));
-        lines.push(Line::from(""));
-    } else {
-        // Top padding for breathing room
-        lines.push(Line::from(""));
-    }
-
-    // Render based on view mode
-    match app.view_mode {
-        ViewMode::Flat => {
-            render_flat_tree(&mut lines, app, is_active, visible_height);
-        }
-        ViewMode::Grouped => {
-            render_grouped_tree(&mut lines, app, is_active, visible_height);
-        }
-    }
-
-    // Build title with view/sort indicator
-    let total_items = app.project_tree_len();
-    let scroll_indicator = if total_items > visible_height {
-        let current = app.project_scroll + 1;
-        format!(" ↕ {}/{} ", current, total_items)
-    } else {
-        String::new()
-    };
-
-    let mode_indicator = format!(" [{}]", app.view_mode.label());
-    let title = format!(
-        " {}{}{}",
-        Theme::SECTION_PROJECT,
-        mode_indicator,
-        scroll_indicator
-    );
-
-    let block = Block::default()
-        .title(title)
-        .title_style(Style::default().fg(Theme::GREY_200)) // Legible title
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .style(Style::default().bg(Theme::GREY_800));
-
-    let paragraph = Paragraph::new(lines).block(block);
-    frame.render_widget(paragraph, area);
-}
-
-/// Render the flat file tree
-fn render_flat_tree<'a>(
-    lines: &mut Vec<Line<'a>>,
-    app: &'a App,
-    is_active: bool,
-    visible_height: usize,
-) {
-    let tree = &app.file_tree;
-    let indices = &app.filtered_tree_indices;
-    let total = indices.len();
-
-    for (i, entry_idx) in indices
-        .iter()
-        .enumerate()
-        .skip(app.project_scroll)
-        .take(visible_height)
-    {
-        let entry = &tree[*entry_idx];
-        let is_selected = i == app.project_selected && is_active;
-
-        // Calculate tree connectors
-        let is_last = {
-            if i + 1 >= total {
-                true
-            } else {
-                let next_entry = &tree[indices[i + 1]];
-                next_entry.depth <= entry.depth
-            }
-        };
-
-        let connector = if is_last { "└" } else { "├" };
-        let indent_str: String = (0..entry.depth.saturating_sub(1))
-            .map(|d| {
-                // Check if ancestor at this depth has more siblings
-                let has_more = indices
-                    .iter()
-                    .skip(i + 1)
-                    .any(|next_idx| tree[*next_idx].depth == d + 1);
-                if has_more {
-                    "│ "
-                } else {
-                    "  "
-                }
-            })
-            .collect();
-
-        let (file_icon_str, icon_color) = if entry.is_dir {
-            ("▸", Theme::GREY_400)
-        } else {
-            file_icon(&entry.name)
-        };
-
-        // Selection indicated by styling only (no cursor)
-        let name_style = if is_selected {
-            Style::default()
-                .fg(Theme::WHITE)
-                .add_modifier(Modifier::BOLD)
-        } else if entry.is_dir {
-            Style::default().fg(Theme::GREY_300)
-        } else if entry.priority == Theme::PRIORITY_HIGH {
-            Style::default().fg(Theme::GREY_200)
-        } else {
-            Style::default().fg(Theme::GREY_500)
-        };
-
-        let priority_indicator = if entry.priority == Theme::PRIORITY_HIGH {
-            Span::styled(" ●", Style::default().fg(Theme::GREY_300))
-        } else {
-            Span::styled("", Style::default())
-        };
-
-        // Icon styling also reflects selection
-        let icon_style = if is_selected {
-            Style::default().fg(Theme::WHITE)
-        } else {
-            Style::default().fg(icon_color)
-        };
-
-        if entry.depth == 0 {
-            // Root level - no connector
-            lines.push(Line::from(vec![
-                Span::styled("   ", Style::default()),
-                Span::styled(format!("{} ", file_icon_str), icon_style),
-                Span::styled(entry.name.as_str(), name_style),
-                priority_indicator,
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled("   ", Style::default()),
-                Span::styled(
-                    format!("{}{}", indent_str, connector),
-                    Style::default().fg(Theme::GREY_700),
-                ),
-                Span::styled(format!(" {} ", file_icon_str), icon_style),
-                Span::styled(entry.name.as_str(), name_style),
-                priority_indicator,
-            ]));
-        }
-    }
-}
-
-/// Get file type icon based on extension - minimal and clean
-fn file_icon(name: &str) -> (&'static str, ratatui::style::Color) {
-    let ext = name.rsplit('.').next().unwrap_or("");
-    match ext {
-        // React/JSX - subtle blue tint
-        "tsx" | "jsx" => ("›", Theme::BADGE_QUALITY),
-        // TypeScript - subtle yellow
-        "ts" => ("›", Theme::BADGE_DOCS),
-        // JavaScript
-        "js" | "mjs" | "cjs" => ("›", Theme::BADGE_DOCS),
-        // Styles - purple
-        "css" | "scss" | "sass" | "less" => ("◈", Theme::BADGE_REFACTOR),
-        // Data files - muted
-        "json" | "yaml" | "yml" | "toml" => ("○", Theme::GREY_600),
-        // Rust - orange
-        "rs" => ("●", Theme::BADGE_SECURITY),
-        // Python - teal
-        "py" => ("●", Theme::BADGE_PERF),
-        // Go - blue
-        "go" => ("●", Theme::BADGE_QUALITY),
-        // Config - very muted
-        "env" | "config" => ("○", Theme::GREY_700),
-        // Markdown - muted
-        "md" | "mdx" => ("○", Theme::GREY_600),
-        // Tests - teal indicator
-        _ if name.contains("test") || name.contains("spec") => ("◎", Theme::BADGE_PERF),
-        // Default - minimal dot
-        _ => ("·", Theme::GREY_600),
-    }
-}
-
-/// Render the grouped file tree
-fn render_grouped_tree<'a>(
-    lines: &mut Vec<Line<'a>>,
-    app: &'a App,
-    is_active: bool,
-    visible_height: usize,
-) {
-    use crate::grouping::GroupedEntryKind;
-
-    let tree = &app.grouped_tree;
-    let indices = &app.filtered_grouped_indices;
-
-    for (i, entry_idx) in indices
-        .iter()
-        .enumerate()
-        .skip(app.project_scroll)
-        .take(visible_height)
-    {
-        let entry = &tree[*entry_idx];
-        let is_selected = i == app.project_selected && is_active;
-
-        match &entry.kind {
-            GroupedEntryKind::Layer(_layer) => {
-                // Add spacing before layer (except first)
-                if i > 0 && app.project_scroll == 0
-                    || (i > app.project_scroll && app.project_scroll > 0)
-                {
-                    // Check if previous visible item was a file - add separator
-                    if i > 0 {
-                        if let Some(prev_idx) = indices.get(i.saturating_sub(1)) {
-                            let prev = &tree[*prev_idx];
-                            if prev.kind == GroupedEntryKind::File {
-                                lines.push(Line::from(""));
-                            }
-                        }
-                    }
-                }
-
-                // Layer header - selection via styling only, expand icon shows state
-                let expand_icon = if entry.expanded { "▾" } else { "▸" };
-                let count_str = format!(" {}", entry.file_count);
-
-                let (expand_style, name_style, count_style) = if is_selected {
-                    (
-                        Style::default().fg(Theme::WHITE),
-                        Style::default()
-                            .fg(Theme::WHITE)
-                            .add_modifier(Modifier::BOLD),
-                        Style::default().fg(Theme::GREY_200),
-                    )
-                } else {
-                    (
-                        Style::default().fg(Theme::GREY_500),
-                        Style::default().fg(Theme::GREY_100),
-                        Style::default().fg(Theme::GREY_600),
-                    )
-                };
-
-                lines.push(Line::from(vec![
-                    Span::styled("   ", Style::default()),
-                    Span::styled(expand_icon.to_string(), expand_style),
-                    Span::styled(format!(" {}", entry.name), name_style),
-                    Span::styled(count_str, count_style),
-                ]));
-            }
-            GroupedEntryKind::Feature => {
-                // Feature header - selection via styling only
-                let style = if is_selected {
-                    Style::default()
-                        .fg(Theme::WHITE)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Theme::GREY_300)
-                };
-
-                let count_str = format!(" {}", entry.file_count);
-
-                lines.push(Line::from(vec![
-                    Span::styled("   ", Style::default()),
-                    Span::styled("   ├─ ", Style::default().fg(Theme::GREY_700)),
-                    Span::styled(entry.name.as_str(), style),
-                    Span::styled(count_str, Style::default().fg(Theme::GREY_600)),
-                ]));
-            }
-            GroupedEntryKind::File => {
-                // File display - selection via styling only
-                let (file_icon_str, icon_color) = file_icon(&entry.name);
-
-                let name_style = if is_selected {
-                    Style::default()
-                        .fg(Theme::WHITE)
-                        .add_modifier(Modifier::BOLD)
-                } else if entry.priority == Theme::PRIORITY_HIGH {
-                    Style::default().fg(Theme::GREY_200)
-                } else {
-                    Style::default().fg(Theme::GREY_500)
-                };
-
-                let icon_style = if is_selected {
-                    Style::default().fg(Theme::WHITE)
-                } else {
-                    Style::default().fg(icon_color)
-                };
-
-                let priority_indicator = if entry.priority == Theme::PRIORITY_HIGH {
-                    Span::styled(" ●", Style::default().fg(Theme::GREY_400))
-                } else {
-                    Span::styled("", Style::default())
-                };
-
-                // Simple indentation with subtle vertical guide
-                let indent = "     │  ";
-
-                lines.push(Line::from(vec![
-                    Span::styled("   ", Style::default()),
-                    Span::styled(indent.to_string(), Style::default().fg(Theme::GREY_800)),
-                    Span::styled(format!("{} ", file_icon_str), icon_style),
-                    Span::styled(entry.name.as_str(), name_style),
-                    priority_indicator,
-                ]));
-            }
-        }
-    }
+    render_suggestions_panel(frame, content_rect, app);
 }
 
 fn render_suggestions_panel(frame: &mut Frame, area: Rect, app: &App) {
-    let is_active = app.active_panel == ActivePanel::Suggestions;
     let is_question_mode = app.input_mode == InputMode::Question;
 
     let border_style = if is_question_mode {
         Style::default().fg(Theme::WHITE) // Bright border when in question mode
-    } else if is_active {
-        Style::default().fg(Theme::GREY_300)
     } else {
-        Style::default().fg(Theme::GREY_600)
+        Style::default().fg(Theme::GREY_300)
     };
 
     // Reserve space for border (2 lines top/bottom)
@@ -447,7 +94,7 @@ fn render_suggestions_panel(frame: &mut Frame, area: Rect, app: &App) {
         // Render content based on workflow step
         match app.workflow_step {
             WorkflowStep::Suggestions => {
-                render_suggestions_content(&mut lines, app, is_active, visible_height, inner_width);
+                render_suggestions_content(&mut lines, app, visible_height, inner_width);
             }
             WorkflowStep::Review => {
                 render_review_content(&mut lines, app, visible_height, inner_width);
@@ -509,11 +156,74 @@ fn render_workflow_title(current: WorkflowStep, ask_cosmos_active: bool) -> Stri
 fn render_suggestions_content<'a>(
     lines: &mut Vec<Line<'a>>,
     app: &App,
-    is_active: bool,
     visible_height: usize,
     inner_width: usize,
 ) {
     use crate::suggest::{Confidence, Priority};
+
+    if !crate::app::background::suggestion_engine_enabled() {
+        lines.push(Line::from(""));
+        let border_style = Style::default().fg(Theme::GREY_700);
+        let card_width = inner_width.saturating_sub(12).clamp(26, 44);
+        let rule_width = card_width + 2;
+        let row_width = card_width;
+        let center_row = |text: &str| -> String {
+            let clipped: String = text.chars().take(row_width).collect();
+            let len = clipped.chars().count();
+            if len >= row_width {
+                return clipped;
+            }
+            let left = (row_width - len) / 2;
+            let right = row_width - len - left;
+            format!("{}{}{}", " ".repeat(left), clipped, " ".repeat(right))
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("    ╭", border_style),
+            Span::styled("─".repeat(rule_width), border_style),
+            Span::styled("╮", border_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    │ ", border_style),
+            Span::styled(" ".repeat(row_width), Style::default()),
+            Span::styled(" │", border_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    │ ", border_style),
+            Span::styled(
+                center_row("Suggestion engine removed"),
+                Style::default().fg(Theme::ACCENT),
+            ),
+            Span::styled(" │", border_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    │ ", border_style),
+            Span::styled(
+                center_row("Suggestions panel preserved"),
+                Style::default().fg(Theme::GREY_300),
+            ),
+            Span::styled(" │", border_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    │ ", border_style),
+            Span::styled(
+                center_row("Ready for a fresh implementation"),
+                Style::default().fg(Theme::GREY_500),
+            ),
+            Span::styled(" │", border_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    │ ", border_style),
+            Span::styled(" ".repeat(row_width), Style::default()),
+            Span::styled(" │", border_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    ╰", border_style),
+            Span::styled("─".repeat(rule_width), border_style),
+            Span::styled("╯", border_style),
+        ]));
+        return;
+    }
 
     let suggestions = app.suggestions.active_suggestions();
 
@@ -723,7 +433,7 @@ fn render_suggestions_content<'a>(
             break;
         }
 
-        let is_selected = i == app.suggestion_selected && is_active;
+        let is_selected = i == app.suggestion_selected;
 
         // Build priority indicator with red exclamation points for critical items
         let priority_indicator = match suggestion.priority {

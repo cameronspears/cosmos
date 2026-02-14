@@ -7,50 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use super::theme::Theme;
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  PANEL AND VIEW STATE
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Active panel
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ActivePanel {
-    #[default]
-    Project,
-    Suggestions,
-}
-
-/// View mode for file explorer
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ViewMode {
-    #[default]
-    Flat, // Traditional flat file list
-    Grouped, // Grouped by layer and feature
-}
-
-impl ViewMode {
-    pub fn label(&self) -> &'static str {
-        match self {
-            ViewMode::Flat => Theme::VIEW_FLAT,
-            ViewMode::Grouped => Theme::VIEW_GROUPED,
-        }
-    }
-
-    pub fn toggle(&self) -> Self {
-        match self {
-            ViewMode::Flat => ViewMode::Grouped,
-            ViewMode::Grouped => ViewMode::Flat,
-        }
-    }
-}
-
 /// Input mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputMode {
     #[default]
     Normal,
-    Search,
     Question, // Asking cosmos a question
 }
 

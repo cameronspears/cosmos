@@ -16,10 +16,10 @@ tokio.workspace = true
 futures.workspace = true
 uuid.workspace = true
 unicode-width.workspace = true
-cosmos-core = { path = "../cosmos-core" }
-cosmos-engine = { path = "../cosmos-engine" }
-cosmos-adapters = { path = "../cosmos-adapters" }
+serde.workspace = true
+serde_json.workspace = true
+git2.workspace = true
+dirs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-git2.workspace = true

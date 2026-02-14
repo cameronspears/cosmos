@@ -2,9 +2,6 @@
 members = [
   "crates/cosmos-app",
   "crates/cosmos-ui",
-  "crates/cosmos-core",
-  "crates/cosmos-engine",
-  "crates/cosmos-adapters",
 ]
 resolver = "2"
 
@@ -19,29 +16,13 @@ anyhow = "1"
 ratatui = "0.29"
 crossterm = "0.28"
 git2 = { version = "0.19", default-features = false }
-walkdir = "2"
-regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 futures = "0.3"
 dirs = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
-
-# AST parsing for multi-language support
-tree-sitter = "0.24"
-tree-sitter-rust = "0.23"
-tree-sitter-javascript = "0.23"
-tree-sitter-typescript = "0.23"
-tree-sitter-python = "0.23"
-tree-sitter-go = "0.23"
-
 unicode-width = "0.2"
-rayon = "1.10"
-fs2 = "0.4.3"
-url = "2"
 tempfile = "3"

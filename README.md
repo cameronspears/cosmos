@@ -17,7 +17,7 @@ This repository now uses a big-bang modular architecture that preserves the exis
 - `crates/cosmos-app` - `cosmos` binary entrypoint and CLI
 - `crates/cosmos-ui` - preserved terminal UI and keybinding behavior
 - `crates/cosmos-core` - shared domain model and protocol contracts
-- `crates/cosmos-engine` - suggestion/preview/apply/review engine implementation
+- `crates/cosmos-engine` - AI workflow implementation (preview/apply/review and related tooling)
 - `crates/cosmos-adapters` - git, auth/config, cache persistence, update adapters
 
 Legacy `src/` backend modules and `cosmos-lab` tooling were removed in this rewrite.

@@ -1,6 +1,6 @@
 //! Cosmos UI module.
 //!
-//! Renders a dual-panel terminal interface with header, main content, and footer.
+//! Renders a terminal interface with header, main content, and footer.
 //! See `render/mod.rs` for the layout implementation.
 
 pub mod helpers;
@@ -9,25 +9,22 @@ pub mod theme;
 pub mod types;
 
 mod render;
-mod tree;
 
 pub use render::render;
 
 // Re-export all types for backward compatibility
 pub use types::{
-    ActivePanel, AskCosmosState, FileChange, InputMode, LoadingState, Overlay, PendingChange,
-    ReviewFileContent, ReviewState, ShipState, ShipStep, Toast, ToastKind, VerifyState, ViewMode,
-    WorkflowStep, SPINNER_FRAMES,
+    AskCosmosState, FileChange, InputMode, LoadingState, Overlay, PendingChange, ReviewFileContent,
+    ReviewState, ShipState, ShipStep, Toast, ToastKind, VerifyState, WorkflowStep, SPINNER_FRAMES,
 };
 
 use crate::context::WorkContext;
-use crate::index::{CodebaseIndex, FlatTreeEntry};
+use crate::index::CodebaseIndex;
 use crate::suggest::{Suggestion, SuggestionEngine};
 use helpers::lowercase_first;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tree::{build_file_tree, build_grouped_tree};
 
 pub fn openrouter_keys_shortcut_display() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -73,25 +70,6 @@ pub fn openrouter_setup_toast_copy() -> &'static str {
 //  APP STATE
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone)]
-struct FlatSearchEntry {
-    name_lower: String,
-    path_lower: String,
-}
-
-#[derive(Debug, Clone)]
-struct GroupedSearchEntry {
-    name_lower: String,
-    path_lower: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct GroupingSearchFile {
-    layer: crate::grouping::Layer,
-    name_lower: String,
-    path_lower: String,
-}
-
 /// Main application state for Cosmos
 pub struct App {
     // Core data
@@ -100,19 +78,14 @@ pub struct App {
     pub context: WorkContext,
 
     // UI state
-    pub active_panel: ActivePanel,
-    pub project_scroll: usize,
-    pub project_selected: usize,
     pub suggestion_scroll: usize,
     pub suggestion_selected: usize,
     pub overlay: Overlay,
     pub toast: Option<Toast>,
     pub should_quit: bool,
 
-    // Search and sort state
+    // Input state
     pub input_mode: InputMode,
-    pub search_query: String,
-    pub view_mode: ViewMode,
 
     // Question input (ask cosmos)
     pub question_input: String,
@@ -149,18 +122,7 @@ pub struct App {
     /// Files that failed summary generation (for retry visibility)
     pub summary_failed_files: Vec<PathBuf>,
 
-    // Cached data for display
-    pub file_tree: Vec<FlatTreeEntry>,
-    pub filtered_tree_indices: Vec<usize>,
-    flat_search_entries: Vec<FlatSearchEntry>,
     pub repo_path: PathBuf,
-
-    // Grouped view data
-    pub grouping: crate::grouping::CodebaseGrouping,
-    pub grouped_tree: Vec<crate::grouping::GroupedTreeEntry>,
-    pub filtered_grouped_indices: Vec<usize>,
-    grouped_search_entries: Vec<GroupedSearchEntry>,
-    grouping_search_files: Vec<GroupingSearchFile>,
 
     // Pending changes for batch commit workflow
     pub pending_changes: Vec<PendingChange>,
@@ -227,33 +189,18 @@ pub struct App {
 impl App {
     /// Create a new Cosmos app
     pub fn new(index: CodebaseIndex, suggestions: SuggestionEngine, context: WorkContext) -> Self {
-        let file_tree = build_file_tree(&index);
-        let flat_search_entries = build_flat_search_entries(&file_tree);
-        let filtered_tree_indices = (0..file_tree.len()).collect();
         let repo_path = index.root.clone();
-
-        // Generate grouping for the codebase
-        let grouping = index.generate_grouping();
-        let grouped_tree = build_grouped_tree(&grouping, &index);
-        let grouped_search_entries = build_grouped_search_entries(&grouped_tree);
-        let filtered_grouped_indices = (0..grouped_tree.len()).collect();
-        let grouping_search_files = build_grouping_search_files(&grouping);
 
         Self {
             index,
             suggestions,
             context,
-            active_panel: ActivePanel::default(),
-            project_scroll: 0,
-            project_selected: 0,
             suggestion_scroll: 0,
             suggestion_selected: 0,
             overlay: Overlay::None,
             toast: None,
             should_quit: false,
             input_mode: InputMode::Normal,
-            search_query: String::new(),
-            view_mode: ViewMode::Grouped, // Default to grouped view
             question_input: String::new(),
             question_suggestions: Vec::new(),
             question_suggestion_selected: 0,
@@ -270,15 +217,7 @@ impl App {
             needs_summary_generation: false,
             summary_progress: None,
             summary_failed_files: Vec::new(),
-            file_tree,
-            filtered_tree_indices,
-            flat_search_entries,
             repo_path,
-            grouping,
-            grouped_tree,
-            filtered_grouped_indices,
-            grouped_search_entries,
-            grouping_search_files,
             pending_changes: Vec::new(),
             cosmos_branch: None,
             cosmos_base_branch: None,
@@ -309,22 +248,6 @@ impl App {
             budget_warned_hard: false,
             needs_redraw: true,
         }
-    }
-
-    /// Apply a new grouping and rebuild grouped trees.
-    pub fn apply_grouping_update(&mut self, grouping: crate::grouping::CodebaseGrouping) {
-        self.index.apply_grouping(&grouping);
-        self.grouping = grouping;
-        self.grouped_tree = build_grouped_tree(&self.grouping, &self.index);
-        self.grouped_search_entries = build_grouped_search_entries(&self.grouped_tree);
-        self.grouping_search_files = build_grouping_search_files(&self.grouping);
-        self.filtered_grouped_indices = (0..self.grouped_tree.len()).collect();
-
-        if self.project_selected >= self.filtered_grouped_indices.len() {
-            self.project_selected = self.filtered_grouped_indices.len().saturating_sub(1);
-        }
-        self.project_scroll = 0;
-        self.needs_redraw = true;
     }
 
     /// Clear all pending changes (after commit)
@@ -400,19 +323,6 @@ impl App {
         self.llm_summaries.get(path)
     }
 
-    /// Enter search mode
-    pub fn start_search(&mut self) {
-        self.input_mode = InputMode::Search;
-        self.search_query.clear();
-    }
-
-    /// Exit search mode
-    pub fn exit_search(&mut self) {
-        self.input_mode = InputMode::Normal;
-        self.search_query.clear();
-        self.apply_filter();
-    }
-
     /// Enter question mode
     pub fn start_question(&mut self) {
         self.input_mode = InputMode::Question;
@@ -486,331 +396,34 @@ impl App {
         }
     }
 
-    /// Add character to search query
-    pub fn search_push(&mut self, c: char) {
-        self.search_query.push(c);
-        self.apply_filter();
-    }
-
-    /// Remove last character from search query
-    pub fn search_pop(&mut self) {
-        self.search_query.pop();
-        self.apply_filter();
-    }
-
-    /// Set search query and re-apply filtering in one pass.
-    pub fn set_search_query(&mut self, query: &str) {
-        self.search_query.clear();
-        self.search_query.push_str(query);
-        self.apply_filter();
-    }
-
-    /// Apply search filter to file tree
-    fn apply_filter(&mut self) {
-        match self.view_mode {
-            ViewMode::Flat => self.apply_flat_filter(),
-            ViewMode::Grouped => self.apply_grouped_filter(),
-        }
-        self.project_scroll = 0;
-        self.needs_redraw = true;
-    }
-
-    fn apply_flat_filter(&mut self) {
-        if self.search_query.is_empty() {
-            self.filtered_tree_indices = (0..self.file_tree.len()).collect();
-        } else {
-            let query = self.search_query.to_lowercase();
-            self.filtered_tree_indices = self
-                .flat_search_entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| {
-                    entry.name_lower.contains(&query) || entry.path_lower.contains(&query)
-                })
-                .map(|(idx, _)| idx)
-                .collect();
-        }
-
-        if self.project_selected >= self.filtered_tree_indices.len() {
-            self.project_selected = self.filtered_tree_indices.len().saturating_sub(1);
-        }
-    }
-
-    fn apply_grouped_filter(&mut self) {
-        if self.search_query.is_empty() {
-            self.filtered_grouped_indices = (0..self.grouped_tree.len()).collect();
-            if self.project_selected >= self.filtered_grouped_indices.len() {
-                self.project_selected = self.filtered_grouped_indices.len().saturating_sub(1);
-            }
-            return;
-        }
-
-        let query = self.search_query.to_lowercase();
-        let mut matching_layers: HashSet<crate::grouping::Layer> = HashSet::new();
-
-        for entry in &self.grouping_search_files {
-            if entry.name_lower.contains(&query) || entry.path_lower.contains(&query) {
-                matching_layers.insert(entry.layer);
-            }
-        }
-
-        for layer in &matching_layers {
-            if let Some(group) = self.grouping.groups.get_mut(layer) {
-                group.expanded = true;
-            }
-        }
-
-        self.rebuild_grouped_tree_cache();
-        self.filtered_grouped_indices = self.filter_grouped_indices(&query, &matching_layers);
-
-        if self.project_selected >= self.filtered_grouped_indices.len() {
-            self.project_selected = self.filtered_grouped_indices.len().saturating_sub(1);
-        }
-    }
-
-    /// Filter out grouped entries in a single pass.
-    fn filter_grouped_indices(
-        &self,
-        query: &str,
-        matching_layers: &HashSet<crate::grouping::Layer>,
-    ) -> Vec<usize> {
-        use crate::grouping::GroupedEntryKind;
-
-        let mut result = Vec::new();
-        let mut current_layer_matches = false;
-        let mut current_feature_idx: Option<usize> = None;
-        let mut current_feature_name_match = false;
-        let mut current_feature_emitted = false;
-
-        for (idx, entry) in self.grouped_tree.iter().enumerate() {
-            match &entry.kind {
-                GroupedEntryKind::Layer(layer) => {
-                    if let Some(feature_idx) = current_feature_idx.take() {
-                        if current_feature_name_match && !current_feature_emitted {
-                            result.push(feature_idx);
-                        }
-                    }
-                    current_layer_matches = matching_layers.contains(layer);
-                    current_feature_name_match = false;
-                    current_feature_emitted = false;
-
-                    if current_layer_matches {
-                        result.push(idx);
-                    }
-                }
-                GroupedEntryKind::Feature => {
-                    if let Some(feature_idx) = current_feature_idx.take() {
-                        if current_feature_name_match && !current_feature_emitted {
-                            result.push(feature_idx);
-                        }
-                    }
-                    if !current_layer_matches {
-                        current_feature_name_match = false;
-                        current_feature_emitted = false;
-                        continue;
-                    }
-                    current_feature_idx = Some(idx);
-                    current_feature_name_match =
-                        self.grouped_search_entries[idx].name_lower.contains(query);
-                    current_feature_emitted = false;
-                }
-                GroupedEntryKind::File => {
-                    if !current_layer_matches {
-                        continue;
-                    }
-
-                    let search = &self.grouped_search_entries[idx];
-                    let name_matches = search.name_lower.contains(query);
-                    let path_matches = search
-                        .path_lower
-                        .as_ref()
-                        .map(|p| p.contains(query))
-                        .unwrap_or(false);
-
-                    if name_matches || path_matches {
-                        if let Some(feature_idx) = current_feature_idx {
-                            if !current_feature_emitted {
-                                result.push(feature_idx);
-                                current_feature_emitted = true;
-                            }
-                        }
-                        result.push(idx);
-                    }
-                }
-            }
-        }
-
-        if let Some(feature_idx) = current_feature_idx {
-            if current_feature_name_match && !current_feature_emitted {
-                result.push(feature_idx);
-            }
-        }
-
-        result
-    }
-
-    /// Toggle between flat and grouped view modes
-    pub fn toggle_view_mode(&mut self) {
-        self.view_mode = self.view_mode.toggle();
-        self.project_selected = 0;
-        self.project_scroll = 0;
-        self.apply_filter();
-        self.show_toast(&format!("View: {}", self.view_mode.label()));
-    }
-
-    /// Toggle expand/collapse of the selected group in grouped view
-    pub fn toggle_group_expand(&mut self) {
-        if self.view_mode != ViewMode::Grouped {
-            return;
-        }
-
-        let selected_kind = self.current_grouped_entry().map(|entry| entry.kind.clone());
-        if let Some(kind) = selected_kind {
-            use crate::grouping::GroupedEntryKind;
-            match kind {
-                GroupedEntryKind::Layer(layer) => {
-                    if let Some(group) = self.grouping.groups.get_mut(&layer) {
-                        group.expanded = !group.expanded;
-                        self.rebuild_grouped_tree();
-                    }
-                }
-                GroupedEntryKind::Feature => {
-                    // For now, features are always expanded - could add feature collapse later
-                }
-                GroupedEntryKind::File => {
-                    // Files can't be expanded - show details instead
-                    self.show_file_detail();
-                }
-            }
-        }
-    }
-
-    /// Rebuild the grouped tree after a toggle
-    fn rebuild_grouped_tree(&mut self) {
-        self.rebuild_grouped_tree_cache();
-        self.apply_filter();
-    }
-
-    /// Page down (jump 10 items)
-    pub fn page_down(&mut self) {
-        let max = self.project_tree_len().saturating_sub(1);
-        self.project_selected = (self.project_selected + 10).min(max);
-        self.ensure_project_visible();
-    }
-
-    /// Page up (jump 10 items)
-    pub fn page_up(&mut self) {
-        self.project_selected = self.project_selected.saturating_sub(10);
-        self.ensure_project_visible();
-    }
-
-    /// Show file detail overlay for currently selected file
-    pub fn show_file_detail(&mut self) {
-        match self.view_mode {
-            ViewMode::Flat => {
-                if let Some(entry) = self.current_flat_entry() {
-                    self.overlay = Overlay::FileDetail {
-                        path: entry.path.clone(),
-                        scroll: 0,
-                    };
-                }
-            }
-            ViewMode::Grouped => {
-                if let Some(entry) = self.current_grouped_entry() {
-                    if let Some(path) = &entry.path {
-                        self.overlay = Overlay::FileDetail {
-                            path: path.clone(),
-                            scroll: 0,
-                        };
-                    }
-                }
-            }
-        }
-    }
-
     /// Switch to the other panel
     pub fn toggle_panel(&mut self) {
-        self.active_panel = match self.active_panel {
-            ActivePanel::Project => ActivePanel::Suggestions,
-            ActivePanel::Suggestions => ActivePanel::Project,
-        };
+        // Single-pane UI: no secondary panel to switch to.
     }
 
-    /// Navigate down in the current panel
+    /// Navigate down in suggestions.
     pub fn navigate_down(&mut self) {
-        match self.active_panel {
-            ActivePanel::Project => {
-                let max = self.project_tree_len().saturating_sub(1);
-                self.project_selected = (self.project_selected + 1).min(max);
-                self.ensure_project_visible();
-            }
-            ActivePanel::Suggestions => {
-                let previous = self.suggestion_selected;
-                let max = self
-                    .suggestions
-                    .active_suggestions()
-                    .len()
-                    .saturating_sub(1);
-                self.suggestion_selected = (self.suggestion_selected + 1).min(max);
-                if self.workflow_step == WorkflowStep::Suggestions
-                    && self.suggestion_selected != previous
-                {
-                    self.clear_apply_confirm();
-                }
-                self.ensure_suggestion_visible();
-            }
+        let previous = self.suggestion_selected;
+        let max = self
+            .suggestions
+            .active_suggestions()
+            .len()
+            .saturating_sub(1);
+        self.suggestion_selected = (self.suggestion_selected + 1).min(max);
+        if self.workflow_step == WorkflowStep::Suggestions && self.suggestion_selected != previous {
+            self.clear_apply_confirm();
         }
+        self.ensure_suggestion_visible();
     }
 
-    /// Navigate up in the current panel
+    /// Navigate up in suggestions.
     pub fn navigate_up(&mut self) {
-        match self.active_panel {
-            ActivePanel::Project => {
-                self.project_selected = self.project_selected.saturating_sub(1);
-                self.ensure_project_visible();
-            }
-            ActivePanel::Suggestions => {
-                let previous = self.suggestion_selected;
-                self.suggestion_selected = self.suggestion_selected.saturating_sub(1);
-                if self.workflow_step == WorkflowStep::Suggestions
-                    && self.suggestion_selected != previous
-                {
-                    self.clear_apply_confirm();
-                }
-                self.ensure_suggestion_visible();
-            }
+        let previous = self.suggestion_selected;
+        self.suggestion_selected = self.suggestion_selected.saturating_sub(1);
+        if self.workflow_step == WorkflowStep::Suggestions && self.suggestion_selected != previous {
+            self.clear_apply_confirm();
         }
-    }
-
-    /// Get the length of the current project tree based on view mode
-    fn project_tree_len(&self) -> usize {
-        match self.view_mode {
-            ViewMode::Flat => self.filtered_tree_indices.len(),
-            ViewMode::Grouped => self.filtered_grouped_indices.len(),
-        }
-    }
-
-    fn current_flat_entry(&self) -> Option<&FlatTreeEntry> {
-        let idx = *self.filtered_tree_indices.get(self.project_selected)?;
-        self.file_tree.get(idx)
-    }
-
-    fn current_grouped_entry(&self) -> Option<&crate::grouping::GroupedTreeEntry> {
-        let idx = *self.filtered_grouped_indices.get(self.project_selected)?;
-        self.grouped_tree.get(idx)
-    }
-
-    fn rebuild_grouped_tree_cache(&mut self) {
-        self.grouped_tree = build_grouped_tree(&self.grouping, &self.index);
-        self.grouped_search_entries = build_grouped_search_entries(&self.grouped_tree);
-    }
-
-    fn ensure_project_visible(&mut self) {
-        if self.project_selected < self.project_scroll {
-            self.project_scroll = self.project_selected;
-        } else if self.project_selected >= self.project_scroll + 15 {
-            self.project_scroll = self.project_selected.saturating_sub(14);
-        }
+        self.ensure_suggestion_visible();
     }
 
     fn ensure_suggestion_visible(&mut self) {
@@ -1660,47 +1273,6 @@ impl App {
     pub fn is_on_main_branch(&self) -> bool {
         self.context.branch == "main" || self.context.branch == "master"
     }
-}
-
-fn build_flat_search_entries(tree: &[FlatTreeEntry]) -> Vec<FlatSearchEntry> {
-    tree.iter()
-        .map(|entry| FlatSearchEntry {
-            name_lower: entry.name.to_lowercase(),
-            path_lower: entry.path.to_string_lossy().to_lowercase(),
-        })
-        .collect()
-}
-
-fn build_grouped_search_entries(
-    tree: &[crate::grouping::GroupedTreeEntry],
-) -> Vec<GroupedSearchEntry> {
-    tree.iter()
-        .map(|entry| GroupedSearchEntry {
-            name_lower: entry.name.to_lowercase(),
-            path_lower: entry
-                .path
-                .as_ref()
-                .map(|path| path.to_string_lossy().to_lowercase()),
-        })
-        .collect()
-}
-
-fn build_grouping_search_files(
-    grouping: &crate::grouping::CodebaseGrouping,
-) -> Vec<GroupingSearchFile> {
-    grouping
-        .file_assignments
-        .iter()
-        .map(|(path, assignment)| GroupingSearchFile {
-            layer: assignment.layer,
-            name_lower: path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_lowercase(),
-            path_lower: path.to_string_lossy().to_lowercase(),
-        })
-        .collect()
 }
 
 #[cfg(test)]

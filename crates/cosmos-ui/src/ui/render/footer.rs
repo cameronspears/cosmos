@@ -1,5 +1,5 @@
 use crate::ui::theme::Theme;
-use crate::ui::{ActivePanel, App, LoadingState, ShipStep, WorkflowStep};
+use crate::ui::{App, LoadingState, ShipStep, WorkflowStep};
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -17,7 +17,6 @@ struct FooterCacheKey {
     stale: bool,
     balance_text: String,
     cost_suffix: String,
-    active_panel: ActivePanel,
     workflow_step: WorkflowStep,
     loading: LoadingState,
     verify_loading: bool,
@@ -162,7 +161,6 @@ pub(super) fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         stale: !stale_text.is_empty(),
         balance_text: balance_text.clone(),
         cost_suffix: cost_suffix.clone(),
-        active_panel: app.active_panel,
         workflow_step: app.workflow_step,
         loading: app.loading,
         verify_loading: app.verify_state.loading,
@@ -355,87 +353,50 @@ pub(super) fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Get primary action buttons based on current state
 fn get_primary_buttons(app: &App) -> Vec<FooterButton> {
-    match app.active_panel {
-        ActivePanel::Project => {
-            vec![hint_button("↵", "expand")]
+    match app.workflow_step {
+        WorkflowStep::Suggestions => vec![],
+        WorkflowStep::Review => {
+            if app.review_passed() {
+                vec![primary_button("↵", "ship")]
+            } else if app.review_state.verification_failed {
+                vec![primary_button("↵", "override")]
+            } else {
+                vec![primary_button("↵", "fix")]
+            }
         }
-        ActivePanel::Suggestions => match app.workflow_step {
-            WorkflowStep::Suggestions => {
-                if app.suggestion_refinement_in_progress
-                    || app.loading == LoadingState::GeneratingFix
-                {
-                    vec![]
-                } else {
-                    vec![primary_button("↵", "preview")]
-                }
-            }
-            WorkflowStep::Review => {
-                if app.review_passed() {
-                    vec![primary_button("↵", "ship")]
-                } else if app.review_state.verification_failed {
-                    vec![primary_button("↵", "override")]
-                } else {
-                    vec![primary_button("↵", "fix")]
-                }
-            }
-            WorkflowStep::Ship => match app.ship_state.step {
-                ShipStep::Confirm => vec![primary_button("↵", "ship")],
-                ShipStep::Done => vec![primary_button("↵", "open PR")],
-                _ => vec![],
-            },
+        WorkflowStep::Ship => match app.ship_state.step {
+            ShipStep::Confirm => vec![primary_button("↵", "ship")],
+            ShipStep::Done => vec![primary_button("↵", "open PR")],
+            _ => vec![],
         },
     }
 }
 
 /// Get secondary action buttons based on current state
 fn get_secondary_buttons(app: &App) -> Vec<FooterButton> {
-    match app.active_panel {
-        ActivePanel::Project => vec![],
-        ActivePanel::Suggestions => match app.workflow_step {
-            WorkflowStep::Suggestions => vec![],
-            WorkflowStep::Review => {
-                if app.review_passed() || app.review_state.verification_failed {
-                    vec![secondary_button("Esc", "back")]
-                } else {
-                    vec![hint_button("␣", "select"), secondary_button("Esc", "back")]
-                }
+    match app.workflow_step {
+        WorkflowStep::Suggestions => vec![],
+        WorkflowStep::Review => {
+            if app.review_passed() || app.review_state.verification_failed {
+                vec![secondary_button("Esc", "back")]
+            } else {
+                vec![hint_button("␣", "select"), secondary_button("Esc", "back")]
             }
-            WorkflowStep::Ship => match app.ship_state.step {
-                ShipStep::Confirm => vec![secondary_button("Esc", "back")],
-                ShipStep::Done => vec![secondary_button("Esc", "done")],
-                _ => vec![],
-            },
+        }
+        WorkflowStep::Ship => match app.ship_state.step {
+            ShipStep::Confirm => vec![secondary_button("Esc", "back")],
+            ShipStep::Done => vec![secondary_button("Esc", "done")],
+            _ => vec![],
         },
     }
 }
 
 /// Get hint buttons based on current state (lowest priority contextual hints)
 fn get_hint_buttons(app: &App) -> Vec<FooterButton> {
-    let mut hints = match app.active_panel {
-        ActivePanel::Project => {
-            vec![hint_button("/", "search"), hint_button("g", "group")]
-        }
-        ActivePanel::Suggestions => match app.workflow_step {
-            WorkflowStep::Suggestions => {
-                let mut hints = vec![
-                    hint_button("i", "ask"),
-                    hint_button("r", "refresh"),
-                    hint_button("x", "dismiss"),
-                    hint_button("d", "diag"),
-                ];
-                if !crate::suggest::llm::is_available() {
-                    hints.push(hint_button("k", "API key"));
-                }
-                hints
-            }
-            _ => vec![],
-        },
-    };
-
-    // Always show Tab hint for panel switching (helps new users discover navigation)
-    hints.push(hint_button("Tab", "panel"));
-
-    hints
+    match app.workflow_step {
+        WorkflowStep::Suggestions => vec![hint_button("i", "disabled"), hint_button("k", "setup")],
+        _ => vec![],
+    }
 }
 
 /// Get optional indicator buttons (undo, update)

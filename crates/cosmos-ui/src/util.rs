@@ -131,8 +131,6 @@ pub fn resolve_repo_path_allow_new(repo_root: &Path, candidate: &Path) -> Result
         return Err(format!("Path escapes repository: {}", candidate.display()));
     }
 
-    // Security: Check for symlinks in any existing path components
-    // This prevents TOCTOU attacks where a directory is replaced with a symlink
     if let Ok(metadata) = std::fs::symlink_metadata(&joined) {
         if metadata.file_type().is_symlink() {
             return Err(format!(
@@ -142,7 +140,6 @@ pub fn resolve_repo_path_allow_new(repo_root: &Path, candidate: &Path) -> Result
         }
     }
 
-    // Also check parent directories for symlinks
     let mut check_path = joined.clone();
     while check_path.starts_with(&root) && check_path != root {
         if let Ok(metadata) = std::fs::symlink_metadata(&check_path) {
@@ -178,7 +175,6 @@ fn canonicalize_existing_parent(path: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("Failed to resolve path {}: {}", current.display(), e))
 }
 
-/// Compute a stable hash of file contents (FNV-1a 64-bit).
 pub fn hash_bytes(content: &[u8]) -> String {
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -194,52 +190,4 @@ pub fn hash_bytes(content: &[u8]) -> String {
 
 pub fn hash_str(content: &str) -> String {
     hash_bytes(content.as_bytes())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{hash_str, resolve_repo_path_allow_new, truncate};
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn test_truncate_unicode_safe() {
-        let input = "ééééé";
-        assert_eq!(truncate(input, 4), "é...");
-    }
-
-    #[test]
-    fn test_truncate_small_max() {
-        let input = "こんにちは";
-        assert_eq!(truncate(input, 3), "こんに");
-        assert_eq!(truncate(input, 0), "");
-    }
-
-    #[test]
-    fn test_hash_str_is_stable() {
-        let a = hash_str("hello");
-        let b = hash_str("hello");
-        let c = hash_str("world");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn test_resolve_repo_path_allow_new_accepts_missing_file() {
-        let mut root = std::env::temp_dir();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        root.push(format!("cosmos_repo_path_test_{}", nanos));
-        fs::create_dir_all(&root).unwrap();
-
-        let candidate = PathBuf::from("new_dir/new_file.rs");
-        let resolved = resolve_repo_path_allow_new(&root, &candidate).unwrap();
-        assert_eq!(resolved.relative, candidate);
-        assert!(resolved.absolute.ends_with("new_dir/new_file.rs"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
 }

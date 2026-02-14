@@ -101,15 +101,8 @@ impl Theme {
     /// The Cosmos header/branding - elegant italic
     pub const COSMOS_LOGO: &'static str = "𝘤 𝘰 𝘴 𝘮 𝘰 𝘴";
 
-    /// Section headers - elegant serif style
-    pub const SECTION_PROJECT: &'static str = "𝘱𝘳𝘰𝘫𝘦𝘤𝘵";
-
     /// Workflow step labels - italic style
     pub const WORKFLOW_SUGGESTIONS: &'static str = "𝘴𝘶𝘨𝘨𝘦𝘴𝘵𝘪𝘰𝘯𝘴";
     pub const WORKFLOW_REVIEW: &'static str = "𝘳𝘦𝘷𝘪𝘦𝘸";
     pub const WORKFLOW_SHIP: &'static str = "𝘴𝘩𝘪𝘱";
-
-    /// View mode labels - italic style
-    pub const VIEW_FLAT: &'static str = "𝘧𝘭𝘢𝘵";
-    pub const VIEW_GROUPED: &'static str = "𝘨𝘳𝘰𝘶𝘱𝘦𝘥";
 }

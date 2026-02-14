@@ -1,4 +1,3 @@
-use super::normal::confirm_apply_from_overlay;
 use crate::app::background;
 use crate::app::messages::BackgroundMessage;
 use crate::app::RuntimeContext;
@@ -110,18 +109,9 @@ pub(super) fn handle_overlay_input(
                     match cfg.set_api_key(&candidate) {
                         Ok(()) => {
                             app.close_overlay();
-                            crate::app::background::spawn_balance_refresh(ctx.tx.clone());
-                            let refreshed = crate::app::background::request_suggestions_refresh(
-                                app,
-                                ctx.tx.clone(),
-                                ctx.repo_path.clone(),
-                                "API key saved",
+                            app.show_toast(
+                                "API key saved. AI workflows are disabled in UI shell mode.",
                             );
-                            if !refreshed {
-                                app.show_toast(
-                                    "API key saved. Press r in Suggestions to refresh analysis.",
-                                );
-                            }
                         }
                         Err(e) => {
                             if let Overlay::ApiKeySetup {
@@ -157,12 +147,12 @@ pub(super) fn handle_overlay_input(
                     app.apply_plan_toggle_technical_details();
                 }
                 KeyCode::Char('y') | KeyCode::Enter => {
-                    app.apply_plan_set_confirm(true);
-                    let cache = crate::cache::Cache::new(&app.repo_path);
-                    if !cache.has_seen_data_notice() {
-                        let _ = cache.mark_data_notice_seen();
-                    }
-                    confirm_apply_from_overlay(app, ctx);
+                    app.apply_plan_set_confirm(false);
+                    app.close_overlay();
+                    app.clear_apply_confirm();
+                    app.show_toast(
+                        "Apply/review workflow is removed in clean-slate mode. UI components are retained only.",
+                    );
                 }
                 _ => {}
             }
