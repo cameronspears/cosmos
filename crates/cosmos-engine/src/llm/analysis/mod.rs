@@ -34,27 +34,27 @@ use cosmos_core::index::GOD_MODULE_LOC_THRESHOLD;
 
 /// Complexity threshold above which a file is considered a "hotspot"
 const HIGH_COMPLEXITY_THRESHOLD: f64 = 20.0;
-const FAST_EVIDENCE_PACK_MAX_ITEMS: usize = 30;
+const FAST_EVIDENCE_PACK_MAX_ITEMS: usize = 60;
 const FAST_EVIDENCE_SNIPPET_LINES_BEFORE: usize = 5;
 const FAST_EVIDENCE_SNIPPET_LINES_AFTER: usize = 8;
 const FAST_GROUNDED_FINAL_TARGET_MIN: usize = 10;
-const FAST_GROUNDED_FINAL_TARGET_MAX: usize = 15;
+const FAST_GROUNDED_FINAL_TARGET_MAX: usize = 20;
 const FAST_GROUNDED_VALIDATED_SOFT_FLOOR: usize = 10;
-const FAST_GROUNDED_VALIDATED_HARD_TARGET: usize = 10;
-const FAST_GROUNDED_VALIDATED_STRETCH_TARGET: usize = 15;
-const FAST_GROUNDED_PROVISIONAL_TARGET_MIN: usize = 18;
-const FAST_GROUNDED_PROVISIONAL_TARGET_MAX: usize = 24;
-const FAST_EVIDENCE_SOURCE_PATTERN_MAX: usize = 14;
-const FAST_EVIDENCE_SOURCE_HOTSPOT_MAX: usize = 10;
-const FAST_EVIDENCE_SOURCE_CORE_MAX: usize = 10;
+const FAST_GROUNDED_VALIDATED_HARD_TARGET: usize = 12;
+const FAST_GROUNDED_VALIDATED_STRETCH_TARGET: usize = 20;
+const FAST_GROUNDED_PROVISIONAL_TARGET_MIN: usize = 26;
+const FAST_GROUNDED_PROVISIONAL_TARGET_MAX: usize = 40;
+const FAST_EVIDENCE_SOURCE_PATTERN_MAX: usize = 24;
+const FAST_EVIDENCE_SOURCE_HOTSPOT_MAX: usize = 20;
+const FAST_EVIDENCE_SOURCE_CORE_MAX: usize = 16;
 const FAST_EVIDENCE_KIND_GOD_MODULE_MAX: usize = 4;
 const FAST_EVIDENCE_PER_FILE_MAX: usize = 3;
 const FAST_EVIDENCE_ANCHORS_PER_FILE_MAX: usize = 3;
 const FAST_EVIDENCE_CHANGED_FILE_MAX: usize = 10;
 const FAST_EVIDENCE_NEIGHBOR_FILE_MAX: usize = 12;
-const REFINEMENT_HARD_PHASE_MAX_ATTEMPTS: usize = 3;
-const REFINEMENT_STRETCH_PHASE_MAX_ATTEMPTS: usize = 1;
-const GENERATION_TOPUP_MAX_CALLS: usize = 2;
+const REFINEMENT_HARD_PHASE_MAX_ATTEMPTS: usize = 4;
+const REFINEMENT_STRETCH_PHASE_MAX_ATTEMPTS: usize = 2;
+const GENERATION_TOPUP_MAX_CALLS: usize = 4;
 const GENERATION_TOPUP_TIMEOUT_MS: u64 = 4_500;
 const REGEN_STRICT_MIN_PACK_SIZE: usize = FAST_GROUNDED_PROVISIONAL_TARGET_MIN;
 const SUGGEST_BALANCED_BUDGET_MS: u64 = 60_000;
@@ -63,11 +63,11 @@ const GATE_RETRY_MIN_REMAINING_BUDGET_MS: u64 = 8_000;
 const GATE_RETRY_MAX_ATTEMPT_COST_FRACTION: f64 = 0.70;
 const VALIDATION_CONCURRENCY: usize = 3;
 const VALIDATION_RETRY_CONCURRENCY: usize = 1;
-const PRIMARY_REQUEST_MIN: usize = 14;
-const PRIMARY_REQUEST_MAX: usize = 18;
-const PRIMARY_REQUEST_MAX_TOKENS: u32 = 1_200;
+const PRIMARY_REQUEST_MIN: usize = 22;
+const PRIMARY_REQUEST_MAX: usize = 30;
+const PRIMARY_REQUEST_MAX_TOKENS: u32 = 1_800;
 const PRIMARY_REQUEST_TIMEOUT_MS: u64 = 6_200;
-const TOPUP_REQUEST_MAX_TOKENS: u32 = 700;
+const TOPUP_REQUEST_MAX_TOKENS: u32 = 1_000;
 const REGEN_REQUEST_MAX_TOKENS: u32 = 800;
 const VALIDATOR_MAX_TOKENS: u32 = 90;
 const VALIDATOR_TIMEOUT_MS: u64 = 4_500;
@@ -76,7 +76,7 @@ const VALIDATOR_BATCH_MAX_TOKENS: u32 = 320;
 const VALIDATOR_BATCH_TIMEOUT_BUFFER_MS: u64 = 1_600;
 const VALIDATION_RETRY_MAX_PER_SUGGESTION: usize = 1;
 const VALIDATION_RETRY_MIN_REMAINING_BUDGET_MS: u64 = 4_000;
-const VALIDATION_RUN_DEADLINE_MS: u64 = 22_000;
+const VALIDATION_RUN_DEADLINE_MS: u64 = 30_000;
 const VALIDATION_MIN_REMAINING_BUDGET_MS: u64 = 2_500;
 const OVERCLAIM_REWRITE_MAX_TOKENS: u32 = 70;
 const OVERCLAIM_REWRITE_TIMEOUT_MS: u64 = 2_000;
@@ -253,7 +253,7 @@ impl Default for SuggestionQualityGateConfig {
     fn default() -> Self {
         Self {
             min_final_count: 10,
-            max_final_count: 15,
+            max_final_count: 20,
             min_displayed_valid_ratio: 1.0,
             min_implementation_readiness_score: DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE,
             max_smart_rewrites_per_run: DEFAULT_MAX_SMART_REWRITES_PER_RUN,
@@ -981,10 +981,6 @@ struct FastGroundedSuggestionJson {
     #[serde(default)]
     snippet_id: Option<usize>,
     #[serde(default)]
-    file: Option<String>,
-    #[serde(default)]
-    line: Option<usize>,
-    #[serde(default)]
     kind: String,
     #[serde(default)]
     priority: String,
@@ -1009,10 +1005,6 @@ enum FastGroundedEvidenceRefJson {
         evidence_id: Option<usize>,
         #[serde(default)]
         snippet_id: Option<usize>,
-        #[serde(default)]
-        file: Option<String>,
-        #[serde(default)]
-        line: Option<usize>,
     },
     Integer(usize),
     String(String),
@@ -1223,21 +1215,10 @@ fn parse_validation_state(
         return (SuggestionValidationState::Validated, None);
     }
 
-    match normalized.as_str() {
-        "validated" => (SuggestionValidationState::Validated, None),
-        "contradicted" => (
-            SuggestionValidationState::Rejected,
-            Some(ValidationRejectClass::Contradicted),
-        ),
-        "insufficient_evidence" => (
-            SuggestionValidationState::Rejected,
-            Some(ValidationRejectClass::InsufficientEvidence),
-        ),
-        _ => (
-            SuggestionValidationState::Rejected,
-            Some(ValidationRejectClass::Other),
-        ),
-    }
+    (
+        SuggestionValidationState::Rejected,
+        Some(ValidationRejectClass::Other),
+    )
 }
 
 fn reconcile_validation_from_reason(
@@ -1341,39 +1322,6 @@ fn reconcile_validation_from_reason(
     }
 
     (state, reject_class)
-}
-
-fn extract_evidence_id(text: &str) -> Option<usize> {
-    // Accept common variants:
-    // - "EVIDENCE 12"
-    // - "(EVIDENCE 12)"
-    // - "evidence_id: 12"
-    let hay = text.as_bytes();
-    let needles: [&[u8]; 3] = [b"EVIDENCE ", b"evidence ", b"evidence_id"];
-
-    for needle in needles {
-        let mut i = 0;
-        while i + needle.len() <= hay.len() {
-            if &hay[i..i + needle.len()] == needle {
-                let mut j = i + needle.len();
-                while j < hay.len() && matches!(hay[j], b' ' | b'\t' | b':' | b'=') {
-                    j += 1;
-                }
-                let start = j;
-                while j < hay.len() && hay[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j > start {
-                    if let Ok(v) = std::str::from_utf8(&hay[start..j]).ok()?.parse::<usize>() {
-                        return Some(v);
-                    }
-                }
-            }
-            i += 1;
-        }
-    }
-
-    None
 }
 
 fn pack_item_by_id(pack: &[EvidenceItem], id: usize) -> Option<&EvidenceItem> {
@@ -1777,18 +1725,6 @@ fn has_overclaim_wording(suggestion: &Suggestion) -> bool {
 fn has_speculative_impact_language(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     [
-        "memory leak",
-        "memory growth",
-        "slow down",
-        "slows down",
-        "slowing",
-        "slower user",
-        "lock up",
-        "locked up",
-        "freeze forever",
-        "stuck forever",
-        "timeouts",
-        "time-outs",
         "campaign reach",
         "marketing targeting",
         "targeting",
@@ -1797,19 +1733,13 @@ fn has_speculative_impact_language(text: &str) -> bool {
         "campaign effectiveness",
         "missed marketing",
         "important alert emails",
-        "users may",
-        "users might",
         "users think",
-        "confusion",
         "frustrate users",
         "smooth experience",
         "engagement",
         "trust",
         "annoyance",
         "annoying",
-        "potentially",
-        "crash",
-        "crashes",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -1939,24 +1869,38 @@ fn filter_speculative_impact_suggestions(suggestions: Vec<Suggestion>) -> (Vec<S
     let mut kept = Vec::with_capacity(suggestions.len());
     let mut dropped = 0usize;
     for mut suggestion in suggestions {
-        if !has_speculative_impact_language(&suggestion.summary) {
+        let summary_is_speculative = has_speculative_impact_language(&suggestion.summary);
+        let summary_is_valid =
+            summary_normalization::is_valid_grounded_summary(&suggestion.summary);
+
+        if summary_is_valid && !summary_is_speculative {
             kept.push(suggestion);
             continue;
         }
 
         if let Some(snippet) = suggestion.evidence.as_deref() {
             if let Some(rewritten) = conservative_summary_from_evidence(snippet) {
-                suggestion.summary = normalize_grounded_summary(
+                let normalized = normalize_grounded_summary(
                     &rewritten,
                     suggestion.detail.as_deref().unwrap_or(""),
                     suggestion.line.unwrap_or_default(),
                 );
-                kept.push(suggestion);
-                continue;
+                if summary_normalization::is_valid_grounded_summary(&normalized)
+                    && (!has_speculative_impact_language(&normalized)
+                        || claim_tokens_grounded_in_snippet(snippet, &normalized))
+                {
+                    suggestion.summary = normalized;
+                    kept.push(suggestion);
+                    continue;
+                }
             }
 
             let grounded = claim_tokens_grounded_in_snippet(snippet, &suggestion.summary);
-            if grounded && !has_overclaim_wording(&suggestion) {
+            if summary_is_valid
+                && grounded
+                && !summary_is_speculative
+                && !has_overclaim_wording(&suggestion)
+            {
                 kept.push(suggestion);
                 continue;
             }
@@ -1968,7 +1912,10 @@ fn filter_speculative_impact_suggestions(suggestions: Vec<Suggestion>) -> (Vec<S
                     suggestion.detail.as_deref().unwrap_or(""),
                     suggestion.line.unwrap_or_default(),
                 );
-                if !has_speculative_impact_language(&normalized) {
+                if summary_normalization::is_valid_grounded_summary(&normalized)
+                    && (!has_speculative_impact_language(&normalized)
+                        || claim_tokens_grounded_in_snippet(snippet, &normalized))
+                {
                     suggestion.summary = normalized;
                     kept.push(suggestion);
                     continue;
@@ -2074,79 +2021,15 @@ fn collect_valid_evidence_refs(
     let mut refs = Vec::new();
     let mut seen = HashSet::new();
 
-    let resolve_by_file_line = |file: &str, line: Option<usize>| -> Option<usize> {
-        let normalized = file.replace('\\', "/");
-        let target_line = line.unwrap_or(0);
-
-        // First try exact path match with nearest line.
-        let mut best_exact: Option<(usize, usize)> = None; // (distance, id)
-        for item in pack {
-            let item_path = item.file.to_string_lossy().replace('\\', "/");
-            if item_path == normalized || normalized.ends_with(&item_path) {
-                let distance = if target_line > 0 {
-                    item.line.abs_diff(target_line)
-                } else {
-                    0
-                };
-                match best_exact {
-                    Some((best_dist, _)) if distance >= best_dist => {}
-                    _ => best_exact = Some((distance, item.id)),
-                }
-            }
-        }
-        if let Some((_, id)) = best_exact {
-            return Some(id);
-        }
-
-        // Fallback to basename match if unique.
-        let file_name = std::path::Path::new(&normalized)
-            .file_name()
-            .and_then(|n| n.to_str())?;
-        let mut matched: Option<usize> = None;
-        for item in pack {
-            let candidate = item.file.file_name().and_then(|n| n.to_str());
-            if candidate == Some(file_name) {
-                if matched.is_some() {
-                    return None;
-                }
-                matched = Some(item.id);
-            }
-        }
-        matched
-    };
-
-    let infer_id_from_text = |text: &str| -> Option<usize> {
-        let text_norm = text.to_lowercase();
-        for item in pack {
-            let item_path = item
-                .file
-                .to_string_lossy()
-                .replace('\\', "/")
-                .to_lowercase();
-            if text_norm.contains(&item_path) {
-                return Some(item.id);
-            }
-        }
-        None
-    };
-
     let parse_ref_id = |reference: &FastGroundedEvidenceRefJson| -> Option<usize> {
         match reference {
             FastGroundedEvidenceRefJson::Object {
                 evidence_id,
                 snippet_id,
-                file,
-                line,
-            } => (*evidence_id)
-                .or(*snippet_id)
-                .or_else(|| file.as_deref().and_then(|f| resolve_by_file_line(f, *line))),
+                ..
+            } => (*evidence_id).or(*snippet_id),
             FastGroundedEvidenceRefJson::Integer(id) => Some(*id),
-            FastGroundedEvidenceRefJson::String(raw) => raw
-                .trim()
-                .parse::<usize>()
-                .ok()
-                .or_else(|| extract_evidence_id(raw))
-                .or_else(|| infer_id_from_text(raw)),
+            FastGroundedEvidenceRefJson::String(raw) => raw.trim().parse::<usize>().ok(),
         }
     };
 
@@ -2156,39 +2039,9 @@ fn collect_valid_evidence_refs(
         }
     }
 
-    // Backward compatibility: older suggestion shape used top-level `evidence_id`.
+    // Minimal compatibility for older payloads that emitted top-level ids.
     if refs.is_empty() {
-        if let Some(id) = suggestion.evidence_id {
-            push_evidence_id(id, pack, &mut seen, &mut refs);
-        }
-    }
-
-    if refs.is_empty() {
-        if let Some(id) = suggestion.snippet_id {
-            push_evidence_id(id, pack, &mut seen, &mut refs);
-        }
-    }
-
-    if refs.is_empty() {
-        if let Some(id) = suggestion
-            .file
-            .as_deref()
-            .and_then(|f| resolve_by_file_line(f, suggestion.line))
-        {
-            push_evidence_id(id, pack, &mut seen, &mut refs);
-        }
-    }
-
-    // Last-chance compatibility: extract explicit evidence markers from text.
-    if refs.is_empty() {
-        if let Some(id) = suggestion
-            .evidence_id
-            .or(suggestion.snippet_id)
-            .or_else(|| extract_evidence_id(&suggestion.summary))
-            .or_else(|| extract_evidence_id(&suggestion.detail))
-            .or_else(|| infer_id_from_text(&suggestion.summary))
-            .or_else(|| infer_id_from_text(&suggestion.detail))
-        {
+        if let Some(id) = suggestion.evidence_id.or(suggestion.snippet_id) {
             push_evidence_id(id, pack, &mut seen, &mut refs);
         }
     }
@@ -2226,6 +2079,9 @@ fn convert_raw_suggestion(
 
     let detail = normalize_grounded_detail(&s.detail, &s.summary);
     let summary = normalize_grounded_summary(&s.summary, &detail, item.line);
+    if summary.is_empty() {
+        return None;
+    }
 
     let suggestion = Suggestion::new(
         kind,
@@ -2290,7 +2146,7 @@ fn should_run_generation_topup(
 }
 
 fn generation_topup_request_count(deficit: usize) -> usize {
-    deficit.saturating_add(3).clamp(4, 10)
+    deficit.saturating_add(4).clamp(6, 14)
 }
 
 fn regeneration_needed(validated_count: usize) -> usize {
@@ -2735,11 +2591,16 @@ Return JSON:
         rewritten_detail
     };
     let normalized_detail = normalize_grounded_detail(&detail_seed, &summary_seed);
-    rewritten.summary = normalize_grounded_summary(
+    let normalized_summary = normalize_grounded_summary(
         &summary_seed,
         &normalized_detail,
         suggestion.line.unwrap_or_default(),
     );
+    rewritten.summary = if normalized_summary.is_empty() {
+        suggestion.summary.clone()
+    } else {
+        normalized_summary
+    };
     rewritten.detail = Some(normalized_detail);
     Ok((rewritten, response.usage))
 }
@@ -4813,10 +4674,15 @@ where
         result.diagnostics.attempt_count = attempts_executed.max(1);
         result.usage = cumulative_usage.clone();
         if !result.gate.passed {
-            result
-                .diagnostics
-                .notes
-                .push("quality_gate_failed_showing_best_effort".to_string());
+            let reasons = if result.gate.fail_reasons.is_empty() {
+                "unknown quality gate failure".to_string()
+            } else {
+                result.gate.fail_reasons.join("; ")
+            };
+            result.diagnostics.notes.push(format!(
+                "quality_gate_missed_best_effort:{}",
+                truncate_str(&reasons, 240)
+            ));
         }
         return Ok(result);
     }

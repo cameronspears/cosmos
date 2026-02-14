@@ -1022,6 +1022,20 @@ fn render_suggestion_diagnostics<'a>(lines: &mut Vec<Line<'a>>, app: &App, inner
             )]));
         }
 
+        let drops = format!(
+            "Drops: semantic dedupe {} · readiness {} · speculative {} · file balance {}",
+            diag.semantic_dedup_dropped_count,
+            diag.readiness_filtered_count,
+            diag.speculative_impact_dropped_count,
+            diag.file_balance_dropped_count
+        );
+        for line in wrap_text(&drops, text_width) {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Theme::GREY_500),
+            )]));
+        }
+
         let pack_mix = format!(
             "Evidence pack: patterns {} · hotspots {} · core {} · line1 {:.0}%",
             diag.pack_pattern_count,

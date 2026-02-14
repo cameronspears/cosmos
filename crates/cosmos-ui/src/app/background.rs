@@ -113,6 +113,18 @@ pub fn request_suggestions_refresh(
         return false;
     }
 
+    let fresh_index = match cosmos_core::index::CodebaseIndex::new(&repo_root) {
+        Ok(index) => index,
+        Err(err) => {
+            app.show_toast(&format!(
+                "Index refresh failed: {}",
+                truncate(&err.to_string(), 120)
+            ));
+            return false;
+        }
+    };
+    app.replace_index(fresh_index);
+
     if app.needs_summary_generation {
         if app.summary_progress.is_some() {
             app.pending_suggestions_on_init = true;

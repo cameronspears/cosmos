@@ -45,7 +45,7 @@ You will be given an EVIDENCE PACK containing real code snippets from the repo.
 Evidence is ONLY for grounding and accuracy. The user should not see it.
 
 TASK:
-- Produce 10 to 15 suggestions by default, based ONLY on the evidence pack.
+- Produce 10 to 20 suggestions by default, based ONLY on the evidence pack.
 - If the user prompt requests a different count/range, follow the user prompt.
 - Every suggestion MUST include exactly one `evidence_refs` item from the pack.
 - Do not invent facts. If an issue is not clearly supported by the evidence snippet, do not suggest it.
@@ -61,7 +61,6 @@ WRITE GREAT SUGGESTIONS:
 - Start with the concrete failure/outcome, then add impact.
   - Good: "Checkout confirmation emails can fail silently, leaving people unsure their order succeeded."
   - Good: "The app can miss layout-shift metrics, so teams lose visibility into jittery page behavior."
-- Recommended shape when natural: "When someone <action>, <visible outcome>. This matters because <real-world impact>."
 - Mention concrete product moments (like sign-in, upload, save, checkout, build, or deploy), not vague wording.
 - Avoid vague wording like "hidden errors", "issues happen", or "things break"; name exactly what fails.
 - Avoid unexplained jargon in `summary`. If evidence is technical, translate it:
@@ -74,12 +73,12 @@ WRITE GREAT SUGGESTIONS:
   - the words "evidence", "snippet", or "EVIDENCE"
   - backticks or code formatting
 - `summary` should be understandable on first read.
-- Keep `summary` to one sentence when possible (max two only if needed for clarity).
-- `summary` must be complete (at least 8 words). Never output dangling fragments like "When users".
+- Keep `summary` to exactly one complete sentence.
+- `summary` must be complete (at least 8 words). Never output dangling fragments like "When users" or "state is.".
 - `detail` is internal technical context for verification/fixing. It may mention files/functions.
 - For both `summary` and `detail`, keep claims local to what the snippet proves.
 - Keep each suggestion focused on one concrete claim backed by one evidence reference.
-- Use distinct `evidence_id` values across suggestions; avoid reusing IDs until you have at least 10 suggestions.
+- Use distinct `evidence_id` values across suggestions; avoid reusing IDs until you have at least 12 suggestions.
 - Reject unsupported impact claims immediately instead of softening with assumptions.
 - Reject speculative outcomes (for example: inferred user-facing rollback behavior, audience effects, or unsaved-state claims) unless explicitly shown.
 - Ignore test-only evidence (unit tests, test helpers, assertion-only snippets) unless it directly proves a runtime defect.
@@ -403,14 +402,18 @@ mod prompt_tests {
     }
 
     #[test]
-    fn fast_grounded_prompt_targets_ten_to_fifteen() {
+    fn fast_grounded_prompt_targets_ten_to_twenty() {
         assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Produce 10 to 15 suggestions by default"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should prefer 10-15 suggestions by default"
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Produce 10 to 20 suggestions by default"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should prefer 10-20 suggestions by default"
         );
         assert!(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("one concrete claim"),
             "FAST_GROUNDED_SUGGESTIONS_SYSTEM should require one grounded claim per suggestion"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("exactly one complete sentence"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should require one complete sentence in summary"
         );
         assert!(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Reject unsupported impact claims"),

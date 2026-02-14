@@ -327,6 +327,17 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// Replace index-backed UI data after a refresh.
+    pub fn replace_index(&mut self, index: CodebaseIndex) {
+        self.index = index;
+        self.suggestions.index = self.index.clone();
+        self.file_tree = build_file_tree(&self.index);
+        self.flat_search_entries = build_flat_search_entries(&self.file_tree);
+        self.filtered_tree_indices = (0..self.file_tree.len()).collect();
+        let grouping = self.index.generate_grouping();
+        self.apply_grouping_update(grouping);
+    }
+
     /// Clear all pending changes (after commit)
     pub fn clear_pending_changes(&mut self) {
         self.pending_changes.clear();

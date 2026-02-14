@@ -1,66 +1,8 @@
 use super::{SUMMARY_MIN_CHARS, SUMMARY_MIN_WORDS};
 use regex::Regex;
 
-fn fallback_never_match_regex() -> Regex {
-    Regex::new("$^").expect("fallback regex should compile")
-}
-
-fn safe_regex(pattern: &str) -> Regex {
-    Regex::new(pattern).unwrap_or_else(|_| fallback_never_match_regex())
-}
-
 fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn is_low_information_summary(summary: &str) -> bool {
-    let trimmed = summary.trim();
-    if trimmed.len() < SUMMARY_MIN_CHARS {
-        return true;
-    }
-    let words = trimmed.split_whitespace().count();
-    if words < SUMMARY_MIN_WORDS {
-        return true;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let has_internal_reference = trimmed.contains('/')
-        || trimmed.contains("::")
-        || trimmed.contains('`')
-        || trimmed
-            .split_whitespace()
-            .any(|token| token.contains('_') && token.len() >= 8)
-        || lower.starts_with("in the code that")
-        || lower.starts_with("the test ");
-    let normalized_lower = lower.trim_end_matches(['.', '!', '?']);
-    let has_vague_hidden_errors = normalized_lower.ends_with("hidden errors")
-        || normalized_lower.starts_with("hidden errors")
-        || normalized_lower.contains("hidden errors when")
-        || normalized_lower.contains(", hidden errors")
-        || normalized_lower.contains(" hidden errors,");
-    lower == "when users"
-        || lower == "when someone"
-        || lower == "when a user"
-        || has_internal_reference
-        || has_vague_hidden_errors
-        || lower.ends_with(" may")
-        || lower.ends_with(" can")
-        || lower.ends_with(" should")
-}
-
-fn sentence_like_fragment(text: &str) -> Option<String> {
-    let cleaned = collapse_whitespace(text);
-    if cleaned.is_empty() {
-        return None;
-    }
-    for raw in cleaned.split(['.', '!', '?']) {
-        let candidate = scrub_user_summary(raw).trim().to_string();
-        if candidate.len() >= SUMMARY_MIN_CHARS
-            && candidate.split_whitespace().count() >= SUMMARY_MIN_WORDS
-        {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 fn first_sentence_only(text: &str) -> String {
@@ -84,33 +26,50 @@ fn ensure_sentence_punctuation(mut text: String) -> String {
     text
 }
 
+fn is_fragment_sentence(summary: &str) -> bool {
+    let normalized = summary
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_ascii_lowercase();
+    let Some(last_token) = normalized.split_whitespace().last() else {
+        return true;
+    };
+    matches!(
+        last_token,
+        "is" | "are" | "was" | "were" | "to" | "with" | "if" | "when"
+    )
+}
+
+pub(super) fn is_valid_grounded_summary(summary: &str) -> bool {
+    let trimmed = summary.trim();
+    if trimmed.len() < SUMMARY_MIN_CHARS {
+        return false;
+    }
+    if trimmed.split_whitespace().count() < SUMMARY_MIN_WORDS {
+        return false;
+    }
+    if is_fragment_sentence(trimmed) {
+        return false;
+    }
+    true
+}
+
 pub(super) fn scrub_user_summary(summary: &str) -> String {
-    // Extra safety: even if the model slips, ensure the user-facing title
-    // doesn't contain file paths / line numbers / evidence markers.
-    let mut s = summary.to_string();
+    let without_ticks = summary.replace('`', "");
+    let evidence_re = Regex::new(r"(?i)\bevidence(?:\s*id)?\s*[:=]?\s*\d+\b")
+        .expect("evidence regex should compile");
+    let cleaned = evidence_re.replace_all(&without_ticks, "");
+    collapse_whitespace(cleaned.trim())
+}
 
-    // Remove explicit evidence markers.
-    let re_evidence = safe_regex(r"(?i)\b(evidence\s*id|evidence)\s*[:=]?\s*\d*\b");
-    s = re_evidence.replace_all(&s, "").to_string();
-
-    // Remove "(path:123)" style suffixes.
-    let re_path_line = safe_regex(r"\s*\(([^)]*/[^)]*?):\d+\)");
-    s = re_path_line.replace_all(&s, "").to_string();
-
-    // Remove bare path-like tokens ("src/foo.rs", "foo.tsx", etc).
-    let re_path_token =
-        safe_regex(r"(?i)\b[\w./-]+\.(rs|tsx|ts|jsx|js|py|go|java|kt|cs|cpp|c|h)\b");
-    s = re_path_token.replace_all(&s, "").to_string();
-    let re_repo_path = safe_regex(r"(?i)\b(?:[a-z0-9_.-]+/){2,}[a-z0-9_.-]+\b");
-    s = re_repo_path.replace_all(&s, "").to_string();
-
-    // Remove formatting artifacts that commonly remain after path/token scrubbing.
-    s = s.replace('`', "");
-    let re_empty_parens = safe_regex(r"\(\s*[\.,;:]*\s*\)");
-    s = re_empty_parens.replace_all(&s, "").to_string();
-
-    // Collapse whitespace after removals.
-    collapse_whitespace(&s)
+fn candidate_sentence(text: &str) -> Option<String> {
+    let scrubbed = scrub_user_summary(text);
+    if scrubbed.is_empty() {
+        return None;
+    }
+    let first = first_sentence_only(&scrubbed);
+    let normalized = ensure_sentence_punctuation(collapse_whitespace(first.trim()));
+    is_valid_grounded_summary(&normalized).then_some(normalized)
 }
 
 pub(super) fn normalize_grounded_summary(
@@ -118,21 +77,9 @@ pub(super) fn normalize_grounded_summary(
     detail: &str,
     _evidence_line: usize,
 ) -> String {
-    let mut normalized = scrub_user_summary(summary);
-    normalized = first_sentence_only(&normalized);
-
-    if is_low_information_summary(&normalized) {
-        if let Some(from_detail) = sentence_like_fragment(detail) {
-            normalized = first_sentence_only(&from_detail);
-        }
-    }
-    if is_low_information_summary(&normalized) {
-        normalized =
-            "When someone uses this flow, visible behavior can break. This matters because it can interrupt normal work."
-                .to_string();
-    }
-
-    ensure_sentence_punctuation(collapse_whitespace(normalized.trim()))
+    candidate_sentence(summary)
+        .or_else(|| candidate_sentence(detail))
+        .unwrap_or_default()
 }
 
 pub(super) fn normalize_grounded_detail(detail: &str, summary: &str) -> String {

@@ -161,7 +161,7 @@ fn parses_mixed_evidence_refs_shapes() {
 }
 
 #[test]
-fn parses_object_evidence_ref_with_snippet_and_file_line() {
+fn parses_object_evidence_ref_with_snippet_id() {
     let parsed: FastGroundedSuggestionJson = serde_json::from_value(json!({
         "evidence_refs": [{
             "snippet_id": 5,
@@ -180,23 +180,31 @@ fn parses_object_evidence_ref_with_snippet_and_file_line() {
         FastGroundedEvidenceRefJson::Object {
             evidence_id,
             snippet_id,
-            file,
-            line,
         } => {
             assert_eq!(*evidence_id, None);
             assert_eq!(*snippet_id, Some(5));
-            assert_eq!(file.as_deref(), Some("src/main.rs"));
-            assert_eq!(*line, Some(42));
         }
         _ => panic!("expected object evidence ref"),
     }
 }
 
 #[test]
-fn extracts_evidence_id_from_common_text_markers() {
-    assert_eq!(extract_evidence_id("EVIDENCE 12"), Some(12));
-    assert_eq!(extract_evidence_id("evidence_id: 4"), Some(4));
-    assert_eq!(extract_evidence_id("No marker here"), None);
+fn collect_valid_evidence_refs_accepts_numeric_string_id() {
+    let pack = vec![test_evidence_item(0), test_evidence_item(4)];
+    let suggestion = FastGroundedSuggestionJson {
+        evidence_refs: vec![FastGroundedEvidenceRefJson::String("4".to_string())],
+        evidence_id: None,
+        snippet_id: None,
+        kind: "improvement".to_string(),
+        priority: "medium".to_string(),
+        confidence: "medium".to_string(),
+        summary: "test".to_string(),
+        detail: "detail".to_string(),
+    };
+
+    let refs = collect_valid_evidence_refs(&suggestion, &pack);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].snippet_id, 4);
 }
 
 #[test]
@@ -777,8 +785,6 @@ fn collect_valid_evidence_refs_truncates_to_one_ref() {
         ],
         evidence_id: None,
         snippet_id: None,
-        file: None,
-        line: None,
         kind: "improvement".to_string(),
         priority: "medium".to_string(),
         confidence: "medium".to_string(),
@@ -917,40 +923,34 @@ fn normalize_grounded_summary_avoids_dangling_when_users_titles() {
 }
 
 #[test]
-fn normalize_grounded_summary_rewrites_when_template_to_plain_sentence() {
+fn normalize_grounded_summary_keeps_one_complete_sentence() {
     let summary = normalize_grounded_summary(
             "When the page hides, CLS errors are ignored, so layout-shift problems may go unnoticed. This matters because undetected CLS bugs can degrade user experience.",
             "CLS metric updates can fail silently during page hide events.",
             42,
         );
-    let lower = summary.to_ascii_lowercase();
-    assert!(!lower.starts_with("when "));
-    assert!(!lower.contains("this matters because"));
-    assert!(lower.contains("when the page hides"));
+    assert!(summary.ends_with('.'));
+    assert!(!summary.contains("This matters because"));
+    assert!(!summary.contains("undetected CLS bugs can degrade user experience"));
 }
 
 #[test]
-fn normalize_grounded_summary_replaces_vague_hidden_errors_phrase() {
+fn normalize_grounded_summary_rejects_fragment_sentence_endings() {
     let summary = normalize_grounded_summary(
-            "When the page experiences layout shifts, hidden errors.",
-            "Layout-shift metric collection errors are swallowed, so the CLS metric is never reported to analytics.",
-            42,
-        );
-    let lower = summary.to_ascii_lowercase();
-    assert!(!lower.contains("hidden errors"));
-    assert!(lower.contains("cls metric"));
+        "When the review UI renders before the review state is.",
+        "State is.",
+        42,
+    );
+    assert!(summary.is_empty());
 }
 
 #[test]
-fn normalize_grounded_summary_discourages_when_openers_without_comma() {
-    let summary = normalize_grounded_summary(
-            "When users save settings they may lose data",
-            "Saving settings can silently fail, so people think their changes were saved when they were not.",
-            42,
-        );
-    let lower = summary.to_ascii_lowercase();
-    assert!(!lower.starts_with("when "));
-    assert!(lower.contains("saving settings"));
+fn normalize_grounded_summary_never_uses_generic_fallback_text() {
+    let summary = normalize_grounded_summary("Fix issue", "Tiny", 42);
+    let fallback =
+        "when someone uses this flow, visible behavior can break. this matters because it can interrupt normal work.";
+    assert_ne!(summary.to_ascii_lowercase(), fallback);
+    assert!(summary.is_empty());
 }
 
 #[test]
@@ -963,6 +963,45 @@ fn normalize_grounded_summary_rewrites_low_information_summary_from_detail() {
     let lower = summary.to_ascii_lowercase();
     assert_ne!(lower, "fix issue");
     assert!(lower.contains("parsing failures"));
+}
+
+#[test]
+fn speculative_filter_keeps_grounded_crash_claim_when_evidence_proves_it() {
+    let suggestion = test_suggestion("The process can crash when this panic path executes.")
+        .with_detail("A panic path is present and unhandled in this flow.".to_string())
+        .with_evidence(
+            " 41| if config.invalid() {\n 42|     panic!(\"invalid config\");\n 43| }\n"
+                .to_string(),
+        )
+        .with_evidence_refs(vec![SuggestionEvidenceRef {
+            snippet_id: 11,
+            file: PathBuf::from("src/runtime.rs"),
+            line: 42,
+        }]);
+
+    let (kept, dropped) = filter_speculative_impact_suggestions(vec![suggestion]);
+    assert_eq!(dropped, 0);
+    assert_eq!(kept.len(), 1);
+}
+
+#[test]
+fn speculative_filter_drops_unsupported_business_impact_claims() {
+    let suggestion =
+        test_suggestion("This path can hurt campaign reach and outreach effectiveness for teams.")
+            .with_detail("The function retries once and then returns false.".to_string())
+            .with_evidence(
+                " 12| let ok = retry_once();\n 13| if !ok {\n 14|   return false;\n 15| }\n"
+                    .to_string(),
+            )
+            .with_evidence_refs(vec![SuggestionEvidenceRef {
+                snippet_id: 12,
+                file: PathBuf::from("src/worker.rs"),
+                line: 14,
+            }]);
+
+    let (kept, dropped) = filter_speculative_impact_suggestions(vec![suggestion]);
+    assert_eq!(kept.len(), 0);
+    assert_eq!(dropped, 1);
 }
 
 #[test]

@@ -4,7 +4,7 @@
 //! Suggestions are generated on-demand via `analyze_codebase()`.
 
 /// Maximum suggestions to display to avoid overwhelming users
-const MAX_SUGGESTIONS: usize = 15;
+const MAX_SUGGESTIONS: usize = 20;
 
 use crate::index::CodebaseIndex;
 use chrono::{DateTime, Utc};
