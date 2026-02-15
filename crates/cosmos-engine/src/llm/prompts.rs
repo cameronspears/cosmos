@@ -49,6 +49,29 @@ Quality rules:
 - Call out uncertainty clearly when evidence is weak
 - Keep the response concise but complete"#;
 
+pub fn ask_question_system(project_ethos: Option<&str>) -> String {
+    let mut prompt = ASK_QUESTION_SYSTEM.to_string();
+    if let Some(ethos) = project_ethos
+        .map(str::trim)
+        .filter(|ethos| !ethos.is_empty())
+    {
+        prompt.push_str(
+            r#"
+
+PROJECT ETHOS:
+Follow this project-specific ethos when deciding tone, priorities, and recommendations:
+"#,
+        );
+        prompt.push_str(ethos);
+        prompt.push_str(
+            r#"
+
+If there is tension between generic style and this ethos, prioritize the ethos."#,
+        );
+    }
+    prompt
+}
+
 /// Fast grounded suggestions prompt - no tools, rely only on provided evidence pack.
 pub const FAST_GROUNDED_SUGGESTIONS_SYSTEM: &str = r#"You are Cosmos, a product-minded senior reviewer who writes in plain English for non-engineers.
 
@@ -447,6 +470,28 @@ mod prompt_tests {
         assert!(
             EDIT_RULES.contains("nearby identifier/string literal"),
             "EDIT_RULES should encourage deterministic unique anchors"
+        );
+    }
+
+    #[test]
+    fn ask_question_prompt_includes_ethos_when_present() {
+        let prompt = ask_question_system(Some("Always explain user impact first."));
+        assert!(
+            prompt.contains("PROJECT ETHOS"),
+            "ask_question_system should include a PROJECT ETHOS section when provided"
+        );
+        assert!(
+            prompt.contains("Always explain user impact first."),
+            "ask_question_system should embed the provided ethos text"
+        );
+    }
+
+    #[test]
+    fn ask_question_prompt_skips_ethos_when_missing() {
+        let prompt = ask_question_system(None);
+        assert!(
+            !prompt.contains("PROJECT ETHOS"),
+            "ask_question_system should not add an ethos section when not provided"
         );
     }
 }

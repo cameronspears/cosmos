@@ -69,13 +69,10 @@ pub fn openrouter_setup_toast_copy() -> &'static str {
     }
 }
 
-pub(crate) const ASK_STARTER_QUESTIONS: [&str; 6] = [
-    "What does this repo help users do?",
-    "How are the main parts connected?",
-    "What should I read first to get productive?",
-    "Where are the biggest reliability risks?",
-    "What improvements would help users most?",
-    "What is already working well and should stay as-is?",
+pub(crate) const ASK_STARTER_QUESTIONS: [&str; 3] = [
+    "What does this repo help users do today?",
+    "Where are the biggest reliability risks for users right now?",
+    "What are the top 3 improvements with the biggest user impact?",
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1782,14 +1779,14 @@ mod tests {
     }
 
     #[test]
-    fn use_selected_suggestion_copies_starter_question() {
+    fn use_selected_suggestion_copies_question() {
         let mut app = make_test_app();
         app.start_question();
-        app.question_suggestion_selected = 3;
+        app.question_suggestion_selected = 2;
 
         app.use_selected_suggestion();
 
-        assert_eq!(app.question_input, ASK_STARTER_QUESTIONS[3]);
+        assert_eq!(app.question_input, ASK_STARTER_QUESTIONS[2]);
     }
 
     #[test]

@@ -999,7 +999,7 @@ fn render_ask_panel(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(ask_state) = &app.ask_cosmos_state {
         render_ask_cosmos_content(&mut lines, ask_state, app, visible_height, inner_width);
     } else {
-        // Always show input + starters by default (no Enter gate/idle state).
+        // Always show input + suggested questions by default (no Enter gate/idle state).
         render_question_mode_content(&mut lines, app, visible_height, inner_width, is_active);
     }
 
@@ -1062,7 +1062,7 @@ fn render_question_mode_content<'a>(
 
     if app.question_input.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            "  Suggested starters:",
+            "  Suggested questions:",
             Style::default().fg(Theme::GREY_400),
         )]));
         lines.push(Line::from(""));
@@ -1088,7 +1088,7 @@ fn render_question_mode_content<'a>(
                 ASK_STARTER_QUESTIONS[i],
                 text_width.saturating_sub(4).max(1),
             );
-            let needed = wrapped.len().saturating_add(1); // +1 vertical spacer between starters
+            let needed = wrapped.len().saturating_add(1); // +1 vertical spacer between questions
 
             if consumed + needed > list_budget {
                 break;

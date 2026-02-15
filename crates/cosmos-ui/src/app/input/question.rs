@@ -90,6 +90,15 @@ fn compute_context_hash(app: &App) -> String {
     // Include prompt memory context digest since it influences generated answers.
     hash_str(&app.repo_memory.to_prompt_context(12, 900)).hash(&mut hasher);
 
+    // Include project ethos digest so ask cache invalidates when ETHOS.md changes.
+    let ethos_digest = match std::fs::read_to_string(app.repo_path.join("ETHOS.md")) {
+        Ok(content) if !content.trim().is_empty() => hash_str(content.trim()),
+        Ok(_) => "<ethos-empty>".to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "<ethos-missing>".to_string(),
+        Err(_) => "<ethos-unreadable>".to_string(),
+    };
+    ethos_digest.hash(&mut hasher);
+
     format!("{:016x}", hasher.finish())
 }
 
@@ -202,6 +211,28 @@ mod tests {
         let first = compute_context_hash(&app);
 
         std::fs::write(&file_path, "pub fn value() -> i32 { 2 }\n").unwrap();
+        let second = compute_context_hash(&app);
+
+        assert_ne!(first, second);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn context_hash_changes_when_ethos_changes() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_question_hash_ethos_test_{}", nanos));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("ETHOS.md"), "# Ethos\n\nPlain language first.\n").unwrap();
+
+        let app = make_test_app(&root);
+        let first = compute_context_hash(&app);
+
+        std::fs::write(root.join("ETHOS.md"), "# Ethos\n\nSafety before speed.\n").unwrap();
         let second = compute_context_hash(&app);
 
         assert_ne!(first, second);

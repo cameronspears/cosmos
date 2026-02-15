@@ -5,7 +5,7 @@ use super::client::{
 use super::models::merge_usage;
 use super::models::{Model, Usage};
 use super::prompt_utils::format_repo_memory_section;
-use super::prompts::{ASK_QUESTION_SYSTEM, FAST_GROUNDED_SUGGESTIONS_SYSTEM};
+use super::prompts::{ask_question_system, FAST_GROUNDED_SUGGESTIONS_SYSTEM};
 use chrono::Utc;
 use cosmos_core::context::WorkContext;
 use cosmos_core::index::{
@@ -96,6 +96,7 @@ const DIVERSITY_FILE_BALANCE_PER_FILE_CAP: usize = 3;
 const DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE: f32 = 0.45;
 const DEFAULT_MAX_SMART_REWRITES_PER_RUN: usize = 8;
 const SMART_REWRITE_READINESS_UPPER_BOUND: f32 = 0.60;
+const ASK_ETHOS_MAX_CHARS: usize = 8_000;
 
 /// Ask cosmos a general question about the codebase
 /// Uses the Smart model for thoughtful, well-reasoned responses in plain English
@@ -139,6 +140,8 @@ pub async fn ask_question(
     );
 
     let memory_section = format_repo_memory_section(repo_memory.as_deref(), "PROJECT NOTES");
+    let project_ethos = load_project_ethos(&context.repo_root);
+    let system = ask_question_system(project_ethos.as_deref());
 
     let user = format!(
         r#"PROJECT CONTEXT:
@@ -163,8 +166,18 @@ QUESTION:
         question
     );
 
-    let response = call_llm_with_usage(ASK_QUESTION_SYSTEM, &user, Model::Smart, false).await?;
+    let response = call_llm_with_usage(&system, &user, Model::Smart, false).await?;
     Ok((response.content, response.usage))
+}
+
+fn load_project_ethos(repo_root: &Path) -> Option<String> {
+    let path = repo_root.join("ETHOS.md");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_str(trimmed, ASK_ETHOS_MAX_CHARS).to_string())
 }
 
 fn tokenize_question_terms(input: &str) -> Vec<String> {
@@ -334,6 +347,7 @@ fn rank_symbols_for_question(
 #[cfg(test)]
 mod ask_ranking_tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn changed_file_gets_higher_rank_than_plain_match() {
@@ -383,6 +397,41 @@ mod ask_ranking_tests {
         );
 
         assert!(matched > unmatched);
+    }
+
+    #[test]
+    fn load_project_ethos_returns_none_when_missing() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_ethos_missing_test_{}", nanos));
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert!(load_project_ethos(&root).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_project_ethos_reads_file_when_present() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_ethos_present_test_{}", nanos));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("ETHOS.md"), "Safety before speed.\n").unwrap();
+
+        let ethos = load_project_ethos(&root).expect("expected ethos content");
+        assert!(
+            ethos.contains("Safety before speed."),
+            "load_project_ethos should include ETHOS.md content"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
