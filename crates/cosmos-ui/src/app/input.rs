@@ -9,7 +9,7 @@
 use crate::app::RuntimeContext;
 use crate::ui::{App, InputMode, Overlay};
 use anyhow::Result;
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 
 mod normal;
 mod overlay;
@@ -27,6 +27,15 @@ use search::handle_search_input;
 
 /// Main key event handler - dispatches to mode-specific handlers
 pub fn handle_key_event(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> Result<()> {
+    // Global panel toggle shortcut.
+    if app.overlay == Overlay::None && key.code == KeyCode::Tab {
+        if app.input_mode == InputMode::Question {
+            app.exit_question();
+        }
+        app.toggle_panel();
+        return Ok(());
+    }
+
     // Dispatch based on current input mode
     match app.input_mode {
         InputMode::Search => return handle_search_input(app, key),

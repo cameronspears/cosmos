@@ -2,7 +2,7 @@ use crate::ui::helpers::{wrap_text, wrap_text_variable_width};
 use crate::ui::markdown;
 use crate::ui::theme::Theme;
 use crate::ui::{
-    ActivePanel, App, AskCosmosState, InputMode, LoadingState, ShipStep, ViewMode, WorkflowStep,
+    ActivePanel, App, AskCosmosState, InputMode, LoadingState, ShipStep, WorkflowStep,
     SPINNER_FRAMES,
 };
 use ratatui::{
@@ -19,8 +19,8 @@ use std::hash::{Hash, Hasher};
 /// Cached main layout to avoid recomputing on every frame
 struct CachedMainLayout {
     area: Rect,
-    project_panel: Rect,
     suggestions_panel: Rect,
+    ask_panel: Rect,
 }
 
 struct CachedAskMarkdown {
@@ -35,18 +35,17 @@ thread_local! {
 }
 
 pub(super) fn render_main(frame: &mut Frame, area: Rect, app: &App) {
-    let (project_rect, suggestions_rect) = MAIN_LAYOUT_CACHE.with(|cache| {
+    let (suggestions_rect, ask_rect) = MAIN_LAYOUT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
 
         // Reuse cached layout if area unchanged
         if let Some(cached) = cache.as_ref() {
             if cached.area == area {
-                return (cached.project_panel, cached.suggestions_panel);
+                return (cached.suggestions_panel, cached.ask_panel);
             }
         }
 
-        // Recompute layout (only on resize)
-        // Add horizontal padding for breathing room
+        // Recompute layout (only on resize) with horizontal padding.
         let padded = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -56,374 +55,32 @@ pub(super) fn render_main(frame: &mut Frame, area: Rect, app: &App) {
             ])
             .split(area);
 
-        // Split into two panels with gap
         let panels = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(38), // Project tree
-                Constraint::Length(2),      // Gap between panels
-                Constraint::Percentage(62), // Suggestions (wider for wrapped text)
+                Constraint::Percentage(74), // Main workflow/suggestions
+                Constraint::Length(2),      // Gap
+                Constraint::Percentage(26), // Ask panel (thin)
             ])
             .split(padded[1]);
-
-        let project_panel = panels[0];
-        let suggestions_panel = panels[2];
 
         // Cache the result
         *cache = Some(CachedMainLayout {
             area,
-            project_panel,
-            suggestions_panel,
+            suggestions_panel: panels[0],
+            ask_panel: panels[2],
         });
 
-        (project_panel, suggestions_panel)
+        (panels[0], panels[2])
     });
 
-    render_project_panel(frame, project_rect, app);
     render_suggestions_panel(frame, suggestions_rect, app);
-}
-
-fn render_project_panel(frame: &mut Frame, area: Rect, app: &App) {
-    let is_active = app.active_panel == ActivePanel::Project;
-    let is_searching = app.input_mode == InputMode::Search;
-
-    let border_style = if is_searching {
-        Style::default().fg(Theme::WHITE) // Bright border when searching
-    } else if is_active {
-        Style::default().fg(Theme::GREY_300) // Bright active border
-    } else {
-        Style::default().fg(Theme::GREY_600) // Visible inactive border
-    };
-
-    // Account for search bar if searching
-    let search_height = if is_searching || !app.search_query.is_empty() {
-        2
-    } else {
-        0
-    };
-    let visible_height = area.height.saturating_sub(4 + search_height as u16) as usize;
-
-    let mut lines = vec![];
-
-    // Search bar
-    if is_searching || !app.search_query.is_empty() {
-        let search_text = if is_searching {
-            format!(" / {}_", app.search_query)
-        } else {
-            format!(" / {} (Esc to clear)", app.search_query)
-        };
-        lines.push(Line::from(vec![Span::styled(
-            search_text,
-            Style::default().fg(Theme::WHITE),
-        )]));
-        lines.push(Line::from(""));
-    } else {
-        // Top padding for breathing room
-        lines.push(Line::from(""));
-    }
-
-    // Render based on view mode
-    match app.view_mode {
-        ViewMode::Flat => {
-            render_flat_tree(&mut lines, app, is_active, visible_height);
-        }
-        ViewMode::Grouped => {
-            render_grouped_tree(&mut lines, app, is_active, visible_height);
-        }
-    }
-
-    // Build title with view/sort indicator
-    let total_items = app.project_tree_len();
-    let scroll_indicator = if total_items > visible_height {
-        let current = app.project_scroll + 1;
-        format!(" ↕ {}/{} ", current, total_items)
-    } else {
-        String::new()
-    };
-
-    let mode_indicator = format!(" [{}]", app.view_mode.label());
-    let title = format!(
-        " {}{}{}",
-        Theme::SECTION_PROJECT,
-        mode_indicator,
-        scroll_indicator
-    );
-
-    let block = Block::default()
-        .title(title)
-        .title_style(Style::default().fg(Theme::GREY_200)) // Legible title
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .style(Style::default().bg(Theme::GREY_800));
-
-    let paragraph = Paragraph::new(lines).block(block);
-    frame.render_widget(paragraph, area);
-}
-
-/// Render the flat file tree
-fn render_flat_tree<'a>(
-    lines: &mut Vec<Line<'a>>,
-    app: &'a App,
-    is_active: bool,
-    visible_height: usize,
-) {
-    let tree = &app.file_tree;
-    let indices = &app.filtered_tree_indices;
-    let total = indices.len();
-
-    for (i, entry_idx) in indices
-        .iter()
-        .enumerate()
-        .skip(app.project_scroll)
-        .take(visible_height)
-    {
-        let entry = &tree[*entry_idx];
-        let is_selected = i == app.project_selected && is_active;
-
-        // Calculate tree connectors
-        let is_last = {
-            if i + 1 >= total {
-                true
-            } else {
-                let next_entry = &tree[indices[i + 1]];
-                next_entry.depth <= entry.depth
-            }
-        };
-
-        let connector = if is_last { "└" } else { "├" };
-        let indent_str: String = (0..entry.depth.saturating_sub(1))
-            .map(|d| {
-                // Check if ancestor at this depth has more siblings
-                let has_more = indices
-                    .iter()
-                    .skip(i + 1)
-                    .any(|next_idx| tree[*next_idx].depth == d + 1);
-                if has_more {
-                    "│ "
-                } else {
-                    "  "
-                }
-            })
-            .collect();
-
-        let (file_icon_str, icon_color) = if entry.is_dir {
-            ("▸", Theme::GREY_400)
-        } else {
-            file_icon(&entry.name)
-        };
-
-        // Selection indicated by styling only (no cursor)
-        let name_style = if is_selected {
-            Style::default()
-                .fg(Theme::WHITE)
-                .add_modifier(Modifier::BOLD)
-        } else if entry.is_dir {
-            Style::default().fg(Theme::GREY_300)
-        } else if entry.priority == Theme::PRIORITY_HIGH {
-            Style::default().fg(Theme::GREY_200)
-        } else {
-            Style::default().fg(Theme::GREY_500)
-        };
-
-        let priority_indicator = if entry.priority == Theme::PRIORITY_HIGH {
-            Span::styled(" ●", Style::default().fg(Theme::GREY_300))
-        } else {
-            Span::styled("", Style::default())
-        };
-
-        // Icon styling also reflects selection
-        let icon_style = if is_selected {
-            Style::default().fg(Theme::WHITE)
-        } else {
-            Style::default().fg(icon_color)
-        };
-
-        if entry.depth == 0 {
-            // Root level - no connector
-            lines.push(Line::from(vec![
-                Span::styled("   ", Style::default()),
-                Span::styled(format!("{} ", file_icon_str), icon_style),
-                Span::styled(entry.name.as_str(), name_style),
-                priority_indicator,
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled("   ", Style::default()),
-                Span::styled(
-                    format!("{}{}", indent_str, connector),
-                    Style::default().fg(Theme::GREY_700),
-                ),
-                Span::styled(format!(" {} ", file_icon_str), icon_style),
-                Span::styled(entry.name.as_str(), name_style),
-                priority_indicator,
-            ]));
-        }
-    }
-}
-
-/// Get file type icon based on extension - minimal and clean
-fn file_icon(name: &str) -> (&'static str, ratatui::style::Color) {
-    let ext = name.rsplit('.').next().unwrap_or("");
-    match ext {
-        // React/JSX - subtle blue tint
-        "tsx" | "jsx" => ("›", Theme::BADGE_QUALITY),
-        // TypeScript - subtle yellow
-        "ts" => ("›", Theme::BADGE_DOCS),
-        // JavaScript
-        "js" | "mjs" | "cjs" => ("›", Theme::BADGE_DOCS),
-        // Styles - purple
-        "css" | "scss" | "sass" | "less" => ("◈", Theme::BADGE_REFACTOR),
-        // Data files - muted
-        "json" | "yaml" | "yml" | "toml" => ("○", Theme::GREY_600),
-        // Rust - orange
-        "rs" => ("●", Theme::BADGE_SECURITY),
-        // Python - teal
-        "py" => ("●", Theme::BADGE_PERF),
-        // Go - blue
-        "go" => ("●", Theme::BADGE_QUALITY),
-        // Config - very muted
-        "env" | "config" => ("○", Theme::GREY_700),
-        // Markdown - muted
-        "md" | "mdx" => ("○", Theme::GREY_600),
-        // Tests - teal indicator
-        _ if name.contains("test") || name.contains("spec") => ("◎", Theme::BADGE_PERF),
-        // Default - minimal dot
-        _ => ("·", Theme::GREY_600),
-    }
-}
-
-/// Render the grouped file tree
-fn render_grouped_tree<'a>(
-    lines: &mut Vec<Line<'a>>,
-    app: &'a App,
-    is_active: bool,
-    visible_height: usize,
-) {
-    use cosmos_core::grouping::GroupedEntryKind;
-
-    let tree = &app.grouped_tree;
-    let indices = &app.filtered_grouped_indices;
-
-    for (i, entry_idx) in indices
-        .iter()
-        .enumerate()
-        .skip(app.project_scroll)
-        .take(visible_height)
-    {
-        let entry = &tree[*entry_idx];
-        let is_selected = i == app.project_selected && is_active;
-
-        match &entry.kind {
-            GroupedEntryKind::Layer(_layer) => {
-                // Add spacing before layer (except first)
-                if i > 0 && app.project_scroll == 0
-                    || (i > app.project_scroll && app.project_scroll > 0)
-                {
-                    // Check if previous visible item was a file - add separator
-                    if i > 0 {
-                        if let Some(prev_idx) = indices.get(i.saturating_sub(1)) {
-                            let prev = &tree[*prev_idx];
-                            if prev.kind == GroupedEntryKind::File {
-                                lines.push(Line::from(""));
-                            }
-                        }
-                    }
-                }
-
-                // Layer header - selection via styling only, expand icon shows state
-                let expand_icon = if entry.expanded { "▾" } else { "▸" };
-                let count_str = format!(" {}", entry.file_count);
-
-                let (expand_style, name_style, count_style) = if is_selected {
-                    (
-                        Style::default().fg(Theme::WHITE),
-                        Style::default()
-                            .fg(Theme::WHITE)
-                            .add_modifier(Modifier::BOLD),
-                        Style::default().fg(Theme::GREY_200),
-                    )
-                } else {
-                    (
-                        Style::default().fg(Theme::GREY_500),
-                        Style::default().fg(Theme::GREY_100),
-                        Style::default().fg(Theme::GREY_600),
-                    )
-                };
-
-                lines.push(Line::from(vec![
-                    Span::styled("   ", Style::default()),
-                    Span::styled(expand_icon.to_string(), expand_style),
-                    Span::styled(format!(" {}", entry.name), name_style),
-                    Span::styled(count_str, count_style),
-                ]));
-            }
-            GroupedEntryKind::Feature => {
-                // Feature header - selection via styling only
-                let style = if is_selected {
-                    Style::default()
-                        .fg(Theme::WHITE)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Theme::GREY_300)
-                };
-
-                let count_str = format!(" {}", entry.file_count);
-
-                lines.push(Line::from(vec![
-                    Span::styled("   ", Style::default()),
-                    Span::styled("   ├─ ", Style::default().fg(Theme::GREY_700)),
-                    Span::styled(entry.name.as_str(), style),
-                    Span::styled(count_str, Style::default().fg(Theme::GREY_600)),
-                ]));
-            }
-            GroupedEntryKind::File => {
-                // File display - selection via styling only
-                let (file_icon_str, icon_color) = file_icon(&entry.name);
-
-                let name_style = if is_selected {
-                    Style::default()
-                        .fg(Theme::WHITE)
-                        .add_modifier(Modifier::BOLD)
-                } else if entry.priority == Theme::PRIORITY_HIGH {
-                    Style::default().fg(Theme::GREY_200)
-                } else {
-                    Style::default().fg(Theme::GREY_500)
-                };
-
-                let icon_style = if is_selected {
-                    Style::default().fg(Theme::WHITE)
-                } else {
-                    Style::default().fg(icon_color)
-                };
-
-                let priority_indicator = if entry.priority == Theme::PRIORITY_HIGH {
-                    Span::styled(" ●", Style::default().fg(Theme::GREY_400))
-                } else {
-                    Span::styled("", Style::default())
-                };
-
-                // Simple indentation with subtle vertical guide
-                let indent = "     │  ";
-
-                lines.push(Line::from(vec![
-                    Span::styled("   ", Style::default()),
-                    Span::styled(indent.to_string(), Style::default().fg(Theme::GREY_800)),
-                    Span::styled(format!("{} ", file_icon_str), icon_style),
-                    Span::styled(entry.name.as_str(), name_style),
-                    priority_indicator,
-                ]));
-            }
-        }
-    }
+    render_ask_panel(frame, ask_rect, app);
 }
 
 fn render_suggestions_panel(frame: &mut Frame, area: Rect, app: &App) {
     let is_active = app.active_panel == ActivePanel::Suggestions;
-    let is_question_mode = app.input_mode == InputMode::Question;
-
-    let border_style = if is_question_mode {
-        Style::default().fg(Theme::WHITE) // Bright border when in question mode
-    } else if is_active {
+    let border_style = if is_active {
         Style::default().fg(Theme::GREY_300)
     } else {
         Style::default().fg(Theme::GREY_600)
@@ -435,34 +92,21 @@ fn render_suggestions_panel(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut lines = vec![];
 
-    // Question input mode takes highest priority
-    if is_question_mode {
-        render_question_mode_content(&mut lines, app, visible_height);
-    } else if let Some(ask_state) = &app.ask_cosmos_state {
-        // Ask cosmos response display
-        render_ask_cosmos_content(&mut lines, ask_state, app, visible_height, inner_width);
-    } else if app.loading == LoadingState::Answering {
-        render_ask_cosmos_loading(&mut lines, app);
-    } else {
-        // Render content based on workflow step
-        match app.workflow_step {
-            WorkflowStep::Suggestions => {
-                render_suggestions_content(&mut lines, app, is_active, visible_height, inner_width);
-            }
-            WorkflowStep::Review => {
-                render_review_content(&mut lines, app, visible_height, inner_width);
-            }
-            WorkflowStep::Ship => {
-                render_ship_content(&mut lines, app, visible_height, inner_width);
-            }
+    // Render content based on workflow step
+    match app.workflow_step {
+        WorkflowStep::Suggestions => {
+            render_suggestions_content(&mut lines, app, is_active, visible_height, inner_width);
+        }
+        WorkflowStep::Review => {
+            render_review_content(&mut lines, app, visible_height, inner_width);
+        }
+        WorkflowStep::Ship => {
+            render_ship_content(&mut lines, app, visible_height, inner_width);
         }
     }
 
-    // Build title with workflow breadcrumbs in the border (italic, lowercase like project panel)
-    let ask_cosmos_active = is_question_mode
-        || app.ask_cosmos_state.is_some()
-        || app.loading == LoadingState::Answering;
-    let title = render_workflow_title(app.workflow_step, ask_cosmos_active);
+    // Build title with workflow breadcrumbs in the border.
+    let title = render_workflow_title(app.workflow_step);
 
     let block = Block::default()
         .title(title)
@@ -475,13 +119,8 @@ fn render_suggestions_panel(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-/// Build the workflow title for the border (italic, lowercase like project panel)
-fn render_workflow_title(current: WorkflowStep, ask_cosmos_active: bool) -> String {
-    // When in ask cosmos mode, show simple title (italicized like other panels)
-    if ask_cosmos_active {
-        return " 𝘢𝘴𝘬 𝘤𝘰𝘴𝘮𝘰𝘴 ".to_string();
-    }
-
+/// Build the workflow title for the border.
+fn render_workflow_title(current: WorkflowStep) -> String {
     let steps = [
         (WorkflowStep::Suggestions, Theme::WORKFLOW_SUGGESTIONS),
         (WorkflowStep::Review, Theme::WORKFLOW_REVIEW),
@@ -517,7 +156,7 @@ fn render_suggestions_content<'a>(
 
     let suggestions = app.suggestions.active_suggestions();
 
-    // Top padding for breathing room (matching project panel)
+    // Top padding for breathing room
     lines.push(Line::from(""));
 
     // Check for loading states relevant to suggestions panel
@@ -709,8 +348,6 @@ fn render_suggestions_content<'a>(
             Span::styled("─".repeat(rule_width), border_style),
             Span::styled("╯", border_style),
         ]));
-
-        render_suggestion_diagnostics(lines, app, inner_width);
         return;
     }
 
@@ -830,302 +467,6 @@ fn render_suggestions_content<'a>(
             format!("  ↕ {}/{}", app.suggestion_selected + 1, suggestions.len()),
             Style::default().fg(Theme::GREY_500),
         )]));
-    }
-}
-
-fn render_suggestion_diagnostics<'a>(lines: &mut Vec<Line<'a>>, app: &App, inner_width: usize) {
-    let diagnostics = app.last_suggestion_diagnostics.as_ref();
-    let last_error = app.last_suggestion_error.as_ref();
-    let has_any =
-        diagnostics.is_some() || last_error.is_some() || !app.suggestions.suggestions.is_empty();
-    if !has_any {
-        return;
-    }
-
-    let indent = "    ";
-    let text_width = inner_width.saturating_sub(6);
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        format!("{indent}Diagnostics"),
-        Style::default().fg(Theme::GREY_500),
-    )]));
-
-    if let Some(error) = last_error {
-        for line in wrap_text(&format!("Last error: {}", error), text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::BADGE_BUG),
-            )]));
-        }
-    }
-
-    let total = app.suggestions.suggestions.len();
-    if total > 0 {
-        let dismissed = app
-            .suggestions
-            .suggestions
-            .iter()
-            .filter(|s| s.dismissed)
-            .count();
-        let applied = app
-            .suggestions
-            .suggestions
-            .iter()
-            .filter(|s| s.applied)
-            .count();
-        let active = total.saturating_sub(dismissed + applied);
-        let line = format!(
-            "Stored suggestions: total {} · active {} · dismissed {} · applied {}",
-            total, active, dismissed, applied
-        );
-        for line in wrap_text(&line, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_400),
-            )]));
-        }
-    }
-
-    if !app.show_suggestion_diagnostics {
-        if let Some(diag) = diagnostics {
-            let compact = format!(
-                "Latest run: {} · gate {} · final {} suggestions · {}ms",
-                diag.model,
-                if diag.gate_passed { "passed" } else { "missed" },
-                diag.final_count,
-                diag.attempt_ms
-            );
-            for line in wrap_text(&compact, text_width) {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{indent}{line}"),
-                    Style::default().fg(Theme::GREY_500),
-                )]));
-            }
-        }
-        lines.push(Line::from(vec![Span::styled(
-            format!("{indent}Press d to show technical diagnostics."),
-            Style::default().fg(Theme::GREY_600),
-        )]));
-        return;
-    }
-
-    if let Some(diag) = diagnostics {
-        let refinement_line = if app.suggestion_refinement_in_progress {
-            "Refinement: in progress"
-        } else if diag.refinement_complete {
-            "Refinement: complete"
-        } else {
-            "Refinement: pending"
-        };
-        for line in wrap_text(refinement_line, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_400),
-            )]));
-        }
-
-        let attempts_line = format!(
-            "Gate: {} · attempt {}/{} · cost ${:.4} · {}ms",
-            if diag.gate_passed { "passed" } else { "missed" },
-            diag.attempt_index.max(1),
-            diag.attempt_count.max(1),
-            diag.attempt_cost_usd,
-            diag.attempt_ms
-        );
-        for line in wrap_text(&attempts_line, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_500),
-            )]));
-        }
-
-        if !diag.gate_fail_reasons.is_empty() {
-            let fail_reasons = format!("Gate reasons: {}", diag.gate_fail_reasons.join("; "));
-            for line in wrap_text(&fail_reasons, text_width) {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{indent}{line}"),
-                    Style::default().fg(Theme::YELLOW),
-                )]));
-            }
-        }
-
-        let tool_names = if diag.tool_names.is_empty() {
-            "none".to_string()
-        } else {
-            diag.tool_names.join(", ")
-        };
-
-        let meta = format!(
-            "Model: {} · {}ms · iterations {} · tool calls {} ({})",
-            diag.model, diag.llm_ms, diag.iterations, diag.tool_calls, tool_names
-        );
-        for line in wrap_text(&meta, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_400),
-            )]));
-        }
-
-        let timing = format!(
-            "Timing: evidence pack {}ms · tools {}ms · batch verify {}ms",
-            diag.evidence_pack_ms, diag.tool_exec_ms, diag.batch_verify_ms
-        );
-        for line in wrap_text(&timing, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_500),
-            )]));
-        }
-
-        let path = format!(
-            "Forced final: {} · formatting pass: {} · structured output: {} · response healing: {}",
-            if diag.forced_final { "yes" } else { "no" },
-            if diag.formatting_pass { "yes" } else { "no" },
-            if diag.response_format { "yes" } else { "no" },
-            if diag.response_healing { "yes" } else { "no" }
-        );
-        for line in wrap_text(&path, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_400),
-            )]));
-        }
-
-        let counts = format!(
-            "Parsed: {} · deduped: {} · grounded removed: {} · low confidence removed: {} · truncated: {} · final: {}",
-            diag.raw_count,
-            diag.deduped_count,
-            diag.grounding_filtered,
-            diag.low_confidence_filtered,
-            diag.truncated_count,
-            diag.final_count
-        );
-        for line in wrap_text(&counts, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_400),
-            )]));
-        }
-
-        let validation = format!(
-            "Validation: provisional {} · validated {} · rejected {} · regen attempts {}",
-            diag.provisional_count,
-            diag.validated_count,
-            diag.rejected_count,
-            diag.regeneration_attempts
-        );
-        for line in wrap_text(&validation, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_500),
-            )]));
-        }
-
-        let drops = format!(
-            "Drops: semantic dedupe {} · readiness {} · speculative {} · file balance {}",
-            diag.semantic_dedup_dropped_count,
-            diag.readiness_filtered_count,
-            diag.speculative_impact_dropped_count,
-            diag.file_balance_dropped_count
-        );
-        for line in wrap_text(&drops, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_500),
-            )]));
-        }
-
-        let pack_mix = format!(
-            "Evidence pack: patterns {} · hotspots {} · core {} · line1 {:.0}%",
-            diag.pack_pattern_count,
-            diag.pack_hotspot_count,
-            diag.pack_core_count,
-            diag.pack_line1_ratio * 100.0
-        );
-        for line in wrap_text(&pack_mix, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_500),
-            )]));
-        }
-
-        let sent = format!(
-            "Sent to model: {} snippets · ~{} bytes",
-            diag.sent_snippet_count, diag.sent_bytes
-        );
-        for line in wrap_text(&sent, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_500),
-            )]));
-        }
-
-        if diag.batch_verify_attempted > 0 {
-            let batch_verify = format!(
-                "Batch verify: attempted {} · confirmed {} · not found {} · errors {}",
-                diag.batch_verify_attempted,
-                diag.batch_verify_verified,
-                diag.batch_verify_not_found,
-                diag.batch_verify_errors
-            );
-            for line in wrap_text(&batch_verify, text_width) {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{indent}{line}"),
-                    Style::default().fg(Theme::GREY_500),
-                )]));
-            }
-        }
-
-        let parse = format!(
-            "Parse: {} · markdown stripped: {} · sanitized: {} · json fix: {} · individual parse: {}",
-            if diag.parse_strategy.is_empty() {
-                "unknown"
-            } else {
-                diag.parse_strategy.as_str()
-            },
-            if diag.parse_stripped_markdown { "yes" } else { "no" },
-            if diag.parse_used_sanitized_fix { "yes" } else { "no" },
-            if diag.parse_used_json_fix { "yes" } else { "no" },
-            if diag.parse_used_individual_parse { "yes" } else { "no" }
-        );
-        for line in wrap_text(&parse, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_500),
-            )]));
-        }
-
-        let response_info = format!("Response chars: {}", diag.response_chars);
-        for line in wrap_text(&response_info, text_width) {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{indent}{line}"),
-                Style::default().fg(Theme::GREY_500),
-            )]));
-        }
-
-        if let Some(precision) = app.rolling_verify_precision {
-            let precision_line = format!(
-                "Rolling verify precision (last 50): {:.0}%",
-                precision * 100.0
-            );
-            for line in wrap_text(&precision_line, text_width) {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{indent}{line}"),
-                    Style::default().fg(Theme::GREY_400),
-                )]));
-            }
-        }
-
-        if diag.final_count == 0 && !diag.response_preview.is_empty() {
-            let preview = format!("Response preview: {}", diag.response_preview);
-            for line in wrap_text(&preview, text_width) {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{indent}{line}"),
-                    Style::default().fg(Theme::GREY_600),
-                )]));
-            }
-        }
     }
 }
 
@@ -1617,8 +958,114 @@ fn render_ship_content<'a>(
     }
 }
 
+fn render_ask_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let is_question_mode = app.input_mode == InputMode::Question;
+    let has_response = app.ask_cosmos_state.is_some();
+    let is_loading = app.loading == LoadingState::Answering;
+    let is_active = app.active_panel == ActivePanel::Ask;
+
+    let border_style = if is_active || is_question_mode || has_response || is_loading {
+        Style::default().fg(Theme::WHITE)
+    } else {
+        Style::default().fg(Theme::GREY_600)
+    };
+
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let inner_width = area.width.saturating_sub(4) as usize;
+    let mut lines = vec![];
+
+    if is_question_mode {
+        render_question_mode_content(&mut lines, app, visible_height, inner_width);
+    } else if let Some(ask_state) = &app.ask_cosmos_state {
+        render_ask_cosmos_content(&mut lines, ask_state, app, visible_height, inner_width);
+    } else if is_loading {
+        render_ask_cosmos_loading(&mut lines, app);
+    } else {
+        render_ask_idle_content(&mut lines, app, visible_height);
+    }
+
+    let block = Block::default()
+        .title(" 𝘢𝘴𝘬 𝘤𝘰𝘴𝘮𝘰𝘴 ")
+        .title_style(Style::default().fg(Theme::GREY_200))
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .style(Style::default().bg(Theme::GREY_800));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_ask_idle_content<'a>(lines: &mut Vec<Line<'a>>, app: &App, visible_height: usize) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Ask about this repo",
+        Style::default().fg(Theme::GREY_300),
+    )]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            " ↵ ",
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+        ),
+        Span::styled(" start question", Style::default().fg(Theme::GREY_400)),
+    ]));
+
+    if !cosmos_engine::llm::is_available() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                " k ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_500),
+            ),
+            Span::styled(" setup API key", Style::default().fg(Theme::GREY_400)),
+        ]));
+    }
+
+    let used = lines.len();
+    for _ in 0..visible_height.saturating_sub(used + 1) {
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled("Q&A", Style::default().fg(Theme::GREY_600)),
+        if app.question_cache.entries.is_empty() {
+            Span::styled("", Style::default())
+        } else {
+            Span::styled(
+                format!(" · {} cached", app.question_cache.entries.len()),
+                Style::default().fg(Theme::GREY_600),
+            )
+        },
+    ]));
+}
+
 /// Render the question input mode content in the right panel
-fn render_question_mode_content<'a>(lines: &mut Vec<Line<'a>>, app: &App, visible_height: usize) {
+fn render_question_mode_content<'a>(
+    lines: &mut Vec<Line<'a>>,
+    app: &App,
+    visible_height: usize,
+    inner_width: usize,
+) {
+    fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+        if max_chars == 0 {
+            return String::new();
+        }
+        let len = text.chars().count();
+        if len <= max_chars {
+            return text.to_string();
+        }
+        if max_chars == 1 {
+            return "…".to_string();
+        }
+        let head: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
+
+    let text_width = inner_width.saturating_sub(6).max(10);
+
     // Top padding
     lines.push(Line::from(""));
 
@@ -1629,17 +1076,18 @@ fn render_question_mode_content<'a>(lines: &mut Vec<Line<'a>>, app: &App, visibl
             Span::styled("  ", Style::default()),
             Span::styled(cursor, Style::default().fg(Theme::WHITE)),
             Span::styled(
-                " Type your question...",
+                format!(
+                    " {}",
+                    truncate_with_ellipsis("Type your question...", text_width)
+                ),
                 Style::default().fg(Theme::GREY_500),
             ),
         ])
     } else {
+        let shown = truncate_with_ellipsis(&app.question_input, text_width.saturating_sub(1));
         Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(
-                app.question_input.clone(),
-                Style::default().fg(Theme::WHITE),
-            ),
+            Span::styled(shown, Style::default().fg(Theme::WHITE)),
             Span::styled(cursor, Style::default().fg(Theme::WHITE)),
         ])
     };
@@ -1655,8 +1103,18 @@ fn render_question_mode_content<'a>(lines: &mut Vec<Line<'a>>, app: &App, visibl
         )]));
         lines.push(Line::from(""));
 
-        for (i, suggestion) in app.question_suggestions.iter().enumerate() {
+        let total = app.question_suggestions.len();
+        let selected = app
+            .question_suggestion_selected
+            .min(total.saturating_sub(1));
+        let list_height = visible_height.saturating_sub(lines.len() + 3).max(1);
+        let start = selected.saturating_sub(list_height.saturating_sub(1));
+        let end = (start + list_height).min(total);
+
+        for i in start..end {
+            let suggestion = &app.question_suggestions[i];
             let is_selected = i == app.question_suggestion_selected;
+            let shown = truncate_with_ellipsis(suggestion, text_width);
 
             let (prefix, style) = if is_selected {
                 (" › ", Style::default().fg(Theme::WHITE))
@@ -1666,8 +1124,15 @@ fn render_question_mode_content<'a>(lines: &mut Vec<Line<'a>>, app: &App, visibl
 
             lines.push(Line::from(vec![
                 Span::styled(prefix, style),
-                Span::styled(suggestion.clone(), style),
+                Span::styled(shown, style),
             ]));
+        }
+
+        if end < total {
+            lines.push(Line::from(vec![Span::styled(
+                format!("   +{} more", total - end),
+                Style::default().fg(Theme::GREY_500),
+            )]));
         }
     }
 
@@ -1687,13 +1152,13 @@ fn render_question_mode_content<'a>(lines: &mut Vec<Line<'a>>, app: &App, visibl
                 Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
             ),
             Span::styled(" browse ", Style::default().fg(Theme::GREY_400)),
-            Span::styled("   ", Style::default()),
+            Span::styled(" ", Style::default()),
             Span::styled(
                 " ↵ ",
                 Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
             ),
             Span::styled(" ask ", Style::default().fg(Theme::GREY_400)),
-            Span::styled("   ", Style::default()),
+            Span::styled(" ", Style::default()),
             Span::styled(
                 " Esc ",
                 Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
@@ -1708,7 +1173,7 @@ fn render_question_mode_content<'a>(lines: &mut Vec<Line<'a>>, app: &App, visibl
                 Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
             ),
             Span::styled(" ask ", Style::default().fg(Theme::GREY_400)),
-            Span::styled("   ", Style::default()),
+            Span::styled(" ", Style::default()),
             Span::styled(
                 " Esc ",
                 Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),

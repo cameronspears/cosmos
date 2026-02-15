@@ -17,7 +17,6 @@ pub(super) fn handle_question_input(
         KeyCode::Esc => app.exit_question(),
         KeyCode::Up if app.question_input.is_empty() => app.question_suggestion_up(),
         KeyCode::Down if app.question_input.is_empty() => app.question_suggestion_down(),
-        KeyCode::Tab => app.use_selected_suggestion(),
         KeyCode::Enter => submit_question(app, ctx)?,
         KeyCode::Backspace => app.question_pop(),
         KeyCode::Char(c) => app.question_push(c),

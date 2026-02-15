@@ -142,7 +142,6 @@ pub fn request_suggestions_refresh(
     }
 
     app.loading = LoadingState::GeneratingSuggestions;
-    app.last_suggestion_error = None;
     app.suggestion_refinement_in_progress = true;
     app.suggestion_provisional_count = 0;
     app.suggestion_validated_count = 0;
@@ -209,8 +208,6 @@ pub fn drain_messages(
                     count, &model
                 ));
                 app.active_model = Some(model);
-                app.last_suggestion_diagnostics = Some(diagnostics);
-                app.last_suggestion_error = None;
                 app.suggestion_refinement_in_progress = true;
                 app.suggestion_provisional_count = count;
                 app.suggestion_validated_count = 0;
@@ -231,11 +228,9 @@ pub fn drain_messages(
                 attempt_index,
                 attempt_count,
                 gate,
-                diagnostics,
+                diagnostics: _diagnostics,
             } => {
                 app.loading = LoadingState::GeneratingSuggestions;
-                app.last_suggestion_diagnostics = Some(diagnostics);
-                app.last_suggestion_error = None;
                 app.suggestion_refinement_in_progress = true;
                 app.suggestion_provisional_count = 0;
                 app.suggestion_validated_count =
@@ -284,8 +279,6 @@ pub fn drain_messages(
                 } else {
                     app.loading = LoadingState::None;
                 }
-                app.last_suggestion_diagnostics = Some(diagnostics.clone());
-                app.last_suggestion_error = None;
                 app.suggestion_refinement_in_progress = false;
                 app.suggestion_provisional_count = diagnostics.provisional_count;
                 app.suggestion_validated_count = validated_count;
@@ -320,7 +313,6 @@ pub fn drain_messages(
                 if !maybe_prompt_api_key_overlay(app, &e) {
                     app.show_toast(&format!("Suggestions error: {}", truncate(&e, 80)));
                 }
-                app.last_suggestion_error = Some(e);
                 app.suggestion_refinement_in_progress = false;
                 app.clear_apply_confirm();
             }

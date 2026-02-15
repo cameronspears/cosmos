@@ -185,12 +185,6 @@ pub struct App {
     pub git_refresh_error: Option<String>,
     /// Last time we surfaced a git refresh error
     pub git_refresh_error_at: Option<Instant>,
-    /// Diagnostics from the most recent suggestion run
-    pub last_suggestion_diagnostics: Option<cosmos_engine::llm::SuggestionDiagnostics>,
-    /// Last suggestion error message (full, untruncated)
-    pub last_suggestion_error: Option<String>,
-    /// Show verbose suggestion diagnostics in the UI.
-    pub show_suggestion_diagnostics: bool,
     /// Whether background refinement is still validating/regenerating suggestions.
     pub suggestion_refinement_in_progress: bool,
     /// Number of provisional suggestions from fast pass.
@@ -243,7 +237,7 @@ impl App {
             index,
             suggestions,
             context,
-            active_panel: ActivePanel::default(),
+            active_panel: ActivePanel::Suggestions,
             project_scroll: 0,
             project_selected: 0,
             suggestion_scroll: 0,
@@ -292,9 +286,6 @@ impl App {
             pending_suggestions_on_init: false,
             git_refresh_error: None,
             git_refresh_error_at: None,
-            last_suggestion_diagnostics: None,
-            last_suggestion_error: None,
-            show_suggestion_diagnostics: false,
             suggestion_refinement_in_progress: false,
             suggestion_provisional_count: 0,
             suggestion_validated_count: 0,
@@ -744,19 +735,15 @@ impl App {
     /// Switch to the other panel
     pub fn toggle_panel(&mut self) {
         self.active_panel = match self.active_panel {
-            ActivePanel::Project => ActivePanel::Suggestions,
-            ActivePanel::Suggestions => ActivePanel::Project,
+            ActivePanel::Ask => ActivePanel::Suggestions,
+            ActivePanel::Suggestions => ActivePanel::Ask,
         };
     }
 
     /// Navigate down in the current panel
     pub fn navigate_down(&mut self) {
         match self.active_panel {
-            ActivePanel::Project => {
-                let max = self.project_tree_len().saturating_sub(1);
-                self.project_selected = (self.project_selected + 1).min(max);
-                self.ensure_project_visible();
-            }
+            ActivePanel::Ask => {}
             ActivePanel::Suggestions => {
                 let previous = self.suggestion_selected;
                 let max = self
@@ -778,10 +765,7 @@ impl App {
     /// Navigate up in the current panel
     pub fn navigate_up(&mut self) {
         match self.active_panel {
-            ActivePanel::Project => {
-                self.project_selected = self.project_selected.saturating_sub(1);
-                self.ensure_project_visible();
-            }
+            ActivePanel::Ask => {}
             ActivePanel::Suggestions => {
                 let previous = self.suggestion_selected;
                 self.suggestion_selected = self.suggestion_selected.saturating_sub(1);
@@ -961,28 +945,6 @@ impl App {
     /// Check if in ask cosmos mode (showing response)
     pub fn is_ask_cosmos_mode(&self) -> bool {
         self.ask_cosmos_state.is_some()
-    }
-
-    pub fn toggle_suggestion_diagnostics(&mut self) {
-        self.show_suggestion_diagnostics = !self.show_suggestion_diagnostics;
-    }
-
-    pub fn dismiss_selected_suggestion(&mut self) -> bool {
-        let suggestion_id = match self.selected_suggestion() {
-            Some(suggestion) => suggestion.id,
-            None => return false,
-        };
-        self.suggestions.mark_dismissed(suggestion_id);
-
-        let max = self
-            .suggestions
-            .active_suggestions()
-            .len()
-            .saturating_sub(1);
-        self.suggestion_selected = self.suggestion_selected.min(max);
-        self.ensure_suggestion_visible();
-        self.clear_apply_confirm();
-        true
     }
 
     /// Scroll ask cosmos response down

@@ -355,86 +355,79 @@ pub(super) fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Get primary action buttons based on current state
 fn get_primary_buttons(app: &App) -> Vec<FooterButton> {
-    match app.active_panel {
-        ActivePanel::Project => {
-            vec![hint_button("↵", "expand")]
+    if app.active_panel == ActivePanel::Ask {
+        return if app.workflow_step == WorkflowStep::Suggestions
+            && cosmos_engine::llm::is_available()
+        {
+            vec![primary_button("↵", "ask")]
+        } else {
+            vec![]
+        };
+    }
+
+    match app.workflow_step {
+        WorkflowStep::Suggestions => {
+            if app.suggestion_refinement_in_progress || app.loading == LoadingState::GeneratingFix {
+                vec![]
+            } else {
+                vec![primary_button("↵", "preview")]
+            }
         }
-        ActivePanel::Suggestions => match app.workflow_step {
-            WorkflowStep::Suggestions => {
-                if app.suggestion_refinement_in_progress
-                    || app.loading == LoadingState::GeneratingFix
-                {
-                    vec![]
-                } else {
-                    vec![primary_button("↵", "preview")]
-                }
+        WorkflowStep::Review => {
+            if app.review_passed() {
+                vec![primary_button("↵", "ship")]
+            } else if app.review_state.verification_failed {
+                vec![primary_button("↵", "override")]
+            } else {
+                vec![primary_button("↵", "fix")]
             }
-            WorkflowStep::Review => {
-                if app.review_passed() {
-                    vec![primary_button("↵", "ship")]
-                } else if app.review_state.verification_failed {
-                    vec![primary_button("↵", "override")]
-                } else {
-                    vec![primary_button("↵", "fix")]
-                }
-            }
-            WorkflowStep::Ship => match app.ship_state.step {
-                ShipStep::Confirm => vec![primary_button("↵", "ship")],
-                ShipStep::Done => vec![primary_button("↵", "open PR")],
-                _ => vec![],
-            },
+        }
+        WorkflowStep::Ship => match app.ship_state.step {
+            ShipStep::Confirm => vec![primary_button("↵", "ship")],
+            ShipStep::Done => vec![primary_button("↵", "open PR")],
+            _ => vec![],
         },
     }
 }
 
 /// Get secondary action buttons based on current state
 fn get_secondary_buttons(app: &App) -> Vec<FooterButton> {
-    match app.active_panel {
-        ActivePanel::Project => vec![],
-        ActivePanel::Suggestions => match app.workflow_step {
-            WorkflowStep::Suggestions => vec![],
-            WorkflowStep::Review => {
-                if app.review_passed() || app.review_state.verification_failed {
-                    vec![secondary_button("Esc", "back")]
-                } else {
-                    vec![hint_button("␣", "select"), secondary_button("Esc", "back")]
-                }
+    if app.active_panel == ActivePanel::Ask {
+        return vec![];
+    }
+
+    match app.workflow_step {
+        WorkflowStep::Suggestions => vec![],
+        WorkflowStep::Review => {
+            if app.review_passed() || app.review_state.verification_failed {
+                vec![secondary_button("Esc", "back")]
+            } else {
+                vec![hint_button("␣", "select"), secondary_button("Esc", "back")]
             }
-            WorkflowStep::Ship => match app.ship_state.step {
-                ShipStep::Confirm => vec![secondary_button("Esc", "back")],
-                ShipStep::Done => vec![secondary_button("Esc", "done")],
-                _ => vec![],
-            },
+        }
+        WorkflowStep::Ship => match app.ship_state.step {
+            ShipStep::Confirm => vec![secondary_button("Esc", "back")],
+            ShipStep::Done => vec![secondary_button("Esc", "done")],
+            _ => vec![],
         },
     }
 }
 
 /// Get hint buttons based on current state (lowest priority contextual hints)
 fn get_hint_buttons(app: &App) -> Vec<FooterButton> {
-    let mut hints = match app.active_panel {
-        ActivePanel::Project => {
-            vec![hint_button("/", "search"), hint_button("g", "group")]
-        }
-        ActivePanel::Suggestions => match app.workflow_step {
-            WorkflowStep::Suggestions => {
-                let mut hints = vec![
-                    hint_button("i", "ask"),
-                    hint_button("r", "refresh"),
-                    hint_button("x", "dismiss"),
-                    hint_button("d", "diag"),
-                ];
-                if !cosmos_engine::llm::is_available() {
-                    hints.push(hint_button("k", "API key"));
-                }
-                hints
-            }
-            _ => vec![],
-        },
-    };
+    let mut hints = Vec::new();
 
-    // Always show Tab hint for panel switching (helps new users discover navigation)
+    if app.active_panel == ActivePanel::Suggestions
+        && app.workflow_step == WorkflowStep::Suggestions
+    {
+        hints.push(hint_button("r", "refresh"));
+    }
+
+    if !cosmos_engine::llm::is_available() {
+        hints.push(hint_button("k", "API key"));
+    }
+
     hints.push(hint_button("Tab", "panel"));
-
     hints
 }
 

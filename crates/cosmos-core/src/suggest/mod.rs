@@ -152,8 +152,6 @@ pub struct Suggestion {
     pub implementation_sketch: Option<String>,
     pub source: SuggestionSource,
     pub created_at: DateTime<Utc>,
-    /// Whether the user has dismissed this suggestion
-    pub dismissed: bool,
     /// Whether the suggestion has been applied
     pub applied: bool,
 }
@@ -185,7 +183,6 @@ impl Suggestion {
             implementation_sketch: None,
             source,
             created_at: Utc::now(),
-            dismissed: false,
             applied: false,
         }
     }
@@ -306,11 +303,11 @@ impl SuggestionEngine {
         }
     }
 
-    /// Get all active suggestions (not dismissed/applied), capped at MAX_SUGGESTIONS
+    /// Get all active suggestions (not yet applied), capped at MAX_SUGGESTIONS
     pub fn active_suggestions(&self) -> Vec<&Suggestion> {
         self.suggestions
             .iter()
-            .filter(|s| !s.dismissed && !s.applied)
+            .filter(|s| !s.applied)
             .take(MAX_SUGGESTIONS)
             .collect()
     }
@@ -318,11 +315,6 @@ impl SuggestionEngine {
     /// Mark a suggestion as applied
     pub fn mark_applied(&mut self, id: Uuid) {
         self.update_suggestion(id, |s| s.applied = true);
-    }
-
-    /// Dismiss a suggestion for the current session.
-    pub fn mark_dismissed(&mut self, id: Uuid) {
-        self.update_suggestion(id, |s| s.dismissed = true);
     }
 
     /// Mark a suggestion as not applied (used for undo).
@@ -439,33 +431,7 @@ mod tests {
             SuggestionSource::Static,
         );
 
-        assert!(!suggestion.dismissed);
         assert!(!suggestion.applied);
-    }
-
-    #[test]
-    fn test_mark_dismissed_removes_suggestion_from_active_list() {
-        let index = CodebaseIndex {
-            root: PathBuf::from("."),
-            files: std::collections::HashMap::new(),
-            index_errors: Vec::new(),
-            git_head: None,
-        };
-        let mut engine = SuggestionEngine::new(index);
-        let suggestion = Suggestion::new(
-            SuggestionKind::Improvement,
-            Priority::High,
-            PathBuf::from("src/lib.rs"),
-            "Dismiss me".to_string(),
-            SuggestionSource::LlmDeep,
-        );
-        let id = suggestion.id;
-        engine.suggestions.push(suggestion);
-
-        assert_eq!(engine.active_suggestions().len(), 1);
-        engine.mark_dismissed(id);
-        assert_eq!(engine.active_suggestions().len(), 0);
-        assert!(engine.suggestions[0].dismissed);
     }
 
     #[test]

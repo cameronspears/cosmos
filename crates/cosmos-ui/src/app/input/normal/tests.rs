@@ -152,7 +152,6 @@ fn enter_is_blocked_while_suggestion_refinement_in_progress() {
         repo_root: root.clone(),
     };
     let mut app = App::new(index.clone(), suggestions, context);
-    app.active_panel = ActivePanel::Suggestions;
     app.workflow_step = WorkflowStep::Suggestions;
     app.suggestion_refinement_in_progress = true;
 
@@ -203,7 +202,6 @@ fn k_opens_api_key_overlay() {
         repo_root: root.clone(),
     };
     let mut app = App::new(index.clone(), suggestions, context);
-    app.active_panel = ActivePanel::Suggestions;
     app.workflow_step = WorkflowStep::Suggestions;
 
     let (tx, _rx) = mpsc::channel();
@@ -266,7 +264,6 @@ fn enter_opens_apply_plan_without_mutation() {
         repo_root: root.clone(),
     };
     let mut app = App::new(index.clone(), suggestions, context);
-    app.active_panel = ActivePanel::Suggestions;
     app.workflow_step = WorkflowStep::Suggestions;
 
     let (tx, _rx) = mpsc::channel();
@@ -342,7 +339,6 @@ fn apply_arm_resets_on_selection_change() {
         repo_root: root.clone(),
     };
     let mut app = App::new(index.clone(), suggestions, context);
-    app.active_panel = ActivePanel::Suggestions;
     app.workflow_step = WorkflowStep::Suggestions;
 
     let (tx, _rx) = mpsc::channel();
@@ -408,7 +404,6 @@ fn apply_plan_cancel_clears_apply_confirmation() {
         repo_root: root.clone(),
     };
     let mut app = App::new(index.clone(), suggestions, context);
-    app.active_panel = ActivePanel::Suggestions;
     app.workflow_step = WorkflowStep::Suggestions;
 
     let (tx, _rx) = mpsc::channel();
@@ -487,7 +482,6 @@ fn apply_plan_confirm_reports_files_changed_since_preview() {
         repo_root: root.clone(),
     };
     let mut app = App::new(index.clone(), suggestions, context);
-    app.active_panel = ActivePanel::Suggestions;
     app.workflow_step = WorkflowStep::Suggestions;
 
     let (tx, _rx) = mpsc::channel();
@@ -558,7 +552,6 @@ async fn apply_plan_confirm_starts_apply_flow() {
         repo_root: repo_path.clone(),
     };
     let mut app = App::new(index.clone(), suggestions, context);
-    app.active_panel = ActivePanel::Suggestions;
     app.workflow_step = WorkflowStep::Suggestions;
 
     let (tx, _rx) = mpsc::channel();
@@ -589,71 +582,6 @@ async fn apply_plan_confirm_starts_apply_flow() {
     assert!(app.armed_file_hashes.is_empty());
 
     std::env::remove_var("OPENROUTER_API_KEY");
-}
-
-#[test]
-fn dismiss_key_removes_active_suggestion() {
-    std::env::set_var("OPENROUTER_API_KEY", "test-key");
-    let mut root = std::env::temp_dir();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    root.push(format!("cosmos_dismiss_test_{}", nanos));
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "fn demo() {}\n").unwrap();
-
-    let index = CodebaseIndex {
-        root: root.clone(),
-        files: HashMap::new(),
-        index_errors: Vec::new(),
-        git_head: Some("deadbeef".to_string()),
-    };
-    let mut suggestions = SuggestionEngine::new(index.clone());
-    suggestions.suggestions.push(
-        cosmos_core::suggest::Suggestion::new(
-            cosmos_core::suggest::SuggestionKind::Improvement,
-            cosmos_core::suggest::Priority::High,
-            PathBuf::from("src/lib.rs"),
-            "Improve demo".to_string(),
-            cosmos_core::suggest::SuggestionSource::LlmDeep,
-        )
-        .with_validation_state(cosmos_core::suggest::SuggestionValidationState::Validated)
-        .with_line(1),
-    );
-    let context = WorkContext {
-        branch: "main".to_string(),
-        uncommitted_files: Vec::new(),
-        staged_files: Vec::new(),
-        untracked_files: Vec::new(),
-        inferred_focus: None,
-        modified_count: 0,
-        repo_root: root.clone(),
-    };
-    let mut app = App::new(index.clone(), suggestions, context);
-    app.active_panel = ActivePanel::Suggestions;
-    app.workflow_step = WorkflowStep::Suggestions;
-    assert_eq!(app.suggestions.active_suggestions().len(), 1);
-
-    let (tx, _rx) = mpsc::channel();
-    let ctx = crate::app::RuntimeContext {
-        index: &index,
-        repo_path: &root,
-        tx: &tx,
-    };
-
-    handle_normal_mode(
-        &mut app,
-        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-        &ctx,
-    )
-    .unwrap();
-
-    assert_eq!(app.suggestions.active_suggestions().len(), 0);
-    assert!(app.suggestions.suggestions[0].dismissed);
-
-    std::env::remove_var("OPENROUTER_API_KEY");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 fn init_temp_git_repo_with_file() -> (tempfile::TempDir, PathBuf) {

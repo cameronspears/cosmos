@@ -17,8 +17,8 @@ use super::theme::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ActivePanel {
     #[default]
-    Project,
     Suggestions,
+    Ask,
 }
 
 /// View mode for file explorer

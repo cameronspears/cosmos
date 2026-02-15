@@ -63,19 +63,10 @@ pub(super) fn render_help(frame: &mut Frame, scroll: usize) {
     // Navigation section
     help_text.extend(section_start("Navigation"));
     help_text.push(section_spacer());
+    help_text.push(key_row("Tab", "Switch suggestions/ask"));
     help_text.push(key_row("↑↓", "Move up/down"));
-    help_text.push(key_row("PgUp/Dn", "Page scroll"));
-    help_text.push(key_row("Tab", "Switch between panels"));
-    help_text.push(key_row("↵", "Expand/collapse or view details"));
+    help_text.push(key_row("↵", "Preview / confirm action"));
     help_text.push(key_row("Esc", "Go back / cancel"));
-    help_text.push(section_spacer());
-    help_text.push(section_end());
-
-    // File Explorer section
-    help_text.extend(section_start("File Explorer"));
-    help_text.push(section_spacer());
-    help_text.push(key_row("/", "Search files"));
-    help_text.push(key_row("g", "Toggle grouped/flat view"));
     help_text.push(section_spacer());
     help_text.push(section_end());
 
@@ -84,9 +75,6 @@ pub(super) fn render_help(frame: &mut Frame, scroll: usize) {
     help_text.push(section_spacer());
     help_text.push(key_row("↵", "Open apply plan / confirm"));
     help_text.push(key_row("r", "Refresh suggestions"));
-    help_text.push(key_row("x", "Dismiss suggestion"));
-    help_text.push(key_row("d", "Toggle diagnostics"));
-    help_text.push(key_row("i", "Ask Cosmos"));
     help_text.push(key_row("k", "Open OpenRouter setup guide"));
     help_text.push(key_row("?", "Show help"));
     help_text.push(key_row("q", "Quit"));
@@ -1186,34 +1174,6 @@ pub(super) fn render_welcome(frame: &mut Frame) {
             Style::default().fg(Theme::GREY_300),
         )]),
         Line::from(""),
-        // Layout explanation
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                "Left panel",
-                Style::default()
-                    .fg(Theme::WHITE)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " - Your codebase structure",
-                Style::default().fg(Theme::GREY_400),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                "Right panel",
-                Style::default()
-                    .fg(Theme::WHITE)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " - AI suggestions for improvements",
-                Style::default().fg(Theme::GREY_400),
-            ),
-        ]),
-        Line::from(""),
         // Workflow explanation
         Line::from(vec![Span::styled(
             "  How it works:",
@@ -1264,18 +1224,7 @@ pub(super) fn render_welcome(frame: &mut Frame) {
                 Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300),
             ),
             Span::styled(
-                " Switch between panels",
-                Style::default().fg(Theme::GREY_400),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("    ", Style::default()),
-            Span::styled(
-                "  i  ",
-                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300),
-            ),
-            Span::styled(
-                " Ask a question about your code",
+                " Switch between suggestions and ask",
                 Style::default().fg(Theme::GREY_400),
             ),
         ]),

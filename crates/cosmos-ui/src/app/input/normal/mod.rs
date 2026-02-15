@@ -716,55 +716,49 @@ pub(super) fn confirm_apply_from_overlay(app: &mut App, ctx: &RuntimeContext) {
 pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> Result<()> {
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Tab => app.toggle_panel(),
         KeyCode::Down => {
-            // Handle ask cosmos scroll first
-            if app.is_ask_cosmos_mode() {
-                app.ask_cosmos_scroll_down();
-            } else if app.active_panel == ActivePanel::Suggestions {
-                // Handle navigation based on workflow step
-                match app.workflow_step {
-                    WorkflowStep::Review
-                        if !app.review_state.reviewing && !app.review_state.fixing =>
-                    {
-                        app.review_cursor_down();
-                    }
-                    WorkflowStep::Ship => {
-                        app.ship_scroll_down();
-                    }
-                    WorkflowStep::Suggestions => app.navigate_down(),
-                    _ => {}
+            if app.active_panel == ActivePanel::Ask {
+                if app.is_ask_cosmos_mode() {
+                    app.ask_cosmos_scroll_down();
                 }
-            } else {
-                app.navigate_down();
+                return Ok(());
+            }
+
+            // Handle navigation based on workflow step
+            match app.workflow_step {
+                WorkflowStep::Review if !app.review_state.reviewing && !app.review_state.fixing => {
+                    app.review_cursor_down();
+                }
+                WorkflowStep::Ship => {
+                    app.ship_scroll_down();
+                }
+                WorkflowStep::Suggestions => app.navigate_down(),
+                _ => {}
             }
         }
         KeyCode::Up => {
-            // Handle ask cosmos scroll first
-            if app.is_ask_cosmos_mode() {
-                app.ask_cosmos_scroll_up();
-            } else if app.active_panel == ActivePanel::Suggestions {
-                // Handle navigation based on workflow step
-                match app.workflow_step {
-                    WorkflowStep::Review
-                        if !app.review_state.reviewing && !app.review_state.fixing =>
-                    {
-                        app.review_cursor_up();
-                    }
-                    WorkflowStep::Ship => {
-                        app.ship_scroll_up();
-                    }
-                    WorkflowStep::Suggestions => app.navigate_up(),
-                    _ => {}
+            if app.active_panel == ActivePanel::Ask {
+                if app.is_ask_cosmos_mode() {
+                    app.ask_cosmos_scroll_up();
                 }
-            } else {
-                app.navigate_up();
+                return Ok(());
+            }
+
+            // Handle navigation based on workflow step
+            match app.workflow_step {
+                WorkflowStep::Review if !app.review_state.reviewing && !app.review_state.fixing => {
+                    app.review_cursor_up();
+                }
+                WorkflowStep::Ship => {
+                    app.ship_scroll_up();
+                }
+                WorkflowStep::Suggestions => app.navigate_up(),
+                _ => {}
             }
         }
         KeyCode::Char(' ') => {
             // Space toggles finding selection in Review step
-            if app.active_panel == ActivePanel::Suggestions
-                && app.workflow_step == WorkflowStep::Review
+            if app.workflow_step == WorkflowStep::Review
                 && !app.review_state.reviewing
                 && !app.review_state.fixing
             {
@@ -773,8 +767,7 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
         }
         KeyCode::Char('f') => {
             // Fix selected findings in Review step
-            if app.active_panel == ActivePanel::Suggestions
-                && app.workflow_step == WorkflowStep::Review
+            if app.workflow_step == WorkflowStep::Review
                 && !app.review_state.reviewing
                 && !app.review_state.fixing
                 && !app.review_state.selected.is_empty()
@@ -783,151 +776,151 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
             }
         }
         KeyCode::Enter => {
+            if app.active_panel == ActivePanel::Ask {
+                if app.workflow_step != WorkflowStep::Suggestions {
+                    return Ok(());
+                }
+
+                if !cosmos_engine::llm::is_available() {
+                    prompt_api_key_setup(
+                        app,
+                        "No API key configured yet. Add your OpenRouter key to ask questions.",
+                    );
+                } else {
+                    app.start_question();
+                }
+                return Ok(());
+            }
+
             // If PR URL is pending, open it in browser
             if let Some(url) = app.pr_url.take() {
                 let _ = git_ops::open_url(&url);
             } else {
-                match app.active_panel {
-                    ActivePanel::Project => app.toggle_group_expand(),
-                    ActivePanel::Suggestions => {
-                        // Handle based on workflow step
-                        match app.workflow_step {
-                            WorkflowStep::Suggestions => {
-                                if app.suggestion_refinement_in_progress {
+                // Handle based on workflow step
+                match app.workflow_step {
+                    WorkflowStep::Suggestions => {
+                        if app.suggestion_refinement_in_progress {
+                            app.show_toast(
+                                "Suggestions are still refining. Wait for refined results before applying.",
+                            );
+                            return Ok(());
+                        }
+                        let suggestion = app.selected_suggestion().cloned();
+                        if let Some(suggestion) = suggestion {
+                            if !llm_available_for_apply() {
+                                prompt_api_key_setup(
+                                    app,
+                                    "No API key configured yet. Add your OpenRouter key to continue.",
+                                );
+                            } else {
+                                match open_apply_plan_for_suggestion(app, &suggestion) {
+                                    Ok(()) => {}
+                                    Err(e) => app.show_toast(&e.user_message()),
+                                };
+                            }
+                        }
+                    }
+                    WorkflowStep::Review => {
+                        if !app.review_state.reviewing && !app.review_state.fixing {
+                            if !app.review_state.selected.is_empty() {
+                                // Fix selected findings (same as 'f' key)
+                                start_review_fix_for_selected_findings(app, ctx);
+                            } else if app.review_passed() {
+                                // Review passed - move to Ship
+                                app.start_ship();
+                            } else if app.review_state.verification_failed {
+                                if app.review_state.confirm_ship {
+                                    app.review_state.confirm_ship = false;
+                                    app.start_ship();
+                                } else {
+                                    app.review_state.confirm_ship = true;
                                     app.show_toast(
-                                        "Suggestions are still refining. Wait for refined results before applying.",
+                                        "Verification failed. Press Enter again to ship with manual override.",
                                     );
-                                    return Ok(());
                                 }
-                                let suggestion = app.selected_suggestion().cloned();
-                                if let Some(suggestion) = suggestion {
-                                    if !llm_available_for_apply() {
-                                        prompt_api_key_setup(
-                                            app,
-                                            "No API key configured yet. Add your OpenRouter key to continue.",
-                                        );
-                                    } else {
-                                        match open_apply_plan_for_suggestion(app, &suggestion) {
-                                            Ok(()) => {}
-                                            Err(e) => app.show_toast(&e.user_message()),
-                                        };
-                                    }
-                                }
+                            } else if app.review_state.confirm_ship {
+                                app.review_state.confirm_ship = false;
+                                app.start_ship();
+                            } else {
+                                app.review_state.confirm_ship = true;
+                                app.show_toast(
+                                    "Review has findings. Select items to fix or press Enter again to ship anyway.",
+                                );
                             }
-                            WorkflowStep::Review => {
-                                if !app.review_state.reviewing && !app.review_state.fixing {
-                                    if !app.review_state.selected.is_empty() {
-                                        // Fix selected findings (same as 'f' key)
-                                        start_review_fix_for_selected_findings(app, ctx);
-                                    } else if app.review_passed() {
-                                        // Review passed - move to Ship
-                                        app.start_ship();
-                                    } else if app.review_state.verification_failed {
-                                        if app.review_state.confirm_ship {
-                                            app.review_state.confirm_ship = false;
-                                            app.start_ship();
-                                        } else {
-                                            app.review_state.confirm_ship = true;
-                                            app.show_toast(
-                                                "Verification failed. Press Enter again to ship with manual override.",
-                                            );
+                        }
+                    }
+                    WorkflowStep::Ship => {
+                        // Execute ship based on current step
+                        match app.ship_state.step {
+                            ShipStep::Confirm => {
+                                // Start the ship process
+                                let repo_path = app.repo_path.clone();
+                                let branch_name = app.ship_state.branch_name.clone();
+                                let commit_message = app.ship_state.commit_message.clone();
+                                let (pr_title, pr_body) = app.generate_pr_content();
+                                let tx_ship = ctx.tx.clone();
+
+                                app.set_ship_step(ShipStep::Committing);
+
+                                background::spawn_background(
+                                    ctx.tx.clone(),
+                                    "ship_confirm",
+                                    async move {
+                                        // Execute ship workflow
+                                        let _ = tx_ship.send(BackgroundMessage::ShipProgress(
+                                            ShipStep::Committing,
+                                        ));
+
+                                        // Commit (files are already staged)
+                                        if let Err(e) = git_ops::commit(&repo_path, &commit_message)
+                                        {
+                                            let _ = tx_ship
+                                                .send(BackgroundMessage::ShipError(e.to_string()));
+                                            return;
                                         }
-                                    } else if app.review_state.confirm_ship {
-                                        app.review_state.confirm_ship = false;
-                                        app.start_ship();
-                                    } else {
-                                        app.review_state.confirm_ship = true;
-                                        app.show_toast(
-                                            "Review has findings. Select items to fix or press Enter again to ship anyway.",
-                                        );
-                                    }
-                                }
-                            }
-                            WorkflowStep::Ship => {
-                                // Execute ship based on current step
-                                match app.ship_state.step {
-                                    ShipStep::Confirm => {
-                                        // Start the ship process
-                                        let repo_path = app.repo_path.clone();
-                                        let branch_name = app.ship_state.branch_name.clone();
-                                        let commit_message = app.ship_state.commit_message.clone();
-                                        let (pr_title, pr_body) = app.generate_pr_content();
-                                        let tx_ship = ctx.tx.clone();
 
-                                        app.set_ship_step(ShipStep::Committing);
+                                        let _ = tx_ship.send(BackgroundMessage::ShipProgress(
+                                            ShipStep::Pushing,
+                                        ));
 
-                                        background::spawn_background(
-                                            ctx.tx.clone(),
-                                            "ship_confirm",
-                                            async move {
-                                                // Execute ship workflow
-                                                let _ =
-                                                    tx_ship.send(BackgroundMessage::ShipProgress(
-                                                        ShipStep::Committing,
-                                                    ));
-
-                                                // Commit (files are already staged)
-                                                if let Err(e) =
-                                                    git_ops::commit(&repo_path, &commit_message)
-                                                {
-                                                    let _ = tx_ship.send(
-                                                        BackgroundMessage::ShipError(e.to_string()),
-                                                    );
-                                                    return;
-                                                }
-
-                                                let _ =
-                                                    tx_ship.send(BackgroundMessage::ShipProgress(
-                                                        ShipStep::Pushing,
-                                                    ));
-
-                                                // Push
-                                                if let Err(e) =
-                                                    git_ops::push_branch(&repo_path, &branch_name)
-                                                {
-                                                    let _ = tx_ship.send(
-                                                        BackgroundMessage::ShipError(e.to_string()),
-                                                    );
-                                                    return;
-                                                }
-
-                                                let _ =
-                                                    tx_ship.send(BackgroundMessage::ShipProgress(
-                                                        ShipStep::CreatingPR,
-                                                    ));
-
-                                                // Create PR with human-friendly content
-                                                match git_ops::create_pr(
-                                                    &repo_path, &pr_title, &pr_body,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(url) => {
-                                                        let _ = tx_ship.send(
-                                                            BackgroundMessage::ShipComplete(url),
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = tx_ship.send(
-                                                            BackgroundMessage::ShipError(
-                                                                e.to_string(),
-                                                            ),
-                                                        );
-                                                    }
-                                                }
-                                            },
-                                        );
-                                    }
-                                    ShipStep::Done => {
-                                        // Open PR in browser and complete workflow
-                                        if let Some(url) = &app.ship_state.pr_url {
-                                            let _ = git_ops::open_url(url);
+                                        // Push
+                                        if let Err(e) =
+                                            git_ops::push_branch(&repo_path, &branch_name)
+                                        {
+                                            let _ = tx_ship
+                                                .send(BackgroundMessage::ShipError(e.to_string()));
+                                            return;
                                         }
-                                        app.workflow_complete();
-                                    }
-                                    _ => {}
-                                }
+
+                                        let _ = tx_ship.send(BackgroundMessage::ShipProgress(
+                                            ShipStep::CreatingPR,
+                                        ));
+
+                                        // Create PR with human-friendly content
+                                        match git_ops::create_pr(&repo_path, &pr_title, &pr_body)
+                                            .await
+                                        {
+                                            Ok(url) => {
+                                                let _ = tx_ship
+                                                    .send(BackgroundMessage::ShipComplete(url));
+                                            }
+                                            Err(e) => {
+                                                let _ = tx_ship.send(BackgroundMessage::ShipError(
+                                                    e.to_string(),
+                                                ));
+                                            }
+                                        }
+                                    },
+                                );
                             }
+                            ShipStep::Done => {
+                                // Open PR in browser and complete workflow
+                                if let Some(url) = &app.ship_state.pr_url {
+                                    let _ = git_ops::open_url(url);
+                                }
+                                app.workflow_complete();
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -935,17 +928,14 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
         }
         KeyCode::Esc => {
             // Handle ask cosmos mode exit first
-            if app.is_ask_cosmos_mode() {
+            if app.active_panel == ActivePanel::Ask && app.is_ask_cosmos_mode() {
                 app.exit_ask_cosmos();
-            } else if app.active_panel == ActivePanel::Suggestions
-                && app.workflow_step == WorkflowStep::Suggestions
+            } else if app.workflow_step == WorkflowStep::Suggestions
                 && app.armed_suggestion_id.is_some()
             {
                 app.clear_apply_confirm();
                 app.show_toast("Apply canceled.");
-            } else if app.active_panel == ActivePanel::Suggestions
-                && app.workflow_step != WorkflowStep::Suggestions
-            {
+            } else if app.workflow_step != WorkflowStep::Suggestions {
                 // Handle workflow back navigation
                 app.workflow_back();
             } else if !app.search_query.is_empty() {
@@ -954,26 +944,7 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                 app.close_overlay();
             }
         }
-        KeyCode::Char('/') => app.start_search(),
-        KeyCode::Char('g') => app.toggle_view_mode(),
-        KeyCode::PageDown => app.page_down(),
-        KeyCode::PageUp => app.page_up(),
         KeyCode::Char('?') => app.toggle_help(),
-        KeyCode::Char('d') => {
-            if app.active_panel == ActivePanel::Suggestions
-                && app.workflow_step == WorkflowStep::Suggestions
-            {
-                app.toggle_suggestion_diagnostics();
-            }
-        }
-        KeyCode::Char('x') => {
-            if app.active_panel == ActivePanel::Suggestions
-                && app.workflow_step == WorkflowStep::Suggestions
-                && app.dismiss_selected_suggestion()
-            {
-                app.show_toast("Suggestion dismissed for this session.");
-            }
-        }
         KeyCode::Char('a') => {
             // Select all findings in Review step
             if app.active_panel == ActivePanel::Suggestions
@@ -982,19 +953,6 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                 && !app.review_state.fixing
             {
                 app.review_select_all();
-            }
-        }
-        KeyCode::Char('i') => {
-            // Ask Cosmos - only available from home (Suggestions step, not in workflow)
-            if app.workflow_step != WorkflowStep::Suggestions {
-                // Silently ignore during workflow
-            } else if !cosmos_engine::llm::is_available() {
-                prompt_api_key_setup(
-                    app,
-                    "No API key configured yet. Add your OpenRouter key to ask questions.",
-                );
-            } else {
-                app.start_question();
             }
         }
         KeyCode::Char('k') => {
