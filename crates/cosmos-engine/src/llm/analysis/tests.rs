@@ -706,6 +706,233 @@ fn prevalidation_rejection_reason_catches_missing_and_duplicate_primary_evidence
 }
 
 #[test]
+fn prevalidation_rejection_reason_rejects_unconfigured_client_id_claim_when_literal_exists() {
+    let mut chunk_seen_evidence_ids: HashSet<usize> = HashSet::new();
+    let used_evidence_ids: HashSet<usize> = HashSet::new();
+
+    let suggestion = test_suggestion(
+        "GitHub login can fail because the client id is not configured in this build.",
+    )
+    .with_evidence("31| const CLIENT_ID: &str = \"Ov23liBvoDPv3W7Dpjoz\";".to_string())
+    .with_evidence_refs(vec![SuggestionEvidenceRef {
+        snippet_id: 11,
+        file: PathBuf::from("src/github.rs"),
+        line: 31,
+    }]);
+
+    let reason = prevalidation_rejection_reason(
+        &suggestion,
+        &used_evidence_ids,
+        &mut chunk_seen_evidence_ids,
+    )
+    .expect("configured client id contradiction should be rejected");
+
+    assert!(reason.0.contains("client ID appears configured"));
+    assert_eq!(reason.1, Some(11));
+}
+
+#[test]
+fn prevalidation_client_id_contradiction_allows_placeholder_value() {
+    let suggestion = test_suggestion(
+        "GitHub login can fail because the client id is not configured in this build.",
+    )
+    .with_evidence("31| const CLIENT_ID: &str = \"YOUR_CLIENT_ID_HERE\";".to_string());
+
+    assert!(
+        deterministic_prevalidation_contradiction_reason(&suggestion).is_none(),
+        "placeholder client id should not be auto-contradicted"
+    );
+}
+
+#[test]
+fn prevalidation_rejection_reason_rejects_absolute_path_guard_false_positive() {
+    let mut chunk_seen_evidence_ids: HashSet<usize> = HashSet::new();
+    let used_evidence_ids: HashSet<usize> = HashSet::new();
+
+    let suggestion = test_suggestion(
+        "Absolute path handling fails and blocks users from opening projects with full paths.",
+    )
+    .with_evidence(
+        "105| if candidate.is_absolute() {\n106|     return Err(format!(\"Absolute paths are not allowed\"));\n107| }"
+            .to_string(),
+    )
+    .with_evidence_refs(vec![SuggestionEvidenceRef {
+        snippet_id: 12,
+        file: PathBuf::from("src/util.rs"),
+        line: 105,
+    }]);
+
+    let reason = prevalidation_rejection_reason(
+        &suggestion,
+        &used_evidence_ids,
+        &mut chunk_seen_evidence_ids,
+    )
+    .expect("absolute path guard contradiction should be rejected");
+
+    assert!(reason.0.contains("absolute-path security guard"));
+    assert_eq!(reason.1, Some(12));
+}
+
+#[test]
+fn prevalidation_rejection_reason_rejects_cache_not_created_false_positive() {
+    let mut chunk_seen_evidence_ids: HashSet<usize> = HashSet::new();
+    let used_evidence_ids: HashSet<usize> = HashSet::new();
+
+    let suggestion = test_suggestion(
+        "Cache operations crash because the cache directory is not automatically created.",
+    )
+    .with_evidence(
+        "757| if exclusive {\n758|     self.ensure_dir()?;\n759| }\n724| fs::create_dir_all(&self.cache_dir)?;"
+            .to_string(),
+    )
+    .with_evidence_refs(vec![SuggestionEvidenceRef {
+        snippet_id: 13,
+        file: PathBuf::from("src/cache.rs"),
+        line: 757,
+    }]);
+
+    let reason = prevalidation_rejection_reason(
+        &suggestion,
+        &used_evidence_ids,
+        &mut chunk_seen_evidence_ids,
+    )
+    .expect("cache directory contradiction should be rejected");
+
+    assert!(reason.0.contains("cache-directory creation/ensure logic"));
+    assert_eq!(reason.1, Some(13));
+}
+
+#[test]
+fn prevalidation_rejection_reason_rejects_non_actionable_safeguard_praise() {
+    let mut chunk_seen_evidence_ids: HashSet<usize> = HashSet::new();
+    let used_evidence_ids: HashSet<usize> = HashSet::new();
+
+    let suggestion = test_suggestion(
+        "Restoring files refuses malicious paths, preventing attackers from accessing arbitrary files.",
+    )
+    .with_evidence(
+        "709| // Validate path to prevent traversal attacks\n710| let resolved = resolve_repo_path_allow_new(repo_path, file_path)\n711|     .map_err(|e| anyhow::anyhow!(\"Invalid path '{}': {}\", file_path.display(), e))?;\n105| if candidate.is_absolute() {\n106|     return Err(format!(\"Absolute paths are not allowed\"));\n107| }".to_string(),
+    )
+    .with_evidence_refs(vec![SuggestionEvidenceRef {
+        snippet_id: 14,
+        file: PathBuf::from("src/git_ops.rs"),
+        line: 709,
+    }]);
+
+    let reason = prevalidation_rejection_reason(
+        &suggestion,
+        &used_evidence_ids,
+        &mut chunk_seen_evidence_ids,
+    )
+    .expect("non-actionable safeguard praise should be rejected");
+
+    assert!(reason.0.contains("Non-actionable safeguard description"));
+    assert_eq!(reason.1, Some(14));
+}
+
+#[test]
+fn prevalidation_safeguard_filter_allows_defect_risk_wording() {
+    let suggestion = test_suggestion(
+        "Path validation can still be bypassed, allowing traversal attacks in some flows.",
+    )
+    .with_evidence(
+        "105| if candidate.is_absolute() {\n106|     return Err(format!(\"Absolute paths are not allowed\"));\n107| }"
+            .to_string(),
+    );
+
+    assert!(
+        deterministic_prevalidation_non_actionable_reason(&suggestion).is_none(),
+        "defect-risk wording should not be treated as non-actionable praise"
+    );
+}
+
+#[test]
+fn prevalidation_non_security_praise_filter_requires_handling_signals() {
+    let suggestion = test_suggestion(
+        "Users get a clear setup error instead of a silent failure when credentials are missing.",
+    )
+    .with_evidence("84| fn setup_label() -> &'static str {\n85|     \"setup\"\n86| }".to_string());
+
+    assert!(
+        deterministic_prevalidation_non_actionable_reason(&suggestion).is_none(),
+        "without explicit handling signals in snippet, non-security praise should not auto-reject"
+    );
+}
+
+#[test]
+fn prevalidation_rejection_reason_rejects_non_security_clear_error_praise() {
+    let mut chunk_seen_evidence_ids: HashSet<usize> = HashSet::new();
+    let used_evidence_ids: HashSet<usize> = HashSet::new();
+
+    let suggestion = test_suggestion(
+        "Missing GitHub token produces a readable error, preventing silent pull-request failures.",
+    )
+    .with_evidence(
+        "420| let token = get_stored_token().ok_or_else(|| anyhow::anyhow!(\"GitHub token not configured\"))?;\n421| return Err(anyhow::anyhow!(\"GitHub token not configured\"));".to_string(),
+    )
+    .with_evidence_refs(vec![SuggestionEvidenceRef {
+        snippet_id: 15,
+        file: PathBuf::from("src/github.rs"),
+        line: 420,
+    }]);
+
+    let reason = prevalidation_rejection_reason(
+        &suggestion,
+        &used_evidence_ids,
+        &mut chunk_seen_evidence_ids,
+    )
+    .expect("non-security clear-error praise should be rejected");
+
+    assert!(reason.0.contains("Non-actionable behavior description"));
+    assert_eq!(reason.1, Some(15));
+}
+
+#[test]
+fn prevalidation_rejection_reason_rejects_non_security_retry_praise() {
+    let mut chunk_seen_evidence_ids: HashSet<usize> = HashSet::new();
+    let used_evidence_ids: HashSet<usize> = HashSet::new();
+
+    let suggestion = test_suggestion(
+        "Network hiccups are automatically retried, so users rarely see hard failures.",
+    )
+    .with_evidence(
+        "1160| let text = send_with_retry(&client, &api_key, &request).await?;\n1170| // retry on transient errors"
+            .to_string(),
+    )
+    .with_evidence_refs(vec![SuggestionEvidenceRef {
+        snippet_id: 16,
+        file: PathBuf::from("src/client.rs"),
+        line: 1160,
+    }]);
+
+    let reason = prevalidation_rejection_reason(
+        &suggestion,
+        &used_evidence_ids,
+        &mut chunk_seen_evidence_ids,
+    )
+    .expect("non-security retry praise should be rejected");
+
+    assert!(reason.0.contains("Non-actionable behavior description"));
+    assert_eq!(reason.1, Some(16));
+}
+
+#[test]
+fn prevalidation_non_security_praise_filter_keeps_strong_defect_risk_claims() {
+    let suggestion = test_suggestion(
+        "The app shows a clear error, but a race condition can still crash under load.",
+    )
+    .with_evidence(
+        "91| return Err(anyhow::anyhow!(\"temporary error\"));\n99| // race condition near shared state"
+            .to_string(),
+    );
+
+    assert!(
+        deterministic_prevalidation_non_actionable_reason(&suggestion).is_none(),
+        "strong defect-risk wording should not be filtered as non-actionable praise"
+    );
+}
+
+#[test]
 fn remap_suggestion_to_original_ids_handles_non_contiguous_ids() {
     let full_pack = vec![
         EvidenceItem {

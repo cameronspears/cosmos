@@ -3144,17 +3144,387 @@ fn prevalidation_rejection_reason(
         ));
     }
 
+    if let Some(reason) = deterministic_prevalidation_contradiction_reason(suggestion) {
+        return Some((reason, Some(evidence_id), false));
+    }
+
+    if let Some(reason) = deterministic_prevalidation_non_actionable_reason(suggestion) {
+        return Some((reason, Some(evidence_id), false));
+    }
+
+    None
+}
+
+fn normalize_claim_text_for_matching(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = true;
+    for ch in text.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            ' '
+        };
+        if mapped == ' ' {
+            if prev_space {
+                continue;
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        out.push(mapped);
+    }
+    out
+}
+
+fn snippet_code_line(line: &str) -> &str {
+    if let Some((_, rest)) = line.split_once('|') {
+        rest
+    } else {
+        line
+    }
+}
+
+fn parse_leading_quoted_literal(rhs: &str) -> Option<String> {
+    let mut chars = rhs.chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let mut value = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            value.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return Some(value);
+        }
+        value.push(ch);
+    }
+    None
+}
+
+fn is_placeholder_client_id(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+    [
+        "your_client_id_here",
+        "client_id_here",
+        "placeholder",
+        "replace",
+        "changeme",
+        "todo",
+        "example",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn snippet_has_configured_client_id_literal(snippet: &str) -> bool {
+    for raw_line in snippet.lines() {
+        let code = snippet_code_line(raw_line).trim();
+        let lower = code.to_ascii_lowercase();
+        if !lower.contains("client_id") {
+            continue;
+        }
+        let Some((_, rhs)) = code.split_once('=') else {
+            continue;
+        };
+        let Some(value) = parse_leading_quoted_literal(rhs.trim()) else {
+            continue;
+        };
+        if !is_placeholder_client_id(&value) {
+            return true;
+        }
+    }
+    false
+}
+
+fn claim_targets_unconfigured_client_id(claim: &str) -> bool {
+    claim.contains("client id")
+        && (claim.contains("not configured")
+            || claim.contains("missing")
+            || claim.contains("placeholder")
+            || claim.contains("not replaced"))
+}
+
+fn claim_targets_absolute_path_guard(claim: &str) -> bool {
+    if !claim.contains("absolute path") {
+        return false;
+    }
+    [
+        "error", "fail", "cannot", "cant", "blocking", "stopping", "break", "trigger", "prevent",
+    ]
+    .iter()
+    .any(|marker| claim.contains(marker))
+}
+
+fn snippet_has_absolute_path_guard(snippet: &str) -> bool {
+    let lower = snippet.to_ascii_lowercase();
+    lower.contains("is_absolute()") && lower.contains("absolute paths are not allowed")
+}
+
+fn claim_targets_cache_dir_creation(claim: &str) -> bool {
+    let mentions_cache_dir = claim.contains("cache directory")
+        || claim.contains("cache dir")
+        || claim.contains("cache folder");
+    if !mentions_cache_dir {
+        return false;
+    }
+    claim.contains("not automatically created")
+        || claim.contains("not created")
+        || claim.contains("missing")
+}
+
+fn snippet_has_cache_dir_creation(snippet: &str) -> bool {
+    let lower = snippet.to_ascii_lowercase();
+    let mentions_cache_dir = lower.contains("cache_dir") || lower.contains("cache directory");
+    let creates_or_ensures = lower.contains("create_dir_all")
+        || lower.contains("ensure_dir()?")
+        || lower.contains("ensure_dir()");
+    mentions_cache_dir && creates_or_ensures
+}
+
+fn claim_is_safeguard_praise(claim: &str) -> bool {
+    let has_positive_guard_word = [
+        "prevent",
+        "prevents",
+        "protect",
+        "protects",
+        "blocks",
+        "refuses",
+        "rejects",
+        "stops",
+        "ensures",
+        "guards",
+        "mitigat",
+        "secure",
+        "safeguard",
+    ]
+    .iter()
+    .any(|marker| claim.contains(marker));
+    if !has_positive_guard_word {
+        return false;
+    }
+
+    [
+        "attacker",
+        "malicious",
+        "traversal",
+        "arbitrary file",
+        "security",
+        "unsafe path",
+        "outside the repository",
+        "outside repository",
+        "path validation",
+        "path guard",
+    ]
+    .iter()
+    .any(|marker| claim.contains(marker))
+}
+
+fn claim_mentions_defect_risk(claim: &str) -> bool {
+    [
+        "bypass",
+        "bypassed",
+        "missing",
+        "fails",
+        "failure",
+        "broken",
+        "bug",
+        "vulnerab",
+        "unsafe",
+        "panic",
+        "crash",
+        "incorrect",
+        "regression",
+        "not validated",
+        "not checked",
+        "can still",
+        "allows",
+        "allowing",
+        "exposes",
+        "exploitable",
+    ]
+    .iter()
+    .any(|marker| claim.contains(marker))
+}
+
+fn claim_has_strong_defect_risk(claim: &str) -> bool {
+    [
+        "vulnerab",
+        "exploitable",
+        "bypass",
+        "data loss",
+        "corrupt",
+        "panic",
+        "crash",
+        "race condition",
+        "deadlock",
+        "stale lock",
+        "unsafe write",
+        "arbitrary file",
+    ]
+    .iter()
+    .any(|marker| claim.contains(marker))
+}
+
+fn claim_is_non_security_praise(claim: &str) -> bool {
+    [
+        "clear error",
+        "readable error",
+        "friendly error",
+        "helpful error",
+        "clear message",
+        "readable message",
+        "instead of hanging",
+        "instead of a silent failure",
+        "instead of silent failure",
+        "doesn t fail silently",
+        "doesnt fail silently",
+        "prevents silent",
+        "preventing silent",
+        "automatically retried",
+        "retries automatically",
+        "retried automatically",
+        "now reflects",
+        "now shows",
+        "no longer result in confusing",
+        "no longer produces confusing",
+        "prevents confusion",
+    ]
+    .iter()
+    .any(|marker| claim.contains(marker))
+}
+
+fn snippet_has_explicit_guard_check(snippet: &str) -> bool {
+    let lower = snippet.to_ascii_lowercase();
+    let has_guard_signal = [
+        "is_absolute()",
+        "absolute paths are not allowed",
+        "parent traversal is not allowed",
+        "path escapes repository",
+        "symlinks are not allowed",
+        "path contains symlink",
+        "resolve_repo_path_allow_new",
+        "component::parentdir",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if !has_guard_signal {
+        return false;
+    }
+
+    [
+        "return err",
+        "return false",
+        "not allowed",
+        "escapes repository",
+        "invalid path",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn snippet_has_explicit_non_security_handling(snippet: &str) -> bool {
+    let lower = snippet.to_ascii_lowercase();
+    let explicit_error_handling = [
+        "return err(",
+        ".map_err(",
+        "anyhow::anyhow!",
+        "show_toast(",
+        "prompt_api_key_setup(",
+        "failed to",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let explicit_retry_handling = ["retry", "send_with_retry", "attempt", "backoff"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    let explicit_ordering = ["sort_by(", "sort_by_key(", ".cmp("]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    explicit_error_handling || explicit_retry_handling || explicit_ordering
+}
+
+fn deterministic_prevalidation_contradiction_reason(suggestion: &Suggestion) -> Option<String> {
+    let snippet = suggestion.evidence.as_deref()?;
+    let claim = normalize_claim_text_for_matching(&format!(
+        "{} {}",
+        suggestion.summary,
+        suggestion.detail.as_deref().unwrap_or("")
+    ));
+
+    if claim_targets_unconfigured_client_id(&claim)
+        && snippet_has_configured_client_id_literal(snippet)
+    {
+        return Some(
+            "Contradicted by evidence: client ID appears configured with a concrete value in the snippet."
+                .to_string(),
+        );
+    }
+
+    if claim_targets_absolute_path_guard(&claim) && snippet_has_absolute_path_guard(snippet) {
+        return Some(
+            "Contradicted by evidence: snippet shows an explicit absolute-path security guard."
+                .to_string(),
+        );
+    }
+
+    if claim_targets_cache_dir_creation(&claim) && snippet_has_cache_dir_creation(snippet) {
+        return Some(
+            "Contradicted by evidence: snippet already includes cache-directory creation/ensure logic."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+fn deterministic_prevalidation_non_actionable_reason(suggestion: &Suggestion) -> Option<String> {
+    let snippet = suggestion.evidence.as_deref()?;
+    let claim = normalize_claim_text_for_matching(&format!(
+        "{} {}",
+        suggestion.summary,
+        suggestion.detail.as_deref().unwrap_or("")
+    ));
+
+    if claim_is_safeguard_praise(&claim)
+        && !claim_mentions_defect_risk(&claim)
+        && snippet_has_explicit_guard_check(snippet)
+    {
+        return Some(
+            "Non-actionable safeguard description: snippet shows intentional guard behavior rather than a defect."
+                .to_string(),
+        );
+    }
+
+    if claim_is_non_security_praise(&claim)
+        && !claim_has_strong_defect_risk(&claim)
+        && snippet_has_explicit_non_security_handling(snippet)
+    {
+        return Some(
+            "Non-actionable behavior description: suggestion praises existing handling rather than identifying a concrete defect."
+                .to_string(),
+        );
+    }
+
     None
 }
 
 fn snippet_contains_empty_catch(snippet: &str) -> bool {
     let mut code_lines = Vec::new();
     for line in snippet.lines() {
-        let code = if let Some((_, rest)) = line.split_once('|') {
-            rest
-        } else {
-            line
-        };
+        let code = snippet_code_line(line);
         code_lines.push(code.trim().to_string());
     }
 
@@ -3231,11 +3601,7 @@ fn has_high_speculation_impact_language(text: &str) -> bool {
 fn snippet_identifier_tokens(snippet: &str) -> HashSet<String> {
     let mut tokens = HashSet::new();
     for line in snippet.lines() {
-        let code = if let Some((_, rest)) = line.split_once('|') {
-            rest
-        } else {
-            line
-        };
+        let code = snippet_code_line(line);
         for raw in code.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
             if let Some(token) = normalize_similarity_token(raw) {
                 tokens.insert(token);

@@ -54,6 +54,7 @@ TASK:
 WRITE GREAT SUGGESTIONS:
 - `summary` is what the user sees. The reader is non-technical.
 - Write for someone building a product or tool, not for engineers.
+- Avoid formulaic templates like "When someone ...".
 - `summary` must answer two things:
   1) What goes wrong for the person using the product.
   2) Why that matters in real life (lost sign-ins, failed saves, slower app, crashes, trust/support cost).
@@ -78,6 +79,7 @@ WRITE GREAT SUGGESTIONS:
 - `detail` is internal technical context for verification/fixing. It may mention files/functions.
 - For both `summary` and `detail`, keep claims local to what the snippet proves.
 - Keep each suggestion focused on one concrete claim backed by one evidence reference.
+- Do not treat explicit guard-rail checks as bugs by default (for example, intentional security policy errors) unless the snippet shows a real defect.
 - Use distinct `evidence_id` values across suggestions; avoid reusing IDs until you have at least 12 suggestions.
 - Reject unsupported impact claims immediately instead of softening with assumptions.
 - Reject speculative outcomes (for example: inferred user-facing rollback behavior, audience effects, or unsaved-state claims) unless explicitly shown.
