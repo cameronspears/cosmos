@@ -2,7 +2,7 @@ use crate::ui::helpers::{wrap_text, wrap_text_variable_width};
 use crate::ui::markdown;
 use crate::ui::theme::Theme;
 use crate::ui::{
-    ActivePanel, App, AskCosmosState, InputMode, LoadingState, ShipStep, WorkflowStep,
+    ActivePanel, App, AskCosmosState, LoadingState, ShipStep, WorkflowStep, ASK_STARTER_QUESTIONS,
     SPINNER_FRAMES,
 };
 use ratatui::{
@@ -34,6 +34,31 @@ thread_local! {
     static ASK_MARKDOWN_CACHE: RefCell<Option<CachedAskMarkdown>> = const { RefCell::new(None) };
 }
 
+const ASK_TARGET_PERCENT: u16 = 30;
+const ASK_MIN_COLS: u16 = 44;
+const ASK_MAX_COLS: u16 = 58;
+const SUGGESTIONS_MIN_COLS: u16 = 52;
+const GAP_COLS: u16 = 2;
+const ASK_HARD_MIN_COLS: u16 = 28;
+
+fn compute_ask_panel_width(padded_width: u16) -> u16 {
+    let available = padded_width.saturating_sub(GAP_COLS);
+    if available == 0 {
+        return 0;
+    }
+
+    let target = ((available as u32 * ASK_TARGET_PERCENT as u32) + 50) / 100;
+    let bounded = (target as u16)
+        .clamp(ASK_MIN_COLS, ASK_MAX_COLS)
+        .min(available);
+    let max_allowed = available
+        .saturating_sub(SUGGESTIONS_MIN_COLS)
+        .max(ASK_HARD_MIN_COLS)
+        .min(available);
+
+    bounded.min(max_allowed)
+}
+
 pub(super) fn render_main(frame: &mut Frame, area: Rect, app: &App) {
     let (suggestions_rect, ask_rect) = MAIN_LAYOUT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -55,12 +80,13 @@ pub(super) fn render_main(frame: &mut Frame, area: Rect, app: &App) {
             ])
             .split(area);
 
+        let ask_width = compute_ask_panel_width(padded[1].width);
         let panels = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(74), // Main workflow/suggestions
-                Constraint::Length(2),      // Gap
-                Constraint::Percentage(26), // Ask panel (thin)
+                Constraint::Min(SUGGESTIONS_MIN_COLS), // Main workflow/suggestions
+                Constraint::Length(GAP_COLS),          // Gap
+                Constraint::Length(ask_width),         // Ask panel (adaptive)
             ])
             .split(padded[1]);
 
@@ -179,7 +205,6 @@ fn render_suggestions_content<'a>(
             }
         }
         LoadingState::Resetting => Some("Resetting cache...".to_string()),
-        LoadingState::Answering => Some("Thinking...".to_string()),
         LoadingState::None => None,
         _ => {
             // For other active loading states, show context if available
@@ -959,13 +984,10 @@ fn render_ship_content<'a>(
 }
 
 fn render_ask_panel(frame: &mut Frame, area: Rect, app: &App) {
-    let is_question_mode = app.input_mode == InputMode::Question;
-    let has_response = app.ask_cosmos_state.is_some();
-    let is_loading = app.loading == LoadingState::Answering;
     let is_active = app.active_panel == ActivePanel::Ask;
 
-    let border_style = if is_active || is_question_mode || has_response || is_loading {
-        Style::default().fg(Theme::WHITE)
+    let border_style = if is_active {
+        Style::default().fg(Theme::GREY_300)
     } else {
         Style::default().fg(Theme::GREY_600)
     };
@@ -974,14 +996,11 @@ fn render_ask_panel(frame: &mut Frame, area: Rect, app: &App) {
     let inner_width = area.width.saturating_sub(4) as usize;
     let mut lines = vec![];
 
-    if is_question_mode {
-        render_question_mode_content(&mut lines, app, visible_height, inner_width);
-    } else if let Some(ask_state) = &app.ask_cosmos_state {
+    if let Some(ask_state) = &app.ask_cosmos_state {
         render_ask_cosmos_content(&mut lines, ask_state, app, visible_height, inner_width);
-    } else if is_loading {
-        render_ask_cosmos_loading(&mut lines, app);
     } else {
-        render_ask_idle_content(&mut lines, app, visible_height);
+        // Always show input + starters by default (no Enter gate/idle state).
+        render_question_mode_content(&mut lines, app, visible_height, inner_width, is_active);
     }
 
     let block = Block::default()
@@ -995,81 +1014,18 @@ fn render_ask_panel(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_ask_idle_content<'a>(lines: &mut Vec<Line<'a>>, app: &App, visible_height: usize) {
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "  Ask about this repo",
-        Style::default().fg(Theme::GREY_300),
-    )]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  ", Style::default()),
-        Span::styled(
-            " ↵ ",
-            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
-        ),
-        Span::styled(" start question", Style::default().fg(Theme::GREY_400)),
-    ]));
-
-    if !cosmos_engine::llm::is_available() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                " k ",
-                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_500),
-            ),
-            Span::styled(" setup API key", Style::default().fg(Theme::GREY_400)),
-        ]));
-    }
-
-    let used = lines.len();
-    for _ in 0..visible_height.saturating_sub(used + 1) {
-        lines.push(Line::from(""));
-    }
-
-    lines.push(Line::from(vec![
-        Span::styled("  ", Style::default()),
-        Span::styled("Q&A", Style::default().fg(Theme::GREY_600)),
-        if app.question_cache.entries.is_empty() {
-            Span::styled("", Style::default())
-        } else {
-            Span::styled(
-                format!(" · {} cached", app.question_cache.entries.len()),
-                Style::default().fg(Theme::GREY_600),
-            )
-        },
-    ]));
-}
-
 /// Render the question input mode content in the right panel
 fn render_question_mode_content<'a>(
     lines: &mut Vec<Line<'a>>,
     app: &App,
     visible_height: usize,
     inner_width: usize,
+    show_action_hints: bool,
 ) {
-    fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
-        if max_chars == 0 {
-            return String::new();
-        }
-        let len = text.chars().count();
-        if len <= max_chars {
-            return text.to_string();
-        }
-        if max_chars == 1 {
-            return "…".to_string();
-        }
-        let head: String = text.chars().take(max_chars.saturating_sub(1)).collect();
-        format!("{head}…")
-    }
-
     let text_width = inner_width.saturating_sub(6).max(10);
 
-    // Top padding
     lines.push(Line::from(""));
 
-    // Input line with cursor
     let cursor = "█";
     let input_line = if app.question_input.is_empty() {
         Line::from(vec![
@@ -1092,118 +1048,156 @@ fn render_question_mode_content<'a>(
         ])
     };
     lines.push(input_line);
-
     lines.push(Line::from(""));
 
-    // Show suggested questions when input is empty
-    if app.question_input.is_empty() && !app.question_suggestions.is_empty() {
+    if app.ask_in_flight {
+        let spinner = SPINNER_FRAMES[app.loading_frame % SPINNER_FRAMES.len()];
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(format!("{} ", spinner), Style::default().fg(Theme::WHITE)),
+            Span::styled("Thinking...", Style::default().fg(Theme::GREY_300)),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    if app.question_input.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            "  Suggested questions:",
+            "  Suggested starters:",
             Style::default().fg(Theme::GREY_400),
         )]));
         lines.push(Line::from(""));
 
-        let total = app.question_suggestions.len();
+        let total = ASK_STARTER_QUESTIONS.len();
         let selected = app
             .question_suggestion_selected
             .min(total.saturating_sub(1));
-        let list_height = visible_height.saturating_sub(lines.len() + 3).max(1);
-        let start = selected.saturating_sub(list_height.saturating_sub(1));
-        let end = (start + list_height).min(total);
+        let list_budget = visible_height.saturating_sub(lines.len() + 2);
+        let max_items_by_budget = list_budget.saturating_div(2).max(1);
+        let (start, end) = suggestion_window(total, selected, max_items_by_budget);
+        let mut consumed = 0usize;
+        let mut rendered = 0usize;
 
         for i in start..end {
-            let suggestion = &app.question_suggestions[i];
-            let is_selected = i == app.question_suggestion_selected;
-            let shown = truncate_with_ellipsis(suggestion, text_width);
-
-            let (prefix, style) = if is_selected {
-                (" › ", Style::default().fg(Theme::WHITE))
+            let is_selected = i == selected;
+            let style = if is_selected {
+                Style::default().fg(Theme::WHITE)
             } else {
-                ("   ", Style::default().fg(Theme::GREY_400))
+                Style::default().fg(Theme::GREY_400)
             };
+            let wrapped = wrap_text(
+                ASK_STARTER_QUESTIONS[i],
+                text_width.saturating_sub(4).max(1),
+            );
+            let needed = wrapped.len().saturating_add(1); // +1 vertical spacer between starters
 
-            lines.push(Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(shown, style),
-            ]));
+            if consumed + needed > list_budget {
+                break;
+            }
+
+            for (line_idx, segment) in wrapped.into_iter().enumerate() {
+                let prefix = if line_idx == 0 {
+                    if is_selected {
+                        " › "
+                    } else {
+                        "   "
+                    }
+                } else {
+                    "   "
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, style),
+                    Span::styled(segment, style),
+                ]));
+            }
+
+            lines.push(Line::from(""));
+            consumed += needed;
+            rendered += 1;
         }
 
-        if end < total {
+        let hidden_count = total.saturating_sub(start + rendered);
+        if hidden_count > 0 && consumed < list_budget {
             lines.push(Line::from(vec![Span::styled(
-                format!("   +{} more", total - end),
+                format!("   +{} more", hidden_count),
                 Style::default().fg(Theme::GREY_500),
             )]));
+        } else if matches!(lines.last(), Some(last) if last.spans.is_empty()) {
+            lines.pop();
         }
     }
 
-    // Fill remaining space and add hints at bottom
-    let used_lines = lines.len();
-    let remaining = visible_height.saturating_sub(used_lines + 2);
+    let footer_lines = usize::from(show_action_hints);
+    let remaining = visible_height.saturating_sub(lines.len() + footer_lines);
     for _ in 0..remaining {
         lines.push(Line::from(""));
     }
 
-    // Action hints
-    let hint = if app.question_input.is_empty() {
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                " ↑↓ ",
-                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
-            ),
-            Span::styled(" browse ", Style::default().fg(Theme::GREY_400)),
-            Span::styled(" ", Style::default()),
-            Span::styled(
-                " ↵ ",
-                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
-            ),
-            Span::styled(" ask ", Style::default().fg(Theme::GREY_400)),
-            Span::styled(" ", Style::default()),
-            Span::styled(
-                " Esc ",
-                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
-            ),
-            Span::styled(" cancel ", Style::default().fg(Theme::GREY_400)),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                " ↵ ",
-                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
-            ),
-            Span::styled(" ask ", Style::default().fg(Theme::GREY_400)),
-            Span::styled(" ", Style::default()),
-            Span::styled(
-                " Esc ",
-                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
-            ),
-            Span::styled(" cancel ", Style::default().fg(Theme::GREY_400)),
-        ])
-    };
-    lines.push(hint);
+    if show_action_hints {
+        let hint = if app.question_input.is_empty() {
+            Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    " ↑↓ ",
+                    Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+                ),
+                Span::styled(" choose ", Style::default().fg(Theme::GREY_400)),
+                Span::styled(" ", Style::default()),
+                Span::styled(
+                    " ↵ ",
+                    Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+                ),
+                Span::styled(" ask ", Style::default().fg(Theme::GREY_400)),
+                Span::styled(" ", Style::default()),
+                Span::styled(
+                    " Esc ",
+                    Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+                ),
+                Span::styled(" cancel ", Style::default().fg(Theme::GREY_400)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    " ↵ ",
+                    Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+                ),
+                Span::styled(" ask ", Style::default().fg(Theme::GREY_400)),
+                Span::styled(" ", Style::default()),
+                Span::styled(
+                    " Esc ",
+                    Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+                ),
+                Span::styled(" cancel ", Style::default().fg(Theme::GREY_400)),
+            ])
+        };
+        lines.push(hint);
+    }
 }
 
-/// Render the loading state for Ask Cosmos
-fn render_ask_cosmos_loading<'a>(lines: &mut Vec<Line<'a>>, app: &App) {
-    lines.push(Line::from(""));
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let len = text.chars().count();
+    if len <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let head: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{head}…")
+}
 
-    let spinner = SPINNER_FRAMES[app.loading_frame % SPINNER_FRAMES.len()];
-    lines.push(Line::from(vec![
-        Span::styled("    ", Style::default()),
-        Span::styled(format!("{} ", spinner), Style::default().fg(Theme::WHITE)),
-        Span::styled("Thinking...", Style::default().fg(Theme::GREY_300)),
-    ]));
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("    ", Style::default()),
-        Span::styled(
-            "Esc",
-            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_500),
-        ),
-        Span::styled(" cancel", Style::default().fg(Theme::GREY_500)),
-    ]));
+fn suggestion_window(total: usize, selected: usize, list_height: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    let clamped_selected = selected.min(total.saturating_sub(1));
+    let height = list_height.max(1);
+    let start = clamped_selected.saturating_sub(height.saturating_sub(1));
+    let end = (start + height).min(total);
+    (start, end)
 }
 
 /// Render the Ask Cosmos response content in the right panel
@@ -1298,4 +1292,99 @@ fn stable_hash(input: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     input.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmos_core::context::WorkContext;
+    use cosmos_core::index::CodebaseIndex;
+    use cosmos_core::suggest::SuggestionEngine;
+    use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_test_app() -> App {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_render_main_test_{}", nanos));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files: HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: Some("deadbeef".to_string()),
+        };
+        let suggestions = SuggestionEngine::new(index.clone());
+        let context = WorkContext {
+            branch: "main".to_string(),
+            uncommitted_files: Vec::new(),
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 0,
+            repo_root: root,
+        };
+        App::new(index, suggestions, context)
+    }
+
+    #[test]
+    fn ask_width_wide_view_respects_max_cap() {
+        let ask_width = compute_ask_panel_width(240);
+        assert_eq!(ask_width, ASK_MAX_COLS);
+    }
+
+    #[test]
+    fn ask_width_medium_view_follows_target_and_min() {
+        let ask_width = compute_ask_panel_width(150);
+        assert_eq!(ask_width, ASK_MIN_COLS);
+    }
+
+    #[test]
+    fn ask_width_narrow_view_preserves_suggestions_space_when_possible() {
+        let padded_width = 90;
+        let ask_width = compute_ask_panel_width(padded_width);
+        let available = padded_width.saturating_sub(GAP_COLS);
+        let suggestions_width = available.saturating_sub(ask_width);
+
+        assert_eq!(ask_width, 36);
+        assert_eq!(suggestions_width, SUGGESTIONS_MIN_COLS);
+    }
+
+    #[test]
+    fn ask_hints_hidden_when_panel_is_not_active() {
+        let app = make_test_app();
+        let mut lines = Vec::new();
+
+        render_question_mode_content(&mut lines, &app, 20, 60, false);
+
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!rendered.contains(" choose "));
+        assert!(!rendered.contains(" ask "));
+        assert!(!rendered.contains(" cancel "));
+    }
+
+    #[test]
+    fn ask_hints_visible_when_panel_is_active() {
+        let app = make_test_app();
+        let mut lines = Vec::new();
+
+        render_question_mode_content(&mut lines, &app, 20, 60, true);
+
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains(" choose "));
+        assert!(rendered.contains(" ask "));
+        assert!(rendered.contains(" cancel "));
+    }
 }

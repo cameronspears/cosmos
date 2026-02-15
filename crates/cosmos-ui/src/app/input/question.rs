@@ -1,7 +1,7 @@
 use crate::app::background;
 use crate::app::messages::BackgroundMessage;
 use crate::app::RuntimeContext;
-use crate::ui::{App, LoadingState};
+use crate::ui::{App, InputMode, ASK_STARTER_QUESTIONS};
 use anyhow::Result;
 use cosmos_adapters::util::{hash_bytes, hash_str, resolve_repo_path_allow_new};
 use crossterm::event::{KeyCode, KeyEvent};
@@ -14,7 +14,10 @@ pub(super) fn handle_question_input(
     ctx: &RuntimeContext,
 ) -> Result<()> {
     match key.code {
-        KeyCode::Esc => app.exit_question(),
+        KeyCode::Esc => {
+            app.question_input.clear();
+            app.question_suggestion_selected = 0;
+        }
         KeyCode::Up if app.question_input.is_empty() => app.question_suggestion_up(),
         KeyCode::Down if app.question_input.is_empty() => app.question_suggestion_down(),
         KeyCode::Enter => submit_question(app, ctx)?,
@@ -93,19 +96,22 @@ fn compute_context_hash(app: &App) -> String {
 /// Submit a question to the LLM
 fn submit_question(app: &mut App, ctx: &RuntimeContext) -> Result<()> {
     // If input is empty, use the selected suggestion first
-    if app.question_input.is_empty() && !app.question_suggestions.is_empty() {
+    if app.question_input.is_empty() && !ASK_STARTER_QUESTIONS.is_empty() {
         app.use_selected_suggestion();
     }
     let question = app.take_question();
     if question.is_empty() {
         return Ok(());
     }
+    app.input_mode = InputMode::Question;
+    let request_id = app.begin_ask_request();
 
     // Check cache first
     let context_hash = compute_context_hash(app);
     if let Some(cached_answer) = app.question_cache.get(&question, &context_hash) {
         // Cache hit! Use cached answer directly
         let _ = ctx.tx.send(BackgroundMessage::QuestionResponse {
+            request_id,
             answer: cached_answer.to_string(),
             usage: None, // No usage for cached response
         });
@@ -120,8 +126,6 @@ fn submit_question(app: &mut App, ctx: &RuntimeContext) -> Result<()> {
     let question_for_cache = question.clone();
     let context_hash_for_cache = context_hash;
 
-    app.loading = LoadingState::Answering;
-
     background::spawn_background(ctx.tx.clone(), "ask_question", async move {
         let mem = if repo_memory_context.trim().is_empty() {
             None
@@ -132,6 +136,7 @@ fn submit_question(app: &mut App, ctx: &RuntimeContext) -> Result<()> {
             Ok((answer, usage)) => {
                 // Send response with cache metadata for storage
                 let _ = tx_question.send(BackgroundMessage::QuestionResponseWithCache {
+                    request_id,
                     question: question_for_cache,
                     answer,
                     usage,
@@ -139,7 +144,10 @@ fn submit_question(app: &mut App, ctx: &RuntimeContext) -> Result<()> {
                 });
             }
             Err(e) => {
-                let _ = tx_question.send(BackgroundMessage::Error(e.to_string()));
+                let _ = tx_question.send(BackgroundMessage::QuestionError {
+                    request_id,
+                    error: e.to_string(),
+                });
             }
         }
     });
@@ -152,7 +160,10 @@ mod tests {
     use cosmos_core::context::WorkContext;
     use cosmos_core::index::CodebaseIndex;
     use cosmos_core::suggest::SuggestionEngine;
+    use crossterm::event::KeyModifiers;
     use std::collections::HashMap;
+    use std::sync::mpsc;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_test_app(repo_root: &std::path::Path) -> App {
@@ -194,6 +205,196 @@ mod tests {
         let second = compute_context_hash(&app);
 
         assert_ne!(first, second);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn enter_with_empty_input_uses_selected_starter_question() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_question_submit_starter_test_{}", nanos));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut app = make_test_app(&root);
+        app.context.uncommitted_files.clear();
+        app.context.modified_count = 0;
+        app.start_question();
+        app.question_suggestion_selected = 2;
+
+        let selected = ASK_STARTER_QUESTIONS[2].to_string();
+        let context_hash = compute_context_hash(&app);
+        app.question_cache
+            .set(selected, "starter-cached-answer".to_string(), context_hash);
+
+        let (tx, rx) = mpsc::channel();
+        let index = app.index.clone();
+        let ctx = RuntimeContext {
+            index: &index,
+            repo_path: &root,
+            tx: &tx,
+        };
+
+        handle_question_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(app.input_mode, crate::ui::InputMode::Question);
+        assert!(app.ask_in_flight);
+        match rx.recv_timeout(Duration::from_millis(200)).unwrap() {
+            BackgroundMessage::QuestionResponse { answer, .. } => {
+                assert_eq!(answer, "starter-cached-answer")
+            }
+            _ => panic!("unexpected message variant"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn enter_with_typed_input_uses_typed_question() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_question_submit_typed_test_{}", nanos));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut app = make_test_app(&root);
+        app.context.uncommitted_files.clear();
+        app.context.modified_count = 0;
+        app.start_question();
+        app.question_suggestion_selected = 1;
+        app.question_input = "How does retries flow work?".to_string();
+
+        let context_hash = compute_context_hash(&app);
+        app.question_cache.set(
+            app.question_input.clone(),
+            "typed-cached-answer".to_string(),
+            context_hash,
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let index = app.index.clone();
+        let ctx = RuntimeContext {
+            index: &index,
+            repo_path: &root,
+            tx: &tx,
+        };
+
+        handle_question_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(app.input_mode, crate::ui::InputMode::Question);
+        assert!(app.ask_in_flight);
+        assert!(app.question_input.is_empty());
+        match rx.recv_timeout(Duration::from_millis(200)).unwrap() {
+            BackgroundMessage::QuestionResponse { answer, .. } => {
+                assert_eq!(answer, "typed-cached-answer")
+            }
+            _ => panic!("unexpected message variant"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn esc_clears_question_input_and_selection() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_question_escape_test_{}", nanos));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut app = make_test_app(&root);
+        app.start_question();
+        app.question_input = "temporary input".to_string();
+        app.question_suggestion_selected = 4;
+
+        let (tx, _rx) = mpsc::channel();
+        let index = app.index.clone();
+        let ctx = RuntimeContext {
+            index: &index,
+            repo_path: &root,
+            tx: &tx,
+        };
+
+        handle_question_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(app.input_mode, crate::ui::InputMode::Question);
+        assert!(app.question_input.is_empty());
+        assert_eq!(app.question_suggestion_selected, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn enter_submits_question_while_suggestions_are_generating() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!(
+            "cosmos_question_submit_during_suggest_test_{}",
+            nanos
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut app = make_test_app(&root);
+        app.loading = crate::ui::LoadingState::GeneratingSuggestions;
+        app.context.uncommitted_files.clear();
+        app.context.modified_count = 0;
+        app.start_question();
+        app.question_input = "How is context ranked?".to_string();
+
+        let context_hash = compute_context_hash(&app);
+        app.question_cache.set(
+            app.question_input.clone(),
+            "answer while suggesting".to_string(),
+            context_hash,
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let index = app.index.clone();
+        let ctx = RuntimeContext {
+            index: &index,
+            repo_path: &root,
+            tx: &tx,
+        };
+
+        handle_question_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(app.ask_in_flight);
+        match rx.recv_timeout(Duration::from_millis(200)).unwrap() {
+            BackgroundMessage::QuestionResponse { answer, .. } => {
+                assert_eq!(answer, "answer while suggesting")
+            }
+            _ => panic!("unexpected message variant"),
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

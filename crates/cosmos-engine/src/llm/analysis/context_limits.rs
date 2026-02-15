@@ -1,40 +1,107 @@
-/// Adaptive limits for context building based on codebase size.
+/// Adaptive limits for Ask context building based on codebase size and question complexity.
 pub(super) struct AdaptiveLimits {
-    /// Max files to list in ask_question
+    /// Max files to list in ask_question.
     pub(super) file_list_limit: usize,
-    /// Max symbols to include
+    /// Max symbols to include.
     pub(super) symbol_limit: usize,
 }
 
 impl AdaptiveLimits {
     pub(super) fn for_codebase(file_count: usize, _total_loc: usize) -> Self {
-        // Scale limits based on codebase size
-        // Smaller codebases: more detail per file
-        // Larger codebases: broader coverage
+        // Scale limits based on codebase size.
         if file_count < 50 {
-            // Small codebase: show more detail
             Self {
-                file_list_limit: file_count.min(50),
-                symbol_limit: 150,
+                file_list_limit: file_count.min(56),
+                symbol_limit: 170,
             }
         } else if file_count < 200 {
-            // Medium codebase: balanced
             Self {
-                file_list_limit: 50,
-                symbol_limit: 100,
+                file_list_limit: 56,
+                symbol_limit: 120,
             }
         } else if file_count < 500 {
-            // Large codebase: prioritize structure
             Self {
-                file_list_limit: 40,
-                symbol_limit: 80,
+                file_list_limit: 48,
+                symbol_limit: 95,
             }
         } else {
-            // Very large codebase: focus on key areas
             Self {
-                file_list_limit: 30,
-                symbol_limit: 60,
+                file_list_limit: 40,
+                symbol_limit: 75,
             }
         }
+    }
+
+    pub(super) fn for_codebase_and_question(
+        file_count: usize,
+        total_loc: usize,
+        question: &str,
+    ) -> Self {
+        let mut limits = Self::for_codebase(file_count, total_loc);
+        if is_complex_question(question) {
+            limits.file_list_limit = limits.file_list_limit.saturating_add(14).min(80);
+            limits.symbol_limit = limits.symbol_limit.saturating_add(45).min(220);
+        }
+        limits
+    }
+}
+
+fn is_complex_question(question: &str) -> bool {
+    let trimmed = question.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let token_count = trimmed.split_whitespace().count();
+
+    let has_complex_keyword = [
+        "architecture",
+        "tradeoff",
+        "trade-off",
+        "data flow",
+        "reliability",
+        "scal",
+        "concurrency",
+        "migration",
+        "security",
+        "failure mode",
+        "end to end",
+        "end-to-end",
+        "bottleneck",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    token_count >= 14 || has_complex_keyword
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complex_questions_expand_limits() {
+        let base = AdaptiveLimits::for_codebase_and_question(180, 50_000, "what is this");
+        let complex = AdaptiveLimits::for_codebase_and_question(
+            180,
+            50_000,
+            "Can you explain the end-to-end architecture and the biggest reliability tradeoffs?",
+        );
+
+        assert!(complex.file_list_limit > base.file_list_limit);
+        assert!(complex.symbol_limit > base.symbol_limit);
+    }
+
+    #[test]
+    fn limits_are_capped_for_huge_repos() {
+        let limits = AdaptiveLimits::for_codebase_and_question(
+            5_000,
+            3_000_000,
+            "Deep architecture and security tradeoffs across the whole stack",
+        );
+
+        assert!(limits.file_list_limit <= 80);
+        assert!(limits.symbol_limit <= 220);
     }
 }

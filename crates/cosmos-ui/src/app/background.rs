@@ -721,6 +721,11 @@ pub fn drain_messages(
                 app.show_toast("Changes discarded - starting fresh");
             }
             BackgroundMessage::Error(e) => {
+                if e.contains("ask_question") {
+                    if let Some(request_id) = app.active_ask_request_id {
+                        let _ = app.complete_ask_request(request_id);
+                    }
+                }
                 app.loading = LoadingState::None;
                 // Reset review fixing state if we were applying review fixes
                 if app.review_state.fixing {
@@ -749,20 +754,23 @@ pub fn drain_messages(
                     app.show_toast(&truncate(&e, 100));
                 }
             }
-            BackgroundMessage::QuestionResponse { answer, usage, .. } => {
-                let _ = track_usage(app, usage.as_ref(), ctx);
-
-                app.loading = LoadingState::None;
-                // Show the response in the ask cosmos panel
-                app.show_inquiry(answer);
+            BackgroundMessage::QuestionError { request_id, error } => {
+                let is_active = app.complete_ask_request(request_id);
+                if !is_active {
+                    continue;
+                }
+                if !maybe_prompt_api_key_overlay(app, &error) {
+                    app.show_toast(&truncate(&error, 100));
+                }
             }
             BackgroundMessage::QuestionResponseWithCache {
+                request_id,
                 question,
                 answer,
                 usage,
                 context_hash,
             } => {
-                let _ = track_usage(app, usage.as_ref(), ctx);
+                let _ = track_usage_for_ask(app, usage.as_ref(), ctx);
 
                 // Store answer in cache
                 app.question_cache
@@ -771,7 +779,21 @@ pub fn drain_messages(
                 let cache = cache::Cache::new(&app.repo_path);
                 let _ = cache.save_question_cache(&app.question_cache);
 
-                app.loading = LoadingState::None;
+                if !app.complete_ask_request(request_id) {
+                    continue;
+                }
+                // Show the response in the ask cosmos panel
+                app.show_inquiry(answer);
+            }
+            BackgroundMessage::QuestionResponse {
+                request_id,
+                answer,
+                usage,
+            } => {
+                let _ = track_usage_for_ask(app, usage.as_ref(), ctx);
+                if !app.complete_ask_request(request_id) {
+                    continue;
+                }
                 // Show the response in the ask cosmos panel
                 app.show_inquiry(answer);
             }
@@ -948,6 +970,23 @@ fn track_usage(
     usage: Option<&cosmos_engine::llm::Usage>,
     ctx: &RuntimeContext,
 ) -> (u32, f64) {
+    track_usage_internal(app, usage, ctx, true)
+}
+
+fn track_usage_for_ask(
+    app: &mut App,
+    usage: Option<&cosmos_engine::llm::Usage>,
+    ctx: &RuntimeContext,
+) -> (u32, f64) {
+    track_usage_internal(app, usage, ctx, false)
+}
+
+fn track_usage_internal(
+    app: &mut App,
+    usage: Option<&cosmos_engine::llm::Usage>,
+    ctx: &RuntimeContext,
+    show_budget_guardrails: bool,
+) -> (u32, f64) {
     let Some(usage) = usage else {
         return (0, 0.0);
     };
@@ -956,7 +995,9 @@ fn track_usage(
     app.session_cost += cost;
     app.session_tokens += usage.total_tokens;
     spawn_balance_refresh(ctx.tx.clone());
-    maybe_show_budget_guardrails(app);
+    if show_budget_guardrails {
+        maybe_show_budget_guardrails(app);
+    }
 
     (usage.total_tokens, cost)
 }
@@ -1058,4 +1099,103 @@ where
             )));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmos_core::context::WorkContext;
+    use cosmos_core::index::CodebaseIndex;
+    use cosmos_core::suggest::SuggestionEngine;
+    use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_test_app() -> App {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_background_test_{}", nanos));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let index = CodebaseIndex {
+            root: root.clone(),
+            files: HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: Some("deadbeef".to_string()),
+        };
+        let suggestions = SuggestionEngine::new(index.clone());
+        let context = WorkContext {
+            branch: "main".to_string(),
+            uncommitted_files: Vec::new(),
+            staged_files: Vec::new(),
+            untracked_files: Vec::new(),
+            inferred_focus: None,
+            modified_count: 0,
+            repo_root: root,
+        };
+        App::new(index, suggestions, context)
+    }
+
+    #[test]
+    fn stale_question_response_does_not_overwrite_active_request() {
+        let mut app = make_test_app();
+        let stale_id = app.begin_ask_request();
+        let active_id = app.begin_ask_request();
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(BackgroundMessage::QuestionResponse {
+            request_id: stale_id,
+            answer: "stale".to_string(),
+            usage: None,
+        })
+        .unwrap();
+        tx.send(BackgroundMessage::QuestionResponse {
+            request_id: active_id,
+            answer: "active".to_string(),
+            usage: None,
+        })
+        .unwrap();
+
+        let index = app.index.clone();
+        let repo_path = app.repo_path.clone();
+        let ctx = RuntimeContext {
+            index: &index,
+            repo_path: &repo_path,
+            tx: &tx,
+        };
+        drain_messages(&mut app, &rx, &ctx);
+
+        assert!(!app.ask_in_flight);
+        assert_eq!(
+            app.ask_cosmos_state.as_ref().map(|s| s.response.as_str()),
+            Some("active")
+        );
+    }
+
+    #[test]
+    fn suggestions_messages_do_not_clear_ask_request_state() {
+        let mut app = make_test_app();
+        let request_id = app.begin_ask_request();
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(BackgroundMessage::SuggestionsError(
+            "transient suggest failure".to_string(),
+        ))
+        .unwrap();
+
+        let index = app.index.clone();
+        let repo_path = app.repo_path.clone();
+        let ctx = RuntimeContext {
+            index: &index,
+            repo_path: &repo_path,
+            tx: &tx,
+        };
+        drain_messages(&mut app, &rx, &ctx);
+
+        assert!(app.ask_in_flight);
+        assert_eq!(app.active_ask_request_id, Some(request_id));
+        assert!(app.ask_cosmos_state.is_none());
+    }
 }

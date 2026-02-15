@@ -116,15 +116,22 @@ pub enum BackgroundMessage {
     Error(String),
     /// Response to a user question
     QuestionResponse {
+        request_id: u64,
         answer: String,
         usage: Option<cosmos_engine::llm::Usage>,
     },
     /// Response to a user question with cache metadata
     QuestionResponseWithCache {
+        request_id: u64,
         question: String,
         answer: String,
         usage: Option<cosmos_engine::llm::Usage>,
         context_hash: String,
+    },
+    /// Error while answering a user question
+    QuestionError {
+        request_id: u64,
+        error: String,
     },
     /// Verification review completed (adversarial review of applied changes)
     VerificationComplete {

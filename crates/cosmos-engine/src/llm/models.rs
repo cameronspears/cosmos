@@ -5,7 +5,7 @@ use serde::Deserialize;
 pub enum Model {
     /// Speed tier - fast, cheap model for summaries and classification (gpt-oss-120b)
     Speed,
-    /// Smart tier - best reasoning for code generation (gpt-5.2)
+    /// Smart tier - best reasoning for code generation (glm-5)
     Smart,
 }
 
@@ -13,7 +13,7 @@ pub enum Model {
 const MODEL_MAX_TOKENS: u32 = 16384;
 
 /// Models we allow to use JSON formatting / structured outputs.
-const JSON_FORMAT_MODELS: [&str; 2] = ["openai/gpt-oss-120b", "openai/gpt-5.2:nitro"];
+const JSON_FORMAT_MODELS: [&str; 2] = ["openai/gpt-oss-120b", "z-ai/glm-5"];
 
 fn supports_json_format(model_id: &str) -> bool {
     JSON_FORMAT_MODELS.contains(&model_id)
@@ -23,7 +23,7 @@ impl Model {
     pub fn id(&self) -> &'static str {
         match self {
             Model::Speed => "openai/gpt-oss-120b",
-            Model::Smart => "openai/gpt-5.2:nitro",
+            Model::Smart => "z-ai/glm-5",
         }
     }
 
@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn test_model_ids() {
         assert!(Model::Speed.id().contains("gpt"));
-        assert!(Model::Smart.id().contains("gpt-5.2"));
+        assert!(Model::Smart.id().contains("glm-5"));
     }
 
     #[test]
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn test_supports_json_format_allowlist() {
         assert!(supports_json_format("openai/gpt-oss-120b"));
-        assert!(supports_json_format("openai/gpt-5.2:nitro"));
+        assert!(supports_json_format("z-ai/glm-5"));
         assert!(!supports_json_format("openai/gpt-4o"));
     }
 

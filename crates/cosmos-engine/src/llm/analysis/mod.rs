@@ -107,29 +107,36 @@ pub async fn ask_question(
 ) -> anyhow::Result<(String, Option<Usage>)> {
     // Build context about the codebase
     let stats = index.stats();
-    let limits = AdaptiveLimits::for_codebase(stats.file_count, stats.total_loc);
+    let limits =
+        AdaptiveLimits::for_codebase_and_question(stats.file_count, stats.total_loc, question);
 
-    let file_list: Vec<_> = index
-        .files
-        .keys()
-        .take(limits.file_list_limit)
-        .map(|p| p.display().to_string())
-        .collect();
+    let query_terms = tokenize_question_terms(question);
+    let changed_paths = collect_changed_paths(context);
+    let changed_roots = collect_changed_roots(&changed_paths);
+    let focus_terms = context
+        .inferred_focus
+        .as_deref()
+        .map(tokenize_question_terms)
+        .unwrap_or_default();
 
-    // Get symbols for context (used internally, not exposed to user)
-    let symbols: Vec<_> = index
-        .files
-        .values()
-        .flat_map(|f| f.symbols.iter())
-        .filter(|s| {
-            matches!(
-                s.kind,
-                SymbolKind::Function | SymbolKind::Struct | SymbolKind::Enum
-            )
-        })
-        .take(limits.symbol_limit)
-        .map(|s| format!("{:?}: {}", s.kind, s.name))
-        .collect();
+    let file_list = rank_files_for_question(
+        index,
+        &query_terms,
+        &focus_terms,
+        &changed_paths,
+        &changed_roots,
+        limits.file_list_limit,
+    );
+
+    // Get symbols for context (used internally, not exposed to user).
+    let symbols = rank_symbols_for_question(
+        index,
+        &query_terms,
+        &focus_terms,
+        &changed_paths,
+        &changed_roots,
+        limits.symbol_limit,
+    );
 
     let memory_section = format_repo_memory_section(repo_memory.as_deref(), "PROJECT NOTES");
 
@@ -158,6 +165,225 @@ QUESTION:
 
     let response = call_llm_with_usage(ASK_QUESTION_SYSTEM, &user, Model::Smart, false).await?;
     Ok((response.content, response.usage))
+}
+
+fn tokenize_question_terms(input: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    input
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .filter_map(|raw| {
+            let term = raw.trim().to_ascii_lowercase();
+            if term.len() < 3 || !seen.insert(term.clone()) {
+                return None;
+            }
+            Some(term)
+        })
+        .collect()
+}
+
+fn normalize_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn collect_changed_paths(context: &WorkContext) -> HashSet<String> {
+    context
+        .all_changed_files()
+        .into_iter()
+        .map(|path| normalize_path(path))
+        .collect()
+}
+
+fn collect_changed_roots(changed_paths: &HashSet<String>) -> HashSet<String> {
+    changed_paths
+        .iter()
+        .filter_map(|path| path.split('/').next().map(str::to_string))
+        .collect()
+}
+
+fn rank_files_for_question(
+    index: &CodebaseIndex,
+    query_terms: &[String],
+    focus_terms: &[String],
+    changed_paths: &HashSet<String>,
+    changed_roots: &HashSet<String>,
+    limit: usize,
+) -> Vec<String> {
+    let mut scored: Vec<(i32, String)> = index
+        .files
+        .keys()
+        .map(|path| {
+            let normalized = normalize_path(path);
+            let score = score_file_path(
+                &normalized,
+                query_terms,
+                focus_terms,
+                changed_paths,
+                changed_roots,
+            );
+
+            (score, path.display().to_string())
+        })
+        .collect();
+
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, path)| path)
+        .collect()
+}
+
+fn score_file_path(
+    normalized_path: &str,
+    query_terms: &[String],
+    focus_terms: &[String],
+    changed_paths: &HashSet<String>,
+    changed_roots: &HashSet<String>,
+) -> i32 {
+    let mut score = 0i32;
+
+    if changed_paths.contains(normalized_path) {
+        score += 700;
+    } else if changed_roots
+        .iter()
+        .any(|root| normalized_path.starts_with(&format!("{root}/")))
+    {
+        score += 220;
+    }
+
+    for term in query_terms {
+        if normalized_path.contains(term) {
+            score += 45;
+        }
+    }
+    for term in focus_terms {
+        if normalized_path.contains(term) {
+            score += 28;
+        }
+    }
+
+    score
+}
+
+fn rank_symbols_for_question(
+    index: &CodebaseIndex,
+    query_terms: &[String],
+    focus_terms: &[String],
+    changed_paths: &HashSet<String>,
+    changed_roots: &HashSet<String>,
+    limit: usize,
+) -> Vec<String> {
+    let mut scored = Vec::new();
+
+    for (path, file) in &index.files {
+        let path_str = path.display().to_string();
+        let normalized_path = normalize_path(path);
+        for symbol in file.symbols.iter().filter(|symbol| {
+            matches!(
+                symbol.kind,
+                SymbolKind::Function | SymbolKind::Struct | SymbolKind::Enum
+            )
+        }) {
+            let mut score = match symbol.kind {
+                SymbolKind::Struct | SymbolKind::Enum => 35,
+                SymbolKind::Function => 28,
+                _ => 10,
+            };
+
+            if changed_paths.contains(&normalized_path) {
+                score += 500;
+            } else if changed_roots
+                .iter()
+                .any(|root| normalized_path.starts_with(&format!("{root}/")))
+            {
+                score += 160;
+            }
+
+            let symbol_name = symbol.name.to_ascii_lowercase();
+            for term in query_terms {
+                if symbol_name.contains(term) {
+                    score += 55;
+                }
+                if normalized_path.contains(term) {
+                    score += 18;
+                }
+            }
+            for term in focus_terms {
+                if symbol_name.contains(term) || normalized_path.contains(term) {
+                    score += 15;
+                }
+            }
+
+            scored.push((
+                score,
+                format!("{:?}: {} ({})", symbol.kind, symbol.name, path_str),
+            ));
+        }
+    }
+
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, symbol)| symbol)
+        .collect()
+}
+
+#[cfg(test)]
+mod ask_ranking_tests {
+    use super::*;
+
+    #[test]
+    fn changed_file_gets_higher_rank_than_plain_match() {
+        let query_terms = vec!["api".to_string()];
+        let focus_terms = Vec::new();
+        let changed_paths = HashSet::from(["src/changed.rs".to_string()]);
+        let changed_roots = HashSet::from(["src".to_string()]);
+
+        let changed_score = score_file_path(
+            "src/changed.rs",
+            &query_terms,
+            &focus_terms,
+            &changed_paths,
+            &changed_roots,
+        );
+        let plain_score = score_file_path(
+            "docs/api-notes.md",
+            &query_terms,
+            &focus_terms,
+            &changed_paths,
+            &changed_roots,
+        );
+
+        assert!(changed_score > plain_score);
+    }
+
+    #[test]
+    fn query_term_match_boosts_path_score() {
+        let query_terms = vec!["retry".to_string()];
+        let focus_terms = Vec::new();
+        let changed_paths = HashSet::new();
+        let changed_roots = HashSet::new();
+
+        let matched = score_file_path(
+            "src/network/retry_policy.rs",
+            &query_terms,
+            &focus_terms,
+            &changed_paths,
+            &changed_roots,
+        );
+        let unmatched = score_file_path(
+            "src/network/client.rs",
+            &query_terms,
+            &focus_terms,
+            &changed_paths,
+            &changed_roots,
+        );
+
+        assert!(matched > unmatched);
+    }
 }
 
 #[derive(Debug, Clone)]

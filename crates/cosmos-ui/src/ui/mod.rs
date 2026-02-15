@@ -69,6 +69,15 @@ pub fn openrouter_setup_toast_copy() -> &'static str {
     }
 }
 
+pub(crate) const ASK_STARTER_QUESTIONS: [&str; 6] = [
+    "What does this repo help users do?",
+    "How are the main parts connected?",
+    "What should I read first to get productive?",
+    "Where are the biggest reliability risks?",
+    "What improvements would help users most?",
+    "What is already working well and should stay as-is?",
+];
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  APP STATE
 // ═══════════════════════════════════════════════════════════════════════════
@@ -116,8 +125,10 @@ pub struct App {
 
     // Question input (ask cosmos)
     pub question_input: String,
-    pub question_suggestions: Vec<String>,
     pub question_suggestion_selected: usize,
+    pub ask_in_flight: bool,
+    pub active_ask_request_id: Option<u64>,
+    next_ask_request_id: u64,
 
     // Loading state for background tasks
     pub loading: LoadingState,
@@ -249,8 +260,10 @@ impl App {
             search_query: String::new(),
             view_mode: ViewMode::Grouped, // Default to grouped view
             question_input: String::new(),
-            question_suggestions: Vec::new(),
             question_suggestion_selected: 0,
+            ask_in_flight: false,
+            active_ask_request_id: None,
+            next_ask_request_id: 1,
             loading: LoadingState::None,
             loading_frame: 0,
             llm_summaries: std::collections::HashMap::new(),
@@ -421,7 +434,6 @@ impl App {
     pub fn start_question(&mut self) {
         self.input_mode = InputMode::Question;
         self.question_input.clear();
-        self.question_suggestions = Self::generate_question_suggestions();
         self.question_suggestion_selected = 0;
     }
 
@@ -429,7 +441,6 @@ impl App {
     pub fn exit_question(&mut self) {
         self.input_mode = InputMode::Normal;
         self.question_input.clear();
-        self.question_suggestions.clear();
     }
 
     /// Add character to question input
@@ -446,24 +457,8 @@ impl App {
     pub fn take_question(&mut self) -> String {
         let q = self.question_input.clone();
         self.question_input.clear();
-        self.question_suggestions.clear();
         self.input_mode = InputMode::Normal;
         q
-    }
-
-    /// Generate exploratory question suggestions for the ask feature
-    fn generate_question_suggestions() -> Vec<String> {
-        vec![
-            // Understanding
-            "What does this project do and who is it for?".into(),
-            "What are the main parts and how do they work together?".into(),
-            "What should I understand first if I'm new here?".into(),
-            // Strategic
-            "What areas would benefit most from improvement?".into(),
-            "What are the risks or rough edges to know about?".into(),
-            // Strengths
-            "What does this project do really well?".into(),
-        ]
     }
 
     /// Move selection up in question suggestions
@@ -475,19 +470,35 @@ impl App {
 
     /// Move selection down in question suggestions
     pub fn question_suggestion_down(&mut self) {
-        if self.question_suggestion_selected < self.question_suggestions.len().saturating_sub(1) {
+        if self.question_suggestion_selected < ASK_STARTER_QUESTIONS.len().saturating_sub(1) {
             self.question_suggestion_selected += 1;
         }
     }
 
     /// Use the selected suggestion as the question input
     pub fn use_selected_suggestion(&mut self) {
-        if let Some(q) = self
-            .question_suggestions
-            .get(self.question_suggestion_selected)
-        {
-            self.question_input = q.clone();
+        if let Some(question) = ASK_STARTER_QUESTIONS.get(self.question_suggestion_selected) {
+            self.question_input = (*question).to_string();
         }
+    }
+
+    /// Begin a new ask request and return the request id.
+    pub fn begin_ask_request(&mut self) -> u64 {
+        let request_id = self.next_ask_request_id;
+        self.next_ask_request_id = self.next_ask_request_id.saturating_add(1);
+        self.ask_in_flight = true;
+        self.active_ask_request_id = Some(request_id);
+        request_id
+    }
+
+    /// Complete the active ask request if the request id matches.
+    pub fn complete_ask_request(&mut self, request_id: u64) -> bool {
+        if self.active_ask_request_id != Some(request_id) {
+            return false;
+        }
+        self.ask_in_flight = false;
+        self.active_ask_request_id = None;
+        true
     }
 
     /// Add character to search query
@@ -738,6 +749,13 @@ impl App {
             ActivePanel::Ask => ActivePanel::Suggestions,
             ActivePanel::Suggestions => ActivePanel::Ask,
         };
+
+        if self.active_panel == ActivePanel::Ask
+            && self.workflow_step == WorkflowStep::Suggestions
+            && self.ask_cosmos_state.is_none()
+        {
+            self.start_question();
+        }
     }
 
     /// Navigate down in the current panel
@@ -930,6 +948,9 @@ impl App {
 
     /// Show inquiry response in the right panel (Ask Cosmos mode)
     pub fn show_inquiry(&mut self, response: String) {
+        self.input_mode = InputMode::Normal;
+        self.ask_in_flight = false;
+        self.active_ask_request_id = None;
         self.ask_cosmos_state = Some(AskCosmosState {
             response,
             scroll: 0,
@@ -1726,5 +1747,76 @@ mod tests {
         app.review_state.verification_failed = true;
 
         assert!(!app.review_passed());
+    }
+
+    #[test]
+    fn start_question_resets_input_and_selection() {
+        let mut app = make_test_app();
+        app.question_input = "existing".to_string();
+        app.question_suggestion_selected = ASK_STARTER_QUESTIONS.len().saturating_sub(1);
+
+        app.start_question();
+
+        assert_eq!(app.input_mode, InputMode::Question);
+        assert!(app.question_input.is_empty());
+        assert_eq!(app.question_suggestion_selected, 0);
+    }
+
+    #[test]
+    fn question_suggestion_navigation_stays_in_bounds() {
+        let mut app = make_test_app();
+        app.start_question();
+
+        for _ in 0..(ASK_STARTER_QUESTIONS.len() * 2) {
+            app.question_suggestion_down();
+        }
+        assert_eq!(
+            app.question_suggestion_selected,
+            ASK_STARTER_QUESTIONS.len().saturating_sub(1)
+        );
+
+        for _ in 0..(ASK_STARTER_QUESTIONS.len() * 2) {
+            app.question_suggestion_up();
+        }
+        assert_eq!(app.question_suggestion_selected, 0);
+    }
+
+    #[test]
+    fn use_selected_suggestion_copies_starter_question() {
+        let mut app = make_test_app();
+        app.start_question();
+        app.question_suggestion_selected = 3;
+
+        app.use_selected_suggestion();
+
+        assert_eq!(app.question_input, ASK_STARTER_QUESTIONS[3]);
+    }
+
+    #[test]
+    fn toggle_panel_to_ask_starts_question_mode() {
+        let mut app = make_test_app();
+        assert_eq!(app.active_panel, ActivePanel::Suggestions);
+        assert_eq!(app.input_mode, InputMode::Normal);
+
+        app.toggle_panel();
+
+        assert_eq!(app.active_panel, ActivePanel::Ask);
+        assert_eq!(app.input_mode, InputMode::Question);
+        assert!(app.question_input.is_empty());
+    }
+
+    #[test]
+    fn ask_request_tracking_ignores_stale_ids() {
+        let mut app = make_test_app();
+        let first = app.begin_ask_request();
+        let second = app.begin_ask_request();
+
+        assert_ne!(first, second);
+        assert!(app.ask_in_flight);
+        assert!(!app.complete_ask_request(first));
+        assert!(app.ask_in_flight);
+        assert!(app.complete_ask_request(second));
+        assert!(!app.ask_in_flight);
+        assert!(app.active_ask_request_id.is_none());
     }
 }
