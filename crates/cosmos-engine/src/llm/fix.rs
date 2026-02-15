@@ -7,7 +7,7 @@ use super::models::{merge_usage, Model, Usage};
 use super::parse::{truncate_content, truncate_content_around_line};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{fix_content_system, multi_file_fix_system, FIX_PREVIEW_AGENTIC_SYSTEM};
-use cosmos_core::suggest::Suggestion;
+use cosmos_core::suggest::{Suggestion, SuggestionKind};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
@@ -1699,6 +1699,318 @@ impl FixScope {
     }
 }
 
+fn normalize_preview_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut last_space = false;
+    for ch in text.trim().chars() {
+        if ch.is_whitespace() {
+            if !last_space {
+                normalized.push(' ');
+            }
+            last_space = true;
+        } else {
+            normalized.push(ch);
+            last_space = false;
+        }
+    }
+    let trimmed = normalized.trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace());
+    trimmed.to_string()
+}
+
+fn preview_text_key(text: &str) -> String {
+    let mut key = String::with_capacity(text.len());
+    let mut last_space = false;
+    for ch in text.to_ascii_lowercase().chars() {
+        let mapped = if ch.is_ascii_alphanumeric() { ch } else { ' ' };
+        if mapped == ' ' {
+            if !last_space {
+                key.push(' ');
+            }
+            last_space = true;
+        } else {
+            key.push(mapped);
+            last_space = false;
+        }
+    }
+    key.trim().to_string()
+}
+
+fn is_effectively_duplicate_preview_text(a: &str, b: &str) -> bool {
+    let a_key = preview_text_key(a);
+    let b_key = preview_text_key(b);
+    if a_key.is_empty() || b_key.is_empty() {
+        return false;
+    }
+    if a_key == b_key {
+        return true;
+    }
+    let (shorter, longer) = if a_key.len() <= b_key.len() {
+        (a_key.as_str(), b_key.as_str())
+    } else {
+        (b_key.as_str(), a_key.as_str())
+    };
+    shorter.len() >= 18
+        && longer.contains(shorter)
+        && (shorter.len() as f32 / longer.len() as f32) >= 0.75
+}
+
+fn sentence_candidates(text: &str) -> Vec<String> {
+    fn split_sentence_like_segments(line: &str) -> Vec<&str> {
+        let mut segments = Vec::new();
+        let mut start = 0usize;
+        let mut chars = line.char_indices().peekable();
+        while let Some((idx, ch)) = chars.next() {
+            if !matches!(ch, '.' | '!' | '?') {
+                continue;
+            }
+            let Some((next_idx, next_ch)) = chars.peek().copied() else {
+                continue;
+            };
+            if !next_ch.is_whitespace() {
+                continue;
+            }
+            let end = idx + ch.len_utf8();
+            if end > start {
+                segments.push(&line[start..end]);
+            }
+            start = next_idx;
+        }
+        if start < line.len() {
+            segments.push(&line[start..]);
+        }
+        segments
+    }
+
+    text.lines()
+        .flat_map(split_sentence_like_segments)
+        .map(normalize_preview_text)
+        .filter(|candidate| candidate.len() >= 24)
+        .map(|mut candidate| {
+            if !matches!(candidate.chars().last(), Some('.') | Some('!') | Some('?')) {
+                candidate.push('.');
+            }
+            candidate
+        })
+        .collect()
+}
+
+fn pick_distinct_preview_text(candidates: &[String], disallowed: &[&str]) -> Option<String> {
+    candidates.iter().find_map(|candidate| {
+        let normalized = normalize_preview_text(candidate);
+        if normalized.len() < 24 {
+            return None;
+        }
+        let duplicate = disallowed
+            .iter()
+            .any(|blocked| is_effectively_duplicate_preview_text(&normalized, blocked));
+        if duplicate {
+            None
+        } else {
+            Some(normalized)
+        }
+    })
+}
+
+fn fallback_why_it_matters(kind: Option<SuggestionKind>) -> String {
+    match kind {
+        Some(SuggestionKind::BugFix | SuggestionKind::Quality) => {
+            "This matters because avoidable failures keep happening and recovery gets harder.".to_string()
+        }
+        Some(SuggestionKind::Optimization) => {
+            "This matters because extra work accumulates and the product can feel slower.".to_string()
+        }
+        Some(SuggestionKind::Refactoring) => {
+            "This matters because this area stays harder to maintain and riskier to change."
+                .to_string()
+        }
+        Some(SuggestionKind::Testing) => {
+            "This matters because regressions in this path are easier to miss.".to_string()
+        }
+        Some(SuggestionKind::Documentation) => {
+            "This matters because expected usage stays unclear and repeated mistakes are more likely."
+                .to_string()
+        }
+        Some(SuggestionKind::Feature | SuggestionKind::Improvement) | None => {
+            "This matters because this behavior stays brittle and less predictable.".to_string()
+        }
+    }
+}
+
+fn fallback_outcome(kind: Option<SuggestionKind>) -> String {
+    match kind {
+        Some(SuggestionKind::BugFix | SuggestionKind::Quality) => {
+            "After apply, this path handles the case safely and behaves consistently.".to_string()
+        }
+        Some(SuggestionKind::Optimization) => {
+            "After apply, this path does the same work with less overhead.".to_string()
+        }
+        Some(SuggestionKind::Refactoring) => {
+            "After apply, this area is simpler to change with lower regression risk.".to_string()
+        }
+        Some(SuggestionKind::Testing) => {
+            "After apply, regressions in this path are caught earlier.".to_string()
+        }
+        Some(SuggestionKind::Documentation) => {
+            "After apply, expected usage is clearer for future changes.".to_string()
+        }
+        Some(SuggestionKind::Feature | SuggestionKind::Improvement) | None => {
+            "After apply, this behavior is more reliable and easier to trust.".to_string()
+        }
+    }
+}
+
+fn has_problem_context(problem: &str, markers: &[&str]) -> bool {
+    let lower = problem.to_ascii_lowercase();
+    markers.iter().any(|marker| lower.contains(marker))
+}
+
+fn derive_why_it_matters_from_problem(
+    problem_summary: &str,
+    kind: Option<SuggestionKind>,
+) -> String {
+    if has_problem_context(
+        problem_summary,
+        &[
+            "pull request",
+            "pr ",
+            "reviewer",
+            "reviewers",
+            "title",
+            "summary",
+        ],
+    ) {
+        return "This matters because reviewers lose context and releases slow down when the PR description is unclear.".to_string();
+    }
+    if has_problem_context(
+        problem_summary,
+        &[
+            "git ref",
+            "reference",
+            "branch",
+            "invalid name",
+            "unsafe character",
+        ],
+    ) {
+        return "This matters because malformed branch names can cause confusing failures and reduce trust in the workflow.".to_string();
+    }
+    fallback_why_it_matters(kind)
+}
+
+fn derive_outcome_from_problem(problem_summary: &str, kind: Option<SuggestionKind>) -> String {
+    if has_problem_context(
+        problem_summary,
+        &[
+            "pull request",
+            "pr ",
+            "reviewer",
+            "reviewers",
+            "title",
+            "summary",
+        ],
+    ) {
+        return "After apply, empty pull requests include a clear title and summary so reviewers can understand intent immediately.".to_string();
+    }
+    if has_problem_context(
+        problem_summary,
+        &[
+            "git ref",
+            "reference",
+            "branch",
+            "invalid name",
+            "unsafe character",
+        ],
+    ) {
+        return "After apply, invalid Git reference names are rejected before branch creation."
+            .to_string();
+    }
+    fallback_outcome(kind)
+}
+
+fn has_implementation_markers(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains('`')
+        || lower.contains("::")
+        || lower.contains("crates/")
+        || lower.contains("src/")
+        || lower.contains(".rs")
+        || lower.contains(".ts")
+        || lower.contains(".js")
+        || lower.contains(".py")
+        || lower.contains(" function ")
+        || lower.contains(" helper ")
+        || lower.contains(" module ")
+        || lower.contains(" line ")
+}
+
+fn outcome_is_problem_framed(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let has_positive_anchor = [
+        "after apply",
+        "now ",
+        "no longer",
+        "instead",
+        "is rejected",
+        "are rejected",
+        "is validated",
+        "are validated",
+        "includes",
+        "shows",
+        "returns",
+        "will ",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let has_negative_anchor = [
+        " may ",
+        " could ",
+        " might ",
+        " can ",
+        " leaving ",
+        " without ",
+        " risk",
+        " confuse",
+        " bypass",
+        " attack",
+        " failure",
+        " bug",
+        " no clear",
+        " non-descriptive",
+        " unsupported",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    has_negative_anchor && !has_positive_anchor
+}
+
+fn dedupe_preview_user_copy(
+    kind_hint: Option<SuggestionKind>,
+    problem_summary: &mut String,
+    description: &mut String,
+    outcome: &mut String,
+) {
+    *problem_summary = normalize_preview_text(problem_summary);
+    if problem_summary.is_empty() {
+        *problem_summary = "An issue was found that needs attention.".to_string();
+    }
+    *description = normalize_preview_text(description);
+    *outcome = normalize_preview_text(outcome);
+
+    if description.is_empty()
+        || is_effectively_duplicate_preview_text(description, problem_summary)
+        || has_implementation_markers(description)
+    {
+        *description = derive_why_it_matters_from_problem(problem_summary, kind_hint);
+    }
+    if outcome.is_empty()
+        || is_effectively_duplicate_preview_text(outcome, problem_summary)
+        || is_effectively_duplicate_preview_text(outcome, description)
+        || has_implementation_markers(outcome)
+        || outcome_is_problem_framed(outcome)
+    {
+        *outcome = derive_outcome_from_problem(problem_summary, kind_hint);
+    }
+}
+
 /// Build a lightweight fix plan from an already-validated suggestion.
 ///
 /// This is used by the real-app runtime when the legacy pre-apply Verify stage
@@ -1713,17 +2025,46 @@ pub fn build_fix_preview_from_validated_suggestion(suggestion: &Suggestion) -> F
             .map(|path| path.display().to_string())
             .collect()
     };
-    let description = suggestion
-        .detail
-        .clone()
-        .unwrap_or_else(|| suggestion.summary.clone());
-    let outcome = suggestion
+    let detail_sentences = suggestion
         .detail
         .as_deref()
-        .and_then(|detail| detail.lines().next())
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
-        .unwrap_or_else(|| suggestion.summary.clone());
+        .map(sentence_candidates)
+        .unwrap_or_default();
+    let sketch_sentences = suggestion
+        .implementation_sketch
+        .as_deref()
+        .map(sentence_candidates)
+        .unwrap_or_default();
+
+    let mut problem_summary = normalize_preview_text(&suggestion.summary);
+    if problem_summary.is_empty() {
+        problem_summary = detail_sentences
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "An issue was found that needs attention.".to_string());
+    }
+
+    let mut description_candidates = detail_sentences.clone();
+    description_candidates.extend(sketch_sentences.clone());
+    let mut description = pick_distinct_preview_text(&description_candidates, &[&problem_summary])
+        .unwrap_or_else(|| fallback_why_it_matters(Some(suggestion.kind)));
+
+    let mut outcome_candidates: Vec<String> = Vec::new();
+    if detail_sentences.len() > 1 {
+        outcome_candidates.extend(detail_sentences.iter().skip(1).cloned());
+    }
+    outcome_candidates.extend(sketch_sentences);
+    let mut outcome =
+        pick_distinct_preview_text(&outcome_candidates, &[&problem_summary, &description])
+            .unwrap_or_else(|| fallback_outcome(Some(suggestion.kind)));
+
+    dedupe_preview_user_copy(
+        Some(suggestion.kind),
+        &mut problem_summary,
+        &mut description,
+        &mut outcome,
+    );
+
     let modifier = suggestion
         .implementation_sketch
         .as_deref()
@@ -1735,7 +2076,7 @@ pub fn build_fix_preview_from_validated_suggestion(suggestion: &Suggestion) -> F
         verified: true,
         verification_state: cosmos_core::suggest::VerificationState::Verified,
         friendly_title: suggestion.kind.label().to_string(),
-        problem_summary: suggestion.summary.clone(),
+        problem_summary,
         outcome,
         verification_note: "Using pre-validated suggestion evidence.".to_string(),
         evidence_snippet: suggestion.evidence.clone(),
@@ -1862,6 +2203,23 @@ fn fix_preview_from_json(parsed: FixPreviewJson, modifier: Option<&str>) -> FixP
         _ => FixScope::Medium,
     };
 
+    let mut problem_summary = if parsed.problem_summary.is_empty() {
+        "An issue was found that needs attention.".to_string()
+    } else {
+        parsed.problem_summary
+    };
+    let mut description = if parsed.description.is_empty() {
+        "Fix the identified issue".to_string()
+    } else {
+        parsed.description
+    };
+    let mut outcome = if parsed.outcome.is_empty() {
+        "This will be fixed.".to_string()
+    } else {
+        parsed.outcome
+    };
+    dedupe_preview_user_copy(None, &mut problem_summary, &mut description, &mut outcome);
+
     FixPreview {
         verified: verification_state == cosmos_core::suggest::VerificationState::Verified,
         verification_state,
@@ -1870,16 +2228,8 @@ fn fix_preview_from_json(parsed: FixPreviewJson, modifier: Option<&str>) -> FixP
         } else {
             parsed.friendly_title
         },
-        problem_summary: if parsed.problem_summary.is_empty() {
-            "An issue was found that needs attention.".to_string()
-        } else {
-            parsed.problem_summary
-        },
-        outcome: if parsed.outcome.is_empty() {
-            "This will be fixed.".to_string()
-        } else {
-            parsed.outcome
-        },
+        problem_summary,
+        outcome,
         verification_note: if parsed.verification_note.is_empty() {
             if parsed.verified {
                 "Issue verified".to_string()
@@ -1891,11 +2241,7 @@ fn fix_preview_from_json(parsed: FixPreviewJson, modifier: Option<&str>) -> FixP
         },
         evidence_snippet: parsed.evidence_snippet.filter(|s| !s.trim().is_empty()),
         evidence_line: parsed.evidence_line,
-        description: if parsed.description.is_empty() {
-            "Fix the identified issue".to_string()
-        } else {
-            parsed.description
-        },
+        description,
         affected_areas: parsed.affected_areas,
         scope,
         modifier: modifier.map(String::from),
@@ -2372,6 +2718,151 @@ mod tests {
             SuggestionSource::LlmDeep,
         )
         .with_detail("Details".to_string())
+    }
+
+    #[test]
+    fn test_build_fix_preview_dedupes_user_sections_when_summary_and_detail_match() {
+        let repeated = "Timed-out commands can leave orphan processes, consuming system resources.";
+        let suggestion = Suggestion::new(
+            SuggestionKind::BugFix,
+            Priority::High,
+            PathBuf::from("src/runtime.rs"),
+            repeated.to_string(),
+            SuggestionSource::LlmDeep,
+        )
+        .with_detail(repeated.to_string());
+
+        let preview = build_fix_preview_from_validated_suggestion(&suggestion);
+
+        assert!(!is_effectively_duplicate_preview_text(
+            &preview.problem_summary,
+            &preview.description
+        ));
+        assert!(!is_effectively_duplicate_preview_text(
+            &preview.problem_summary,
+            &preview.outcome
+        ));
+        assert!(!is_effectively_duplicate_preview_text(
+            &preview.description,
+            &preview.outcome
+        ));
+    }
+
+    #[test]
+    fn test_build_fix_preview_prefers_distinct_detail_sentence_for_why_section() {
+        let summary = "Timed-out commands can leave orphan processes, consuming system resources.";
+        let detail = format!(
+            "{} Kill the child process on timeout and clear the handle to prevent leaks.",
+            summary
+        );
+        let suggestion = Suggestion::new(
+            SuggestionKind::BugFix,
+            Priority::High,
+            PathBuf::from("src/runtime.rs"),
+            summary.to_string(),
+            SuggestionSource::LlmDeep,
+        )
+        .with_detail(detail);
+
+        let preview = build_fix_preview_from_validated_suggestion(&suggestion);
+
+        assert!(preview
+            .description
+            .contains("Kill the child process on timeout"));
+        assert!(preview.outcome.starts_with("After apply"));
+    }
+
+    #[test]
+    fn test_sentence_candidates_do_not_split_file_extensions() {
+        let detail = "The `is_valid_git_ref` helper (`crates/cosmos-adapters/src/github.rs`) rejects empty and overly long names but does not check for unsafe characters.";
+        let candidates = sentence_candidates(detail);
+        assert_eq!(candidates.len(), 1, "{:?}", candidates);
+        assert!(candidates[0].contains("github.rs"), "{}", candidates[0]);
+    }
+
+    #[test]
+    fn test_fix_preview_from_json_dedupes_repeated_user_copy() {
+        let parsed = FixPreviewJson {
+            verified: true,
+            verification_state: "verified".to_string(),
+            friendly_title: "Issue".to_string(),
+            problem_summary: "Same explanation for every section.".to_string(),
+            outcome: "Same explanation for every section.".to_string(),
+            verification_note: "Verified".to_string(),
+            evidence_snippet: None,
+            evidence_line: None,
+            description: "Same explanation for every section.".to_string(),
+            affected_areas: vec!["src/runtime.rs".to_string()],
+            scope: "medium".to_string(),
+        };
+
+        let preview = fix_preview_from_json(parsed, None);
+        assert!(!is_effectively_duplicate_preview_text(
+            &preview.problem_summary,
+            &preview.description
+        ));
+        assert!(!is_effectively_duplicate_preview_text(
+            &preview.problem_summary,
+            &preview.outcome
+        ));
+        assert!(!is_effectively_duplicate_preview_text(
+            &preview.description,
+            &preview.outcome
+        ));
+    }
+
+    #[test]
+    fn test_pr_like_preview_sections_follow_plain_language_shape() {
+        let summary = "Empty pull-request titles and bodies are generated for no-change commits, leaving reviewers without a clear description of what the PR does.";
+        let detail = "The `generate_pr_content` function (`crates/cosmos-ui/src/ui/mod.rs`) returns a generic \"Improvements\" title and a static summary when there are no pending changes. This means a user who creates an empty pull request gets a non-descriptive PR that may confuse reviewers.";
+        let suggestion = Suggestion::new(
+            SuggestionKind::Quality,
+            Priority::Medium,
+            PathBuf::from("crates/cosmos-ui/src/ui/mod.rs"),
+            summary.to_string(),
+            SuggestionSource::LlmDeep,
+        )
+        .with_detail(detail.to_string());
+
+        let preview = build_fix_preview_from_validated_suggestion(&suggestion);
+        let why = preview.description.to_ascii_lowercase();
+        let outcome = preview.outcome.to_ascii_lowercase();
+
+        assert!(
+            why.starts_with("this matters because"),
+            "{}",
+            preview.description
+        );
+        assert!(
+            !preview.description.contains("`"),
+            "{}",
+            preview.description
+        );
+        assert!(!why.contains("crates/"), "{}", preview.description);
+        assert!(outcome.starts_with("after apply"), "{}", preview.outcome);
+        assert!(!outcome.contains(" may "), "{}", preview.outcome);
+    }
+
+    #[test]
+    fn test_problem_framed_outcome_is_rewritten_to_after_apply_copy() {
+        let mut problem = "People may get confusing PR descriptions.".to_string();
+        let mut why = "This matters because reviewers lose context.".to_string();
+        let mut outcome =
+            "This means a user may get a non-descriptive PR that may confuse reviewers."
+                .to_string();
+
+        dedupe_preview_user_copy(
+            Some(SuggestionKind::Quality),
+            &mut problem,
+            &mut why,
+            &mut outcome,
+        );
+
+        assert!(
+            outcome.to_ascii_lowercase().starts_with("after apply"),
+            "{outcome}"
+        );
+        assert!(!outcome.to_ascii_lowercase().contains(" may "), "{outcome}");
     }
 
     #[test]
