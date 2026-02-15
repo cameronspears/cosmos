@@ -86,31 +86,51 @@ pub async fn run_tui(
         ));
     }
 
+    // Create channel for background tasks
+    let (tx, rx) = mpsc::channel::<BackgroundMessage>();
+
+    // Gate startup generation until startup check is resolved.
+    if matches!(app.overlay, ui::Overlay::StartupCheck { .. }) {
+        wait_for_startup_decision(&mut terminal, &mut app, &rx, &tx, &repo_path, &index)?;
+    }
+
+    // Refresh context/index after startup choice so background generation reflects
+    // the post-choice repository state (stash/discard/switch-main).
+    let _ = app.context.refresh();
+    let startup_index = match CodebaseIndex::new(&repo_path) {
+        Ok(fresh) => {
+            app.replace_index(fresh.clone());
+            fresh
+        }
+        Err(_) => app.index.clone(),
+    };
+    let startup_context = app.context.clone();
+
     // ═══════════════════════════════════════════════════════════════════════
     //  SMART SUMMARY CACHING
     // ═══════════════════════════════════════════════════════════════════════
 
     // Compute file hashes for change detection
-    let file_hashes = cache::compute_file_hashes(&index);
+    let file_hashes = cache::compute_file_hashes(&startup_index);
 
     // Optional AI-assisted grouping (safe fallback, low-confidence only)
     let grouping_ai_enabled = true;
     let mut grouping_ai_cache = cache_manager.load_grouping_ai_cache().unwrap_or_default();
-    if grouping_ai_cache.normalize_paths(&index.root) {
+    if grouping_ai_cache.normalize_paths(&startup_index.root) {
         let _ = cache_manager.save_grouping_ai_cache(&grouping_ai_cache);
     }
     if grouping_ai_enabled {
         let overrides = cached_grouping_overrides(&app.grouping, &grouping_ai_cache, &file_hashes);
         if !overrides.is_empty() {
             let grouping =
-                cosmos_core::grouping::generate_grouping_with_overrides(&index, &overrides);
+                cosmos_core::grouping::generate_grouping_with_overrides(&startup_index, &overrides);
             app.apply_grouping_update(grouping);
         }
     }
 
     // Load cached LLM summaries and apply immediately
     let mut llm_cache = cache_manager.load_llm_summaries_cache().unwrap_or_default();
-    if llm_cache.normalize_paths(&index.root) {
+    if llm_cache.normalize_paths(&startup_index.root) {
         let _ = cache_manager.save_llm_summaries_cache(&llm_cache);
     }
 
@@ -128,7 +148,7 @@ pub async fn run_tui(
     }
 
     // Discover project context (for better quality summaries)
-    let project_context = cosmos_engine::llm::discover_project_context(&index);
+    let project_context = cosmos_engine::llm::discover_project_context(&startup_index);
     llm_cache.set_project_context(project_context.clone());
 
     // Find files that need new/updated summaries
@@ -145,9 +165,6 @@ pub async fn run_tui(
     }
 
     eprintln!();
-
-    // Create channel for background tasks
-    let (tx, rx) = mpsc::channel::<BackgroundMessage>();
 
     // ═══════════════════════════════════════════════════════════════════════
     //  BACKGROUND VERSION CHECK
@@ -183,7 +200,7 @@ pub async fn run_tui(
         );
 
         if !candidates.is_empty() {
-            let index_clone = index.clone();
+            let index_clone = startup_index.clone();
             let baseline_grouping = app.grouping.clone();
             let file_hashes_clone = file_hashes.clone();
             let tx_grouping = tx.clone();
@@ -285,8 +302,8 @@ pub async fn run_tui(
             app.pending_suggestions_on_init = true;
             app.summary_progress = Some((0, needs_summary_count));
 
-            let index_clone2 = index.clone();
-            let context_clone2 = context.clone();
+            let index_clone2 = startup_index.clone();
+            let context_clone2 = startup_context.clone();
             let tx_summaries = tx.clone();
             let cache_path = repo_path.clone();
             let file_hashes_clone = file_hashes.clone();
@@ -426,7 +443,7 @@ pub async fn run_tui(
     }
 
     // Main loop with async event handling
-    let result = run_loop(&mut terminal, &mut app, rx, tx, repo_path, index);
+    let result = run_loop(&mut terminal, &mut app, rx, tx, repo_path, startup_index);
 
     // Restore terminal
     disable_raw_mode()?;
@@ -438,6 +455,72 @@ pub async fn run_tui(
     terminal.show_cursor()?;
 
     result
+}
+
+fn wait_for_startup_decision<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    rx: &mpsc::Receiver<BackgroundMessage>,
+    tx: &mpsc::Sender<BackgroundMessage>,
+    repo_path: &PathBuf,
+    index: &CodebaseIndex,
+) -> Result<()> {
+    let spinner_interval = Duration::from_millis(100);
+    let idle_poll = Duration::from_millis(120);
+    let mut last_spinner_tick = std::time::Instant::now();
+    let mut needs_redraw = true;
+    let ctx = RuntimeContext {
+        index,
+        repo_path,
+        tx,
+    };
+
+    loop {
+        let startup_overlay_active = matches!(app.overlay, ui::Overlay::StartupCheck { .. });
+        let startup_action_in_progress = matches!(
+            app.loading,
+            LoadingState::Stashing | LoadingState::Discarding | LoadingState::SwitchingBranch
+        );
+        if !startup_overlay_active && !startup_action_in_progress {
+            break;
+        }
+
+        if app.loading.is_loading() && last_spinner_tick.elapsed() >= spinner_interval {
+            app.tick_loading();
+            last_spinner_tick = std::time::Instant::now();
+            needs_redraw = true;
+        }
+
+        if background::drain_messages(app, rx, &ctx) {
+            needs_redraw = true;
+        }
+        if app.needs_redraw {
+            needs_redraw = true;
+        }
+
+        if needs_redraw {
+            terminal.draw(|f| ui::render(f, app))?;
+            needs_redraw = false;
+            app.needs_redraw = false;
+        }
+
+        if app.should_quit {
+            break;
+        }
+
+        if event::poll(idle_poll)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                input::handle_key_event(app, key, &ctx)?;
+                needs_redraw = true;
+                app.needs_redraw = true;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Main event loop with background message handling

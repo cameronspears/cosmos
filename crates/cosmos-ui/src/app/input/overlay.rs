@@ -2,7 +2,7 @@ use super::normal::confirm_apply_from_overlay;
 use crate::app::background;
 use crate::app::messages::BackgroundMessage;
 use crate::app::RuntimeContext;
-use crate::ui::{App, LoadingState, Overlay};
+use crate::ui::{App, LoadingState, Overlay, StartupAction, StartupMode};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -30,6 +30,59 @@ fn open_openrouter_link(app: &mut App, url: &str, label: &str) {
 
 fn has_control_or_command(modifiers: KeyModifiers) -> bool {
     modifiers.contains(KeyModifiers::CONTROL) || modifiers.contains(KeyModifiers::SUPER)
+}
+
+fn execute_startup_stash(app: &mut App, ctx: &RuntimeContext) {
+    app.loading = LoadingState::Stashing;
+    app.close_overlay();
+    let tx = ctx.tx.clone();
+    let repo_path = app.repo_path.clone();
+    background::spawn_background(ctx.tx.clone(), "stash_changes", async move {
+        match cosmos_adapters::git_ops::stash_changes(&repo_path) {
+            Ok(message) => {
+                let _ = tx.send(BackgroundMessage::StashComplete { message });
+            }
+            Err(e) => {
+                let _ = tx.send(BackgroundMessage::Error(e.to_string()));
+            }
+        }
+    });
+}
+
+fn execute_startup_discard(app: &mut App, ctx: &RuntimeContext) {
+    app.loading = LoadingState::Discarding;
+    app.close_overlay();
+    let tx = ctx.tx.clone();
+    let repo_path = app.repo_path.clone();
+    background::spawn_background(ctx.tx.clone(), "discard_changes", async move {
+        match cosmos_adapters::git_ops::discard_all_changes(&repo_path) {
+            Ok(()) => {
+                let _ = tx.send(BackgroundMessage::DiscardComplete);
+            }
+            Err(e) => {
+                let _ = tx.send(BackgroundMessage::Error(e.to_string()));
+            }
+        }
+    });
+}
+
+fn execute_startup_switch_to_main(app: &mut App, ctx: &RuntimeContext, main_branch: String) {
+    app.loading = LoadingState::SwitchingBranch;
+    app.close_overlay();
+    let tx = ctx.tx.clone();
+    let repo_path = app.repo_path.clone();
+    background::spawn_background(ctx.tx.clone(), "switch_to_main_branch", async move {
+        match cosmos_adapters::git_ops::checkout_branch(&repo_path, &main_branch) {
+            Ok(()) => {
+                let _ = tx.send(BackgroundMessage::StartupSwitchedToMain {
+                    branch: main_branch,
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(BackgroundMessage::Error(e.to_string()));
+            }
+        }
+    });
 }
 
 /// Handle key events when an overlay is active
@@ -217,90 +270,62 @@ pub(super) fn handle_overlay_input(
 
         // Handle Startup Check overlay
         if let Overlay::StartupCheck {
-            confirming_discard, ..
+            changed_count,
+            current_branch,
+            main_branch,
+            mode,
+            ..
         } = &app.overlay
         {
-            let confirming = *confirming_discard;
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    app.close_overlay();
-                }
-                KeyCode::Down => {
-                    app.overlay_scroll_down();
-                }
-                KeyCode::Up => {
-                    app.overlay_scroll_up();
-                }
-                // === Confirmation mode handlers ===
-                KeyCode::Char('y') if confirming => {
-                    // Confirm discard - actually discard changes
-                    app.loading = LoadingState::Discarding;
-                    app.close_overlay();
-                    let tx = ctx.tx.clone();
-                    let repo_path = app.repo_path.clone();
-                    background::spawn_background(ctx.tx.clone(), "discard_changes", async move {
-                        match cosmos_adapters::git_ops::discard_all_changes(&repo_path) {
-                            Ok(()) => {
-                                let _ = tx.send(BackgroundMessage::DiscardComplete);
-                            }
-                            Err(e) => {
-                                let _ = tx.send(BackgroundMessage::Error(e.to_string()));
-                            }
+            let startup_mode = *mode;
+            let available_actions =
+                App::startup_actions_for_context(*changed_count, current_branch, main_branch);
+            let main_branch_name = main_branch.clone();
+
+            match startup_mode {
+                StartupMode::ConfirmDiscard => match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => execute_startup_discard(app, ctx),
+                    KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
+                        app.startup_check_set_mode(StartupMode::Choose);
+                    }
+                    _ => {}
+                },
+                StartupMode::Choose => match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
+                    KeyCode::Down => app.startup_check_navigate(1),
+                    KeyCode::Up => app.startup_check_navigate(-1),
+                    KeyCode::Enter => match app.startup_check_selected_action() {
+                        Some(StartupAction::SaveStartFresh) => execute_startup_stash(app, ctx),
+                        Some(StartupAction::DiscardStartFresh) => {
+                            app.startup_check_set_mode(StartupMode::ConfirmDiscard)
                         }
-                    });
-                }
-                KeyCode::Enter if confirming => {
-                    // Confirm discard via Enter
-                    app.loading = LoadingState::Discarding;
-                    app.close_overlay();
-                    let tx = ctx.tx.clone();
-                    let repo_path = app.repo_path.clone();
-                    background::spawn_background(ctx.tx.clone(), "discard_changes", async move {
-                        match cosmos_adapters::git_ops::discard_all_changes(&repo_path) {
-                            Ok(()) => {
-                                let _ = tx.send(BackgroundMessage::DiscardComplete);
-                            }
-                            Err(e) => {
-                                let _ = tx.send(BackgroundMessage::Error(e.to_string()));
-                            }
+                        Some(StartupAction::SwitchToMain) => {
+                            execute_startup_switch_to_main(app, ctx, main_branch_name)
                         }
-                    });
-                }
-                KeyCode::Char('n') if confirming => {
-                    // Cancel confirmation - go back to main menu
-                    app.startup_check_confirm_discard(false);
-                }
-                KeyCode::Char('c') if confirming => {
-                    // Cancel confirmation - go back to main menu
-                    app.startup_check_confirm_discard(false);
-                }
-                // === Initial menu handlers ===
-                KeyCode::Char('s') if !confirming => {
-                    // Save my work and start fresh (git stash)
-                    app.loading = LoadingState::Stashing;
-                    app.close_overlay();
-                    let tx = ctx.tx.clone();
-                    let repo_path = app.repo_path.clone();
-                    background::spawn_background(ctx.tx.clone(), "stash_changes", async move {
-                        match cosmos_adapters::git_ops::stash_changes(&repo_path) {
-                            Ok(message) => {
-                                let _ = tx.send(BackgroundMessage::StashComplete { message });
-                            }
-                            Err(e) => {
-                                let _ = tx.send(BackgroundMessage::Error(e.to_string()));
-                            }
-                        }
-                    });
-                }
-                KeyCode::Char('d') if !confirming => {
-                    // Discard and start fresh - show confirmation
-                    app.startup_check_confirm_discard(true);
-                }
-                KeyCode::Char('c') if !confirming => {
-                    // Continue as-is - just close the overlay
-                    app.close_overlay();
-                }
-                _ => {}
+                        Some(StartupAction::ContinueAsIs) | None => app.close_overlay(),
+                    },
+                    KeyCode::Char('s')
+                        if available_actions.contains(&StartupAction::SaveStartFresh) =>
+                    {
+                        execute_startup_stash(app, ctx);
+                    }
+                    KeyCode::Char('d')
+                        if available_actions.contains(&StartupAction::DiscardStartFresh) =>
+                    {
+                        app.startup_check_set_mode(StartupMode::ConfirmDiscard);
+                    }
+                    KeyCode::Char('m')
+                        if available_actions.contains(&StartupAction::SwitchToMain) =>
+                    {
+                        execute_startup_switch_to_main(app, ctx, main_branch_name);
+                    }
+                    KeyCode::Char('c')
+                        if available_actions.contains(&StartupAction::ContinueAsIs) =>
+                    {
+                        app.close_overlay();
+                    }
+                    _ => {}
+                },
             }
             return Ok(());
         }

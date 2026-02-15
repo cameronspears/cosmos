@@ -1,7 +1,8 @@
 use crate::ui::helpers::{centered_rect, wrap_text};
 use crate::ui::theme::Theme;
+use crate::ui::{StartupAction, StartupMode};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -953,13 +954,36 @@ pub(super) fn render_startup_check(
     changed_count: usize,
     current_branch: &str,
     main_branch: &str,
-    scroll: usize,
-    confirming_discard: bool,
+    mode: StartupMode,
+    selected_action: StartupAction,
 ) {
-    let area = centered_rect(65, 60, frame.area());
+    let viewport = frame.area();
+    let is_branch_only = changed_count == 0 && current_branch != main_branch;
+    let desired_width = if mode == StartupMode::ConfirmDiscard {
+        74
+    } else {
+        98
+    };
+    let desired_height = if mode == StartupMode::ConfirmDiscard {
+        14
+    } else if is_branch_only {
+        18
+    } else {
+        20
+    };
+    let max_width = viewport.width.saturating_sub(2);
+    let max_height = viewport.height.saturating_sub(2);
+    let width = desired_width.min(max_width).max(40).min(viewport.width);
+    let height = desired_height.min(max_height).max(10).min(viewport.height);
+    let area = Rect::new(
+        viewport.x + viewport.width.saturating_sub(width) / 2,
+        viewport.y + viewport.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
     frame.render_widget(Clear, area);
 
-    let title = if confirming_discard {
+    let title = if mode == StartupMode::ConfirmDiscard {
         " Confirm "
     } else {
         " Startup Check "
@@ -979,7 +1003,7 @@ pub(super) fn render_startup_check(
     // Split inner area: scrollable body + fixed footer
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner_area);
 
     let body_area = layout[0];
@@ -987,45 +1011,48 @@ pub(super) fn render_startup_check(
 
     // Build body content
     let mut lines: Vec<Line> = Vec::new();
+    let compact = mode == StartupMode::Choose && body_area.height <= 10;
+    let show_selected_desc = !compact && body_area.height >= 12;
 
-    if confirming_discard {
+    if mode == StartupMode::ConfirmDiscard {
         // Confirmation dialog for discard
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Are you sure?",
+            "  Discard uncommitted changes?",
             Style::default()
                 .fg(Theme::WHITE)
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  This will permanently remove your uncommitted changes.",
+            "  This permanently removes local changes on this branch.",
             Style::default().fg(Theme::GREY_300),
         )));
         lines.push(Line::from(""));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  ─────────────────────────────────────────────────",
-            Style::default().fg(Theme::GREY_600),
-        )));
         lines.push(Line::from(vec![
-            Span::styled("   ", Style::default()),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                " irreversible ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::RED),
+            ),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
             Span::styled(" y ", Style::default().fg(Theme::GREY_900).bg(Theme::RED)),
-            Span::styled(" yes, discard  ", Style::default().fg(Theme::GREY_400)),
+            Span::styled(" discard now  ", Style::default().fg(Theme::GREY_300)),
             Span::styled(
                 " n ",
                 Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
             ),
-            Span::styled(" cancel", Style::default().fg(Theme::GREY_400)),
+            Span::styled(" go back", Style::default().fg(Theme::GREY_400)),
         ]));
-        lines.push(Line::from(""));
     } else {
-        // Main startup check dialog
+        // Main startup check dialog (guided selection)
         lines.push(Line::from(""));
-        let headline = if changed_count == 0 && current_branch != main_branch {
+        let headline = if is_branch_only {
             "  You're on a non-main branch"
         } else {
-            "  You have unsaved work"
+            "  Local changes detected"
         };
         lines.push(Line::from(Span::styled(
             headline,
@@ -1033,106 +1060,243 @@ pub(super) fn render_startup_check(
                 .fg(Theme::WHITE)
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Cosmos works best from a fresh starting point.",
-            Style::default().fg(Theme::GREY_300),
-        )));
-        lines.push(Line::from(Span::styled(
-            if changed_count == 0 {
-                "  No uncommitted changes found.".to_string()
-            } else {
-                format!(
-                    "  You have {} file{} with changes.",
-                    changed_count,
-                    if changed_count == 1 { "" } else { "s" }
-                )
-            },
-            Style::default().fg(Theme::GREY_300),
-        )));
-        if current_branch != main_branch {
+
+        if compact {
             lines.push(Line::from(Span::styled(
-                format!("  Branch: {} (main: {})", current_branch, main_branch),
-                Style::default().fg(Theme::GREY_400),
+                if current_branch != main_branch {
+                    format!(
+                        "  files: {}   branch: {} -> {}",
+                        changed_count, current_branch, main_branch
+                    )
+                } else {
+                    format!("  files changed: {}", changed_count)
+                },
+                Style::default().fg(Theme::GREY_300),
             )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "  Choose how Cosmos should start this session.",
+                Style::default().fg(Theme::GREY_300),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    " Status ",
+                    Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!("  Changed files: {}", changed_count),
+                Style::default().fg(Theme::GREY_300),
+            )));
+            if current_branch != main_branch {
+                lines.push(Line::from(Span::styled(
+                    format!("  Branch: {} (main: {})", current_branch, main_branch),
+                    Style::default().fg(Theme::GREY_400),
+                )));
+            }
         }
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  ─────────────────────────────────────────────────",
-            Style::default().fg(Theme::GREY_600),
-        )));
-        lines.push(Line::from(""));
 
-        // Option: Save
-        lines.push(Line::from(vec![
-            Span::styled("   ", Style::default()),
-            Span::styled(" s ", Style::default().fg(Theme::GREY_900).bg(Theme::GREEN)),
-            Span::styled(
-                "  Save my work and start fresh",
-                Style::default().fg(Theme::GREY_100),
-            ),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "      Your changes are safely stored.",
-            Style::default().fg(Theme::GREY_500),
-        )));
-        lines.push(Line::from(""));
+        let mut selected_desc: Option<String> = None;
+        let mut push_action = |action: StartupAction,
+                               key: &str,
+                               key_style: Style,
+                               label: &str,
+                               tag: Option<(&str, Style)>,
+                               desc: &str| {
+            let selected = selected_action == action;
+            let row_bg = if selected {
+                Theme::GREY_700
+            } else {
+                Theme::GREY_800
+            };
+            let indicator = if selected { " ▸ " } else { "   " };
 
-        // Option: Discard
-        lines.push(Line::from(vec![
-            Span::styled("   ", Style::default()),
-            Span::styled(
-                " d ",
+            let mut row = vec![
+                Span::styled(
+                    indicator,
+                    Style::default()
+                        .fg(if selected {
+                            Theme::ACCENT
+                        } else {
+                            Theme::GREY_600
+                        })
+                        .bg(row_bg),
+                ),
+                Span::styled(format!(" {} ", key), key_style),
+                Span::styled(
+                    format!(" {}", label),
+                    Style::default()
+                        .fg(if selected {
+                            Theme::WHITE
+                        } else {
+                            Theme::GREY_100
+                        })
+                        .bg(row_bg)
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ];
+            if let Some((tag_text, tag_style)) = tag {
+                row.push(Span::styled(" ", Style::default().bg(row_bg)));
+                row.push(Span::styled(format!(" {} ", tag_text), tag_style));
+            }
+            lines.push(Line::from(row));
+            if selected {
+                selected_desc = Some(desc.to_string());
+            }
+        };
+
+        if is_branch_only {
+            push_action(
+                StartupAction::SwitchToMain,
+                "m",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREEN),
+                "switch to main branch",
+                Some((
+                    "recommended",
+                    Style::default().fg(Theme::GREY_900).bg(Theme::YELLOW),
+                )),
+                "Start from the repository's default branch.",
+            );
+            push_action(
+                StartupAction::ContinueAsIs,
+                "c",
                 Style::default().fg(Theme::GREY_900).bg(Theme::GREY_500),
-            ),
-            Span::styled(
-                "  Discard and start fresh",
-                Style::default().fg(Theme::GREY_100),
-            ),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "      Remove all changes and start clean.",
-            Style::default().fg(Theme::GREY_500),
-        )));
-        lines.push(Line::from(""));
-
-        // Option: Continue
-        lines.push(Line::from(vec![
-            Span::styled("   ", Style::default()),
-            Span::styled(
-                " c ",
+                "continue on current branch",
+                None,
+                "Keep this branch as the base for this session.",
+            );
+        } else {
+            push_action(
+                StartupAction::SaveStartFresh,
+                "s",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREEN),
+                "save and start fresh",
+                Some((
+                    "recommended",
+                    Style::default().fg(Theme::GREY_900).bg(Theme::YELLOW),
+                )),
+                "Stashes your local changes safely before continuing.",
+            );
+            push_action(
+                StartupAction::DiscardStartFresh,
+                "d",
                 Style::default().fg(Theme::GREY_900).bg(Theme::GREY_500),
-            ),
-            Span::styled("  Continue as-is", Style::default().fg(Theme::GREY_100)),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "      Keep your current branch as the base for applied fixes.",
-            Style::default().fg(Theme::GREY_500),
-        )));
+                "discard and start fresh",
+                Some(("permanent", Style::default().fg(Theme::RED))),
+                "Permanently removes uncommitted local changes.",
+            );
+            push_action(
+                StartupAction::ContinueAsIs,
+                "c",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_500),
+                "continue as-is",
+                None,
+                "Use your current branch and local state as the base.",
+            );
+        }
+
         lines.push(Line::from(""));
+        if show_selected_desc {
+            if let Some(desc) = selected_desc {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        "Selected: ",
+                        Style::default()
+                            .fg(Theme::GREY_300)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(desc, Style::default().fg(Theme::GREY_500)),
+                ]));
+            }
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    "Tip: use ↑↓ to see every option",
+                    Style::default().fg(Theme::GREY_500),
+                ),
+            ]));
+        }
     }
 
-    // Render scrollable body
-    let body = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll as u16, 0));
+    // Render body
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(body, body_area);
 
-    // Render fixed footer with scroll hint
-    let footer_lines = vec![
-        Line::from(Span::styled(
-            "  ─────────────────────────────────────────────────",
-            Style::default().fg(Theme::GREY_600),
-        )),
-        Line::from(vec![
-            Span::styled("   ", Style::default()),
+    // Render fixed footer controls
+    let footer_lines = if mode == StartupMode::ConfirmDiscard {
+        vec![Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(" y ", Style::default().fg(Theme::GREY_900).bg(Theme::RED)),
+            Span::styled(" discard  ", Style::default().fg(Theme::GREY_300)),
+            Span::styled(
+                " n ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+            ),
+            Span::styled(" cancel  ", Style::default().fg(Theme::GREY_400)),
+            Span::styled(
+                " Esc ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+            ),
+            Span::styled(" back", Style::default().fg(Theme::GREY_400)),
+        ])]
+    } else if is_branch_only {
+        vec![Line::from(vec![
+            Span::styled("  ", Style::default()),
             Span::styled(
                 " ↑↓ ",
                 Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
             ),
-            Span::styled(" scroll ", Style::default().fg(Theme::GREY_400)),
-        ]),
-    ];
+            Span::styled(" move  ", Style::default().fg(Theme::GREY_400)),
+            Span::styled(
+                " Enter ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREEN),
+            ),
+            Span::styled(" choose  ", Style::default().fg(Theme::GREY_300)),
+            Span::styled(
+                " m/c ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+            ),
+            Span::styled(" quick  ", Style::default().fg(Theme::GREY_400)),
+            Span::styled(
+                " Esc ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+            ),
+            Span::styled(" continue", Style::default().fg(Theme::GREY_400)),
+        ])]
+    } else {
+        vec![Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                " ↑↓ ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+            ),
+            Span::styled(" move  ", Style::default().fg(Theme::GREY_400)),
+            Span::styled(
+                " Enter ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREEN),
+            ),
+            Span::styled(" choose  ", Style::default().fg(Theme::GREY_300)),
+            Span::styled(
+                " s/d/c ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+            ),
+            Span::styled(" quick  ", Style::default().fg(Theme::GREY_400)),
+            Span::styled(
+                " Esc ",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+            ),
+            Span::styled(" continue", Style::default().fg(Theme::GREY_400)),
+        ])]
+    };
     let footer = Paragraph::new(footer_lines);
     frame.render_widget(footer, footer_area);
 }

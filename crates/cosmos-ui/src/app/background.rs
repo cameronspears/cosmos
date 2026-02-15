@@ -720,6 +720,10 @@ pub fn drain_messages(
                 app.loading = LoadingState::None;
                 app.show_toast("Changes discarded - starting fresh");
             }
+            BackgroundMessage::StartupSwitchedToMain { branch } => {
+                app.loading = LoadingState::None;
+                app.show_toast(&format!("Switched to {}", branch));
+            }
             BackgroundMessage::Error(e) => {
                 if e.contains("ask_question") {
                     if let Some(request_id) = app.active_ask_request_id {

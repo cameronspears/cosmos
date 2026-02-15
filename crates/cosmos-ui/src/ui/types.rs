@@ -72,6 +72,7 @@ pub enum LoadingState {
     Resetting,           // Clearing cache/data
     Stashing,            // Saving work via git stash
     Discarding,          // Discarding uncommitted changes
+    SwitchingBranch,     // Switching to main branch from startup check
 }
 
 impl LoadingState {
@@ -122,7 +123,7 @@ pub enum Overlay {
         /// Currently focused option index
         selected: usize,
     },
-    /// Startup check - shown when cosmos starts with unsaved work
+    /// Startup action choices shown in Startup Check
     StartupCheck {
         /// Number of files with uncommitted changes
         changed_count: usize,
@@ -130,10 +131,10 @@ pub enum Overlay {
         current_branch: String,
         /// Default/main branch name
         main_branch: String,
-        /// Scroll position within the overlay
-        scroll: usize,
-        /// True when showing "are you sure?" confirmation for discard
-        confirming_discard: bool,
+        /// Current interaction mode for startup check
+        mode: StartupMode,
+        /// Currently focused action in choose mode
+        selected_action: StartupAction,
     },
     /// Update available panel - shown when a new version is detected
     Update {
@@ -148,6 +149,20 @@ pub enum Overlay {
     },
     /// Welcome overlay - shown on first run to explain the basics
     Welcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupAction {
+    SaveStartFresh,
+    DiscardStartFresh,
+    ContinueAsIs,
+    SwitchToMain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupMode {
+    Choose,
+    ConfirmDiscard,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

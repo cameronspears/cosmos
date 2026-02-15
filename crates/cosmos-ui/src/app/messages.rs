@@ -112,6 +112,10 @@ pub enum BackgroundMessage {
     },
     /// Discard changes completed
     DiscardComplete,
+    /// Switched to main branch from startup check
+    StartupSwitchedToMain {
+        branch: String,
+    },
     /// Generic error (used for push/etc)
     Error(String),
     /// Response to a user question

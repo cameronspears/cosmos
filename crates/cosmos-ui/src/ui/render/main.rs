@@ -203,6 +203,7 @@ fn render_suggestions_content<'a>(
             }
         }
         LoadingState::Resetting => Some("Resetting cache...".to_string()),
+        LoadingState::SwitchingBranch => Some("Switching to main branch...".to_string()),
         LoadingState::None => None,
         _ => {
             // For other active loading states, show context if available

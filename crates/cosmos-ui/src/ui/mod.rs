@@ -16,8 +16,8 @@ pub use render::render;
 // Re-export all types for backward compatibility
 pub use types::{
     ActivePanel, AskCosmosState, FileChange, InputMode, LoadingState, Overlay, PendingChange,
-    ReviewFileContent, ReviewState, ShipState, ShipStep, Toast, ToastKind, VerifyState, ViewMode,
-    WorkflowStep, SPINNER_FRAMES,
+    ReviewFileContent, ReviewState, ShipState, ShipStep, StartupAction, StartupMode, Toast,
+    ToastKind, VerifyState, ViewMode, WorkflowStep, SPINNER_FRAMES,
 };
 
 use cosmos_core::context::WorkContext;
@@ -1066,22 +1066,125 @@ impl App {
         current_branch: String,
         main_branch: String,
     ) {
+        let actions =
+            Self::startup_actions_for_context(changed_count, &current_branch, &main_branch);
+        let selected_action = actions
+            .first()
+            .copied()
+            .unwrap_or(StartupAction::ContinueAsIs);
         self.overlay = Overlay::StartupCheck {
             changed_count,
             current_branch,
             main_branch,
-            scroll: 0,
-            confirming_discard: false,
+            mode: StartupMode::Choose,
+            selected_action,
         };
     }
 
-    /// Set confirming_discard state in startup check overlay
-    pub fn startup_check_confirm_discard(&mut self, confirming: bool) {
+    /// Startup check actions shown for the current git context.
+    pub fn startup_actions_for_context(
+        changed_count: usize,
+        current_branch: &str,
+        main_branch: &str,
+    ) -> Vec<StartupAction> {
+        if changed_count > 0 {
+            vec![
+                StartupAction::SaveStartFresh,
+                StartupAction::DiscardStartFresh,
+                StartupAction::ContinueAsIs,
+            ]
+        } else if current_branch != main_branch {
+            vec![StartupAction::SwitchToMain, StartupAction::ContinueAsIs]
+        } else {
+            vec![StartupAction::ContinueAsIs]
+        }
+    }
+
+    /// Move focus in startup check action list.
+    pub fn startup_check_navigate(&mut self, delta: isize) {
         if let Overlay::StartupCheck {
-            confirming_discard, ..
+            changed_count,
+            current_branch,
+            main_branch,
+            selected_action,
+            mode,
         } = &mut self.overlay
         {
-            *confirming_discard = confirming;
+            if *mode != StartupMode::Choose {
+                return;
+            }
+
+            let actions =
+                Self::startup_actions_for_context(*changed_count, current_branch, main_branch);
+            let len = actions.len();
+            if len == 0 {
+                return;
+            }
+
+            let current_idx = actions
+                .iter()
+                .position(|action| action == selected_action)
+                .unwrap_or(0);
+            let new_idx = if delta > 0 {
+                (current_idx + delta as usize) % len
+            } else {
+                (current_idx + len - ((-delta) as usize % len)) % len
+            };
+            *selected_action = actions[new_idx];
+        }
+    }
+
+    /// Set selected startup action when valid for current context.
+    pub fn startup_check_set_selected(&mut self, action: StartupAction) {
+        if let Overlay::StartupCheck {
+            changed_count,
+            current_branch,
+            main_branch,
+            selected_action,
+            ..
+        } = &mut self.overlay
+        {
+            let actions =
+                Self::startup_actions_for_context(*changed_count, current_branch, main_branch);
+            if actions.contains(&action) {
+                *selected_action = action;
+            }
+        }
+    }
+
+    /// Set startup check mode (choose vs confirm discard).
+    pub fn startup_check_set_mode(&mut self, mode: StartupMode) {
+        if let Overlay::StartupCheck {
+            changed_count,
+            current_branch,
+            main_branch,
+            selected_action,
+            mode: startup_mode,
+        } = &mut self.overlay
+        {
+            *startup_mode = mode;
+            if mode == StartupMode::Choose {
+                let actions =
+                    Self::startup_actions_for_context(*changed_count, current_branch, main_branch);
+                if !actions.contains(selected_action) {
+                    *selected_action = actions
+                        .first()
+                        .copied()
+                        .unwrap_or(StartupAction::ContinueAsIs);
+                }
+            }
+        }
+    }
+
+    /// Get currently selected startup action.
+    pub fn startup_check_selected_action(&self) -> Option<StartupAction> {
+        if let Overlay::StartupCheck {
+            selected_action, ..
+        } = &self.overlay
+        {
+            Some(*selected_action)
+        } else {
+            None
         }
     }
 
@@ -1120,9 +1223,7 @@ impl App {
     /// Scroll overlay down
     pub fn overlay_scroll_down(&mut self) {
         match &mut self.overlay {
-            Overlay::Help { scroll }
-            | Overlay::FileDetail { scroll, .. }
-            | Overlay::StartupCheck { scroll, .. } => {
+            Overlay::Help { scroll } | Overlay::FileDetail { scroll, .. } => {
                 *scroll += 1;
             }
             _ => {}
@@ -1132,9 +1233,7 @@ impl App {
     /// Scroll overlay up
     pub fn overlay_scroll_up(&mut self) {
         match &mut self.overlay {
-            Overlay::Help { scroll }
-            | Overlay::FileDetail { scroll, .. }
-            | Overlay::StartupCheck { scroll, .. } => {
+            Overlay::Help { scroll } | Overlay::FileDetail { scroll, .. } => {
                 *scroll = scroll.saturating_sub(1);
             }
             _ => {}
@@ -1815,5 +1914,81 @@ mod tests {
         assert!(app.complete_ask_request(second));
         assert!(!app.ask_in_flight);
         assert!(app.active_ask_request_id.is_none());
+    }
+
+    #[test]
+    fn startup_actions_for_changed_context() {
+        let actions = App::startup_actions_for_context(2, "feature/work", "main");
+        assert_eq!(
+            actions,
+            vec![
+                StartupAction::SaveStartFresh,
+                StartupAction::DiscardStartFresh,
+                StartupAction::ContinueAsIs
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_actions_for_branch_only_context() {
+        let actions = App::startup_actions_for_context(0, "feature/work", "main");
+        assert_eq!(
+            actions,
+            vec![StartupAction::SwitchToMain, StartupAction::ContinueAsIs]
+        );
+    }
+
+    #[test]
+    fn show_startup_check_sets_default_selection_for_changed_context() {
+        let mut app = make_test_app();
+        app.show_startup_check(3, "feature/work".to_string(), "main".to_string());
+
+        if let Overlay::StartupCheck {
+            mode,
+            selected_action,
+            ..
+        } = app.overlay
+        {
+            assert_eq!(mode, StartupMode::Choose);
+            assert_eq!(selected_action, StartupAction::SaveStartFresh);
+        } else {
+            panic!("expected startup check overlay");
+        }
+    }
+
+    #[test]
+    fn show_startup_check_sets_default_selection_for_branch_only_context() {
+        let mut app = make_test_app();
+        app.show_startup_check(0, "feature/work".to_string(), "main".to_string());
+
+        if let Overlay::StartupCheck {
+            mode,
+            selected_action,
+            ..
+        } = app.overlay
+        {
+            assert_eq!(mode, StartupMode::Choose);
+            assert_eq!(selected_action, StartupAction::SwitchToMain);
+        } else {
+            panic!("expected startup check overlay");
+        }
+    }
+
+    #[test]
+    fn startup_check_navigation_wraps() {
+        let mut app = make_test_app();
+        app.show_startup_check(1, "feature/work".to_string(), "main".to_string());
+
+        app.startup_check_navigate(-1);
+        assert_eq!(
+            app.startup_check_selected_action(),
+            Some(StartupAction::ContinueAsIs)
+        );
+
+        app.startup_check_navigate(1);
+        assert_eq!(
+            app.startup_check_selected_action(),
+            Some(StartupAction::SaveStartFresh)
+        );
     }
 }

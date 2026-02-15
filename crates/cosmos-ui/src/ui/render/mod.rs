@@ -86,16 +86,16 @@ pub fn render(frame: &mut Frame, app: &App) {
             changed_count,
             current_branch,
             main_branch,
-            scroll,
-            confirming_discard,
+            mode,
+            selected_action,
         } => {
             render_startup_check(
                 frame,
                 *changed_count,
                 current_branch,
                 main_branch,
-                *scroll,
-                *confirming_discard,
+                *mode,
+                *selected_action,
             );
         }
         Overlay::Update {
