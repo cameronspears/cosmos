@@ -141,10 +141,6 @@ pub async fn run_tui(
 
     if !cached_summaries.is_empty() {
         app.update_summaries(cached_summaries);
-        eprintln!(
-            "  Loaded {} cached summaries ({} files total)",
-            cached_count, total_files
-        );
     }
 
     // Discover project context (for better quality summaries)
@@ -157,14 +153,6 @@ pub async fn run_tui(
 
     // Track if we need to generate summaries (used to control loading state)
     app.needs_summary_generation = needs_summary_count > 0;
-
-    if needs_summary_count > 0 {
-        eprintln!("  {} files need summary generation", needs_summary_count);
-    } else if cached_count > 0 {
-        eprintln!("  All {} summaries loaded from cache", cached_count);
-    }
-
-    eprintln!();
 
     // ═══════════════════════════════════════════════════════════════════════
     //  BACKGROUND VERSION CHECK

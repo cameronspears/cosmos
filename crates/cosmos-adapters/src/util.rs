@@ -196,6 +196,16 @@ pub fn hash_str(content: &str) -> String {
     hash_bytes(content.as_bytes())
 }
 
+pub fn debug_stderr_enabled() -> bool {
+    matches!(
+        std::env::var("COSMOS_DEBUG_STDERR")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{hash_str, resolve_repo_path_allow_new, truncate};

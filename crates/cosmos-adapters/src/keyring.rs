@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::util::debug_stderr_enabled;
+
 /// Single service name for all cosmos credentials.
 /// Using one entry means only one macOS keychain prompt instead of two.
 const KEYRING_SERVICE: &str = "cosmos-credentials";
@@ -181,7 +183,7 @@ fn write_fallback_credentials(creds: &StoredCredentials) -> KeyringResult<()> {
 
 /// Warn about keychain errors only once per session
 pub fn warn_keychain_error_once(context: &str, err: &str) {
-    if KEYRING_ERROR_WARNED.swap(true, Ordering::Relaxed) {
+    if !debug_stderr_enabled() || KEYRING_ERROR_WARNED.swap(true, Ordering::Relaxed) {
         return;
     }
     eprintln!(

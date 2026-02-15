@@ -3,6 +3,7 @@
 //! Stores settings in ~/.config/cosmos/config.json
 
 use crate::keyring;
+use crate::util::debug_stderr_enabled;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -34,10 +35,12 @@ impl Config {
                     Ok(config) => return config,
                     Err(err) => {
                         preserve_corrupt_config(&path, &content);
-                        eprintln!(
-                            "  Warning: Config file was corrupted ({}). A backup was saved and defaults were loaded.",
-                            err
-                        );
+                        if debug_stderr_enabled() {
+                            eprintln!(
+                                "  Warning: Config file was corrupted ({}). A backup was saved and defaults were loaded.",
+                                err
+                            );
+                        }
                     }
                 }
             }
@@ -57,10 +60,12 @@ impl Config {
         {
             use std::os::unix::fs::PermissionsExt;
             if let Err(e) = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)) {
-                eprintln!(
-                    "  Warning: Failed to set config directory permissions: {}",
-                    e
-                );
+                if debug_stderr_enabled() {
+                    eprintln!(
+                        "  Warning: Failed to set config directory permissions: {}",
+                        e
+                    );
+                }
             }
         }
 
@@ -239,10 +244,12 @@ fn write_config_atomic(path: &std::path::Path, content: &str) -> Result<(), Stri
         .map_err(|e| e.to_string())?;
 
     if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-        eprintln!(
-            "  Warning: Failed to set temp config file permissions: {}",
-            e
-        );
+        if debug_stderr_enabled() {
+            eprintln!(
+                "  Warning: Failed to set temp config file permissions: {}",
+                e
+            );
+        }
     }
 
     file.write_all(content.as_bytes())
