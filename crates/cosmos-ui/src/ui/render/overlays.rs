@@ -956,7 +956,7 @@ pub(super) fn render_startup_check(
     scroll: usize,
     confirming_discard: bool,
 ) {
-    let area = centered_rect(55, 45, frame.area());
+    let area = centered_rect(65, 60, frame.area());
     frame.render_widget(Clear, area);
 
     let title = if confirming_discard {
