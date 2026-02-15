@@ -136,8 +136,6 @@ pub async fn run_tui(
 
     // Get all valid cached summaries and load them immediately (instant startup!)
     let cached_summaries = llm_cache.get_all_valid_summaries(&file_hashes);
-    let cached_count = cached_summaries.len();
-    let total_files = file_hashes.len();
 
     if !cached_summaries.is_empty() {
         app.update_summaries(cached_summaries);
@@ -303,14 +301,6 @@ pub async fn run_tui(
                     &context_clone2,
                     &files_needing_summary,
                 );
-
-            // Show initial cached count
-            if cached_count > 0 {
-                app.show_toast(&format!(
-                    "{}/{} cached · summarizing {}",
-                    cached_count, total_files, needs_summary_count
-                ));
-            }
 
             // Calculate total file count for progress
             let total_to_process = high_priority.len() + medium_priority.len() + low_priority.len();
@@ -523,9 +513,7 @@ fn run_loop<B: Backend>(
     // Track scheduled maintenance ticks
     let mut last_git_refresh = std::time::Instant::now();
     let mut last_spinner_tick = std::time::Instant::now();
-    let mut last_toast_check = std::time::Instant::now();
     let spinner_interval = Duration::from_millis(100);
-    let toast_check_interval = Duration::from_millis(250);
     let idle_poll_cap = Duration::from_millis(500);
 
     let git_refresh_interval = if index.stats().file_count > 20000 {
@@ -551,16 +539,6 @@ fn run_loop<B: Backend>(
             needs_redraw = true;
         }
 
-        // Check toast expiration on a coarse timer.
-        if last_toast_check.elapsed() >= toast_check_interval {
-            let had_toast = app.toast.is_some();
-            app.clear_expired_toast();
-            if had_toast && app.toast.is_none() {
-                needs_redraw = true;
-            }
-            last_toast_check = std::time::Instant::now();
-        }
-
         // Periodically refresh git status.
         if last_git_refresh.elapsed() >= git_refresh_interval {
             match app.context.refresh() {
@@ -576,7 +554,6 @@ fn run_loop<B: Backend>(
                         .map(|t| t.elapsed() >= Duration::from_secs(30))
                         .unwrap_or(true);
                     if should_log {
-                        app.show_toast(&message);
                         app.git_refresh_error_at = Some(std::time::Instant::now());
                         needs_redraw = true;
                     }
@@ -607,15 +584,7 @@ fn run_loop<B: Backend>(
         } else {
             idle_poll_cap
         };
-        let to_next_toast = if app.toast.is_some() {
-            toast_check_interval.saturating_sub(last_toast_check.elapsed())
-        } else {
-            idle_poll_cap
-        };
-        let poll_timeout = to_next_git
-            .min(to_next_spinner)
-            .min(to_next_toast)
-            .min(idle_poll_cap);
+        let poll_timeout = to_next_git.min(to_next_spinner).min(idle_poll_cap);
 
         if event::poll(poll_timeout)? {
             if let Event::Key(key) = event::read()? {

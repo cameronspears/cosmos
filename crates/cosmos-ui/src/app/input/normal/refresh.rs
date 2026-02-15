@@ -13,7 +13,6 @@ pub(super) fn llm_available_for_apply() -> bool {
 
 pub(super) fn prompt_api_key_setup(app: &mut App, reason: &str) {
     app.open_api_key_overlay(Some(reason.to_string()));
-    app.show_toast(crate::ui::openrouter_setup_toast_copy());
 }
 
 pub(super) fn refresh_suggestions_now(app: &mut App, ctx: &RuntimeContext, reason: &str) {

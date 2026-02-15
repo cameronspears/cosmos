@@ -17,14 +17,18 @@ fn normalize_api_key_input(raw: &str) -> String {
 
 fn open_openrouter_link(app: &mut App, url: &str, label: &str) {
     match cosmos_adapters::git_ops::open_url(url) {
-        Ok(()) => app.show_toast(&format!(
-            "Opened OpenRouter {} page in your browser.",
-            label
-        )),
-        Err(_) => app.show_toast(&format!(
-            "Couldn't open browser. Visit {} to open OpenRouter {} page.",
-            url, label
-        )),
+        Ok(()) => {}
+        Err(_) => {
+            let message = format!(
+                "Couldn't open browser. Visit {} to open OpenRouter {} page.",
+                url, label
+            );
+            if let Overlay::ApiKeySetup { error, .. } = &mut app.overlay {
+                *error = Some(message);
+            } else {
+                app.open_alert("Couldn't open browser", message);
+            }
+        }
     }
 }
 
@@ -93,12 +97,19 @@ pub(super) fn handle_overlay_input(
 ) -> Result<()> {
     // Handle overlay mode
     if app.overlay != Overlay::None {
+        if let Overlay::Alert { .. } = &app.overlay {
+            match key.code {
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
+                _ => {}
+            }
+            return Ok(());
+        }
+
         // Handle API key setup overlay
         if let Overlay::ApiKeySetup { .. } = &app.overlay {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     app.close_overlay();
-                    app.show_toast("API key setup canceled.");
                 }
                 KeyCode::Char('k') if has_control_or_command(key.modifiers) => {
                     open_openrouter_link(app, OPENROUTER_KEYS_URL, "keys");
@@ -166,17 +177,12 @@ pub(super) fn handle_overlay_input(
                         Ok(()) => {
                             app.close_overlay();
                             crate::app::background::spawn_balance_refresh(ctx.tx.clone());
-                            let refreshed = crate::app::background::request_suggestions_refresh(
+                            let _ = crate::app::background::request_suggestions_refresh(
                                 app,
                                 ctx.tx.clone(),
                                 ctx.repo_path.clone(),
                                 "API key saved",
                             );
-                            if !refreshed {
-                                app.show_toast(
-                                    "API key saved. Press r in Suggestions to refresh analysis.",
-                                );
-                            }
                         }
                         Err(e) => {
                             if let Overlay::ApiKeySetup {
@@ -200,7 +206,6 @@ pub(super) fn handle_overlay_input(
                 KeyCode::Esc | KeyCode::Char('q') => {
                     app.close_overlay();
                     app.clear_apply_confirm();
-                    app.show_toast("Apply canceled.");
                 }
                 KeyCode::Down => {
                     app.apply_plan_scroll_down();
@@ -242,7 +247,7 @@ pub(super) fn handle_overlay_input(
                 KeyCode::Enter => {
                     let selected = app.get_reset_selections();
                     if selected.is_empty() {
-                        app.show_toast("Select at least one reset option");
+                        app.set_reset_overlay_error("Select at least one reset option".to_string());
                         return Ok(());
                     }
 
@@ -352,8 +357,18 @@ pub(super) fn handle_overlay_input(
                 }
                 // Accept update: y or Enter
                 KeyCode::Char('y') | KeyCode::Enter => {
-                    // Start download if not already downloading and no error
-                    if !is_downloading && !has_error {
+                    // Start download if not already downloading. If an error is shown,
+                    // Enter acts as an immediate retry.
+                    if !is_downloading {
+                        if has_error {
+                            if let Overlay::Update {
+                                progress, error, ..
+                            } = &mut app.overlay
+                            {
+                                *progress = None;
+                                *error = None;
+                            }
+                        }
                         // Set initial progress
                         app.set_update_progress(0);
                         app.update_progress = Some(0);
@@ -389,15 +404,6 @@ pub(super) fn handle_overlay_input(
                                 }
                             }
                         });
-                    } else if has_error {
-                        // Retry on error - reset and allow starting again
-                        if let Overlay::Update {
-                            progress, error, ..
-                        } = &mut app.overlay
-                        {
-                            *progress = None;
-                            *error = None;
-                        }
                     }
                 }
                 _ => {}

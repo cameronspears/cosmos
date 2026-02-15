@@ -5,7 +5,6 @@
 use cosmos_engine::llm::FixPreview;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Instant;
 
 use super::theme::Theme;
 
@@ -93,6 +92,11 @@ pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 pub enum Overlay {
     #[default]
     None,
+    /// Generic blocking message panel for important errors
+    Alert {
+        title: String,
+        message: String,
+    },
     Help {
         scroll: usize,
     },
@@ -122,6 +126,8 @@ pub enum Overlay {
         options: Vec<(cosmos_adapters::cache::ResetOption, bool)>,
         /// Currently focused option index
         selected: usize,
+        /// Inline overlay error message
+        error: Option<String>,
     },
     /// Startup action choices shown in Startup Check
     StartupCheck {
@@ -283,70 +289,6 @@ pub struct ShipState {
 pub struct AskCosmosState {
     pub response: String,
     pub scroll: usize,
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  TOAST NOTIFICATIONS
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Toast notification kind - affects duration and styling
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ToastKind {
-    #[default]
-    Info,
-    Success,
-    Error,
-    RateLimit,
-}
-
-impl ToastKind {
-    /// Duration in seconds before toast expires
-    pub fn duration_secs(&self) -> u64 {
-        match self {
-            ToastKind::Info => 3,
-            ToastKind::Success => 3,
-            ToastKind::Error => 10,     // Errors stay longer
-            ToastKind::RateLimit => 15, // Rate limits stay even longer
-        }
-    }
-}
-
-/// Toast notification
-pub struct Toast {
-    pub message: String,
-    pub created_at: Instant,
-    pub kind: ToastKind,
-}
-
-impl Toast {
-    pub fn new(message: &str) -> Self {
-        // Auto-detect toast type - check success indicators BEFORE error keywords
-        let kind = if message.contains("Rate limit")
-            || message.contains("rate limited")
-            || message.contains("Budget guardrail")
-        {
-            ToastKind::RateLimit
-        } else if message.starts_with("Fixed:") || message.starts_with('+') {
-            ToastKind::Success
-        } else if message.contains("failed")
-            || message.contains("error")
-            || message.contains("Error")
-        {
-            ToastKind::Error
-        } else {
-            ToastKind::Info
-        };
-
-        Self {
-            message: message.to_string(),
-            created_at: Instant::now(),
-            kind,
-        }
-    }
-
-    pub fn is_expired(&self) -> bool {
-        self.created_at.elapsed().as_secs() >= self.kind.duration_secs()
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

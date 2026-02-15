@@ -43,7 +43,6 @@ fn maybe_prompt_api_key_overlay(app: &mut App, message: &str) -> bool {
         "Cosmos needs an OpenRouter API key to run AI actions."
     };
     app.open_api_key_overlay(Some(detail.to_string()));
-    app.show_toast(crate::ui::openrouter_setup_toast_copy());
     true
 }
 
@@ -102,24 +101,26 @@ pub fn request_suggestions_refresh(
     app: &mut App,
     tx: mpsc::Sender<BackgroundMessage>,
     repo_root: PathBuf,
-    reason: &str,
+    _reason: &str,
 ) -> bool {
     if !cosmos_engine::llm::is_available() {
         return false;
     }
 
     if app.loading == LoadingState::GeneratingSuggestions {
-        app.show_toast("Suggestions are already regenerating...");
         return false;
     }
 
     let fresh_index = match cosmos_core::index::CodebaseIndex::new(&repo_root) {
         Ok(index) => index,
         Err(err) => {
-            app.show_toast(&format!(
-                "Index refresh failed: {}",
-                truncate(&err.to_string(), 120)
-            ));
+            app.open_alert(
+                "Refresh failed",
+                format!(
+                    "Couldn't refresh suggestions: {}",
+                    truncate(&err.to_string(), 120)
+                ),
+            );
             return false;
         }
     };
@@ -128,15 +129,9 @@ pub fn request_suggestions_refresh(
     if app.needs_summary_generation {
         if app.summary_progress.is_some() {
             app.pending_suggestions_on_init = true;
-            app.show_toast("Summaries still generating. Suggestions will refresh automatically.");
             return false;
         }
         if !app.summary_failed_files.is_empty() {
-            app.show_toast(&format!(
-                "Summaries incomplete: {} files failed. Open Reset Cosmos (R), clear summaries, then restart Cosmos.{}",
-                app.summary_failed_files.len(),
-                failed_files_hint(&app.summary_failed_files)
-            ));
             return false;
         }
     }
@@ -147,16 +142,6 @@ pub fn request_suggestions_refresh(
     app.suggestion_validated_count = 0;
     app.suggestion_rejected_count = 0;
     app.clear_apply_confirm();
-
-    if app.glossary.is_empty() {
-        app.show_toast(&format!("{} · generating suggestions...", reason));
-    } else {
-        app.show_toast(&format!(
-            "{} · {} glossary terms · generating suggestions...",
-            reason,
-            app.glossary.len()
-        ));
-    }
 
     let index = app.index.clone();
     let context = app.context.clone();
@@ -203,10 +188,6 @@ pub fn drain_messages(
                 }
 
                 // Provisional stage only: don't surface actionable suggestions yet.
-                app.show_toast(&format!(
-                    "Refining {} provisional suggestions ({})",
-                    count, &model
-                ));
                 app.active_model = Some(model);
                 app.suggestion_refinement_in_progress = true;
                 app.suggestion_provisional_count = count;
@@ -225,8 +206,8 @@ pub fn drain_messages(
                 );
             }
             BackgroundMessage::SuggestionsRefinementProgress {
-                attempt_index,
-                attempt_count,
+                attempt_index: _,
+                attempt_count: _,
                 gate,
                 diagnostics: _diagnostics,
             } => {
@@ -236,10 +217,6 @@ pub fn drain_messages(
                 app.suggestion_validated_count =
                     gate.final_count.saturating_sub(gate.pending_count);
                 app.suggestion_rejected_count = 0;
-                app.show_toast(&format!(
-                    "Refining suggestions (attempt {}/{})",
-                    attempt_index, attempt_count
-                ));
             }
             BackgroundMessage::SuggestionsRefined {
                 suggestions,
@@ -255,7 +232,6 @@ pub fn drain_messages(
                             == cosmos_core::suggest::SuggestionValidationState::Validated
                     })
                     .count();
-                let count = suggestions.len();
                 let contradiction_counts = cache::Cache::new(&app.repo_path)
                     .recent_contradicted_evidence_counts(300)
                     .unwrap_or_default();
@@ -285,23 +261,6 @@ pub fn drain_messages(
                 app.suggestion_rejected_count = diagnostics.rejected_count;
                 app.clear_apply_confirm();
                 app.current_suggestion_run_id = Some(run_id);
-                if diagnostics.gate_passed {
-                    app.show_toast(&format!(
-                        "{} suggestions refined · {} validated",
-                        count, validated_count
-                    ));
-                } else {
-                    let reasons = if diagnostics.gate_fail_reasons.is_empty() {
-                        "quality gate miss".to_string()
-                    } else {
-                        diagnostics.gate_fail_reasons.join("; ")
-                    };
-                    app.show_toast(&format!(
-                        "{} suggestions (best effort) · {}. Press i to retry if needed.",
-                        count,
-                        truncate(&reasons, 120)
-                    ));
-                }
             }
             BackgroundMessage::SuggestionsError(e) => {
                 // If summaries are still generating, switch to that loading state
@@ -311,7 +270,10 @@ pub fn drain_messages(
                     app.loading = LoadingState::None;
                 }
                 if !maybe_prompt_api_key_overlay(app, &e) {
-                    app.show_toast(&format!("Suggestions error: {}", truncate(&e, 80)));
+                    app.open_alert(
+                        "Suggestions failed",
+                        format!("Couldn't generate suggestions: {}", truncate(&e, 120)),
+                    );
                 }
                 app.suggestion_refinement_in_progress = false;
                 app.clear_apply_confirm();
@@ -322,7 +284,6 @@ pub fn drain_messages(
                 failed_files,
                 duration_ms,
             } => {
-                let new_count = summaries.len();
                 app.update_summaries(summaries);
                 let failed_count = failed_files.len();
                 app.summary_failed_files = failed_files;
@@ -356,12 +317,6 @@ pub fn drain_messages(
                     // Strict summary gate: do not generate suggestions until summaries are complete.
                     if failed_count > 0 {
                         app.loading = LoadingState::None;
-                        let message = format!(
-                            "Summaries incomplete: {} files failed. Open Reset Cosmos (R), clear summaries, then restart Cosmos.{}",
-                            failed_count,
-                            failed_files_hint(&app.summary_failed_files)
-                        );
-                        app.show_toast(&message);
                     } else if ai_enabled {
                         let _ = request_suggestions_refresh(
                             app,
@@ -371,44 +326,11 @@ pub fn drain_messages(
                         );
                     } else {
                         app.loading = LoadingState::None;
-                        if failed_count > 0 {
-                            let message = format!(
-                                "Summaries incomplete: {} files failed. Press 'R' to open Reset Cosmos, clear summaries, then restart Cosmos.{}",
-                                failed_count,
-                                failed_files_hint(&app.summary_failed_files)
-                            );
-                            app.show_toast(&message);
-                        } else if new_count > 0 {
-                            app.show_toast(&format!(
-                                "{} summaries · {} glossary terms",
-                                new_count,
-                                app.glossary.len()
-                            ));
-                        }
                     }
                 } else {
                     // Not waiting for suggestions, just finish up
                     if !matches!(app.loading, LoadingState::GeneratingSuggestions) {
                         app.loading = LoadingState::None;
-                    }
-                    if failed_count > 0 {
-                        let message = format!(
-                            "Summaries incomplete: {} files failed. Press 'R' to open Reset Cosmos, clear summaries, then restart Cosmos.{}",
-                            failed_count,
-                            failed_files_hint(&app.summary_failed_files)
-                        );
-                        app.show_toast(&message);
-                    } else if new_count > 0 {
-                        app.show_toast(&format!(
-                            "{} summaries · {} glossary terms",
-                            new_count,
-                            app.glossary.len()
-                        ));
-                    } else {
-                        app.show_toast(&format!(
-                            "Summaries ready · {} glossary terms",
-                            app.glossary.len()
-                        ));
                     }
                 }
             }
@@ -435,16 +357,10 @@ pub fn drain_messages(
                 let _ = track_usage(app, usage.as_ref(), ctx);
 
                 if updated_files > 0 {
-                    app.show_toast(&format!(
-                        "Grouping updated for {} files ({})",
-                        updated_files, model
-                    ));
                     app.active_model = Some(model);
                 }
             }
-            BackgroundMessage::GroupingEnhanceError(e) => {
-                app.show_toast(&format!("Grouping error: {}", truncate(&e, 80)));
-            }
+            BackgroundMessage::GroupingEnhanceError(_e) => {}
             BackgroundMessage::PreviewReady {
                 preview,
                 usage,
@@ -508,19 +424,18 @@ pub fn drain_messages(
                 app.workflow_step = WorkflowStep::Suggestions;
                 app.verify_state = ui::VerifyState::default();
                 if !maybe_prompt_api_key_overlay(app, &e) {
-                    app.show_toast(&format!("Preview error: {}", truncate(&e, 80)));
+                    app.open_alert(
+                        "Preview failed",
+                        format!("Couldn't prepare a safe preview: {}", truncate(&e, 120)),
+                    );
                 }
             }
             BackgroundMessage::ApplyHarnessProgress {
-                attempt_index,
-                attempt_count,
-                detail,
+                attempt_index: _,
+                attempt_count: _,
+                detail: _,
             } => {
                 app.loading = LoadingState::GeneratingFix;
-                app.show_toast(&format!(
-                    "Apply harness {}/{}: {}",
-                    attempt_index, attempt_count, detail
-                ));
             }
             BackgroundMessage::ApplyHarnessFailed {
                 summary,
@@ -546,21 +461,18 @@ pub fn drain_messages(
                 if let Some(path) = report_path {
                     detail = format!("{}. See report at {}", detail, path.display());
                 }
-                app.show_toast(&format!("Apply failed: {}", truncate(&detail, 140)));
+                app.open_alert(
+                    "Apply failed",
+                    format!(
+                        "Couldn't apply this change safely: {}",
+                        truncate(&detail, 140)
+                    ),
+                );
             }
             BackgroundMessage::ApplyHarnessReducedConfidence {
-                detail,
-                report_path,
-            } => {
-                let mut msg = detail;
-                if let Some(path) = report_path {
-                    msg = format!("{}. See report at {}", msg, path.display());
-                }
-                app.show_toast(&truncate(
-                    &format!("Applied with lower confidence: {}", msg),
-                    160,
-                ));
-            }
+                detail: _,
+                report_path: _,
+            } => {}
             BackgroundMessage::DirectFixApplied {
                 suggestion_id,
                 file_changes,
@@ -673,7 +585,10 @@ pub fn drain_messages(
                 app.verify_state = ui::VerifyState::default();
                 app.clear_apply_confirm();
                 if !maybe_prompt_api_key_overlay(app, &e) {
-                    app.show_toast(&format!("Apply failed: {}", truncate(&e, 80)));
+                    app.open_alert(
+                        "Apply failed",
+                        format!("Couldn't apply this change safely: {}", truncate(&e, 120)),
+                    );
                 }
             }
             BackgroundMessage::ShipProgress(step) => {
@@ -688,7 +603,6 @@ pub fn drain_messages(
                 // Handle workflow mode
                 if app.workflow_step == WorkflowStep::Ship {
                     app.set_ship_pr_url(url.clone());
-                    app.show_toast("PR created!");
                 } else {
                     app.ship_step = Some(ui::ShipStep::Done);
                     app.pr_url = Some(url.clone());
@@ -698,31 +612,28 @@ pub fn drain_messages(
             BackgroundMessage::ShipError(e) => {
                 app.ship_step = None;
                 app.close_overlay();
-                app.show_toast(&format!("Ship failed: {}", truncate(&e, 80)));
+                app.open_alert(
+                    "Ship failed",
+                    format!(
+                        "Couldn't complete the shipping steps: {}",
+                        truncate(&e, 120)
+                    ),
+                );
             }
             BackgroundMessage::ResetComplete { options } => {
                 app.loading = LoadingState::None;
                 if options.contains(&cosmos_adapters::cache::ResetOption::QuestionCache) {
                     app.question_cache = cosmos_adapters::cache::QuestionCache::default();
                 }
-                let labels: Vec<&str> = options.iter().map(|o| o.label()).collect();
-                if labels.is_empty() {
-                    app.show_toast("Reset complete");
-                } else {
-                    app.show_toast(&format!("Reset complete: {}", labels.join(", ")));
-                }
             }
-            BackgroundMessage::StashComplete { message } => {
+            BackgroundMessage::StashComplete { message: _ } => {
                 app.loading = LoadingState::None;
-                app.show_toast(&format!("Changes saved: {}", message));
             }
             BackgroundMessage::DiscardComplete => {
                 app.loading = LoadingState::None;
-                app.show_toast("Changes discarded - starting fresh");
             }
-            BackgroundMessage::StartupSwitchedToMain { branch } => {
+            BackgroundMessage::StartupSwitchedToMain { branch: _ } => {
                 app.loading = LoadingState::None;
-                app.show_toast(&format!("Switched to {}", branch));
             }
             BackgroundMessage::Error(e) => {
                 if e.contains("ask_question") {
@@ -751,11 +662,11 @@ pub fn drain_messages(
                             "Verification failed before completion. Review manually before shipping."
                                 .to_string();
                     }
-                    app.show_toast(
-                        "Verification failed. Review manually, then press Enter twice to override and ship.",
-                    );
                 } else {
-                    app.show_toast(&truncate(&e, 100));
+                    app.open_alert(
+                        "Operation failed",
+                        format!("Cosmos hit an error: {}", truncate(&e, 120)),
+                    );
                 }
             }
             BackgroundMessage::QuestionError { request_id, error } => {
@@ -764,7 +675,10 @@ pub fn drain_messages(
                     continue;
                 }
                 if !maybe_prompt_api_key_overlay(app, &error) {
-                    app.show_toast(&truncate(&error, 100));
+                    app.show_inquiry(format!(
+                        "Couldn't answer that right now.\n\n{}",
+                        truncate(&error, 180)
+                    ));
                 }
             }
             BackgroundMessage::QuestionResponseWithCache {
@@ -837,7 +751,7 @@ pub fn drain_messages(
                     true,
                 );
 
-                app.show_toast(&format!("Fixed: {}", truncate(&description, 40)));
+                let _ = description;
 
                 // Apply file updates to disk and stage them.
                 let mut apply_failed = false;
@@ -847,11 +761,10 @@ pub fn drain_messages(
                         if let Err(e) = std::fs::create_dir_all(parent) {
                             app.review_state.fixing = false;
                             app.loading = LoadingState::None;
-                            app.show_toast(&format!(
-                                "Review fix failed: could not create {} ({})",
-                                parent.display(),
-                                e
-                            ));
+                            app.open_alert(
+                                "Review fix failed",
+                                format!("Couldn't create {} ({})", parent.display(), e),
+                            );
                             apply_failed = true;
                             break;
                         }
@@ -860,11 +773,10 @@ pub fn drain_messages(
                     if let Err(e) = std::fs::write(&full_path, new_content) {
                         app.review_state.fixing = false;
                         app.loading = LoadingState::None;
-                        app.show_toast(&format!(
-                            "Review fix failed: could not write {} ({})",
-                            path.display(),
-                            e
-                        ));
+                        app.open_alert(
+                            "Review fix failed",
+                            format!("Couldn't write {} ({})", path.display(), e),
+                        );
                         apply_failed = true;
                         break;
                     }
@@ -874,11 +786,10 @@ pub fn drain_messages(
                     {
                         app.review_state.fixing = false;
                         app.loading = LoadingState::None;
-                        app.show_toast(&format!(
-                            "Review fix failed: could not stage {} ({})",
-                            path.display(),
-                            e
-                        ));
+                        app.open_alert(
+                            "Review fix failed",
+                            format!("Couldn't stage {} ({})", path.display(), e),
+                        );
                         apply_failed = true;
                         break;
                     }
@@ -1009,13 +920,9 @@ fn track_usage_internal(
 fn maybe_show_budget_guardrails(app: &mut App) {
     if app.session_cost >= 0.04 && !app.budget_warned_soft {
         app.budget_warned_soft = true;
-        app.show_toast("Budget guardrail: approaching $0.04 session spend.");
     }
     if app.session_cost >= 0.05 && !app.budget_warned_hard {
         app.budget_warned_hard = true;
-        app.show_toast(
-            "Budget guardrail: hard limit ($0.05) reached. Extra review loops require confirmation.",
-        );
     }
 }
 
@@ -1054,24 +961,6 @@ fn record_pipeline_metric(
     }
 
     let _ = cache.append_pipeline_metric(&metric);
-}
-
-fn failed_files_hint(files: &[PathBuf]) -> String {
-    if files.is_empty() {
-        return String::new();
-    }
-
-    let mut shown = files
-        .iter()
-        .take(3)
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>();
-    let extra = files.len().saturating_sub(shown.len());
-    if extra > 0 {
-        shown.push(format!("+{} more", extra));
-    }
-
-    format!(" Failed file(s): {}.", shown.join(", "))
 }
 
 /// Spawn a background task to fetch the wallet balance

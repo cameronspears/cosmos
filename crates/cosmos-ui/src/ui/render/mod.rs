@@ -2,7 +2,6 @@ mod footer;
 mod header;
 mod main;
 mod overlays;
-mod toast;
 
 use crate::ui::theme::Theme;
 use crate::ui::{App, Overlay};
@@ -17,10 +16,9 @@ use footer::render_footer;
 use header::render_header;
 use main::render_main;
 use overlays::{
-    render_api_key_overlay, render_apply_plan, render_file_detail, render_help,
+    render_alert, render_api_key_overlay, render_apply_plan, render_file_detail, render_help,
     render_reset_overlay, render_startup_check, render_update_overlay, render_welcome,
 };
-use toast::render_toast;
 
 /// Main render function
 pub fn render(frame: &mut Frame, app: &App) {
@@ -47,6 +45,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     // Overlays
     match &app.overlay {
+        Overlay::Alert { title, message } => render_alert(frame, title, message),
         Overlay::Help { scroll } => render_help(frame, *scroll),
         Overlay::FileDetail { path, scroll } => {
             if let Some(file_index) = app.index.files.get(path) {
@@ -79,8 +78,12 @@ pub fn render(frame: &mut Frame, app: &App) {
                 *scroll,
             );
         }
-        Overlay::Reset { options, selected } => {
-            render_reset_overlay(frame, options, *selected);
+        Overlay::Reset {
+            options,
+            selected,
+            error,
+        } => {
+            render_reset_overlay(frame, options, *selected, error.as_deref());
         }
         Overlay::StartupCheck {
             changed_count,
@@ -116,10 +119,5 @@ pub fn render(frame: &mut Frame, app: &App) {
             render_welcome(frame);
         }
         Overlay::None => {}
-    }
-
-    // Toast
-    if let Some(toast) = &app.toast {
-        render_toast(frame, toast);
     }
 }

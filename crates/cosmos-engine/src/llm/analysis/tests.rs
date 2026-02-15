@@ -388,7 +388,7 @@ fn regeneration_needed_uses_soft_floor_ten() {
 }
 
 #[test]
-fn finalize_validated_suggestions_drops_pending_and_caps_at_final_target_max() {
+fn finalize_validated_suggestions_drops_pending_without_capping() {
     let mut input = (0..24)
         .map(|i| {
             test_suggestion(&format!("v{}", i))
@@ -399,7 +399,7 @@ fn finalize_validated_suggestions_drops_pending_and_caps_at_final_target_max() {
         .push(test_suggestion("pending").with_validation_state(SuggestionValidationState::Pending));
 
     let out = finalize_validated_suggestions(input);
-    assert_eq!(out.len(), FAST_GROUNDED_FINAL_TARGET_MAX);
+    assert_eq!(out.len(), 24);
     assert!(out
         .iter()
         .all(|s| s.validation_state == SuggestionValidationState::Validated));
@@ -1190,6 +1190,93 @@ fn normalize_grounded_summary_rewrites_low_information_summary_from_detail() {
     let lower = summary.to_ascii_lowercase();
     assert_ne!(lower, "fix issue");
     assert!(lower.contains("parsing failures"));
+}
+
+#[test]
+fn normalize_grounded_detail_does_not_inject_generic_user_impact_fallback() {
+    let detail = normalize_grounded_detail(
+        "Too short",
+        "Cache writes are silently ignored in this path",
+    );
+    let lower = detail.to_ascii_lowercase();
+    assert!(!lower.contains("this matters because"));
+    assert!(!lower.contains("users can observe incorrect behavior"));
+}
+
+#[test]
+fn readiness_annotation_penalizes_ungrounded_generic_claims() {
+    let suggestion = test_suggestion("This path may fail.")
+        .with_detail("This flow may fail.".to_string())
+        .with_evidence(" 10| const retries = 2;\n 11| let total = retries + 1;\n".to_string())
+        .with_line(11)
+        .with_validation_state(SuggestionValidationState::Validated);
+
+    let annotated = annotate_implementation_readiness(suggestion);
+    let score = annotated
+        .implementation_readiness_score
+        .expect("score should be set");
+    assert!(score < DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE);
+    assert!(annotated
+        .implementation_risk_flags
+        .iter()
+        .any(|flag| flag == "claim_not_grounded_in_snippet"));
+    assert!(annotated
+        .implementation_risk_flags
+        .iter()
+        .any(|flag| flag == "generic_or_low_information_description"));
+}
+
+#[test]
+fn readiness_annotation_keeps_grounded_specific_claims_high() {
+    let suggestion = test_suggestion(
+        "create_dir_all(cache_dir) errors are ignored in this branch.",
+    )
+    .with_detail(
+        "The create_dir_all(cache_dir) error branch swallows _err and continues.".to_string(),
+    )
+    .with_evidence(
+        " 40| if let Err(_err) = std::fs::create_dir_all(cache_dir) {\n 41|   // ignored\n 42| }\n"
+            .to_string(),
+    )
+    .with_line(40)
+    .with_validation_state(SuggestionValidationState::Validated);
+
+    let annotated = annotate_implementation_readiness(suggestion);
+    let score = annotated
+        .implementation_readiness_score
+        .expect("score should be set");
+    assert!(score >= DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE);
+    assert!(!annotated
+        .implementation_risk_flags
+        .iter()
+        .any(|flag| flag == "claim_not_grounded_in_snippet"));
+}
+
+#[test]
+fn apply_readiness_filter_backfills_when_threshold_is_too_strict() {
+    let suggestions = (0..9)
+        .map(|i| {
+            let mut suggestion = test_suggestion("Users will see broken behavior in production.")
+                .with_detail("This path may fail.".to_string())
+                .with_evidence(
+                    " 10| const retries = 2;\n 11| let total = retries + 1;\n".to_string(),
+                )
+                .with_line(11)
+                .with_validation_state(SuggestionValidationState::Validated);
+            suggestion.file = PathBuf::from(format!("src/backfill_{}.rs", i));
+            suggestion
+        })
+        .collect::<Vec<_>>();
+
+    let (filtered, _dropped, _mean) =
+        apply_readiness_filter(suggestions, DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE);
+    let expected_floor = FAST_GROUNDED_FINAL_TARGET_MIN.saturating_sub(2);
+    assert_eq!(filtered.len(), expected_floor);
+    assert!(filtered.iter().any(|s| {
+        s.implementation_risk_flags
+            .iter()
+            .any(|flag| flag == "below_readiness_threshold_backfill")
+    }));
 }
 
 #[test]

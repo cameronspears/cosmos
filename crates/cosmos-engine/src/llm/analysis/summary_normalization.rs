@@ -87,10 +87,7 @@ pub(super) fn normalize_grounded_detail(detail: &str, summary: &str) -> String {
     if normalized.len() < 40 {
         let fallback = summary.trim();
         if !fallback.is_empty() {
-            normalized = format!(
-                "{}. This matters because users can observe incorrect behavior when this path runs.",
-                fallback
-            );
+            normalized = fallback.to_string();
         }
     }
 

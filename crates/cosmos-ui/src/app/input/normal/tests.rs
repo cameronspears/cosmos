@@ -25,7 +25,7 @@ fn test_apply_error_already_applying() {
     let err = ApplyError::AlreadyApplying;
     let msg = err.user_message();
     assert!(msg.contains("in progress"));
-    assert!(msg.contains("failed")); // Must contain for toast visibility
+    assert!(msg.contains("failed")); // Must include clear failure wording
 }
 
 #[test]
@@ -41,7 +41,7 @@ fn test_apply_error_suggestion_not_found() {
     let err = ApplyError::SuggestionNotFound;
     let msg = err.user_message();
     assert!(msg.contains("no longer exists"));
-    assert!(msg.contains("failed")); // Must contain for toast visibility
+    assert!(msg.contains("failed")); // Must include clear failure wording
 }
 
 #[test]
@@ -58,7 +58,7 @@ fn test_apply_error_dirty_working_tree() {
     let msg = err.user_message();
     assert!(msg.contains("changes"));
     assert!(msg.contains("stash"));
-    assert!(msg.contains("failed")); // Must contain for toast visibility
+    assert!(msg.contains("failed")); // Must include clear failure wording
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn test_apply_error_files_changed_single() {
     assert!(msg.contains("files changed"));
     assert!(msg.contains("src/main.rs"));
     assert!(msg.contains("Refresh suggestions"));
-    assert!(msg.contains("failed")); // Must contain for toast visibility
+    assert!(msg.contains("failed")); // Must include clear failure wording
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn test_apply_error_files_changed_multiple() {
     assert!(msg.contains("b.rs"));
     assert!(msg.contains("c.rs"));
     assert!(msg.contains("+1 more"));
-    assert!(msg.contains("failed")); // Must contain for toast visibility
+    assert!(msg.contains("failed")); // Must include clear failure wording
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn test_apply_error_unsafe_path() {
     let msg = err.user_message();
     assert!(msg.contains("unsafe path"));
     assert!(msg.contains("../evil"));
-    assert!(msg.contains("failed")); // Must contain for toast visibility
+    assert!(msg.contains("failed")); // Must include clear failure wording
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn test_apply_error_file_read_failed() {
     let msg = err.user_message();
     assert!(msg.contains("couldn't read"));
     assert!(msg.contains("missing.rs"));
-    assert!(msg.contains("failed")); // Must contain for toast visibility
+    assert!(msg.contains("failed")); // Must include clear failure wording
 }
 
 // ========================================================================
@@ -165,13 +165,8 @@ fn enter_is_blocked_while_suggestion_refinement_in_progress() {
     let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     handle_normal_mode(&mut app, key, &ctx).unwrap();
 
-    let toast = app
-        .toast
-        .as_ref()
-        .map(|t| t.message.clone())
-        .unwrap_or_default();
-    assert!(toast.contains("still refining"));
     assert_eq!(app.workflow_step, WorkflowStep::Suggestions);
+    assert_eq!(app.overlay, Overlay::None);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -431,12 +426,6 @@ fn apply_plan_cancel_clears_apply_confirmation() {
     assert_eq!(app.overlay, Overlay::None);
     assert!(app.armed_suggestion_id.is_none());
     assert!(app.armed_file_hashes.is_empty());
-    let toast = app
-        .toast
-        .as_ref()
-        .map(|t| t.message.clone())
-        .unwrap_or_default();
-    assert!(toast.contains("Apply canceled"));
 
     std::env::remove_var("OPENROUTER_API_KEY");
     let _ = std::fs::remove_dir_all(root);
@@ -506,14 +495,11 @@ fn apply_plan_confirm_reports_files_changed_since_preview() {
     )
     .unwrap();
 
-    let toast = app
-        .toast
-        .as_ref()
-        .map(|t| t.message.clone())
-        .unwrap_or_default();
-    assert!(toast.contains("files changed"));
+    match &app.overlay {
+        Overlay::Alert { message, .. } => assert!(message.contains("files changed")),
+        _ => panic!("expected alert overlay with files changed message"),
+    }
     assert!(app.armed_suggestion_id.is_none());
-    assert_eq!(app.overlay, Overlay::None);
 
     std::env::remove_var("OPENROUTER_API_KEY");
     let _ = std::fs::remove_dir_all(root);

@@ -40,8 +40,9 @@ const FAST_EVIDENCE_SNIPPET_LINES_AFTER: usize = 8;
 const FAST_GROUNDED_FINAL_TARGET_MIN: usize = 10;
 const FAST_GROUNDED_FINAL_TARGET_MAX: usize = 20;
 const FAST_GROUNDED_VALIDATED_SOFT_FLOOR: usize = 10;
-const FAST_GROUNDED_VALIDATED_HARD_TARGET: usize = 12;
-const FAST_GROUNDED_VALIDATED_STRETCH_TARGET: usize = 20;
+const FAST_GROUNDED_VALIDATED_HARD_TARGET: usize = 14;
+const FAST_GROUNDED_VALIDATED_STRETCH_TARGET: usize = 24;
+const FAST_GROUNDED_VALIDATED_POOL_MAX: usize = 28;
 const FAST_GROUNDED_PROVISIONAL_TARGET_MIN: usize = 26;
 const FAST_GROUNDED_PROVISIONAL_TARGET_MAX: usize = 40;
 const FAST_EVIDENCE_SOURCE_PATTERN_MAX: usize = 24;
@@ -534,7 +535,7 @@ impl Default for SuggestionQualityGateConfig {
             max_smart_rewrites_per_run: DEFAULT_MAX_SMART_REWRITES_PER_RUN,
             max_suggest_cost_usd: 0.035,
             max_suggest_ms: SUGGEST_GATE_BUDGET_MS,
-            max_attempts: 2,
+            max_attempts: 3,
         }
     }
 }
@@ -1946,6 +1947,84 @@ fn quick_check_targetability_score(path: &Path) -> f32 {
     }
 }
 
+fn evidence_claim_grounding_score(suggestion: &Suggestion) -> f32 {
+    let claim_text = format!(
+        "{} {}",
+        suggestion.summary,
+        suggestion.detail.as_deref().unwrap_or("")
+    );
+    let claim_tokens = claim_specific_tokens(&claim_text);
+    if claim_tokens.is_empty() {
+        return 0.65;
+    }
+
+    let Some(snippet) = suggestion.evidence.as_deref() else {
+        return 0.40;
+    };
+    let snippet_tokens = snippet_identifier_tokens(snippet);
+    if snippet_tokens.is_empty() {
+        return 0.35;
+    }
+
+    let overlap = claim_tokens.intersection(&snippet_tokens).count();
+    let ratio = overlap as f32 / claim_tokens.len() as f32;
+    if ratio >= 0.80 {
+        1.0
+    } else if ratio >= 0.60 {
+        0.85
+    } else if ratio >= 0.45 {
+        0.70
+    } else if ratio >= 0.30 {
+        0.52
+    } else {
+        0.25
+    }
+}
+
+fn has_low_information_language(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "this matters because",
+        "incorrect behavior",
+        "potential issue",
+        "may fail",
+        "might fail",
+        "could fail",
+        "could break",
+        "improve reliability",
+        "improve performance",
+        "unexpected behavior",
+        "this path",
+        "this flow",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn description_specificity_score(suggestion: &Suggestion) -> f32 {
+    let text = format!(
+        "{} {}",
+        suggestion.summary,
+        suggestion.detail.as_deref().unwrap_or("")
+    );
+    let token_count = collect_similarity_tokens(&text).len();
+    let mut score: f32 = match token_count {
+        0..=2 => 0.35,
+        3..=4 => 0.55,
+        5..=7 => 0.72,
+        _ => 0.88,
+    };
+
+    if has_low_information_language(&text) {
+        score -= 0.18;
+    }
+    if suggestion.line.unwrap_or_default() > 0 {
+        score += 0.07;
+    }
+
+    score.clamp(0.0, 1.0)
+}
+
 fn historical_fail_penalty_score(suggestion: &Suggestion) -> f32 {
     let text = format!(
         "{} {}",
@@ -2223,10 +2302,27 @@ fn annotate_implementation_readiness(mut suggestion: Suggestion) -> Suggestion {
     let scope_tightness = scope_tightness_score(&suggestion);
     let quick_check_targetability = quick_check_targetability_score(&suggestion.file);
     let historical_fail_penalty = historical_fail_penalty_score(&suggestion);
-    let readiness = (0.35 * evidence_strength)
-        + (0.35 * scope_tightness)
-        + (0.20 * quick_check_targetability)
-        + (0.10 * historical_fail_penalty);
+    let grounding = evidence_claim_grounding_score(&suggestion);
+    let specificity = description_specificity_score(&suggestion);
+    let overclaim_penalty = if has_overclaim_wording(&suggestion) {
+        0.30
+    } else {
+        1.0
+    };
+    let speculative_penalty = if has_speculative_impact_language(&suggestion.summary) {
+        0.35
+    } else {
+        1.0
+    };
+    let base_readiness = (0.30 * evidence_strength)
+        + (0.24 * scope_tightness)
+        + (0.18 * quick_check_targetability)
+        + (0.12 * historical_fail_penalty)
+        + (0.08 * overclaim_penalty)
+        + (0.08 * speculative_penalty);
+    let grounding_multiplier = 0.60 + (0.40 * grounding);
+    let specificity_multiplier = 0.70 + (0.30 * specificity);
+    let mut readiness = base_readiness * grounding_multiplier * specificity_multiplier;
 
     let mut flags = Vec::new();
     if evidence_strength < 0.65 {
@@ -2240,6 +2336,21 @@ fn annotate_implementation_readiness(mut suggestion: Suggestion) -> Suggestion {
     }
     if historical_fail_penalty < 0.65 {
         flags.push("historical_fail_risk".to_string());
+    }
+    if grounding < 0.50 {
+        flags.push("claim_not_grounded_in_snippet".to_string());
+    }
+    if grounding < 0.30 {
+        readiness = readiness.min(DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE - 0.02);
+    }
+    if specificity < 0.55 {
+        flags.push("generic_or_low_information_description".to_string());
+    }
+    if overclaim_penalty < 1.0 {
+        flags.push("overclaim_language".to_string());
+    }
+    if speculative_penalty < 1.0 {
+        flags.push("speculative_impact_language".to_string());
     }
 
     suggestion.implementation_readiness_score = Some(readiness.clamp(0.0, 1.0));
@@ -2266,13 +2377,45 @@ fn apply_readiness_filter(
         .sum::<f64>()
         / annotated.len() as f64;
 
-    let filtered = annotated
+    let mut kept = annotated
         .iter()
         .filter(|s| s.implementation_readiness_score.unwrap_or(0.0) >= min_score)
         .cloned()
         .collect::<Vec<_>>();
-    let filtered_count = annotated.len().saturating_sub(filtered.len());
-    (filtered, filtered_count, mean)
+
+    // Guardrail: when strict readiness filtering over-prunes, backfill top borderline items
+    // so users still get a useful set to choose from.
+    let adaptive_floor = FAST_GROUNDED_FINAL_TARGET_MIN
+        .saturating_sub(2)
+        .min(annotated.len());
+    if kept.len() < adaptive_floor {
+        let mut backfill_candidates = annotated
+            .iter()
+            .filter(|s| s.implementation_readiness_score.unwrap_or(0.0) < min_score)
+            .cloned()
+            .collect::<Vec<_>>();
+        backfill_candidates.sort_by(|a, b| {
+            b.implementation_readiness_score
+                .partial_cmp(&a.implementation_readiness_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.priority.cmp(&a.priority))
+                .then_with(|| b.confidence.cmp(&a.confidence))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        });
+
+        for mut candidate in backfill_candidates {
+            if kept.len() >= adaptive_floor {
+                break;
+            }
+            candidate
+                .implementation_risk_flags
+                .push("below_readiness_threshold_backfill".to_string());
+            kept.push(candidate);
+        }
+    }
+
+    let filtered_count = annotated.len().saturating_sub(kept.len());
+    (kept, filtered_count, mean)
 }
 
 fn collect_valid_evidence_refs(
@@ -2518,7 +2661,6 @@ fn build_remaining_pack_for_regeneration(
 fn finalize_validated_suggestions(mut validated: Vec<Suggestion>) -> Vec<Suggestion> {
     // Defensive filter: refinement should only surface validated suggestions.
     validated.retain(|s| s.validation_state == SuggestionValidationState::Validated);
-    validated.truncate(FAST_GROUNDED_FINAL_TARGET_MAX);
     validated
 }
 
@@ -3716,6 +3858,7 @@ fn snippet_has_explicit_non_security_handling(snippet: &str) -> bool {
         "return err(",
         ".map_err(",
         "anyhow::anyhow!",
+        "show_notice(",
         "show_toast(",
         "prompt_api_key_setup(",
         "failed to",
@@ -4032,7 +4175,7 @@ async fn validate_batch_suggestions(
             rejection_stats.deadline_exceeded = true;
             break;
         }
-        if validated.len() >= FAST_GROUNDED_FINAL_TARGET_MAX {
+        if validated.len() >= FAST_GROUNDED_VALIDATED_POOL_MAX {
             break;
         }
         let chunk_size = VALIDATION_CONCURRENCY.min(queue.len());
@@ -4201,7 +4344,7 @@ async fn validate_batch_suggestions(
                 rejection_stats.deadline_exceeded = true;
                 break;
             }
-            if validated.len() >= FAST_GROUNDED_FINAL_TARGET_MAX {
+            if validated.len() >= FAST_GROUNDED_VALIDATED_POOL_MAX {
                 break;
             }
 
@@ -4688,10 +4831,10 @@ pub async fn refine_grounded_suggestions(
     let (sent_snippet_count, sent_bytes) = evidence_payload_metrics(&pack);
     let hard_target = FAST_GROUNDED_VALIDATED_HARD_TARGET
         .min(pack.len())
-        .min(FAST_GROUNDED_FINAL_TARGET_MAX);
+        .min(FAST_GROUNDED_VALIDATED_POOL_MAX);
     let stretch_target = FAST_GROUNDED_VALIDATED_STRETCH_TARGET
         .min(pack.len())
-        .min(FAST_GROUNDED_FINAL_TARGET_MAX);
+        .min(FAST_GROUNDED_VALIDATED_POOL_MAX);
     while validated.len() < stretch_target {
         let remaining_validation_budget = remaining_validation_budget_ms(validation_deadline);
         if should_stop_regeneration_for_validation_budget(
@@ -4836,11 +4979,24 @@ pub async fn refine_grounded_suggestions(
     let (impact_filtered, speculative_impact_dropped_count) =
         filter_speculative_impact_suggestions(validated);
     let impact_filtered_len = impact_filtered.len();
-    let (validated, file_balance_dropped_count) = balance_suggestions_across_files(
-        impact_filtered,
+    let mut ranked_for_balance = impact_filtered;
+    ranked_for_balance.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| b.confidence.cmp(&a.confidence))
+            .then_with(|| {
+                b.implementation_readiness_score
+                    .partial_cmp(&a.implementation_readiness_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+    let (mut validated, file_balance_dropped_count) = balance_suggestions_across_files(
+        ranked_for_balance,
         DIVERSITY_FILE_BALANCE_PER_FILE_CAP,
         FAST_GROUNDED_FINAL_TARGET_MIN.min(impact_filtered_len),
     );
+    validated.truncate(FAST_GROUNDED_FINAL_TARGET_MAX);
     let diversity_metrics = compute_suggestion_diversity_metrics(&validated);
     let refinement_ms = refine_start.elapsed().as_millis() as u64;
     diagnostics.batch_verify_ms = refinement_ms;

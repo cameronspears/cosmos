@@ -10,6 +10,59 @@ use ratatui::{
 };
 use std::path::{Path, PathBuf};
 
+pub(super) fn render_alert(frame: &mut Frame, title: &str, message: &str) {
+    let area = centered_rect(58, 36, frame.area());
+    frame.render_widget(Clear, area);
+
+    let text_width = area.width.saturating_sub(8).max(16) as usize;
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!("  {}", title),
+            Style::default()
+                .fg(Theme::WHITE)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+    ];
+
+    for line in wrap_text(message, text_width) {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {}", line),
+            Style::default().fg(Theme::GREY_200),
+        )]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            " Enter ",
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300),
+        ),
+        Span::styled(" or ", Style::default().fg(Theme::GREY_500)),
+        Span::styled(
+            " Esc ",
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300),
+        ),
+        Span::styled(" to close", Style::default().fg(Theme::GREY_500)),
+    ]));
+    lines.push(Line::from(""));
+
+    let block = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Message ")
+                .title_style(Style::default().fg(Theme::GREY_100))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Theme::GREY_400))
+                .style(Style::default().bg(Theme::GREY_800)),
+        )
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(block, area);
+}
+
 pub(super) fn render_help(frame: &mut Frame, scroll: usize) {
     let area = centered_rect(55, 80, frame.area());
     frame.render_widget(Clear, area);
@@ -489,7 +542,7 @@ pub(super) fn render_api_key_overlay(
                 Style::default().fg(Theme::GREY_900).bg(Theme::GREEN),
             ),
             Span::styled(
-                " to save key and refresh suggestions.",
+                " to save key and try refreshing suggestions.",
                 Style::default().fg(Theme::GREY_300),
             ),
         ]));
@@ -546,7 +599,7 @@ pub(super) fn render_api_key_overlay(
     let enter_label = if save_armed {
         " save anyway "
     } else {
-        " save + refresh "
+        " save + try refresh "
     };
     lines.push(Line::from(vec![
         Span::styled("   ", Style::default()),
@@ -849,6 +902,7 @@ pub(super) fn render_reset_overlay(
     frame: &mut Frame,
     options: &[(cosmos_adapters::cache::ResetOption, bool)],
     selected: usize,
+    error: Option<&str>,
 ) {
     let area = centered_rect(55, 50, frame.area());
     frame.render_widget(Clear, area);
@@ -907,6 +961,14 @@ pub(super) fn render_reset_overlay(
             ])
             .style(line_style),
         );
+    }
+
+    if let Some(message) = error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  ! ", Style::default().fg(Theme::YELLOW)),
+            Span::styled(message.to_string(), Style::default().fg(Theme::GREY_200)),
+        ]));
     }
 
     // Separator and help

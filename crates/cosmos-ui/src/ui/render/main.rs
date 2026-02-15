@@ -113,7 +113,7 @@ fn render_suggestions_panel(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     // Reserve space for border (2 lines top/bottom)
-    let visible_height = area.height.saturating_sub(2) as usize;
+    let content_height = area.height.saturating_sub(2) as usize;
     let inner_width = area.width.saturating_sub(4) as usize;
 
     let mut lines = vec![];
@@ -121,13 +121,13 @@ fn render_suggestions_panel(frame: &mut Frame, area: Rect, app: &App) {
     // Render content based on workflow step
     match app.workflow_step {
         WorkflowStep::Suggestions => {
-            render_suggestions_content(&mut lines, app, is_active, visible_height, inner_width);
+            render_suggestions_content(&mut lines, app, is_active, content_height, inner_width);
         }
         WorkflowStep::Review => {
-            render_review_content(&mut lines, app, visible_height, inner_width);
+            render_review_content(&mut lines, app, content_height, inner_width);
         }
         WorkflowStep::Ship => {
-            render_ship_content(&mut lines, app, visible_height, inner_width);
+            render_ship_content(&mut lines, app, content_height, inner_width);
         }
     }
 
@@ -971,15 +971,15 @@ fn render_ask_panel(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Theme::GREY_600)
     };
 
-    let visible_height = area.height.saturating_sub(2) as usize;
+    let content_height = area.height.saturating_sub(2) as usize;
     let inner_width = area.width.saturating_sub(4) as usize;
     let mut lines = vec![];
 
     if let Some(ask_state) = &app.ask_cosmos_state {
-        render_ask_cosmos_content(&mut lines, ask_state, app, visible_height, inner_width);
+        render_ask_cosmos_content(&mut lines, ask_state, app, content_height, inner_width);
     } else {
         // Always show input + suggested questions by default (no Enter gate/idle state).
-        render_question_mode_content(&mut lines, app, visible_height, inner_width, is_active);
+        render_question_mode_content(&mut lines, app, content_height, inner_width, is_active);
     }
 
     let block = Block::default()

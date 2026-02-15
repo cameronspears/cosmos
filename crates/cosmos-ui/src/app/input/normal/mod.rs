@@ -47,7 +47,7 @@ pub enum ApplyError {
 }
 
 impl ApplyError {
-    /// Returns a user-friendly message for display in toasts
+    /// Returns a user-friendly message for display in user-facing error UI
     pub fn user_message(&self) -> String {
         match self {
             Self::ApplyNotConfirmed => {
@@ -255,8 +255,9 @@ fn start_review_fix_for_selected_findings(app: &mut App, ctx: &RuntimeContext) {
 
     if app.session_cost >= 0.05 && !app.review_state.confirm_extra_review_budget {
         app.review_state.confirm_extra_review_budget = true;
-        app.show_toast(
-            "Budget guardrail: press f/Enter again to run another review-fix cycle beyond $0.05.",
+        app.open_alert(
+            "Budget guardrail",
+            "This extra review-fix run is beyond the $0.05 session guardrail. Press f or Enter again to continue.",
         );
         return;
     }
@@ -707,7 +708,7 @@ pub(super) fn confirm_apply_from_overlay(app: &mut App, ctx: &RuntimeContext) {
         Err(e) => {
             app.close_overlay();
             app.clear_apply_confirm();
-            app.show_toast(&e.user_message());
+            app.open_alert("Couldn't apply", e.user_message());
         }
     }
 }
@@ -800,9 +801,6 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                 match app.workflow_step {
                     WorkflowStep::Suggestions => {
                         if app.suggestion_refinement_in_progress {
-                            app.show_toast(
-                                "Suggestions are still refining. Wait for refined results before applying.",
-                            );
                             return Ok(());
                         }
                         let suggestion = app.selected_suggestion().cloned();
@@ -815,7 +813,9 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                             } else {
                                 match open_apply_plan_for_suggestion(app, &suggestion) {
                                     Ok(()) => {}
-                                    Err(e) => app.show_toast(&e.user_message()),
+                                    Err(e) => {
+                                        app.open_alert("Couldn't open preview", e.user_message())
+                                    }
                                 };
                             }
                         }
@@ -834,18 +834,12 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                                     app.start_ship();
                                 } else {
                                     app.review_state.confirm_ship = true;
-                                    app.show_toast(
-                                        "Verification failed. Press Enter again to ship with manual override.",
-                                    );
                                 }
                             } else if app.review_state.confirm_ship {
                                 app.review_state.confirm_ship = false;
                                 app.start_ship();
                             } else {
                                 app.review_state.confirm_ship = true;
-                                app.show_toast(
-                                    "Review has findings. Select items to fix or press Enter again to ship anyway.",
-                                );
                             }
                         }
                     }
@@ -934,7 +928,6 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                 && app.armed_suggestion_id.is_some()
             {
                 app.clear_apply_confirm();
-                app.show_toast("Apply canceled.");
             } else if app.workflow_step != WorkflowStep::Suggestions {
                 // Handle workflow back navigation
                 app.workflow_back();
@@ -960,9 +953,8 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
         }
         KeyCode::Char('u') => {
             // Undo the last applied change (restore from git)
-            match app.undo_last_pending_change() {
-                Ok(()) => app.show_toast("Change undone"),
-                Err(e) => app.show_toast(&e),
+            if let Err(e) = app.undo_last_pending_change() {
+                app.open_alert("Couldn't undo", e);
             }
         }
         KeyCode::Char('r') => {
@@ -983,11 +975,6 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                     cosmos_adapters::update::CURRENT_VERSION.to_string(),
                     target_version,
                 );
-            } else {
-                app.show_toast(&format!(
-                    "Already running latest version (v{})",
-                    cosmos_adapters::update::CURRENT_VERSION
-                ));
             }
         }
         _ => {}

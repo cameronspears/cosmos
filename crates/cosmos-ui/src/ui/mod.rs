@@ -16,8 +16,8 @@ pub use render::render;
 // Re-export all types for backward compatibility
 pub use types::{
     ActivePanel, AskCosmosState, FileChange, InputMode, LoadingState, Overlay, PendingChange,
-    ReviewFileContent, ReviewState, ShipState, ShipStep, StartupAction, StartupMode, Toast,
-    ToastKind, VerifyState, ViewMode, WorkflowStep, SPINNER_FRAMES,
+    ReviewFileContent, ReviewState, ShipState, ShipStep, StartupAction, StartupMode, VerifyState,
+    ViewMode, WorkflowStep, SPINNER_FRAMES,
 };
 
 use cosmos_core::context::WorkContext;
@@ -58,14 +58,6 @@ pub fn openrouter_credits_shortcut_chip() -> &'static str {
         " control+b "
     } else {
         " Ctrl+b "
-    }
-}
-
-pub fn openrouter_setup_toast_copy() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "OpenRouter setup required. Press control + k for keys, control + b for credits, then press Enter."
-    } else {
-        "OpenRouter setup required. Press Ctrl + k for keys, Ctrl + b for credits, then press Enter."
     }
 }
 
@@ -112,7 +104,6 @@ pub struct App {
     pub suggestion_scroll: usize,
     pub suggestion_selected: usize,
     pub overlay: Overlay,
-    pub toast: Option<Toast>,
     pub should_quit: bool,
 
     // Search and sort state
@@ -251,7 +242,6 @@ impl App {
             suggestion_scroll: 0,
             suggestion_selected: 0,
             overlay: Overlay::None,
-            toast: None,
             should_quit: false,
             input_mode: InputMode::Normal,
             search_query: String::new(),
@@ -667,7 +657,6 @@ impl App {
         self.project_selected = 0;
         self.project_scroll = 0;
         self.apply_filter();
-        self.show_toast(&format!("View: {}", self.view_mode.label()));
     }
 
     /// Toggle expand/collapse of the selected group in grouped view
@@ -979,19 +968,12 @@ impl App {
         }
     }
 
-    /// Clear expired toast
-    pub fn clear_expired_toast(&mut self) {
-        if let Some(ref toast) = self.toast {
-            if toast.is_expired() {
-                self.toast = None;
-                self.needs_redraw = true;
-            }
-        }
-    }
-
-    /// Show a toast message.
-    pub fn show_toast(&mut self, message: &str) {
-        self.toast = Some(Toast::new(message));
+    /// Show a blocking message overlay for important failures.
+    pub fn open_alert<T: Into<String>, U: Into<String>>(&mut self, title: T, message: U) {
+        self.overlay = Overlay::Alert {
+            title: title.into(),
+            message: message.into(),
+        };
         self.needs_redraw = true;
     }
 
@@ -1015,12 +997,18 @@ impl App {
         self.overlay = Overlay::Reset {
             options,
             selected: 0,
+            error: None,
         };
     }
 
     /// Navigate in reset overlay
     pub fn reset_navigate(&mut self, delta: isize) {
-        if let Overlay::Reset { options, selected } = &mut self.overlay {
+        if let Overlay::Reset {
+            options,
+            selected,
+            error,
+        } = &mut self.overlay
+        {
             let len = options.len();
             if len == 0 {
                 return;
@@ -1030,15 +1018,22 @@ impl App {
             } else {
                 (*selected + len - ((-delta) as usize % len)) % len
             };
+            *error = None;
         }
     }
 
     /// Toggle selection of the currently focused reset option
     pub fn reset_toggle_selected(&mut self) {
-        if let Overlay::Reset { options, selected } = &mut self.overlay {
+        if let Overlay::Reset {
+            options,
+            selected,
+            error,
+        } = &mut self.overlay
+        {
             if let Some((_, is_selected)) = options.get_mut(*selected) {
                 *is_selected = !*is_selected;
             }
+            *error = None;
         }
     }
 
@@ -1052,6 +1047,14 @@ impl App {
                 .collect()
         } else {
             Vec::new()
+        }
+    }
+
+    pub fn set_reset_overlay_error(&mut self, message: String) {
+        if let Overlay::Reset { error, .. } = &mut self.overlay {
+            *error = Some(message);
+        } else {
+            self.open_alert("Reset failed", message);
         }
     }
 
