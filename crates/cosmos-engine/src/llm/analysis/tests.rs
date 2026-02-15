@@ -1,11 +1,14 @@
 use super::*;
 use chrono::Utc;
+use cosmos_adapters::config::SuggestionsProfile;
 use cosmos_core::context::WorkContext;
 use cosmos_core::index::{
     CodebaseIndex, FileIndex, FileSummary, Language, Pattern, PatternKind, PatternReliability,
     Symbol, SymbolKind, Visibility,
 };
-use cosmos_core::suggest::{Priority, SuggestionKind, SuggestionSource};
+use cosmos_core::suggest::{
+    Priority, SuggestionKind, SuggestionSource, SuggestionValidationMetadata,
+};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -29,6 +32,9 @@ fn test_evidence_item(id: usize) -> EvidenceItem {
         line: id + 1,
         snippet: format!("{}| let value = {};", id + 1, id),
         why_interesting: "test".to_string(),
+        file_loc: None,
+        file_complexity: None,
+        anchor_context: None,
         source: EvidenceSource::Pattern,
         pattern_kind: None,
     }
@@ -223,7 +229,7 @@ fn grounded_finalizer_does_not_backfill_duplicates() {
 
 #[test]
 fn grounded_finalizer_caps_results_at_provisional_target_max() {
-    let mapped: Vec<(usize, Suggestion)> = (0..40)
+    let mapped: Vec<(usize, Suggestion)> = (0..120)
         .map(|i| (i, test_suggestion(&format!("item-{}", i))))
         .collect();
 
@@ -379,12 +385,12 @@ fn godmodule_anchor_prefers_complex_function_line_not_line1() {
 }
 
 #[test]
-fn regeneration_needed_uses_soft_floor_ten() {
-    assert_eq!(regeneration_needed(0), 10);
-    assert_eq!(regeneration_needed(1), 9);
-    assert_eq!(regeneration_needed(9), 1);
-    assert_eq!(regeneration_needed(10), 0);
-    assert_eq!(regeneration_needed(14), 0);
+fn regeneration_needed_uses_soft_floor_eighteen() {
+    assert_eq!(regeneration_needed(0), 18);
+    assert_eq!(regeneration_needed(1), 17);
+    assert_eq!(regeneration_needed(17), 1);
+    assert_eq!(regeneration_needed(18), 0);
+    assert_eq!(regeneration_needed(22), 0);
 }
 
 #[test]
@@ -653,8 +659,10 @@ fn prevalidation_rejection_reason_catches_missing_and_duplicate_primary_evidence
     let missing_reason =
         prevalidation_rejection_reason(&missing, &used_evidence_ids, &mut chunk_seen_evidence_ids)
             .expect("missing evidence should be rejected");
-    assert!(missing_reason.0.contains("Missing primary evidence ref"));
-    assert!(missing_reason.1.is_none());
+    assert!(missing_reason
+        .reason
+        .contains("Missing primary evidence ref"));
+    assert!(missing_reason.evidence_id.is_none());
 
     let first = test_suggestion("first").with_evidence_refs(vec![SuggestionEvidenceRef {
         snippet_id: 3,
@@ -681,9 +689,9 @@ fn prevalidation_rejection_reason_catches_missing_and_duplicate_primary_evidence
     )
     .expect("duplicate in batch should be rejected");
     assert!(duplicate_reason
-        .0
+        .reason
         .contains("Duplicate evidence_id in validation batch"));
-    assert_eq!(duplicate_reason.1, Some(3));
+    assert_eq!(duplicate_reason.evidence_id, Some(3));
 
     let mut chunk_seen_evidence_ids: HashSet<usize> = HashSet::new();
     let used_evidence_ids = HashSet::from([9usize]);
@@ -700,9 +708,9 @@ fn prevalidation_rejection_reason_catches_missing_and_duplicate_primary_evidence
     )
     .expect("duplicate against used set should be rejected");
     assert!(duplicate_used_reason
-        .0
+        .reason
         .contains("Duplicate evidence_id already validated"));
-    assert_eq!(duplicate_used_reason.1, Some(9));
+    assert_eq!(duplicate_used_reason.evidence_id, Some(9));
 }
 
 #[test]
@@ -727,8 +735,9 @@ fn prevalidation_rejection_reason_rejects_unconfigured_client_id_claim_when_lite
     )
     .expect("configured client id contradiction should be rejected");
 
-    assert!(reason.0.contains("client ID appears configured"));
-    assert_eq!(reason.1, Some(11));
+    assert!(reason.reason.contains("client ID appears configured"));
+    assert_eq!(reason.evidence_id, Some(11));
+    assert!(reason.is_contradiction);
 }
 
 #[test]
@@ -769,8 +778,9 @@ fn prevalidation_rejection_reason_rejects_absolute_path_guard_false_positive() {
     )
     .expect("absolute path guard contradiction should be rejected");
 
-    assert!(reason.0.contains("absolute-path security guard"));
-    assert_eq!(reason.1, Some(12));
+    assert!(reason.reason.contains("absolute-path security guard"));
+    assert_eq!(reason.evidence_id, Some(12));
+    assert!(reason.is_contradiction);
 }
 
 #[test]
@@ -798,8 +808,11 @@ fn prevalidation_rejection_reason_rejects_cache_not_created_false_positive() {
     )
     .expect("cache directory contradiction should be rejected");
 
-    assert!(reason.0.contains("cache-directory creation/ensure logic"));
-    assert_eq!(reason.1, Some(13));
+    assert!(reason
+        .reason
+        .contains("cache-directory creation/ensure logic"));
+    assert_eq!(reason.evidence_id, Some(13));
+    assert!(reason.is_contradiction);
 }
 
 #[test]
@@ -826,8 +839,11 @@ fn prevalidation_rejection_reason_rejects_non_actionable_safeguard_praise() {
     )
     .expect("non-actionable safeguard praise should be rejected");
 
-    assert!(reason.0.contains("Non-actionable safeguard description"));
-    assert_eq!(reason.1, Some(14));
+    assert!(reason
+        .reason
+        .contains("Non-actionable safeguard description"));
+    assert_eq!(reason.evidence_id, Some(14));
+    assert!(reason.rewrite_candidate);
 }
 
 #[test]
@@ -883,8 +899,11 @@ fn prevalidation_rejection_reason_rejects_non_security_clear_error_praise() {
     )
     .expect("non-security clear-error praise should be rejected");
 
-    assert!(reason.0.contains("Non-actionable behavior description"));
-    assert_eq!(reason.1, Some(15));
+    assert!(reason
+        .reason
+        .contains("Non-actionable behavior description"));
+    assert_eq!(reason.evidence_id, Some(15));
+    assert!(reason.rewrite_candidate);
 }
 
 #[test]
@@ -912,8 +931,11 @@ fn prevalidation_rejection_reason_rejects_non_security_retry_praise() {
     )
     .expect("non-security retry praise should be rejected");
 
-    assert!(reason.0.contains("Non-actionable behavior description"));
-    assert_eq!(reason.1, Some(16));
+    assert!(reason
+        .reason
+        .contains("Non-actionable behavior description"));
+    assert_eq!(reason.evidence_id, Some(16));
+    assert!(reason.rewrite_candidate);
 }
 
 #[test]
@@ -941,6 +963,9 @@ fn remap_suggestion_to_original_ids_handles_non_contiguous_ids() {
             line: 7,
             snippet: "7| let a = 1;".to_string(),
             why_interesting: "pattern".to_string(),
+            file_loc: None,
+            file_complexity: None,
+            anchor_context: None,
             source: EvidenceSource::Pattern,
             pattern_kind: Some(PatternKind::MissingErrorHandling),
         },
@@ -950,6 +975,9 @@ fn remap_suggestion_to_original_ids_handles_non_contiguous_ids() {
             line: 11,
             snippet: "11| let b = 2;".to_string(),
             why_interesting: "hotspot".to_string(),
+            file_loc: None,
+            file_complexity: None,
+            anchor_context: None,
             source: EvidenceSource::Hotspot,
             pattern_kind: None,
         },
@@ -1034,7 +1062,7 @@ fn suggestion_batch_validation_schema_sets_local_index_bounds() {
 
 #[test]
 fn map_batch_validation_response_fills_missing_entries() {
-    let mapped = map_batch_validation_response(
+    let (mapped, stats) = map_batch_validation_response(
         3,
         SuggestionBatchValidationJson {
             validations: vec![
@@ -1058,10 +1086,12 @@ fn map_batch_validation_response_fills_missing_entries() {
     );
 
     assert_eq!(mapped.len(), 3);
+    assert_eq!(stats.missing_index_count, 1);
+    assert_eq!(stats.no_reason_count, 1);
 
     let (state0, reason0, class0) = &mapped[0];
     assert_eq!(*state0, SuggestionValidationState::Rejected);
-    assert!(reason0.contains("missing batch result"));
+    assert!(reason0.contains("retry needed"));
     assert!(matches!(class0, Some(ValidationRejectClass::Transport)));
 
     let (state1, _reason1, class1) = &mapped[1];
@@ -1071,7 +1101,74 @@ fn map_batch_validation_response_fills_missing_entries() {
     let (state2, reason2, class2) = &mapped[2];
     assert_eq!(*state2, SuggestionValidationState::Rejected);
     assert!(reason2.contains("no reason"));
-    assert!(matches!(class2, Some(ValidationRejectClass::Other)));
+    assert!(matches!(class2, Some(ValidationRejectClass::Transport)));
+}
+
+#[test]
+fn default_gate_config_is_balanced_high_volume() {
+    let config = SuggestionQualityGateConfig::default();
+    assert_eq!(config.min_final_count, 14);
+    assert_eq!(config.max_final_count, 30);
+    assert_eq!(config.max_suggest_cost_usd, 0.08);
+    assert_eq!(config.max_suggest_ms, 120_000);
+    assert_eq!(config.max_attempts, 3);
+}
+
+#[test]
+fn gate_profile_mapping_matches_expected_ranges() {
+    let strict = suggestion_gate_config_for_profile(SuggestionsProfile::Strict);
+    assert_eq!(strict.min_final_count, 10);
+    assert_eq!(strict.max_final_count, 20);
+    assert_eq!(strict.max_attempts, 3);
+
+    let balanced = suggestion_gate_config_for_profile(SuggestionsProfile::BalancedHighVolume);
+    assert_eq!(balanced.min_final_count, 14);
+    assert_eq!(balanced.max_final_count, 30);
+    assert_eq!(balanced.max_attempts, 3);
+
+    let max_volume = suggestion_gate_config_for_profile(SuggestionsProfile::MaxVolume);
+    assert_eq!(max_volume.min_final_count, 24);
+    assert_eq!(max_volume.max_final_count, 30);
+    assert_eq!(max_volume.max_attempts, 5);
+}
+
+#[test]
+fn rewrite_revalidation_triggers_for_insufficient_evidence() {
+    assert!(should_attempt_rewrite_revalidation(
+        ValidationRejectClass::InsufficientEvidence,
+        "insufficient evidence from snippet"
+    ));
+    assert!(should_attempt_rewrite_revalidation(
+        ValidationRejectClass::Contradicted,
+        "assumption beyond evidence about user impact"
+    ));
+    assert!(!should_attempt_rewrite_revalidation(
+        ValidationRejectClass::Transport,
+        "validation failed: deadline exceeded"
+    ));
+}
+
+#[test]
+fn validation_evidence_block_includes_deterministic_metadata() {
+    let suggestion = test_suggestion("metadata")
+        .with_evidence("12| let ok = true;".to_string())
+        .with_evidence_refs(vec![SuggestionEvidenceRef {
+            snippet_id: 7,
+            file: PathBuf::from("src/lib.rs"),
+            line: 12,
+        }])
+        .with_validation_metadata(SuggestionValidationMetadata {
+            why_interesting: Some("Hotspot sample".to_string()),
+            file_loc: Some(240),
+            file_complexity: Some(33.4),
+            anchor_context: Some("Anchor near run:Function".to_string()),
+        });
+
+    let block = build_validation_evidence_block(&suggestion);
+    assert!(block.contains("Why interesting: Hotspot sample"));
+    assert!(block.contains("File LOC: 240"));
+    assert!(block.contains("File complexity: 33.4"));
+    assert!(block.contains("Anchor context: Anchor near run:Function"));
 }
 
 #[test]
@@ -1081,7 +1178,12 @@ fn gate_snapshot_reports_fail_reasons_for_count_and_cost() {
         test_suggestion("one").with_validation_state(SuggestionValidationState::Validated),
         test_suggestion("two").with_validation_state(SuggestionValidationState::Validated),
     ];
-    let gate = build_gate_snapshot(&config, &suggestions, 3_000, 0.04);
+    let gate = build_gate_snapshot(
+        &config,
+        &suggestions,
+        3_000,
+        config.max_suggest_cost_usd + 0.01,
+    );
     assert!(!gate.passed);
     assert!(gate
         .fail_reasons
@@ -1271,7 +1373,7 @@ fn apply_readiness_filter_backfills_when_threshold_is_too_strict() {
     let (filtered, _dropped, _mean) =
         apply_readiness_filter(suggestions, DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE);
     let expected_floor = FAST_GROUNDED_FINAL_TARGET_MIN.saturating_sub(2);
-    assert_eq!(filtered.len(), expected_floor);
+    assert_eq!(filtered.len(), expected_floor.min(9));
     assert!(filtered.iter().any(|s| {
         s.implementation_risk_flags
             .iter()
@@ -1526,6 +1628,65 @@ fn reconcile_validation_from_reason_recovers_supported_other_label() {
     );
     assert_eq!(state, SuggestionValidationState::Validated);
     assert!(class.is_none());
+}
+
+#[test]
+fn reconcile_validation_from_reason_recovers_supported_contradicted_label() {
+    let (state, class) = reconcile_validation_from_reason(
+        SuggestionValidationState::Rejected,
+        Some(ValidationRejectClass::Contradicted),
+        "The snippet shows a missing return path, supporting the suggestion.",
+    );
+    assert_eq!(state, SuggestionValidationState::Validated);
+    assert!(class.is_none());
+}
+
+#[test]
+fn reconcile_validation_from_reason_maps_does_not_show_to_insufficient_evidence() {
+    let (state, class) = reconcile_validation_from_reason(
+        SuggestionValidationState::Rejected,
+        Some(ValidationRejectClass::Other),
+        "The snippet does not show retry backoff behavior.",
+    );
+    assert_eq!(state, SuggestionValidationState::Rejected);
+    assert_eq!(class, Some(ValidationRejectClass::InsufficientEvidence));
+}
+
+#[test]
+fn map_batch_validation_response_treats_short_reason_as_retry_needed() {
+    let (mapped, stats) = map_batch_validation_response(
+        1,
+        SuggestionBatchValidationJson {
+            validations: vec![SuggestionBatchValidationItemJson {
+                local_index: 0,
+                validation: "contradicted".to_string(),
+                reason: "Snippet".to_string(),
+            }],
+        },
+    );
+
+    assert_eq!(stats.no_reason_count, 1);
+    let (state, reason, class) = &mapped[0];
+    assert_eq!(*state, SuggestionValidationState::Rejected);
+    assert!(reason.contains("no reason"));
+    assert_eq!(*class, Some(ValidationRejectClass::Transport));
+}
+
+#[test]
+fn infer_validation_reject_class_detects_insufficient_evidence_phrasing() {
+    let class = infer_validation_reject_class(
+        "The snippet does not provide evidence for this claim.",
+        None,
+    );
+    assert_eq!(class, ValidationRejectClass::InsufficientEvidence);
+}
+
+#[test]
+fn is_unusable_validation_reason_requires_minimum_length() {
+    assert!(is_unusable_validation_reason("Snippet"));
+    assert!(!is_unusable_validation_reason(
+        "Evidence shows the claim is directly supported."
+    ));
 }
 
 #[test]

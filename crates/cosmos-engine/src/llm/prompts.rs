@@ -79,7 +79,7 @@ You will be given an EVIDENCE PACK containing real code snippets from the repo.
 Evidence is ONLY for grounding and accuracy. The user should not see it.
 
 TASK:
-- Produce 10 to 20 suggestions by default, based ONLY on the evidence pack.
+- Produce 18 to 30 suggestions by default, based ONLY on the evidence pack.
 - If the user prompt requests a different count/range, follow the user prompt.
 - Every suggestion MUST include exactly one `evidence_refs` item from the pack.
 - Do not invent facts. If an issue is not clearly supported by the evidence snippet, do not suggest it.
@@ -114,6 +114,8 @@ WRITE GREAT SUGGESTIONS:
 - For both `summary` and `detail`, keep claims local to what the snippet proves.
 - Keep each suggestion focused on one concrete claim backed by one evidence reference.
 - Do not treat explicit guard-rail checks as bugs by default (for example, intentional security policy errors) unless the snippet shows a real defect.
+- Do not output existing-safeguard praise (for example, "this guard prevents attacks") unless you show a concrete defect risk that still remains.
+- Do not make function-size or complexity claims unless the snippet itself shows the concrete maintenance or correctness risk.
 - Use distinct `evidence_id` values across suggestions; avoid reusing IDs until you have at least 12 suggestions.
 - Reject unsupported impact claims immediately instead of softening with assumptions.
 - Reject speculative outcomes (for example: inferred user-facing rollback behavior, audience effects, or unsaved-state claims) unless explicitly shown.
@@ -438,10 +440,10 @@ mod prompt_tests {
     }
 
     #[test]
-    fn fast_grounded_prompt_targets_ten_to_twenty() {
+    fn fast_grounded_prompt_targets_balanced_high_volume_defaults() {
         assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Produce 10 to 20 suggestions by default"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should prefer 10-20 suggestions by default"
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Produce 18 to 30 suggestions by default"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should prefer 18-30 suggestions by default"
         );
         assert!(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("one concrete claim"),
@@ -454,6 +456,14 @@ mod prompt_tests {
         assert!(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Reject unsupported impact claims"),
             "FAST_GROUNDED_SUGGESTIONS_SYSTEM should explicitly reject unsupported impact claims"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("existing-safeguard praise"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should forbid existing safeguard praise without defect risk"
+        );
+        assert!(
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("function-size or complexity claims"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should forbid function-size claims without snippet support"
         );
     }
 

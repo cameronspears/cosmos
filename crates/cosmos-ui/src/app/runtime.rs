@@ -12,8 +12,8 @@ use crate::app::{background, input, RuntimeContext};
 use crate::ui;
 use crate::ui::{App, LoadingState};
 use anyhow::Result;
-use cosmos_adapters::cache;
 use cosmos_adapters::git_ops;
+use cosmos_adapters::{cache, config};
 use cosmos_core::context::WorkContext;
 use cosmos_core::grouping::{Confidence, Layer, LayerOverride};
 use cosmos_core::index::CodebaseIndex;
@@ -47,7 +47,14 @@ pub async fn run_tui(
     let mut terminal = Terminal::new(backend)?;
 
     // Create app with loading state
-    let mut app = App::new(index.clone(), suggestions, context.clone());
+    let app_config = config::Config::load();
+    let mut app = App::new_with_suggestion_preferences(
+        index.clone(),
+        suggestions,
+        context.clone(),
+        app_config.suggestions_profile,
+        app_config.suggestions_display_cap,
+    );
     // Load repo-local “memory” (decisions/conventions) from .cosmos/
     app.repo_memory = cache_manager.load_repo_memory();
     // Load cached domain glossary (auto-extracted terminology)

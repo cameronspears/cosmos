@@ -7,11 +7,14 @@ use super::models::{Model, Usage};
 use super::prompt_utils::format_repo_memory_section;
 use super::prompts::{ask_question_system, FAST_GROUNDED_SUGGESTIONS_SYSTEM};
 use chrono::Utc;
+use cosmos_adapters::config::SuggestionsProfile;
 use cosmos_core::context::WorkContext;
 use cosmos_core::index::{
     CodebaseIndex, PatternKind, PatternReliability, PatternSeverity, SymbolKind,
 };
-use cosmos_core::suggest::{Suggestion, SuggestionEvidenceRef, SuggestionValidationState};
+use cosmos_core::suggest::{
+    Suggestion, SuggestionEvidenceRef, SuggestionValidationMetadata, SuggestionValidationState,
+};
 use futures::future::join_all;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -34,55 +37,59 @@ use cosmos_core::index::GOD_MODULE_LOC_THRESHOLD;
 
 /// Complexity threshold above which a file is considered a "hotspot"
 const HIGH_COMPLEXITY_THRESHOLD: f64 = 20.0;
-const FAST_EVIDENCE_PACK_MAX_ITEMS: usize = 60;
-const FAST_EVIDENCE_SNIPPET_LINES_BEFORE: usize = 5;
-const FAST_EVIDENCE_SNIPPET_LINES_AFTER: usize = 8;
-const FAST_GROUNDED_FINAL_TARGET_MIN: usize = 10;
-const FAST_GROUNDED_FINAL_TARGET_MAX: usize = 20;
-const FAST_GROUNDED_VALIDATED_SOFT_FLOOR: usize = 10;
-const FAST_GROUNDED_VALIDATED_HARD_TARGET: usize = 14;
-const FAST_GROUNDED_VALIDATED_STRETCH_TARGET: usize = 24;
-const FAST_GROUNDED_VALIDATED_POOL_MAX: usize = 28;
+const FAST_EVIDENCE_PACK_MAX_ITEMS: usize = 96;
+const FAST_EVIDENCE_SNIPPET_LINES_BEFORE: usize = 8;
+const FAST_EVIDENCE_SNIPPET_LINES_AFTER: usize = 12;
+const FAST_GROUNDED_FINAL_TARGET_MIN: usize = 18;
+const FAST_GROUNDED_FINAL_TARGET_MAX: usize = 30;
+const FAST_GROUNDED_VALIDATED_SOFT_FLOOR: usize = 18;
+const FAST_GROUNDED_VALIDATED_HARD_TARGET: usize = 22;
+const FAST_GROUNDED_VALIDATED_STRETCH_TARGET: usize = 28;
+const FAST_GROUNDED_VALIDATED_POOL_MAX: usize = 42;
 const FAST_GROUNDED_PROVISIONAL_TARGET_MIN: usize = 26;
-const FAST_GROUNDED_PROVISIONAL_TARGET_MAX: usize = 40;
+const FAST_GROUNDED_PROVISIONAL_TARGET_MAX: usize = 72;
 const FAST_EVIDENCE_SOURCE_PATTERN_MAX: usize = 24;
 const FAST_EVIDENCE_SOURCE_HOTSPOT_MAX: usize = 20;
 const FAST_EVIDENCE_SOURCE_CORE_MAX: usize = 16;
 const FAST_EVIDENCE_KIND_GOD_MODULE_MAX: usize = 4;
-const FAST_EVIDENCE_PER_FILE_MAX: usize = 3;
-const FAST_EVIDENCE_ANCHORS_PER_FILE_MAX: usize = 3;
-const FAST_EVIDENCE_CHANGED_FILE_MAX: usize = 10;
-const FAST_EVIDENCE_NEIGHBOR_FILE_MAX: usize = 12;
+const FAST_EVIDENCE_PER_FILE_MAX: usize = 4;
+const FAST_EVIDENCE_ANCHORS_PER_FILE_MAX: usize = 4;
+const FAST_EVIDENCE_CHANGED_FILE_MAX: usize = 16;
+const FAST_EVIDENCE_NEIGHBOR_FILE_MAX: usize = 20;
 const REFINEMENT_HARD_PHASE_MAX_ATTEMPTS: usize = 4;
 const REFINEMENT_STRETCH_PHASE_MAX_ATTEMPTS: usize = 2;
 const GENERATION_TOPUP_MAX_CALLS: usize = 4;
 const GENERATION_TOPUP_TIMEOUT_MS: u64 = 4_500;
 const REGEN_STRICT_MIN_PACK_SIZE: usize = FAST_GROUNDED_PROVISIONAL_TARGET_MIN;
-const SUGGEST_BALANCED_BUDGET_MS: u64 = 60_000;
-const SUGGEST_GATE_BUDGET_MS: u64 = 70_000;
+const SUGGEST_BALANCED_BUDGET_MS: u64 = 120_000;
+const SUGGEST_GATE_BUDGET_MS: u64 = 120_000;
 const GATE_RETRY_MIN_REMAINING_BUDGET_MS: u64 = 8_000;
 const GATE_RETRY_MAX_ATTEMPT_COST_FRACTION: f64 = 0.70;
 const VALIDATION_CONCURRENCY: usize = 3;
 const VALIDATION_RETRY_CONCURRENCY: usize = 1;
-const PRIMARY_REQUEST_MIN: usize = 22;
-const PRIMARY_REQUEST_MAX: usize = 30;
+const PRIMARY_REQUEST_MIN: usize = 30;
+const PRIMARY_REQUEST_MAX: usize = 38;
 const PRIMARY_REQUEST_MAX_TOKENS: u32 = 1_800;
 const PRIMARY_REQUEST_TIMEOUT_MS: u64 = 6_200;
 const TOPUP_REQUEST_MAX_TOKENS: u32 = 1_000;
 const REGEN_REQUEST_MAX_TOKENS: u32 = 800;
 const VALIDATOR_MAX_TOKENS: u32 = 90;
-const VALIDATOR_TIMEOUT_MS: u64 = 4_500;
-const VALIDATOR_RETRY_TIMEOUT_MS: u64 = 3_200;
-const VALIDATOR_BATCH_MAX_TOKENS: u32 = 320;
+const VALIDATOR_TIMEOUT_MS: u64 = 7_500;
+const VALIDATOR_RETRY_TIMEOUT_MS: u64 = 5_500;
+const VALIDATOR_BATCH_MAX_TOKENS: u32 = 700;
 const VALIDATOR_BATCH_TIMEOUT_BUFFER_MS: u64 = 1_600;
-const VALIDATION_RETRY_MAX_PER_SUGGESTION: usize = 1;
+const VALIDATION_RETRY_MAX_PER_SUGGESTION: usize = 2;
 const VALIDATION_RETRY_MIN_REMAINING_BUDGET_MS: u64 = 4_000;
-const VALIDATION_RUN_DEADLINE_MS: u64 = 30_000;
+const VALIDATION_RUN_DEADLINE_MS: u64 = 55_000;
 const VALIDATION_MIN_REMAINING_BUDGET_MS: u64 = 2_500;
 const OVERCLAIM_REWRITE_MAX_TOKENS: u32 = 70;
 const OVERCLAIM_REWRITE_TIMEOUT_MS: u64 = 2_000;
 const OVERCLAIM_REVALIDATE_MAX_TOKENS: u32 = 70;
 const OVERCLAIM_REVALIDATE_TIMEOUT_MS: u64 = 2_000;
+const VALIDATION_REASON_MIN_CHARS: usize = 12;
+const BATCH_RETRY_MISSING_RESULT_REASON: &str = "Validation retry needed: missing batch result";
+const BATCH_RETRY_NO_REASON_REASON: &str =
+    "Validation retry needed: batch validator returned no reason";
 const SMART_BORDERLINE_REWRITE_MAX_TOKENS: u32 = 90;
 const SMART_BORDERLINE_REWRITE_TIMEOUT_MS: u64 = 2_600;
 const STRETCH_PHASE_MAX_COST_USD: f64 = 0.012;
@@ -486,6 +493,12 @@ pub struct SuggestionDiagnostics {
     pub validation_rejection_histogram: HashMap<String, usize>,
     pub validation_deadline_exceeded: bool,
     pub validation_deadline_ms: u64,
+    pub batch_missing_index_count: usize,
+    pub batch_no_reason_count: usize,
+    pub transport_retry_count: usize,
+    pub transport_recovered_count: usize,
+    pub rewrite_recovered_count: usize,
+    pub prevalidation_contradiction_count: usize,
     pub validation_transport_retry_count: usize,
     pub validation_transport_recovered_count: usize,
     pub regen_stopped_validation_budget: bool,
@@ -528,15 +541,43 @@ pub struct SuggestionQualityGateConfig {
 impl Default for SuggestionQualityGateConfig {
     fn default() -> Self {
         Self {
+            min_final_count: 14,
+            max_final_count: 30,
+            min_displayed_valid_ratio: 1.0,
+            min_implementation_readiness_score: DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE,
+            max_smart_rewrites_per_run: DEFAULT_MAX_SMART_REWRITES_PER_RUN,
+            max_suggest_cost_usd: 0.08,
+            max_suggest_ms: SUGGEST_GATE_BUDGET_MS,
+            max_attempts: 3,
+        }
+    }
+}
+
+pub fn suggestion_gate_config_for_profile(
+    profile: SuggestionsProfile,
+) -> SuggestionQualityGateConfig {
+    match profile {
+        SuggestionsProfile::Strict => SuggestionQualityGateConfig {
             min_final_count: 10,
             max_final_count: 20,
             min_displayed_valid_ratio: 1.0,
             min_implementation_readiness_score: DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE,
             max_smart_rewrites_per_run: DEFAULT_MAX_SMART_REWRITES_PER_RUN,
             max_suggest_cost_usd: 0.035,
-            max_suggest_ms: SUGGEST_GATE_BUDGET_MS,
+            max_suggest_ms: 70_000,
             max_attempts: 3,
-        }
+        },
+        SuggestionsProfile::BalancedHighVolume => SuggestionQualityGateConfig::default(),
+        SuggestionsProfile::MaxVolume => SuggestionQualityGateConfig {
+            min_final_count: 24,
+            max_final_count: 30,
+            min_displayed_valid_ratio: 1.0,
+            min_implementation_readiness_score: DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE,
+            max_smart_rewrites_per_run: DEFAULT_MAX_SMART_REWRITES_PER_RUN.saturating_add(4),
+            max_suggest_cost_usd: 0.14,
+            max_suggest_ms: 180_000,
+            max_attempts: 5,
+        },
     }
 }
 
@@ -575,6 +616,9 @@ struct EvidenceItem {
     line: usize, // 1-based
     snippet: String,
     why_interesting: String,
+    file_loc: Option<usize>,
+    file_complexity: Option<f64>,
+    anchor_context: Option<String>,
     source: EvidenceSource,
     pattern_kind: Option<PatternKind>,
 }
@@ -713,6 +757,25 @@ fn best_function_anchor(file: &cosmos_core::index::FileIndex) -> usize {
         })
         .map(|s| s.line)
         .unwrap_or(1)
+}
+
+fn anchor_context_for_line(file: &cosmos_core::index::FileIndex, line: usize) -> Option<String> {
+    let mut symbols = file
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            let start = symbol.line.saturating_sub(3);
+            let end = symbol.end_line.saturating_add(3);
+            line >= start && line <= end
+        })
+        .take(2)
+        .map(|symbol| format!("{}:{:?}", symbol.name, symbol.kind))
+        .collect::<Vec<_>>();
+    if symbols.is_empty() {
+        return None;
+    }
+    symbols.sort();
+    Some(format!("Anchor near {}", symbols.join(", ")))
 }
 
 fn is_test_like_path(path: &Path) -> bool {
@@ -876,6 +939,9 @@ fn build_evidence_pack(
                         line: anchor,
                         snippet,
                         why_interesting: format!("Detected {:?}: {}", p.kind, p.description),
+                        file_loc: Some(file.loc),
+                        file_complexity: Some(file.complexity),
+                        anchor_context: anchor_context_for_line(file, anchor),
                         source: EvidenceSource::Pattern,
                         pattern_kind: Some(p.kind),
                     },
@@ -934,6 +1000,9 @@ fn build_evidence_pack(
                             f.complexity,
                             f.loc
                         ),
+                        file_loc: Some(f.loc),
+                        file_complexity: Some(f.complexity),
+                        anchor_context: anchor_context_for_line(f, anchor),
                         source: EvidenceSource::Hotspot,
                         pattern_kind: None,
                     },
@@ -988,6 +1057,9 @@ fn build_evidence_pack(
                             anchor_rank + 1,
                             f.summary.used_by.len()
                         ),
+                        file_loc: Some(f.loc),
+                        file_complexity: Some(f.complexity),
+                        anchor_context: anchor_context_for_line(f, anchor.max(1)),
                         source: EvidenceSource::Core,
                         pattern_kind: None,
                     },
@@ -1029,6 +1101,9 @@ fn build_evidence_pack(
                             file.complexity,
                             file.loc
                         ),
+                        file_loc: Some(file.loc),
+                        file_complexity: Some(file.complexity),
+                        anchor_context: anchor_context_for_line(file, anchor),
                         source: EvidenceSource::Hotspot,
                         pattern_kind: None,
                     },
@@ -1097,6 +1172,9 @@ fn build_evidence_pack(
                     snippet,
                     why_interesting: "Neighbor of changed code (dependency/call boundary sample)"
                         .to_string(),
+                    file_loc: Some(file.loc),
+                    file_complexity: Some(file.complexity),
+                    anchor_context: anchor_context_for_line(file, anchor),
                     source: EvidenceSource::Core,
                     pattern_kind: None,
                 },
@@ -1142,6 +1220,9 @@ fn build_evidence_pack(
                         snippet,
                         why_interesting: "Coverage sample: scan this snippet for concrete issues visible in code."
                             .to_string(),
+                        file_loc: Some(f.loc),
+                        file_complexity: Some(f.complexity),
+                        anchor_context: anchor_context_for_line(f, anchor),
                         source: EvidenceSource::Hotspot,
                         pattern_kind: None,
                     },
@@ -1329,14 +1410,18 @@ enum ValidationRejectClass {
 #[derive(Debug, Clone, Default)]
 struct ValidationRejectionStats {
     prevalidation: usize,
+    prevalidation_contradiction_count: usize,
     validator_contradicted: usize,
     validator_insufficient_evidence: usize,
     validator_transport: usize,
     validator_other: usize,
+    batch_missing_index_count: usize,
+    batch_no_reason_count: usize,
     transport_retry_count: usize,
     transport_recovered_count: usize,
     overclaim_rewrite_count: usize,
     overclaim_rewrite_validated_count: usize,
+    rewrite_recovered_count: usize,
     deterministic_auto_validated: usize,
     deadline_exceeded: bool,
 }
@@ -1347,6 +1432,10 @@ fn build_validation_rejection_histogram(
     HashMap::from([
         ("prevalidation".to_string(), stats.prevalidation),
         (
+            "prevalidation_contradiction_count".to_string(),
+            stats.prevalidation_contradiction_count,
+        ),
+        (
             "validator_contradicted".to_string(),
             stats.validator_contradicted,
         ),
@@ -1356,6 +1445,26 @@ fn build_validation_rejection_histogram(
         ),
         ("validator_transport".to_string(), stats.validator_transport),
         ("validator_other".to_string(), stats.validator_other),
+        (
+            "batch_missing_index_count".to_string(),
+            stats.batch_missing_index_count,
+        ),
+        (
+            "batch_no_reason_count".to_string(),
+            stats.batch_no_reason_count,
+        ),
+        (
+            "transport_retry_count".to_string(),
+            stats.transport_retry_count,
+        ),
+        (
+            "transport_recovered_count".to_string(),
+            stats.transport_recovered_count,
+        ),
+        (
+            "rewrite_recovered_count".to_string(),
+            stats.rewrite_recovered_count,
+        ),
         (
             "deterministic_auto_validated".to_string(),
             stats.deterministic_auto_validated,
@@ -1433,6 +1542,12 @@ fn is_overclaim_validation_reason(reason: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
+fn should_attempt_rewrite_revalidation(class: ValidationRejectClass, reason: &str) -> bool {
+    matches!(class, ValidationRejectClass::InsufficientEvidence)
+        || (!matches!(class, ValidationRejectClass::Transport)
+            && is_overclaim_validation_reason(reason))
+}
+
 fn build_validation_evidence_block(suggestion: &Suggestion) -> String {
     let mut evidence_block = String::new();
     for (idx, reference) in suggestion.evidence_refs.iter().take(3).enumerate() {
@@ -1443,6 +1558,18 @@ fn build_validation_evidence_block(suggestion: &Suggestion) -> String {
             reference.line,
             reference.snippet_id
         ));
+    }
+    if let Some(why_interesting) = suggestion.validation_metadata.why_interesting.as_deref() {
+        evidence_block.push_str(&format!("Why interesting: {}\n", why_interesting));
+    }
+    if let Some(file_loc) = suggestion.validation_metadata.file_loc {
+        evidence_block.push_str(&format!("File LOC: {}\n", file_loc));
+    }
+    if let Some(file_complexity) = suggestion.validation_metadata.file_complexity {
+        evidence_block.push_str(&format!("File complexity: {:.1}\n", file_complexity));
+    }
+    if let Some(anchor_context) = suggestion.validation_metadata.anchor_context.as_deref() {
+        evidence_block.push_str(&format!("Anchor context: {}\n", anchor_context));
     }
     if let Some(snippet) = &suggestion.evidence {
         evidence_block.push_str("\nPRIMARY SNIPPET:\n");
@@ -1497,6 +1624,93 @@ fn parse_validation_state(
     )
 }
 
+fn reason_indicates_transport_failure(lower: &str) -> bool {
+    [
+        "validation failed",
+        "deadline exceeded",
+        "missing batch result",
+        "retry needed",
+        "rate limited",
+        "empty response",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn reason_indicates_insufficient_evidence(lower: &str) -> bool {
+    [
+        "insufficient",
+        "not enough evidence",
+        "cannot verify",
+        "unclear from evidence",
+        "does not show",
+        "doesn't show",
+        "did not show",
+        "does not demonstrate",
+        "doesn't demonstrate",
+        "did not demonstrate",
+        "does not provide evidence",
+        "doesn't provide evidence",
+        "did not provide evidence",
+        "provides no evidence",
+        "no evidence",
+        "only shows",
+        "only describes",
+        "only mentions",
+        "does not mention",
+        "not shown",
+        "not in snippet",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn reason_indicates_contradiction(lower: &str) -> bool {
+    [
+        "contradict",
+        "beyond evidence",
+        "assumption",
+        "not supported",
+        "unsupported",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn reason_has_negative_validation_marker(lower: &str) -> bool {
+    reason_indicates_transport_failure(lower)
+        || reason_indicates_insufficient_evidence(lower)
+        || reason_indicates_contradiction(lower)
+        || [
+            "not support",
+            "does not support",
+            "cannot support",
+            "fails to support",
+            "not supporting",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn reason_has_positive_support_marker(lower: &str) -> bool {
+    [
+        "evidence shows",
+        "evidence contains",
+        "supports",
+        "supported",
+        "supporting",
+        "confirm",
+        "directly shown",
+        "demonstrates",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn is_unusable_validation_reason(reason: &str) -> bool {
+    reason.trim().len() < VALIDATION_REASON_MIN_CHARS
+}
+
 fn reconcile_validation_from_reason(
     state: SuggestionValidationState,
     reject_class: Option<ValidationRejectClass>,
@@ -1504,27 +1718,11 @@ fn reconcile_validation_from_reason(
 ) -> (SuggestionValidationState, Option<ValidationRejectClass>) {
     let lower = reason.to_ascii_lowercase();
     if state == SuggestionValidationState::Validated
-        && [
-            "not support",
-            "does not support",
-            "cannot support",
-            "insufficient",
-            "contradict",
-            "beyond evidence",
-            "assumption",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+        && reason_has_negative_validation_marker(&lower)
     {
-        let class = if [
-            "insufficient",
-            "not enough evidence",
-            "cannot verify",
-            "unclear from evidence",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
-        {
+        let class = if reason_indicates_transport_failure(&lower) {
+            ValidationRejectClass::Transport
+        } else if reason_indicates_insufficient_evidence(&lower) {
             ValidationRejectClass::InsufficientEvidence
         } else {
             ValidationRejectClass::Contradicted
@@ -1532,65 +1730,33 @@ fn reconcile_validation_from_reason(
         return (SuggestionValidationState::Rejected, Some(class));
     }
 
-    if !(state == SuggestionValidationState::Rejected
-        && matches!(reject_class, Some(ValidationRejectClass::Other)))
-    {
-        return (state, reject_class);
-    }
-    let has_negative_marker = [
-        "not support",
-        "does not support",
-        "cannot support",
-        "insufficient",
-        "contradict",
-        "beyond evidence",
-        "assumption",
-        "deadline exceeded",
-        "validation failed",
-        "missing batch result",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
-
-    if !has_negative_marker
-        && [
-            "evidence shows",
-            "evidence contains",
-            "supports",
-            "supported",
-            "confirm",
-            "directly shown",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    if state == SuggestionValidationState::Rejected
+        && !matches!(reject_class, Some(ValidationRejectClass::Transport))
+        && !reason_has_negative_validation_marker(&lower)
+        && reason_has_positive_support_marker(&lower)
     {
         return (SuggestionValidationState::Validated, None);
     }
 
-    if [
-        "insufficient",
-        "not enough evidence",
-        "cannot verify",
-        "unclear from evidence",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-    {
+    if state != SuggestionValidationState::Rejected {
+        return (state, reject_class);
+    }
+
+    if reason_indicates_transport_failure(&lower) {
+        return (
+            SuggestionValidationState::Rejected,
+            Some(ValidationRejectClass::Transport),
+        );
+    }
+
+    if reason_indicates_insufficient_evidence(&lower) {
         return (
             SuggestionValidationState::Rejected,
             Some(ValidationRejectClass::InsufficientEvidence),
         );
     }
 
-    if [
-        "contradict",
-        "beyond evidence",
-        "assumption",
-        "not supported",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-    {
+    if reason_indicates_contradiction(&lower) {
         return (
             SuggestionValidationState::Rejected,
             Some(ValidationRejectClass::Contradicted),
@@ -2516,6 +2682,12 @@ fn convert_raw_suggestion(
     .with_detail(detail)
     .with_evidence(item.snippet.clone())
     .with_evidence_refs(evidence_refs)
+    .with_validation_metadata(SuggestionValidationMetadata {
+        why_interesting: Some(item.why_interesting.clone()),
+        file_loc: item.file_loc,
+        file_complexity: item.file_complexity,
+        anchor_context: item.anchor_context.clone(),
+    })
     .with_validation_state(SuggestionValidationState::Pending);
 
     Some((evidence_id, suggestion))
@@ -2656,6 +2828,41 @@ fn build_remaining_pack_for_regeneration(
         .cloned()
         .collect::<Vec<_>>();
     (relaxed, true, Vec::new())
+}
+
+fn build_underrepresented_pack_for_regeneration(
+    pack: &[EvidenceItem],
+    validated: &[Suggestion],
+) -> Vec<EvidenceItem> {
+    let mut file_counts: HashMap<PathBuf, usize> = HashMap::new();
+    for suggestion in validated {
+        *file_counts.entry(suggestion.file.clone()).or_insert(0) += 1;
+    }
+
+    let mut scored = pack.to_vec();
+    scored.sort_by(|a, b| {
+        let a_count = file_counts.get(&a.file).copied().unwrap_or(0);
+        let b_count = file_counts.get(&b.file).copied().unwrap_or(0);
+        a_count
+            .cmp(&b_count)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+    });
+
+    let mut selected = Vec::new();
+    let mut per_file: HashMap<PathBuf, usize> = HashMap::new();
+    for item in scored {
+        if per_file.get(&item.file).copied().unwrap_or(0) >= FAST_EVIDENCE_PER_FILE_MAX {
+            continue;
+        }
+        *per_file.entry(item.file.clone()).or_insert(0) += 1;
+        selected.push(item);
+        if selected.len() >= FAST_EVIDENCE_PACK_MAX_ITEMS {
+            break;
+        }
+    }
+
+    selected
 }
 
 fn finalize_validated_suggestions(mut validated: Vec<Suggestion>) -> Vec<Suggestion> {
@@ -2949,12 +3156,21 @@ Return JSON:
     )
     .await?;
 
+    let reason = truncate_str(response.data.reason.trim(), 180).to_string();
+    if is_unusable_validation_reason(&reason) {
+        return Ok((
+            SuggestionValidationState::Rejected,
+            BATCH_RETRY_NO_REASON_REASON.to_string(),
+            response.usage,
+            Some(ValidationRejectClass::Transport),
+        ));
+    }
+
     let normalized = response.data.validation.trim().to_lowercase();
     let (state, reject_class) = parse_validation_state(normalized.as_str());
-    let (state, reject_class) =
-        reconcile_validation_from_reason(state, reject_class, &response.data.reason);
+    let (state, reject_class) = reconcile_validation_from_reason(state, reject_class, &reason);
 
-    Ok((state, response.data.reason, response.usage, reject_class))
+    Ok((state, reason, response.usage, reject_class))
 }
 
 async fn rewrite_overclaim_suggestion_with_model(
@@ -3031,7 +3247,26 @@ fn append_suggestion_quality_record(
     suggestion: &Suggestion,
     outcome: &str,
     reason: Option<String>,
+    rejection_stats: Option<&ValidationRejectionStats>,
 ) {
+    let batch_missing_index_count = rejection_stats
+        .map(|stats| stats.batch_missing_index_count)
+        .unwrap_or(0);
+    let batch_no_reason_count = rejection_stats
+        .map(|stats| stats.batch_no_reason_count)
+        .unwrap_or(0);
+    let transport_retry_count = rejection_stats
+        .map(|stats| stats.transport_retry_count)
+        .unwrap_or(0);
+    let transport_recovered_count = rejection_stats
+        .map(|stats| stats.transport_recovered_count)
+        .unwrap_or(0);
+    let rewrite_recovered_count = rejection_stats
+        .map(|stats| stats.rewrite_recovered_count)
+        .unwrap_or(0);
+    let prevalidation_contradiction_count = rejection_stats
+        .map(|stats| stats.prevalidation_contradiction_count)
+        .unwrap_or(0);
     let record = cosmos_adapters::cache::SuggestionQualityRecord {
         timestamp: Utc::now(),
         run_id: run_id.to_string(),
@@ -3044,6 +3279,12 @@ fn append_suggestion_quality_record(
         validation_outcome: outcome.to_string(),
         validation_reason: reason,
         user_verify_outcome: None,
+        batch_missing_index_count,
+        batch_no_reason_count,
+        transport_retry_count,
+        transport_recovered_count,
+        rewrite_recovered_count,
+        prevalidation_contradiction_count,
     };
     let _ = cache.append_suggestion_quality(&record);
 }
@@ -3064,6 +3305,12 @@ type BatchValidationDecision = (
     Option<ValidationRejectClass>,
 );
 
+#[derive(Debug, Clone, Default)]
+struct BatchValidationMapStats {
+    missing_index_count: usize,
+    no_reason_count: usize,
+}
+
 fn sort_validation_outcomes(outcomes: &mut [ValidationOutcome]) {
     outcomes.sort_by_key(|(idx, _, _, _, _, _, _)| *idx);
 }
@@ -3076,8 +3323,13 @@ fn infer_validation_reject_class(
         return class;
     }
     let lowered = reason.to_ascii_lowercase();
-    if lowered.starts_with("validation failed:") {
+    if lowered.starts_with("validation failed:")
+        || lowered.starts_with("validation retry needed:")
+        || reason_indicates_transport_failure(&lowered)
+    {
         ValidationRejectClass::Transport
+    } else if reason_indicates_insufficient_evidence(&lowered) {
+        ValidationRejectClass::InsufficientEvidence
     } else if lowered.contains("assumption")
         || lowered.contains("beyond evidence")
         || lowered.contains("business impact")
@@ -3093,35 +3345,53 @@ fn infer_validation_reject_class(
 fn map_batch_validation_response(
     chunk_len: usize,
     response: SuggestionBatchValidationJson,
-) -> Vec<BatchValidationDecision> {
+) -> (Vec<BatchValidationDecision>, BatchValidationMapStats) {
     let mut decisions: Vec<Option<BatchValidationDecision>> = vec![None; chunk_len];
+    let mut stats = BatchValidationMapStats::default();
 
     for item in response.validations {
         if item.local_index >= chunk_len || decisions[item.local_index].is_some() {
             continue;
         }
 
+        if is_unusable_validation_reason(&item.reason) {
+            stats.no_reason_count += 1;
+            decisions[item.local_index] = Some((
+                SuggestionValidationState::Rejected,
+                BATCH_RETRY_NO_REASON_REASON.to_string(),
+                Some(ValidationRejectClass::Transport),
+            ));
+            continue;
+        }
         let normalized = item.validation.trim().to_ascii_lowercase();
-        let reason = if item.reason.trim().is_empty() {
-            "Batch validator returned no reason".to_string()
-        } else {
-            truncate_str(item.reason.trim(), 180).to_string()
-        };
+        let reason = truncate_str(item.reason.trim(), 180).to_string();
         let (state, reject_class) = parse_validation_state(normalized.as_str());
         let (state, reject_class) = reconcile_validation_from_reason(state, reject_class, &reason);
         decisions[item.local_index] = Some((state, reason, reject_class));
     }
 
-    decisions
+    let mapped = decisions
         .into_iter()
         .map(|decision| {
             decision.unwrap_or((
                 SuggestionValidationState::Rejected,
-                "Validation failed: missing batch result".to_string(),
+                BATCH_RETRY_MISSING_RESULT_REASON.to_string(),
                 Some(ValidationRejectClass::Transport),
             ))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    stats.missing_index_count = mapped
+        .iter()
+        .filter(|(_, reason, class)| {
+            reason.as_str() == BATCH_RETRY_MISSING_RESULT_REASON
+                && matches!(class, Some(ValidationRejectClass::Transport))
+        })
+        .count();
+    (mapped, stats)
+}
+
+fn is_retry_needed_batch_reason(reason: &str) -> bool {
+    reason == BATCH_RETRY_MISSING_RESULT_REASON || reason == BATCH_RETRY_NO_REASON_REASON
 }
 
 async fn validate_suggestions_batch_with_model_budget(
@@ -3130,9 +3400,13 @@ async fn validate_suggestions_batch_with_model_budget(
     validation_model: Model,
     max_tokens: u32,
     timeout_ms: u64,
-) -> anyhow::Result<(Vec<BatchValidationDecision>, Option<Usage>)> {
+) -> anyhow::Result<(
+    Vec<BatchValidationDecision>,
+    Option<Usage>,
+    BatchValidationMapStats,
+)> {
     if chunk.is_empty() {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), None, BatchValidationMapStats::default()));
     }
 
     let system = r#"You are a strict evidence-grounded suggestion validator.
@@ -3180,10 +3454,8 @@ Return JSON:
     )
     .await?;
 
-    Ok((
-        map_batch_validation_response(chunk.len(), response.data),
-        response.usage,
-    ))
+    let (mapped, stats) = map_batch_validation_response(chunk.len(), response.data);
+    Ok((mapped, response.usage, stats))
 }
 
 async fn try_overclaim_rewrite_revalidation(
@@ -3344,6 +3616,7 @@ async fn run_validation_attempts(
     validation_model: Model,
     validation_deadline: std::time::Instant,
     per_call_timeout_ms: u64,
+    rejection_stats: &mut ValidationRejectionStats,
 ) -> Vec<ValidationOutcome> {
     if chunk.is_empty() {
         return Vec::new();
@@ -3387,25 +3660,96 @@ async fn run_validation_attempts(
             )
             .await;
 
-            if let Ok(Ok((decisions, batch_usage))) = batch_call {
+            if let Ok(Ok((decisions, batch_usage, map_stats))) = batch_call {
+                rejection_stats.batch_missing_index_count += map_stats.missing_index_count;
+                rejection_stats.batch_no_reason_count += map_stats.no_reason_count;
                 let mut usage_slot = batch_usage;
-                let mut outcomes: Vec<ValidationOutcome> = chunk
-                    .into_iter()
-                    .zip(decisions.into_iter())
-                    .map(
-                        |((idx, suggestion, attempts), (state, reason, reject_class))| {
+                let mut outcomes: Vec<ValidationOutcome> = Vec::with_capacity(chunk.len());
+                for ((idx, suggestion, attempts), (state, reason, reject_class)) in
+                    chunk.into_iter().zip(decisions.into_iter())
+                {
+                    let mut call_usage = usage_slot.take();
+                    if state == SuggestionValidationState::Rejected
+                        && matches!(reject_class, Some(ValidationRejectClass::Transport))
+                        && is_retry_needed_batch_reason(&reason)
+                    {
+                        let remaining = validation_deadline
+                            .saturating_duration_since(std::time::Instant::now());
+                        let timeout =
+                            remaining.min(std::time::Duration::from_millis(per_call_timeout_ms));
+                        let timeout_ms = timeout.as_millis() as u64;
+                        let fallback = if timeout.is_zero() {
                             (
-                                idx,
-                                suggestion,
-                                attempts,
-                                state,
-                                reason,
-                                usage_slot.take(),
-                                reject_class,
+                                SuggestionValidationState::Rejected,
+                                "Validation failed: deadline exceeded".to_string(),
+                                None,
+                                Some(ValidationRejectClass::Transport),
                             )
-                        },
-                    )
-                    .collect();
+                        } else {
+                            match tokio::time::timeout(
+                                timeout,
+                                validate_suggestion_with_model_budget(
+                                    &suggestion,
+                                    memory_section,
+                                    validation_model,
+                                    VALIDATOR_MAX_TOKENS,
+                                    timeout_ms,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(result)) => result,
+                                Ok(Err(err)) => (
+                                    SuggestionValidationState::Rejected,
+                                    format!(
+                                        "Validation failed: {}",
+                                        truncate_str(&err.to_string(), 120)
+                                    ),
+                                    None,
+                                    Some(ValidationRejectClass::Transport),
+                                ),
+                                Err(_) => (
+                                    SuggestionValidationState::Rejected,
+                                    "Validation failed: deadline exceeded".to_string(),
+                                    None,
+                                    Some(ValidationRejectClass::Transport),
+                                ),
+                            }
+                        };
+                        let (fallback_state, fallback_reason, fallback_usage, fallback_class) =
+                            fallback;
+                        if attempts == 0
+                            && (fallback_state == SuggestionValidationState::Validated
+                                || !matches!(
+                                    fallback_class,
+                                    Some(ValidationRejectClass::Transport)
+                                ))
+                        {
+                            rejection_stats.transport_recovered_count += 1;
+                        }
+                        call_usage = merge_usage(call_usage, fallback_usage);
+                        outcomes.push((
+                            idx,
+                            suggestion,
+                            attempts,
+                            fallback_state,
+                            fallback_reason,
+                            call_usage,
+                            fallback_class,
+                        ));
+                        continue;
+                    }
+
+                    outcomes.push((
+                        idx,
+                        suggestion,
+                        attempts,
+                        state,
+                        reason,
+                        call_usage,
+                        reject_class,
+                    ));
+                }
                 sort_validation_outcomes(&mut outcomes);
                 return outcomes;
             }
@@ -3522,7 +3866,14 @@ fn record_rejected_validation(
     } else {
         "rejected"
     };
-    append_suggestion_quality_record(cache, run_id, suggestion, outcome, Some(reason));
+    append_suggestion_quality_record(
+        cache,
+        run_id,
+        suggestion,
+        outcome,
+        Some(reason),
+        Some(rejection_stats),
+    );
 }
 
 fn primary_evidence_id(suggestion: &Suggestion) -> Option<usize> {
@@ -3532,41 +3883,70 @@ fn primary_evidence_id(suggestion: &Suggestion) -> Option<usize> {
         .map(|reference| reference.snippet_id)
 }
 
+#[derive(Debug, Clone)]
+struct PrevalidationDecision {
+    reason: String,
+    evidence_id: Option<usize>,
+    block_for_regeneration: bool,
+    rewrite_candidate: bool,
+    is_contradiction: bool,
+}
+
 fn prevalidation_rejection_reason(
     suggestion: &Suggestion,
     used_evidence_ids: &HashSet<usize>,
     chunk_seen_evidence_ids: &mut HashSet<usize>,
-) -> Option<(String, Option<usize>, bool)> {
+) -> Option<PrevalidationDecision> {
     let Some(evidence_id) = primary_evidence_id(suggestion) else {
-        return Some((
-            "Missing primary evidence ref before validation".to_string(),
-            None,
-            false,
-        ));
+        return Some(PrevalidationDecision {
+            reason: "Missing primary evidence ref before validation".to_string(),
+            evidence_id: None,
+            block_for_regeneration: false,
+            rewrite_candidate: false,
+            is_contradiction: false,
+        });
     };
 
     if used_evidence_ids.contains(&evidence_id) {
-        return Some((
-            "Duplicate evidence_id already validated; skipped before validation".to_string(),
-            Some(evidence_id),
-            false,
-        ));
+        return Some(PrevalidationDecision {
+            reason: "Duplicate evidence_id already validated; skipped before validation"
+                .to_string(),
+            evidence_id: Some(evidence_id),
+            block_for_regeneration: false,
+            rewrite_candidate: false,
+            is_contradiction: false,
+        });
     }
 
     if !chunk_seen_evidence_ids.insert(evidence_id) {
-        return Some((
-            "Duplicate evidence_id in validation batch; skipped before validation".to_string(),
-            Some(evidence_id),
-            false,
-        ));
+        return Some(PrevalidationDecision {
+            reason: "Duplicate evidence_id in validation batch; skipped before validation"
+                .to_string(),
+            evidence_id: Some(evidence_id),
+            block_for_regeneration: false,
+            rewrite_candidate: false,
+            is_contradiction: false,
+        });
     }
 
     if let Some(reason) = deterministic_prevalidation_contradiction_reason(suggestion) {
-        return Some((reason, Some(evidence_id), false));
+        return Some(PrevalidationDecision {
+            reason,
+            evidence_id: Some(evidence_id),
+            block_for_regeneration: false,
+            rewrite_candidate: false,
+            is_contradiction: true,
+        });
     }
 
     if let Some(reason) = deterministic_prevalidation_non_actionable_reason(suggestion) {
-        return Some((reason, Some(evidence_id), false));
+        return Some(PrevalidationDecision {
+            reason,
+            evidence_id: Some(evidence_id),
+            block_for_regeneration: false,
+            rewrite_candidate: true,
+            is_contradiction: false,
+        });
     }
 
     None
@@ -3881,6 +4261,15 @@ fn deterministic_prevalidation_contradiction_reason(suggestion: &Suggestion) -> 
         suggestion.summary,
         suggestion.detail.as_deref().unwrap_or("")
     ));
+    let snippet_lower = snippet.to_ascii_lowercase();
+    let lexical_anchor_overlap = (claim.contains("client id")
+        && snippet_lower.contains("client_id"))
+        || (claim.contains("absolute path") && snippet_lower.contains("is_absolute"))
+        || (claim.contains("cache directory")
+            && (snippet_lower.contains("cache_dir") || snippet_lower.contains("cache directory")));
+    if !claim_tokens_grounded_in_snippet(snippet, &claim) && !lexical_anchor_overlap {
+        return None;
+    }
 
     if claim_targets_unconfigured_client_id(&claim)
         && snippet_has_configured_client_id_literal(snippet)
@@ -4120,7 +4509,14 @@ fn accept_validated_suggestion(
     if let Some(eid) = primary_evidence_id(&suggestion) {
         if used_evidence_ids.insert(eid) {
             suggestion.validation_state = SuggestionValidationState::Validated;
-            append_suggestion_quality_record(cache, run_id, &suggestion, "validated", Some(reason));
+            append_suggestion_quality_record(
+                cache,
+                run_id,
+                &suggestion,
+                "validated",
+                Some(reason),
+                Some(rejection_stats),
+            );
             validated.push(suggestion);
             return true;
         }
@@ -4133,6 +4529,7 @@ fn accept_validated_suggestion(
             &suggestion,
             "rejected",
             Some("Duplicate evidence_id after validation".to_string()),
+            Some(rejection_stats),
         );
         return false;
     }
@@ -4146,6 +4543,7 @@ fn accept_validated_suggestion(
         &suggestion,
         "rejected",
         Some("Missing evidence refs after validation".to_string()),
+        Some(rejection_stats),
     );
     false
 }
@@ -4184,17 +4582,25 @@ async fn validate_batch_suggestions(
         let mut chunk_seen_evidence_ids: HashSet<usize> = HashSet::new();
 
         for (idx, mut suggestion, attempts) in raw_chunk {
-            if let Some((reason, evidence_id, block_for_regeneration)) =
-                prevalidation_rejection_reason(
-                    &suggestion,
-                    used_evidence_ids,
-                    &mut chunk_seen_evidence_ids,
-                )
-            {
+            if let Some(prevalidation) = prevalidation_rejection_reason(
+                &suggestion,
+                used_evidence_ids,
+                &mut chunk_seen_evidence_ids,
+            ) {
+                if prevalidation.rewrite_candidate {
+                    suggestion
+                        .implementation_risk_flags
+                        .push("prevalidation_non_actionable_rewrite_candidate".to_string());
+                    chunk.push((idx, suggestion, attempts));
+                    continue;
+                }
                 *rejected_count += 1;
                 rejection_stats.prevalidation += 1;
-                if block_for_regeneration {
-                    if let Some(eid) = evidence_id {
+                if prevalidation.is_contradiction {
+                    rejection_stats.prevalidation_contradiction_count += 1;
+                }
+                if prevalidation.block_for_regeneration {
+                    if let Some(eid) = prevalidation.evidence_id {
                         rejected_evidence_ids.insert(eid);
                     }
                 }
@@ -4204,7 +4610,8 @@ async fn validate_batch_suggestions(
                     run_id,
                     &suggestion,
                     "rejected",
-                    Some(reason),
+                    Some(prevalidation.reason),
+                    Some(rejection_stats),
                 );
                 continue;
             }
@@ -4237,6 +4644,7 @@ async fn validate_batch_suggestions(
             validation_model,
             validation_deadline,
             VALIDATOR_TIMEOUT_MS,
+            rejection_stats,
         )
         .await;
         let mut retry_queue: Vec<(usize, Suggestion, usize)> = Vec::new();
@@ -4259,9 +4667,7 @@ async fn validate_batch_suggestions(
                 SuggestionValidationState::Rejected => {
                     let mut reason = reason;
                     let mut class = infer_validation_reject_class(&reason, reject_class);
-                    if !matches!(class, ValidationRejectClass::Transport)
-                        && is_overclaim_validation_reason(&reason)
-                    {
+                    if should_attempt_rewrite_revalidation(class, &reason) {
                         rejection_stats.overclaim_rewrite_count += 1;
                         if let Some((
                             rewritten,
@@ -4290,6 +4696,7 @@ async fn validate_batch_suggestions(
                                     rejection_stats,
                                 ) {
                                     rejection_stats.overclaim_rewrite_validated_count += 1;
+                                    rejection_stats.rewrite_recovered_count += 1;
                                 }
                                 continue;
                             }
@@ -4330,6 +4737,7 @@ async fn validate_batch_suggestions(
                         &suggestion,
                         "rejected",
                         Some("Validator returned pending".to_string()),
+                        Some(rejection_stats),
                     );
                 }
             }
@@ -4357,6 +4765,7 @@ async fn validate_batch_suggestions(
                 validation_model,
                 validation_deadline,
                 VALIDATOR_RETRY_TIMEOUT_MS,
+                rejection_stats,
             )
             .await;
 
@@ -4383,9 +4792,7 @@ async fn validate_batch_suggestions(
                     SuggestionValidationState::Rejected => {
                         let mut reason = reason;
                         let mut class = infer_validation_reject_class(&reason, reject_class);
-                        if !matches!(class, ValidationRejectClass::Transport)
-                            && is_overclaim_validation_reason(&reason)
-                        {
+                        if should_attempt_rewrite_revalidation(class, &reason) {
                             rejection_stats.overclaim_rewrite_count += 1;
                             if let Some((
                                 rewritten,
@@ -4414,6 +4821,7 @@ async fn validate_batch_suggestions(
                                         rejection_stats,
                                     ) {
                                         rejection_stats.overclaim_rewrite_validated_count += 1;
+                                        rejection_stats.rewrite_recovered_count += 1;
                                         if attempts > 0 {
                                             rejection_stats.transport_recovered_count += 1;
                                         }
@@ -4450,6 +4858,7 @@ async fn validate_batch_suggestions(
                             &suggestion,
                             "rejected",
                             Some("Validator returned pending".to_string()),
+                            Some(rejection_stats),
                         );
                     }
                 }
@@ -4720,6 +5129,12 @@ pub async fn analyze_codebase_fast_grounded(
         validation_rejection_histogram: HashMap::new(),
         validation_deadline_exceeded: false,
         validation_deadline_ms: VALIDATION_RUN_DEADLINE_MS,
+        batch_missing_index_count: 0,
+        batch_no_reason_count: 0,
+        transport_retry_count: 0,
+        transport_recovered_count: 0,
+        rewrite_recovered_count: 0,
+        prevalidation_contradiction_count: 0,
         validation_transport_retry_count: 0,
         validation_transport_recovered_count: 0,
         regen_stopped_validation_budget: false,
@@ -4771,6 +5186,12 @@ pub async fn refine_grounded_suggestions(
         diagnostics.validated_count = 0;
         diagnostics.rejected_count = 0;
         diagnostics.final_count = 0;
+        diagnostics.batch_missing_index_count = 0;
+        diagnostics.batch_no_reason_count = 0;
+        diagnostics.transport_retry_count = 0;
+        diagnostics.transport_recovered_count = 0;
+        diagnostics.rewrite_recovered_count = 0;
+        diagnostics.prevalidation_contradiction_count = 0;
         diagnostics.validation_transport_retry_count = 0;
         diagnostics.validation_transport_recovered_count = 0;
         diagnostics.regen_stopped_validation_budget = false;
@@ -4961,6 +5382,86 @@ pub async fn refine_grounded_suggestions(
         usage = merge_usage(usage, batch_usage);
     }
 
+    if validated.len() < FAST_GROUNDED_FINAL_TARGET_MIN {
+        let remaining_validation_budget = remaining_validation_budget_ms(validation_deadline);
+        if !should_stop_regeneration_for_validation_budget(
+            rejection_stats.deadline_exceeded,
+            remaining_validation_budget,
+        ) {
+            let underrepresented_pack_original =
+                build_underrepresented_pack_for_regeneration(&pack, &validated);
+            if underrepresented_pack_original.len() >= 4 {
+                regeneration_attempts += 1;
+                notes.push("underrepresented_regeneration_pass".to_string());
+                let (underrepresented_pack_local, local_to_original) =
+                    renumber_pack(&underrepresented_pack_original);
+                let needed = regeneration_needed_for_target(
+                    validated.len(),
+                    FAST_GROUNDED_FINAL_TARGET_MIN.min(FAST_GROUNDED_VALIDATED_POOL_MAX),
+                );
+                if needed > 0 {
+                    let (request_min, request_max) = regeneration_request_bounds(needed);
+                    let schema = grounded_suggestion_schema(underrepresented_pack_local.len());
+                    let user = format_grounded_user_prompt(
+                        &memory_section,
+                        index,
+                        summaries,
+                        &underrepresented_pack_local,
+                        &format!(
+                            "Return {} to {} suggestions. Prioritize files that are underrepresented in already validated suggestions.",
+                            request_min, request_max
+                        ),
+                    );
+
+                    if let Ok(response) = call_grounded_suggestions_with_fallback(
+                        FAST_GROUNDED_SUGGESTIONS_SYSTEM,
+                        &user,
+                        generation_model,
+                        "fast_grounded_regeneration_underrepresented",
+                        schema,
+                        REGEN_REQUEST_MAX_TOKENS,
+                        7_200,
+                    )
+                    .await
+                    {
+                        usage = merge_usage(usage, response.usage);
+                        let (mapped, _missing_or_invalid) = map_raw_items_to_grounded(
+                            response.data.suggestions,
+                            &underrepresented_pack_local,
+                        );
+                        let mut regenerated = Vec::new();
+                        for (_local_id, mut suggestion) in mapped {
+                            if remap_suggestion_to_original_ids(
+                                &mut suggestion,
+                                &local_to_original,
+                                &pack,
+                            ) {
+                                regenerated.push(suggestion);
+                            }
+                        }
+                        if !regenerated.is_empty() {
+                            let batch_usage = validate_batch_suggestions(
+                                regenerated,
+                                &memory_section,
+                                validation_model,
+                                &cache,
+                                &diagnostics.run_id,
+                                &mut validated,
+                                &mut rejected_count,
+                                &mut used_evidence_ids,
+                                &mut rejected_evidence_ids,
+                                validation_deadline,
+                                &mut rejection_stats,
+                            )
+                            .await;
+                            usage = merge_usage(usage, batch_usage);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let validated = finalize_validated_suggestions(validated);
     let (semantic_deduped, semantic_dedup_dropped_count) =
         semantic_dedupe_validated_suggestions(validated);
@@ -5018,6 +5519,13 @@ pub async fn refine_grounded_suggestions(
         build_validation_rejection_histogram(&rejection_stats);
     diagnostics.validation_deadline_exceeded = rejection_stats.deadline_exceeded;
     diagnostics.validation_deadline_ms = VALIDATION_RUN_DEADLINE_MS;
+    diagnostics.batch_missing_index_count = rejection_stats.batch_missing_index_count;
+    diagnostics.batch_no_reason_count = rejection_stats.batch_no_reason_count;
+    diagnostics.transport_retry_count = rejection_stats.transport_retry_count;
+    diagnostics.transport_recovered_count = rejection_stats.transport_recovered_count;
+    diagnostics.rewrite_recovered_count = rejection_stats.rewrite_recovered_count;
+    diagnostics.prevalidation_contradiction_count =
+        rejection_stats.prevalidation_contradiction_count;
     diagnostics.validation_transport_retry_count = rejection_stats.transport_retry_count;
     diagnostics.validation_transport_recovered_count = rejection_stats.transport_recovered_count;
     diagnostics.regen_stopped_validation_budget = regen_stopped_validation_budget;
@@ -5330,6 +5838,7 @@ where
     let mut last_error: Option<anyhow::Error> = None;
     let mut attempts_executed = 0usize;
     let mut next_attempt_model = Model::Speed;
+    let mut forced_smart_rescue_attempted = false;
 
     for attempt_index in 1..=max_attempts {
         if attempt_index > 1 {
@@ -5450,21 +5959,29 @@ where
                     .fail_reasons
                     .iter()
                     .any(|reason| reason.starts_with("unique_file_count"));
-            next_attempt_model = if diversity_gate_failed || auto_validation_overused {
-                Model::Smart
-            } else {
-                Model::Speed
-            };
-
             let remaining_budget_ms = gate_config
                 .max_suggest_ms
                 .saturating_sub(overall_start.elapsed().as_millis() as u64);
-            if !should_retry_after_gate_miss(
+            let needs_smart_count_rescue = gate.final_count < gate_config.min_final_count
+                && !forced_smart_rescue_attempted
+                && remaining_budget_ms >= GATE_RETRY_MIN_REMAINING_BUDGET_MS;
+            next_attempt_model =
+                if needs_smart_count_rescue || diversity_gate_failed || auto_validation_overused {
+                    Model::Smart
+                } else {
+                    Model::Speed
+                };
+            if needs_smart_count_rescue {
+                forced_smart_rescue_attempted = true;
+            }
+
+            let should_retry_after_gate = should_retry_after_gate_miss(
                 &gate_config,
                 &gate,
                 attempt_cost_usd,
                 remaining_budget_ms,
-            ) {
+            );
+            if !should_retry_after_gate && !needs_smart_count_rescue {
                 break;
             }
         }

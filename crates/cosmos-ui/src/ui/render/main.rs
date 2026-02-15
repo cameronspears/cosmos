@@ -178,7 +178,9 @@ fn render_suggestions_content<'a>(
     visible_height: usize,
     inner_width: usize,
 ) {
-    let suggestions = app.suggestions.active_suggestions();
+    let suggestions = app
+        .suggestions
+        .active_suggestions_with_limit(app.suggestions_display_cap);
 
     // Top padding for breathing room
     lines.push(Line::from(""));
@@ -1056,17 +1058,19 @@ fn render_question_mode_content<'a>(
         let mut consumed = 0usize;
         let mut rendered = 0usize;
 
-        for i in start..end {
+        for (i, question) in ASK_STARTER_QUESTIONS
+            .iter()
+            .enumerate()
+            .take(end)
+            .skip(start)
+        {
             let is_selected = i == selected;
             let style = if is_selected {
                 Style::default().fg(Theme::WHITE)
             } else {
                 Style::default().fg(Theme::GREY_400)
             };
-            let wrapped = wrap_text(
-                ASK_STARTER_QUESTIONS[i],
-                text_width.saturating_sub(4).max(1),
-            );
+            let wrapped = wrap_text(question, text_width.saturating_sub(4).max(1));
             let needed = wrapped.len().saturating_add(1); // +1 vertical spacer between questions
 
             if consumed + needed > list_budget {

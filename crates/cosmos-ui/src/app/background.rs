@@ -51,6 +51,7 @@ fn spawn_suggestions_generation(
     repo_root: PathBuf,
     index: cosmos_core::index::CodebaseIndex,
     context: cosmos_core::context::WorkContext,
+    suggestions_profile: cosmos_adapters::config::SuggestionsProfile,
     repo_memory_context: String,
     summaries_for_suggestions: std::collections::HashMap<PathBuf, String>,
 ) {
@@ -62,7 +63,8 @@ fn spawn_suggestions_generation(
         } else {
             Some(repo_memory_context)
         };
-        let gate_config = cosmos_engine::llm::SuggestionQualityGateConfig::default();
+        let gate_config =
+            cosmos_engine::llm::suggestion_gate_config_for_profile(suggestions_profile);
         let run = cosmos_engine::llm::run_fast_grounded_with_gate_with_progress(
             &repo_root,
             &index,
@@ -152,6 +154,7 @@ pub fn request_suggestions_refresh(
         repo_root,
         index,
         context,
+        app.suggestions_profile,
         repo_memory_context,
         summaries_for_suggestions,
     );
@@ -410,6 +413,12 @@ pub fn drain_messages(
                         validation_outcome: "verify_result".to_string(),
                         validation_reason: None,
                         user_verify_outcome: Some(gate.to_string()),
+                        batch_missing_index_count: 0,
+                        batch_no_reason_count: 0,
+                        transport_retry_count: 0,
+                        transport_recovered_count: 0,
+                        rewrite_recovered_count: 0,
+                        prevalidation_contradiction_count: 0,
                     };
                     let cache = cache::Cache::new(&app.repo_path);
                     let _ = cache.append_suggestion_quality(&quality);

@@ -449,6 +449,18 @@ pub struct SuggestionQualityRecord {
     pub validation_reason: Option<String>,
     /// One of: verified, contradicted, insufficient_evidence (set later by user verify).
     pub user_verify_outcome: Option<String>,
+    #[serde(default)]
+    pub batch_missing_index_count: usize,
+    #[serde(default)]
+    pub batch_no_reason_count: usize,
+    #[serde(default)]
+    pub transport_retry_count: usize,
+    #[serde(default)]
+    pub transport_recovered_count: usize,
+    #[serde(default)]
+    pub rewrite_recovered_count: usize,
+    #[serde(default)]
+    pub prevalidation_contradiction_count: usize,
 }
 
 /// One apply-harness execution summary row written as JSONL.
@@ -1521,6 +1533,12 @@ mod tests {
             validation_outcome: "validated".to_string(),
             validation_reason: Some("Looks good".to_string()),
             user_verify_outcome: None,
+            batch_missing_index_count: 0,
+            batch_no_reason_count: 0,
+            transport_retry_count: 0,
+            transport_recovered_count: 0,
+            rewrite_recovered_count: 0,
+            prevalidation_contradiction_count: 0,
         };
         cache.append_suggestion_quality(&quality).unwrap();
         let harness = ImplementationHarnessRecord {
@@ -1612,6 +1630,12 @@ mod tests {
         let parsed: SuggestionQualityRecord = serde_json::from_value(row).unwrap();
         assert_eq!(parsed.validation_reason, None);
         assert_eq!(parsed.user_verify_outcome, None);
+        assert_eq!(parsed.batch_missing_index_count, 0);
+        assert_eq!(parsed.batch_no_reason_count, 0);
+        assert_eq!(parsed.transport_retry_count, 0);
+        assert_eq!(parsed.transport_recovered_count, 0);
+        assert_eq!(parsed.rewrite_recovered_count, 0);
+        assert_eq!(parsed.prevalidation_contradiction_count, 0);
     }
 
     #[test]

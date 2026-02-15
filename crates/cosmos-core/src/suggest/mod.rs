@@ -4,7 +4,7 @@
 //! Suggestions are generated on-demand via `analyze_codebase()`.
 
 /// Maximum suggestions to display to avoid overwhelming users
-const MAX_SUGGESTIONS: usize = 20;
+const MAX_SUGGESTIONS: usize = 30;
 
 use crate::index::CodebaseIndex;
 use chrono::{DateTime, Utc};
@@ -101,6 +101,19 @@ pub enum SuggestionValidationState {
     Rejected,
 }
 
+/// Deterministic metadata captured from evidence sampling for validation context.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SuggestionValidationMetadata {
+    #[serde(default)]
+    pub why_interesting: Option<String>,
+    #[serde(default)]
+    pub file_loc: Option<usize>,
+    #[serde(default)]
+    pub file_complexity: Option<f64>,
+    #[serde(default)]
+    pub anchor_context: Option<String>,
+}
+
 /// A concrete evidence reference backing a suggestion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuggestionEvidenceRef {
@@ -150,6 +163,9 @@ pub struct Suggestion {
     /// Plain-language implementation sketch consumed by harness prompts.
     #[serde(default)]
     pub implementation_sketch: Option<String>,
+    /// Deterministic evidence metadata carried into validation prompts.
+    #[serde(default)]
+    pub validation_metadata: SuggestionValidationMetadata,
     pub source: SuggestionSource,
     pub created_at: DateTime<Utc>,
     /// Whether the suggestion has been applied
@@ -181,6 +197,7 @@ impl Suggestion {
             implementation_readiness_score: None,
             implementation_risk_flags: Vec::new(),
             implementation_sketch: None,
+            validation_metadata: SuggestionValidationMetadata::default(),
             source,
             created_at: Utc::now(),
             applied: false,
@@ -229,6 +246,11 @@ impl Suggestion {
 
     pub fn with_implementation_sketch(mut self, sketch: String) -> Self {
         self.implementation_sketch = Some(sketch);
+        self
+    }
+
+    pub fn with_validation_metadata(mut self, metadata: SuggestionValidationMetadata) -> Self {
+        self.validation_metadata = metadata;
         self
     }
 
@@ -303,12 +325,21 @@ impl SuggestionEngine {
         }
     }
 
-    /// Get all active suggestions (not yet applied), capped at MAX_SUGGESTIONS
+    /// Get all active suggestions (not yet applied), capped at MAX_SUGGESTIONS.
     pub fn active_suggestions(&self) -> Vec<&Suggestion> {
+        self.active_suggestions_with_limit(MAX_SUGGESTIONS)
+    }
+
+    /// Get active suggestions (not yet applied), capped by caller limit and MAX_SUGGESTIONS.
+    pub fn active_suggestions_with_limit(&self, limit: usize) -> Vec<&Suggestion> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let cap = limit.min(MAX_SUGGESTIONS);
         self.suggestions
             .iter()
             .filter(|s| !s.applied)
-            .take(MAX_SUGGESTIONS)
+            .take(cap)
             .collect()
     }
 
@@ -452,6 +483,7 @@ mod tests {
             map.remove("evidence_refs");
             map.remove("verification_state");
             map.remove("validation_state");
+            map.remove("validation_metadata");
         }
 
         let round: Suggestion = serde_json::from_value(value).unwrap();
@@ -459,6 +491,55 @@ mod tests {
         assert!(round.evidence_refs.is_empty());
         assert_eq!(round.verification_state, VerificationState::Unverified);
         assert_eq!(round.validation_state, SuggestionValidationState::Pending);
+        assert!(round.validation_metadata.why_interesting.is_none());
+    }
+
+    #[test]
+    fn test_active_suggestions_with_limit_caps_and_keeps_wrapper_compatibility() {
+        let index = CodebaseIndex {
+            root: PathBuf::from("."),
+            files: std::collections::HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: None,
+        };
+        let mut engine = SuggestionEngine::new(index);
+        for i in 0..40 {
+            engine.add_llm_suggestion(Suggestion::new(
+                SuggestionKind::Improvement,
+                Priority::Medium,
+                PathBuf::from(format!("src/file_{}.rs", i)),
+                format!("Suggestion {}", i),
+                SuggestionSource::LlmDeep,
+            ));
+        }
+
+        let capped_30 = engine.active_suggestions_with_limit(30);
+        assert_eq!(capped_30.len(), 30);
+
+        let capped_overflow = engine.active_suggestions_with_limit(99);
+        assert_eq!(capped_overflow.len(), 30);
+
+        let wrapper = engine.active_suggestions();
+        assert_eq!(wrapper.len(), 30);
+    }
+
+    #[test]
+    fn test_active_suggestions_with_limit_zero_returns_empty() {
+        let index = CodebaseIndex {
+            root: PathBuf::from("."),
+            files: std::collections::HashMap::new(),
+            index_errors: Vec::new(),
+            git_head: None,
+        };
+        let mut engine = SuggestionEngine::new(index);
+        engine.add_llm_suggestion(Suggestion::new(
+            SuggestionKind::Improvement,
+            Priority::Medium,
+            PathBuf::from("src/lib.rs"),
+            "Suggestion".to_string(),
+            SuggestionSource::LlmDeep,
+        ));
+        assert!(engine.active_suggestions_with_limit(0).is_empty());
     }
 
     #[test]
