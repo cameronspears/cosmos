@@ -178,8 +178,6 @@ fn render_suggestions_content<'a>(
     visible_height: usize,
     inner_width: usize,
 ) {
-    use cosmos_core::suggest::{Confidence, Priority};
-
     let suggestions = app.suggestions.active_suggestions();
 
     // Top padding for breathing room
@@ -387,16 +385,6 @@ fn render_suggestions_content<'a>(
 
         let is_selected = i == app.suggestion_selected && is_active;
 
-        // Build priority indicator with red exclamation points for critical items
-        let priority_indicator = match suggestion.priority {
-            Priority::High => Span::styled(
-                "!! ",
-                Style::default().fg(Theme::RED).add_modifier(Modifier::BOLD),
-            ),
-            Priority::Medium => Span::styled("!  ", Style::default().fg(Theme::YELLOW)),
-            Priority::Low => Span::styled("   ", Style::default()),
-        };
-
         // Kind label with subtle styling - brighter when selected
         let kind_label = suggestion.kind.label();
         let kind_style = if is_selected {
@@ -404,13 +392,6 @@ fn render_suggestions_content<'a>(
         } else {
             Style::default().fg(Theme::GREY_500)
         };
-
-        let (confidence_label, confidence_style) = match suggestion.confidence {
-            Confidence::High => ("high-confidence", Style::default().fg(Theme::GREEN)),
-            Confidence::Medium => ("likely", Style::default().fg(Theme::YELLOW)),
-            Confidence::Low => ("uncertain", Style::default().fg(Theme::GREY_500)),
-        };
-        let confidence_prefix = format!(" [{}]", confidence_label);
 
         // Multi-file indicator
         let multi_file_indicator = if suggestion.is_multi_file() {
@@ -429,9 +410,8 @@ fn render_suggestions_content<'a>(
             Style::default().fg(Theme::GREY_300)
         };
 
-        // First line has: padding (2) + priority (3) + kind + multi-file + confidence + ": "
-        let first_prefix_len =
-            2 + 3 + kind_label.len() + multi_file_indicator.len() + confidence_prefix.len() + 2;
+        // First line has: padding (2) + kind + multi-file + ": "
+        let first_prefix_len = 2 + kind_label.len() + multi_file_indicator.len() + 2;
         let first_line_width = text_width.saturating_sub(first_prefix_len);
         // Continuation lines just have small indent (5 chars)
         let cont_indent = "     ";
@@ -441,17 +421,15 @@ fn render_suggestions_content<'a>(
         let wrapped =
             wrap_text_variable_width(&suggestion.summary, first_line_width, cont_line_width);
 
-        // Render first line with priority, kind, and multi-file indicator
+        // Render first line with kind and multi-file indicator
         if let Some(first_line) = wrapped.first() {
             let mut spans = vec![
                 Span::styled("  ", Style::default()),
-                priority_indicator,
                 Span::styled(kind_label, kind_style),
             ];
             if suggestion.is_multi_file() {
                 spans.push(Span::styled(multi_file_indicator, multi_file_style));
             }
-            spans.push(Span::styled(confidence_prefix, confidence_style));
             spans.push(Span::styled(": ", kind_style));
             spans.push(Span::styled(first_line.clone(), summary_style));
             lines.push(Line::from(spans));
