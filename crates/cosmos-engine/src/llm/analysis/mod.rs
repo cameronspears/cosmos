@@ -1,99 +1,47 @@
-use super::client::{
-    call_llm_structured_limited, call_llm_structured_with_provider, call_llm_with_usage,
-    truncate_str, StructuredResponse,
-};
+use super::agentic::{call_llm_agentic, schema_to_response_format};
+use super::client::{call_llm_with_usage, truncate_str};
 use super::models::merge_usage;
 use super::models::{Model, Usage};
 use super::prompt_utils::format_repo_memory_section;
-use super::prompts::{ask_question_system, FAST_GROUNDED_SUGGESTIONS_SYSTEM};
+use super::prompts::ask_question_system;
 use chrono::Utc;
 use cosmos_adapters::config::SuggestionsProfile;
 use cosmos_core::context::WorkContext;
-use cosmos_core::index::{
-    CodebaseIndex, PatternKind, PatternReliability, PatternSeverity, SymbolKind,
-};
+use cosmos_core::index::{CodebaseIndex, SymbolKind};
 use cosmos_core::suggest::{
-    Suggestion, SuggestionEvidenceRef, SuggestionValidationMetadata, SuggestionValidationState,
+    Suggestion, SuggestionEvidenceRef, SuggestionKind, SuggestionValidationMetadata,
+    SuggestionValidationState, VerificationState,
 };
 use futures::future::join_all;
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use uuid::Uuid;
 
 mod context_limits;
 mod summary_normalization;
 
 use context_limits::AdaptiveLimits;
-use summary_normalization::{
-    normalize_grounded_detail, normalize_grounded_summary, scrub_user_summary,
-};
+use summary_normalization::{normalize_grounded_detail, normalize_grounded_summary};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  THRESHOLDS AND CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-use cosmos_core::index::GOD_MODULE_LOC_THRESHOLD;
-
-/// Complexity threshold above which a file is considered a "hotspot"
-const HIGH_COMPLEXITY_THRESHOLD: f64 = 20.0;
-const FAST_EVIDENCE_PACK_MAX_ITEMS: usize = 96;
-const FAST_EVIDENCE_SNIPPET_LINES_BEFORE: usize = 8;
-const FAST_EVIDENCE_SNIPPET_LINES_AFTER: usize = 12;
-const FAST_GROUNDED_FINAL_TARGET_MIN: usize = 18;
-const FAST_GROUNDED_FINAL_TARGET_MAX: usize = 30;
-const FAST_GROUNDED_VALIDATED_SOFT_FLOOR: usize = 18;
-const FAST_GROUNDED_VALIDATED_HARD_TARGET: usize = 22;
-const FAST_GROUNDED_VALIDATED_STRETCH_TARGET: usize = 28;
-const FAST_GROUNDED_VALIDATED_POOL_MAX: usize = 42;
-const FAST_GROUNDED_PROVISIONAL_TARGET_MIN: usize = 26;
-const FAST_GROUNDED_PROVISIONAL_TARGET_MAX: usize = 72;
-const FAST_EVIDENCE_SOURCE_PATTERN_MAX: usize = 24;
-const FAST_EVIDENCE_SOURCE_HOTSPOT_MAX: usize = 20;
-const FAST_EVIDENCE_SOURCE_CORE_MAX: usize = 16;
-const FAST_EVIDENCE_KIND_GOD_MODULE_MAX: usize = 4;
-const FAST_EVIDENCE_PER_FILE_MAX: usize = 4;
-const FAST_EVIDENCE_ANCHORS_PER_FILE_MAX: usize = 4;
-const FAST_EVIDENCE_CHANGED_FILE_MAX: usize = 16;
-const FAST_EVIDENCE_NEIGHBOR_FILE_MAX: usize = 20;
-const REFINEMENT_HARD_PHASE_MAX_ATTEMPTS: usize = 4;
-const REFINEMENT_STRETCH_PHASE_MAX_ATTEMPTS: usize = 2;
-const GENERATION_TOPUP_MAX_CALLS: usize = 4;
-const GENERATION_TOPUP_TIMEOUT_MS: u64 = 4_500;
-const REGEN_STRICT_MIN_PACK_SIZE: usize = FAST_GROUNDED_PROVISIONAL_TARGET_MIN;
-const SUGGEST_BALANCED_BUDGET_MS: u64 = 120_000;
-const SUGGEST_GATE_BUDGET_MS: u64 = 120_000;
-const GATE_RETRY_MIN_REMAINING_BUDGET_MS: u64 = 8_000;
-const GATE_RETRY_MAX_ATTEMPT_COST_FRACTION: f64 = 0.70;
-const VALIDATION_CONCURRENCY: usize = 3;
-const VALIDATION_RETRY_CONCURRENCY: usize = 1;
-const PRIMARY_REQUEST_MIN: usize = 30;
-const PRIMARY_REQUEST_MAX: usize = 38;
-const PRIMARY_REQUEST_MAX_TOKENS: u32 = 1_800;
-const PRIMARY_REQUEST_TIMEOUT_MS: u64 = 6_200;
-const TOPUP_REQUEST_MAX_TOKENS: u32 = 1_000;
-const REGEN_REQUEST_MAX_TOKENS: u32 = 800;
-const VALIDATOR_MAX_TOKENS: u32 = 90;
-const VALIDATOR_TIMEOUT_MS: u64 = 7_500;
-const VALIDATOR_RETRY_TIMEOUT_MS: u64 = 5_500;
-const VALIDATOR_BATCH_MAX_TOKENS: u32 = 700;
-const VALIDATOR_BATCH_TIMEOUT_BUFFER_MS: u64 = 1_600;
-const VALIDATION_RETRY_MAX_PER_SUGGESTION: usize = 2;
-const VALIDATION_RETRY_MIN_REMAINING_BUDGET_MS: u64 = 4_000;
-const VALIDATION_RUN_DEADLINE_MS: u64 = 55_000;
-const VALIDATION_MIN_REMAINING_BUDGET_MS: u64 = 2_500;
-const OVERCLAIM_REWRITE_MAX_TOKENS: u32 = 70;
-const OVERCLAIM_REWRITE_TIMEOUT_MS: u64 = 2_000;
-const OVERCLAIM_REVALIDATE_MAX_TOKENS: u32 = 70;
-const OVERCLAIM_REVALIDATE_TIMEOUT_MS: u64 = 2_000;
-const VALIDATION_REASON_MIN_CHARS: usize = 12;
-const BATCH_RETRY_MISSING_RESULT_REASON: &str = "Validation retry needed: missing batch result";
-const BATCH_RETRY_NO_REASON_REASON: &str =
-    "Validation retry needed: batch validator returned no reason";
-const SMART_BORDERLINE_REWRITE_MAX_TOKENS: u32 = 90;
-const SMART_BORDERLINE_REWRITE_TIMEOUT_MS: u64 = 2_600;
-const STRETCH_PHASE_MAX_COST_USD: f64 = 0.012;
-const STRETCH_PHASE_MIN_REMAINING_VALIDATION_MS: u64 = 6_000;
+const EVIDENCE_TOP_WINDOW_COMMENT_RATIO_MAX: f64 = 0.80;
+const EVIDENCE_EXECUTABLE_RATIO_MIN: f64 = 0.20;
+const FAST_GROUNDED_FINAL_TARGET_MAX: usize = 16;
+const FAST_GROUNDED_VALIDATED_POOL_MAX: usize = 32;
+const FAST_GROUNDED_PROVISIONAL_TARGET_MAX: usize = 24;
+const AGENTIC_SUGGESTION_TARGET_MIN: usize = 4;
+const AGENTIC_SUGGESTION_TARGET_MAX: usize = 16;
+const AGENTIC_SUGGESTIONS_MAX_ITERATIONS_MIN: usize = 3;
+const AGENTIC_SUGGESTIONS_MAX_ITERATIONS_MAX: usize = 6;
+const AGENTIC_SUBAGENT_MIN: usize = 2;
+const AGENTIC_SUBAGENT_MAX: usize = 6;
+const AGENTIC_SUBAGENT_FILES_PER_AGENT: usize = 2;
+const AGENTIC_SUBAGENT_MIN_COMMIT_WINDOW: usize = 80;
+const AGENTIC_SUBAGENT_MAX_COMMIT_WINDOW: usize = 300;
 const SUMMARY_MIN_WORDS: usize = 5;
 const SUMMARY_MIN_CHARS: usize = 24;
 const DIVERSITY_DOMINANT_TOPIC_RATIO_MAX: f64 = 0.60;
@@ -101,10 +49,235 @@ const DIVERSITY_MIN_UNIQUE_TOPICS: usize = 4;
 const DIVERSITY_DOMINANT_FILE_RATIO_MAX: f64 = 0.60;
 const DIVERSITY_MIN_UNIQUE_FILES: usize = 4;
 const DIVERSITY_FILE_BALANCE_PER_FILE_CAP: usize = 3;
-const DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE: f32 = 0.45;
+const DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE: f32 = 0.30;
 const DEFAULT_MAX_SMART_REWRITES_PER_RUN: usize = 8;
-const SMART_REWRITE_READINESS_UPPER_BOUND: f32 = 0.60;
 const ASK_ETHOS_MAX_CHARS: usize = 8_000;
+const ENFORCE_SUGGESTION_QUALITY_GATES: bool = false;
+
+const AGENTIC_SUGGESTIONS_SYSTEM: &str = r#"You are Cosmos, a senior code reviewer.
+
+Goal: find VERIFIED bugs and VERIFIED security flaws only.
+- Use tools to inspect the codebase directly.
+- Prioritize concrete runtime defects and security vulnerabilities.
+- Do not invent facts.
+- Return only VERIFIED claims.
+- A claim is VERIFIED only if you inspected the relevant code and can quote exact supporting code text.
+- If you cannot verify a claim from code, do not include it.
+- Follow project ETHOS when provided.
+- Use plain language. Avoid file paths, symbols, or implementation jargon in summaries.
+- Keep every suggestion actionable: the detail should explain root cause and what to change.
+- Output ONLY bug/security findings. No refactors, style advice, optimizations, documentation, or quality nits.
+
+Return JSON only:
+{
+  "suggestions": [{
+    "file": "repo/relative/path.ext",
+    "line": 123,
+    "kind": "bugfix|security",
+    "priority": "high|medium|low",
+    "confidence": "high|medium",
+    "observed_behavior": "Concrete runtime behavior observed in code.",
+    "impact_class": "correctness|reliability|security|data_integrity",
+    "summary": "One plain-English sentence about visible product impact.",
+    "detail": "Concise root cause + actionable change direction.",
+    "evidence_quote": "Exact code text proving the claim."
+  }]
+}"#;
+
+fn clamp_agentic_target(target: usize) -> usize {
+    target.clamp(AGENTIC_SUGGESTION_TARGET_MIN, AGENTIC_SUGGESTION_TARGET_MAX)
+}
+
+fn agentic_iterations_for_target(target: usize) -> usize {
+    let clamped = clamp_agentic_target(target);
+    let extra = clamped.saturating_sub(AGENTIC_SUGGESTION_TARGET_MIN) / 5;
+    (AGENTIC_SUGGESTIONS_MAX_ITERATIONS_MIN + extra).clamp(
+        AGENTIC_SUGGESTIONS_MAX_ITERATIONS_MIN,
+        AGENTIC_SUGGESTIONS_MAX_ITERATIONS_MAX,
+    )
+}
+
+fn subagent_count_for_target(target: usize) -> usize {
+    let clamped = clamp_agentic_target(target);
+    clamped
+        .saturating_add(3)
+        .checked_div(4)
+        .unwrap_or(AGENTIC_SUBAGENT_MIN)
+        .clamp(AGENTIC_SUBAGENT_MIN, AGENTIC_SUBAGENT_MAX)
+}
+
+fn churn_commit_window_for_target(target: usize) -> usize {
+    let clamped = clamp_agentic_target(target);
+    let scaled = AGENTIC_SUBAGENT_MIN_COMMIT_WINDOW + (clamped * 10);
+    scaled.clamp(
+        AGENTIC_SUBAGENT_MIN_COMMIT_WINDOW,
+        AGENTIC_SUBAGENT_MAX_COMMIT_WINDOW,
+    )
+}
+
+fn normalize_churn_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim().trim_start_matches("./").replace('\\', "/");
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn churn_counts_from_git(repo_root: &Path, commit_window: usize) -> HashMap<PathBuf, usize> {
+    let window = commit_window.max(1);
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args([
+            "log",
+            "--format=",
+            "--name-only",
+            "--diff-filter=AMRT",
+            "--no-merges",
+            "-n",
+            &window.to_string(),
+        ])
+        .output();
+    let Ok(output) = output else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut counts = HashMap::new();
+    for line in stdout.lines() {
+        let Some(path) = normalize_churn_path(line) else {
+            continue;
+        };
+        *counts.entry(path).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn rank_top_churn_files_for_subagents(
+    repo_root: &Path,
+    index: &CodebaseIndex,
+    context: &WorkContext,
+    generation_target: usize,
+    max_files: usize,
+) -> Vec<PathBuf> {
+    if max_files == 0 {
+        return Vec::new();
+    }
+
+    let commit_window = churn_commit_window_for_target(generation_target);
+    let churn_counts = churn_counts_from_git(repo_root, commit_window);
+    let changed: HashSet<PathBuf> = context.all_changed_files().into_iter().cloned().collect();
+    let mut ranked = index
+        .files
+        .iter()
+        .filter(|(path, _)| !is_test_like_path(path))
+        .map(|(path, file)| {
+            let churn = churn_counts.get(path).copied().unwrap_or(0);
+            let changed_boost = if changed.contains(path) { 24 } else { 0 };
+            let complexity_score = if file.complexity.is_finite() && file.complexity > 0.0 {
+                ((file.complexity / 10.0).round() as usize).min(20)
+            } else {
+                0
+            };
+            let loc_score = (file.loc / 250).min(6);
+            let score = churn
+                .saturating_mul(8)
+                .saturating_add(changed_boost)
+                .saturating_add(complexity_score)
+                .saturating_add(loc_score)
+                .max(1);
+            (score, file.complexity, file.loc, path.clone())
+        })
+        .collect::<Vec<_>>();
+
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+
+    ranked
+        .iter()
+        .take(max_files)
+        .map(|(_, _, _, path)| path.clone())
+        .collect::<Vec<_>>()
+}
+
+fn shard_subagent_focus_files(files: &[PathBuf], subagent_count: usize) -> Vec<Vec<PathBuf>> {
+    if subagent_count == 0 {
+        return Vec::new();
+    }
+    if files.is_empty() {
+        return vec![Vec::new(); subagent_count];
+    }
+
+    let mut shards = vec![Vec::new(); subagent_count];
+    for (idx, file) in files.iter().enumerate() {
+        shards[idx % subagent_count].push(file.clone());
+    }
+    for idx in 0..subagent_count {
+        if shards[idx].is_empty() {
+            shards[idx].push(files[idx % files.len()].clone());
+        }
+    }
+    shards
+}
+
+fn build_subagent_user_prompt(
+    subagent_index: usize,
+    subagent_count: usize,
+    target_for_subagent: usize,
+    focus_files: &[PathBuf],
+    project_ethos: Option<&str>,
+    retry_feedback: Option<&str>,
+) -> String {
+    let mut prompt = format!(
+        "You are subagent {}/{}.\nInspect the assigned high-churn files first.\nReturn {} to {} VERIFIED findings total.\n\
+Each finding must be either a bugfix or a security flaw.\n\
+Target mix: 1-2 bug findings and 1-2 security findings.\n\
+If the assigned scope has fewer verified issues, return fewer and do not invent claims.\n\
+Every finding must include an exact evidence_quote copied from code you inspected.",
+        subagent_index + 1,
+        subagent_count,
+        target_for_subagent.saturating_sub(1).max(1),
+        target_for_subagent.saturating_add(1).max(2),
+    );
+
+    if !focus_files.is_empty() {
+        prompt.push_str("\n\nASSIGNED FILES (focus here first):");
+        for path in focus_files {
+            prompt.push_str("\n- ");
+            prompt.push_str(&path.display().to_string());
+        }
+    }
+
+    prompt.push_str(
+        "\n\nQUALITY BAR:\n\
+- Only include runtime defects and security vulnerabilities.\n\
+- Exclude refactors, style nits, architecture proposals, and pure performance tuning.\n\
+- summary: one plain-language sentence about visible impact.\n\
+- detail: root cause and concrete fix direction.\n\
+- If uncertain, omit the claim.",
+    );
+
+    if let Some(ethos) = project_ethos.map(str::trim).filter(|text| !text.is_empty()) {
+        prompt.push_str("\n\nPROJECT ETHOS (must follow):\n");
+        prompt.push_str(truncate_str(ethos, 2_000));
+    }
+
+    if let Some(feedback) = retry_feedback
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        prompt.push_str("\n\nPrevious attempt feedback to correct:\n");
+        prompt.push_str(feedback);
+    }
+
+    prompt
+}
 
 /// Ask cosmos a general question about the codebase
 /// Uses the Smart model for thoughtful, well-reasoned responses in plain English
@@ -541,14 +714,14 @@ pub struct SuggestionQualityGateConfig {
 impl Default for SuggestionQualityGateConfig {
     fn default() -> Self {
         Self {
-            min_final_count: 14,
-            max_final_count: 30,
+            min_final_count: 1,
+            max_final_count: 12,
             min_displayed_valid_ratio: 1.0,
             min_implementation_readiness_score: DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE,
             max_smart_rewrites_per_run: DEFAULT_MAX_SMART_REWRITES_PER_RUN,
-            max_suggest_cost_usd: 0.08,
-            max_suggest_ms: SUGGEST_GATE_BUDGET_MS,
-            max_attempts: 3,
+            max_suggest_cost_usd: 0.20,
+            max_suggest_ms: 180_000,
+            max_attempts: 4,
         }
     }
 }
@@ -558,24 +731,24 @@ pub fn suggestion_gate_config_for_profile(
 ) -> SuggestionQualityGateConfig {
     match profile {
         SuggestionsProfile::Strict => SuggestionQualityGateConfig {
-            min_final_count: 10,
-            max_final_count: 20,
+            min_final_count: 1,
+            max_final_count: 8,
             min_displayed_valid_ratio: 1.0,
             min_implementation_readiness_score: DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE,
             max_smart_rewrites_per_run: DEFAULT_MAX_SMART_REWRITES_PER_RUN,
-            max_suggest_cost_usd: 0.035,
-            max_suggest_ms: 70_000,
+            max_suggest_cost_usd: 0.10,
+            max_suggest_ms: 90_000,
             max_attempts: 3,
         },
         SuggestionsProfile::BalancedHighVolume => SuggestionQualityGateConfig::default(),
         SuggestionsProfile::MaxVolume => SuggestionQualityGateConfig {
-            min_final_count: 24,
-            max_final_count: 30,
+            min_final_count: 2,
+            max_final_count: 16,
             min_displayed_valid_ratio: 1.0,
             min_implementation_readiness_score: DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE,
             max_smart_rewrites_per_run: DEFAULT_MAX_SMART_REWRITES_PER_RUN.saturating_add(4),
-            max_suggest_cost_usd: 0.14,
-            max_suggest_ms: 180_000,
+            max_suggest_cost_usd: 0.30,
+            max_suggest_ms: 240_000,
             max_attempts: 5,
         },
     }
@@ -586,6 +759,8 @@ pub struct SuggestionGateSnapshot {
     pub final_count: usize,
     pub displayed_valid_ratio: f64,
     pub pending_count: usize,
+    #[serde(default)]
+    pub ethos_actionable_count: usize,
     pub suggest_total_ms: u64,
     pub suggest_total_cost_usd: f64,
     #[serde(default)]
@@ -609,173 +784,75 @@ pub struct GatedSuggestionRunResult {
     pub gate: SuggestionGateSnapshot,
 }
 
-#[derive(Debug, Clone)]
-struct EvidenceItem {
-    id: usize,
-    file: PathBuf,
-    line: usize, // 1-based
-    snippet: String,
-    why_interesting: String,
-    file_loc: Option<usize>,
-    file_complexity: Option<f64>,
-    anchor_context: Option<String>,
-    source: EvidenceSource,
-    pattern_kind: Option<PatternKind>,
+#[derive(Debug, Clone, Copy, Default)]
+struct EvidenceSnippetQuality {
+    comment_ratio: f64,
+    top_window_comment_ratio: f64,
+    executable_ratio: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum EvidenceSource {
-    Pattern,
-    Hotspot,
-    Core,
+fn snippet_code_is_comment_or_blank(line: &str) -> bool {
+    let code = snippet_code_line(line).trim();
+    code.is_empty()
+        || code.starts_with("//")
+        || code.starts_with("/*")
+        || code.starts_with('*')
+        || code.starts_with('#')
 }
 
-#[derive(Debug, Clone)]
-struct EvidenceCandidate {
-    score: f64,
-    source_priority: usize,
-    severity: PatternSeverity,
-    item: EvidenceItem,
-}
-
-#[derive(Debug, Clone, Default)]
-struct EvidencePackStats {
-    pattern_count: usize,
-    hotspot_count: usize,
-    core_count: usize,
-    line1_ratio: f64,
-}
-
-fn normalize_repo_relative(repo_root: &Path, path: &Path) -> Option<PathBuf> {
-    if path.is_absolute() {
-        path.strip_prefix(repo_root).ok().map(|p| p.to_path_buf())
-    } else {
-        Some(path.to_path_buf())
-    }
-}
-
-fn read_snippet_around_line(
-    repo_root: &Path,
-    rel_path: &Path,
-    line_1_based: usize,
-) -> Option<String> {
-    let full = repo_root.join(rel_path);
-    let content = std::fs::read_to_string(&full).ok()?;
-    let lines: Vec<&str> = content.lines().collect();
+fn evidence_snippet_quality(snippet: &str) -> EvidenceSnippetQuality {
+    let lines: Vec<&str> = snippet.lines().collect();
     if lines.is_empty() {
-        return None;
+        return EvidenceSnippetQuality::default();
     }
-    let target = line_1_based.max(1).min(lines.len());
-    let start = target
-        .saturating_sub(FAST_EVIDENCE_SNIPPET_LINES_BEFORE)
-        .max(1);
-    let end = (target + FAST_EVIDENCE_SNIPPET_LINES_AFTER).min(lines.len());
-    let snippet = lines
-        .iter()
-        .enumerate()
-        .skip(start - 1)
-        .take(end - start + 1)
-        .map(|(i, l)| format!("{:4}| {}", i + 1, l))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Some(redact_obvious_secrets(&snippet))
-}
 
-fn redact_obvious_secrets(snippet: &str) -> String {
-    // Deterministic redaction for common secret shapes before sending evidence to the LLM.
-    let mut out = snippet.to_string();
-    let patterns = [
-        // Quoted key/value assignments.
-        r#"(?i)\b(api[_-]?key|token|secret|password)\b\s*[:=]\s*["'][^"']{8,}["']"#,
-        // Bearer tokens.
-        r#"(?i)\b(bearer)\s+[A-Za-z0-9._-]{16,}"#,
-        // OpenRouter/OpenAI/GitHub style keys.
-        r#"\b(sk-[A-Za-z0-9_-]{16,})\b"#,
-        r#"\b(gh[pousr]_[A-Za-z0-9]{16,})\b"#,
-        // AWS access key IDs.
-        r#"\b(AKIA[0-9A-Z]{16})\b"#,
-        // Private keys in PEM blocks.
-        r#"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"#,
-    ];
+    let mut nonempty = 0usize;
+    let mut comment = 0usize;
+    let mut executable = 0usize;
+    for line in &lines {
+        let code = snippet_code_line(line).trim();
+        if code.is_empty() {
+            continue;
+        }
+        nonempty += 1;
+        if snippet_code_is_comment_or_blank(line) {
+            comment += 1;
+        } else {
+            executable += 1;
+        }
+    }
+    if nonempty == 0 {
+        return EvidenceSnippetQuality::default();
+    }
 
-    for pattern in patterns {
-        if let Ok(re) = Regex::new(pattern) {
-            out = re.replace_all(&out, "<redacted-secret>").to_string();
+    let top_window = lines.iter().take(10).copied().collect::<Vec<_>>();
+    let mut top_nonempty = 0usize;
+    let mut top_comment = 0usize;
+    for line in top_window {
+        let code = snippet_code_line(line).trim();
+        if code.is_empty() {
+            continue;
+        }
+        top_nonempty += 1;
+        if snippet_code_is_comment_or_blank(line) {
+            top_comment += 1;
         }
     }
 
-    out
-}
-
-fn evidence_payload_metrics(pack: &[EvidenceItem]) -> (usize, usize) {
-    let snippet_count = pack.len();
-    let bytes = pack.iter().map(|item| item.snippet.len()).sum::<usize>();
-    (snippet_count, bytes)
-}
-
-fn severity_score(severity: PatternSeverity) -> f64 {
-    match severity {
-        PatternSeverity::High => 3.0,
-        PatternSeverity::Medium => 2.0,
-        PatternSeverity::Low => 1.0,
-        PatternSeverity::Info => 0.5,
+    EvidenceSnippetQuality {
+        comment_ratio: comment as f64 / nonempty as f64,
+        top_window_comment_ratio: if top_nonempty == 0 {
+            0.0
+        } else {
+            top_comment as f64 / top_nonempty as f64
+        },
+        executable_ratio: executable as f64 / nonempty as f64,
     }
 }
 
-fn reliability_score(reliability: PatternReliability) -> f64 {
-    match reliability {
-        PatternReliability::High => 0.55,
-        PatternReliability::Medium => 0.3,
-        PatternReliability::Low => 0.1,
-    }
-}
-
-fn source_priority(source: EvidenceSource) -> usize {
-    match source {
-        EvidenceSource::Pattern => 3,
-        EvidenceSource::Hotspot => 2,
-        EvidenceSource::Core => 1,
-    }
-}
-
-fn source_limit(source: EvidenceSource) -> usize {
-    match source {
-        EvidenceSource::Pattern => FAST_EVIDENCE_SOURCE_PATTERN_MAX,
-        EvidenceSource::Hotspot => FAST_EVIDENCE_SOURCE_HOTSPOT_MAX,
-        EvidenceSource::Core => FAST_EVIDENCE_SOURCE_CORE_MAX,
-    }
-}
-
-fn best_function_anchor(file: &cosmos_core::index::FileIndex) -> usize {
-    file.symbols
-        .iter()
-        .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
-        .max_by(|a, b| {
-            a.complexity
-                .partial_cmp(&b.complexity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|s| s.line)
-        .unwrap_or(1)
-}
-
-fn anchor_context_for_line(file: &cosmos_core::index::FileIndex, line: usize) -> Option<String> {
-    let mut symbols = file
-        .symbols
-        .iter()
-        .filter(|symbol| {
-            let start = symbol.line.saturating_sub(3);
-            let end = symbol.end_line.saturating_add(3);
-            line >= start && line <= end
-        })
-        .take(2)
-        .map(|symbol| format!("{}:{:?}", symbol.name, symbol.kind))
-        .collect::<Vec<_>>();
-    if symbols.is_empty() {
-        return None;
-    }
-    symbols.sort();
-    Some(format!("Anchor near {}", symbols.join(", ")))
+fn snippet_is_low_quality_for_grounding(quality: EvidenceSnippetQuality) -> bool {
+    quality.top_window_comment_ratio >= EVIDENCE_TOP_WINDOW_COMMENT_RATIO_MAX
+        || quality.executable_ratio < EVIDENCE_EXECUTABLE_RATIO_MIN
 }
 
 fn is_test_like_path(path: &Path) -> bool {
@@ -794,549 +871,12 @@ fn is_test_like_path(path: &Path) -> bool {
         || normalized.ends_with(".spec.js")
 }
 
-fn is_test_like_snippet(snippet: &str) -> bool {
-    let lower = snippet.to_ascii_lowercase();
-    lower.contains("#[test]")
-        || lower.contains("mod tests")
-        || lower.contains("fn test_")
-        || lower.contains("assert!(")
-        || lower.contains("assert_eq!(")
-        || lower.contains("assert_ne!(")
-}
-
-fn should_skip_evidence(path: &Path, snippet: &str) -> bool {
-    is_test_like_path(path) || is_test_like_snippet(snippet)
-}
-
-fn exploratory_anchor_lines(file: &cosmos_core::index::FileIndex, max: usize) -> Vec<usize> {
-    let max = max.max(1);
-    let mut anchors: Vec<usize> = Vec::new();
-
-    let mut symbols: Vec<_> = file
-        .symbols
-        .iter()
-        .filter(|s| {
-            matches!(
-                s.kind,
-                SymbolKind::Function
-                    | SymbolKind::Method
-                    | SymbolKind::Struct
-                    | SymbolKind::Enum
-                    | SymbolKind::Class
-            )
-        })
-        .collect();
-
-    symbols.sort_by(|a, b| {
-        b.complexity
-            .partial_cmp(&a.complexity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.line_count().cmp(&a.line_count()))
-            .then_with(|| a.line.cmp(&b.line))
-    });
-
-    for symbol in symbols {
-        let line = symbol.line.max(1);
-        if !anchors.contains(&line) {
-            anchors.push(line);
-        }
-        if anchors.len() >= max {
-            return anchors;
-        }
-    }
-
-    let fallback = best_function_anchor(file).max(1);
-    if !anchors.contains(&fallback) {
-        anchors.push(fallback);
-    }
-
-    if file.loc > GOD_MODULE_LOC_THRESHOLD {
-        let middle = (file.loc / 2).max(1);
-        if !anchors.contains(&middle) {
-            anchors.push(middle);
-        }
-    }
-
-    let tail = file.loc.saturating_sub(20).max(1);
-    if !anchors.contains(&tail) {
-        anchors.push(tail);
-    }
-
-    anchors.truncate(max);
-    anchors
-}
-
-fn build_evidence_pack(
-    repo_root: &Path,
-    index: &CodebaseIndex,
-    context: &WorkContext,
-) -> (Vec<EvidenceItem>, EvidencePackStats) {
-    let changed: HashSet<PathBuf> = context.all_changed_files().into_iter().cloned().collect();
-    let mut changed_in_index: Vec<(PathBuf, &cosmos_core::index::FileIndex)> = changed
-        .iter()
-        .filter_map(|path| index.files.get(path).map(|file| (path.clone(), file)))
-        .collect();
-    changed_in_index.sort_by(|(a_path, a_file), (b_path, b_file)| {
-        b_file
-            .complexity
-            .partial_cmp(&a_file.complexity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b_file.loc.cmp(&a_file.loc))
-            .then_with(|| a_path.cmp(b_path))
-    });
-    let mut candidates: Vec<EvidenceCandidate> = Vec::new();
-
-    // Patterns (high-signal, deterministic ranking with reliability weighting)
-    for file in index.files.values() {
-        for p in &file.patterns {
-            let Some(rel_file) = normalize_repo_relative(repo_root, &p.file) else {
-                continue;
-            };
-            if matches!(
-                p.kind,
-                PatternKind::MissingErrorHandling | PatternKind::TodoMarker
-            ) {
-                continue;
-            }
-            let reliability = p.reliability;
-            let severity = p.kind.severity();
-            let pattern_bonus = match p.kind {
-                PatternKind::PotentialResourceLeak => 0.35,
-                PatternKind::GodModule => -0.35,
-                _ => 0.0,
-            };
-            let changed_boost = if changed.contains(&rel_file) {
-                0.2
-            } else {
-                0.0
-            };
-            let score = severity_score(severity)
-                + reliability_score(reliability)
-                + changed_boost
-                + pattern_bonus;
-
-            let anchor = if p.kind == PatternKind::GodModule {
-                index
-                    .files
-                    .get(&rel_file)
-                    .map(best_function_anchor)
-                    .unwrap_or_else(|| p.line.max(1))
-            } else {
-                p.line.max(1)
-            };
-
-            if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
-                if should_skip_evidence(&rel_file, &snippet) {
-                    continue;
-                }
-                candidates.push(EvidenceCandidate {
-                    score,
-                    source_priority: source_priority(EvidenceSource::Pattern),
-                    severity,
-                    item: EvidenceItem {
-                        id: 0,
-                        file: rel_file,
-                        line: anchor,
-                        snippet,
-                        why_interesting: format!("Detected {:?}: {}", p.kind, p.description),
-                        file_loc: Some(file.loc),
-                        file_complexity: Some(file.complexity),
-                        anchor_context: anchor_context_for_line(file, anchor),
-                        source: EvidenceSource::Pattern,
-                        pattern_kind: Some(p.kind),
-                    },
-                });
-            }
-        }
-    }
-
-    // Hotspots (complexity/LOC)
-    let mut hotspot_files: Vec<_> = index.files.values().collect();
-    hotspot_files.sort_by(|a, b| {
-        b.complexity
-            .partial_cmp(&a.complexity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.loc.cmp(&a.loc))
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    for f in hotspot_files
-        .iter()
-        .filter(|f| f.complexity > HIGH_COMPLEXITY_THRESHOLD || f.loc > GOD_MODULE_LOC_THRESHOLD)
-        .take(10)
-    {
-        let Some(rel_file) = normalize_repo_relative(repo_root, &f.path) else {
-            continue;
-        };
-        if is_test_like_path(&rel_file) {
-            continue;
-        }
-        for (anchor_rank, anchor) in exploratory_anchor_lines(f, FAST_EVIDENCE_ANCHORS_PER_FILE_MAX)
-            .into_iter()
-            .enumerate()
-        {
-            if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
-                if should_skip_evidence(&rel_file, &snippet) {
-                    continue;
-                }
-                let changed_boost = if changed.contains(&rel_file) {
-                    0.2
-                } else {
-                    0.0
-                };
-                let score = 2.1 + (f.complexity / 60.0).min(1.0) + changed_boost
-                    - (anchor_rank as f64 * 0.10);
-                candidates.push(EvidenceCandidate {
-                    score,
-                    source_priority: source_priority(EvidenceSource::Hotspot),
-                    severity: PatternSeverity::High,
-                    item: EvidenceItem {
-                        id: 0,
-                        file: rel_file.clone(),
-                        line: anchor,
-                        snippet,
-                        why_interesting: format!(
-                            "Hotspot sample {} (complexity {:.1}, {} LOC)",
-                            anchor_rank + 1,
-                            f.complexity,
-                            f.loc
-                        ),
-                        file_loc: Some(f.loc),
-                        file_complexity: Some(f.complexity),
-                        anchor_context: anchor_context_for_line(f, anchor),
-                        source: EvidenceSource::Hotspot,
-                        pattern_kind: None,
-                    },
-                });
-            }
-        }
-    }
-
-    // Core files (fan-in)
-    let mut core_files: Vec<_> = index.files.values().collect();
-    core_files.sort_by(|a, b| {
-        b.summary
-            .used_by
-            .len()
-            .cmp(&a.summary.used_by.len())
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    for f in core_files
-        .iter()
-        .filter(|f| f.summary.used_by.len() >= 3)
-        .take(10)
-    {
-        let Some(rel_file) = normalize_repo_relative(repo_root, &f.path) else {
-            continue;
-        };
-        if is_test_like_path(&rel_file) {
-            continue;
-        }
-        for (anchor_rank, anchor) in exploratory_anchor_lines(f, 2).into_iter().enumerate() {
-            if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
-                if should_skip_evidence(&rel_file, &snippet) {
-                    continue;
-                }
-                let changed_boost = if changed.contains(&rel_file) {
-                    0.15
-                } else {
-                    0.0
-                };
-                let score = 1.7 + (f.summary.used_by.len() as f64 / 25.0).min(1.0) + changed_boost
-                    - (anchor_rank as f64 * 0.08);
-                candidates.push(EvidenceCandidate {
-                    score,
-                    source_priority: source_priority(EvidenceSource::Core),
-                    severity: PatternSeverity::Medium,
-                    item: EvidenceItem {
-                        id: 0,
-                        file: rel_file.clone(),
-                        line: anchor.max(1),
-                        snippet,
-                        why_interesting: format!(
-                            "Core file sample {} used by {} other files",
-                            anchor_rank + 1,
-                            f.summary.used_by.len()
-                        ),
-                        file_loc: Some(f.loc),
-                        file_complexity: Some(f.complexity),
-                        anchor_context: anchor_context_for_line(f, anchor.max(1)),
-                        source: EvidenceSource::Core,
-                        pattern_kind: None,
-                    },
-                });
-            }
-        }
-    }
-
-    // Changed-file exploration: include multiple anchors in actively edited files,
-    // even if they don't trip static pattern thresholds.
-    for (rel_file, file) in changed_in_index.iter().take(FAST_EVIDENCE_CHANGED_FILE_MAX) {
-        if is_test_like_path(rel_file) {
-            continue;
-        }
-        for (anchor_rank, anchor) in
-            exploratory_anchor_lines(file, FAST_EVIDENCE_ANCHORS_PER_FILE_MAX)
-                .into_iter()
-                .enumerate()
-        {
-            if let Some(snippet) = read_snippet_around_line(repo_root, rel_file, anchor) {
-                if should_skip_evidence(rel_file, &snippet) {
-                    continue;
-                }
-                let score =
-                    2.0 + (file.complexity / 70.0).min(1.0) + ((file.loc as f64) / 1200.0).min(0.3)
-                        - (anchor_rank as f64 * 0.10);
-                candidates.push(EvidenceCandidate {
-                    score,
-                    source_priority: source_priority(EvidenceSource::Hotspot),
-                    severity: PatternSeverity::High,
-                    item: EvidenceItem {
-                        id: 0,
-                        file: rel_file.clone(),
-                        line: anchor,
-                        snippet,
-                        why_interesting: format!(
-                            "Changed-file sample {} (complexity {:.1}, {} LOC)",
-                            anchor_rank + 1,
-                            file.complexity,
-                            file.loc
-                        ),
-                        file_loc: Some(file.loc),
-                        file_complexity: Some(file.complexity),
-                        anchor_context: anchor_context_for_line(file, anchor),
-                        source: EvidenceSource::Hotspot,
-                        pattern_kind: None,
-                    },
-                });
-            }
-        }
-    }
-
-    // Neighbor exploration: sample files directly connected to changed files
-    // to broaden context across call/dependency boundaries.
-    let mut neighbor_paths: HashSet<PathBuf> = HashSet::new();
-    for (_path, file) in &changed_in_index {
-        for dep in &file.summary.depends_on {
-            neighbor_paths.insert(dep.clone());
-        }
-        for used_by in &file.summary.used_by {
-            neighbor_paths.insert(used_by.clone());
-        }
-    }
-    for changed_path in &changed {
-        neighbor_paths.remove(changed_path);
-    }
-
-    let mut neighbor_files: Vec<(PathBuf, &cosmos_core::index::FileIndex)> = neighbor_paths
-        .into_iter()
-        .filter_map(|path| index.files.get(&path).map(|file| (path, file)))
-        .collect();
-    neighbor_files.sort_by(|(a_path, a_file), (b_path, b_file)| {
-        b_file
-            .summary
-            .used_by
-            .len()
-            .cmp(&a_file.summary.used_by.len())
-            .then_with(|| {
-                b_file
-                    .complexity
-                    .partial_cmp(&a_file.complexity)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| a_path.cmp(b_path))
-    });
-
-    for (rel_file, file) in neighbor_files
-        .into_iter()
-        .take(FAST_EVIDENCE_NEIGHBOR_FILE_MAX)
-    {
-        if is_test_like_path(&rel_file) {
-            continue;
-        }
-        let anchor = best_function_anchor(file).max(1);
-        if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
-            if should_skip_evidence(&rel_file, &snippet) {
-                continue;
-            }
-            let score = 1.8
-                + (file.summary.used_by.len() as f64 / 20.0).min(1.0)
-                + (file.complexity / 80.0).min(0.8);
-            candidates.push(EvidenceCandidate {
-                score,
-                source_priority: source_priority(EvidenceSource::Core),
-                severity: PatternSeverity::Medium,
-                item: EvidenceItem {
-                    id: 0,
-                    file: rel_file,
-                    line: anchor,
-                    snippet,
-                    why_interesting: "Neighbor of changed code (dependency/call boundary sample)"
-                        .to_string(),
-                    file_loc: Some(file.loc),
-                    file_complexity: Some(file.complexity),
-                    anchor_context: anchor_context_for_line(file, anchor),
-                    source: EvidenceSource::Core,
-                    pattern_kind: None,
-                },
-            });
-        }
-    }
-
-    // Coverage fallback: some repos (or subprojects) won't trip any of our pattern/hotspot/core
-    // heuristics, but Cosmos should still be able to generate grounded suggestions by sampling
-    // representative code. Only do this when we have no other candidates at all.
-    if candidates.is_empty() {
-        let mut fallback_files: Vec<_> = index.files.values().collect();
-        fallback_files.sort_by(|a, b| {
-            b.complexity
-                .partial_cmp(&a.complexity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.loc.cmp(&a.loc))
-                .then_with(|| a.path.cmp(&b.path))
-        });
-
-        for f in fallback_files.iter().take(FAST_EVIDENCE_PACK_MAX_ITEMS) {
-            let Some(rel_file) = normalize_repo_relative(repo_root, &f.path) else {
-                continue;
-            };
-            if is_test_like_path(&rel_file) {
-                continue;
-            }
-            let anchor = best_function_anchor(f).max(1);
-            if let Some(snippet) = read_snippet_around_line(repo_root, &rel_file, anchor) {
-                if should_skip_evidence(&rel_file, &snippet) {
-                    continue;
-                }
-                let score =
-                    0.8 + (f.complexity / 40.0).min(1.0) + ((f.loc as f64) / 600.0).min(1.0) * 0.2;
-                candidates.push(EvidenceCandidate {
-                    score,
-                    source_priority: 0,
-                    severity: PatternSeverity::Info,
-                    item: EvidenceItem {
-                        id: 0,
-                        file: rel_file,
-                        line: anchor,
-                        snippet,
-                        why_interesting: "Coverage sample: scan this snippet for concrete issues visible in code."
-                            .to_string(),
-                        file_loc: Some(f.loc),
-                        file_complexity: Some(f.complexity),
-                        anchor_context: anchor_context_for_line(f, anchor),
-                        source: EvidenceSource::Hotspot,
-                        pattern_kind: None,
-                    },
-                });
-            }
-        }
-    }
-
-    // Deterministic ranking:
-    // score, source priority, severity, then file path + line.
-    candidates.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.source_priority.cmp(&a.source_priority))
-            .then_with(|| b.severity.cmp(&a.severity))
-            .then_with(|| a.item.file.cmp(&b.item.file))
-            .then_with(|| a.item.line.cmp(&b.item.line))
-    });
-
-    let mut seen: HashSet<(PathBuf, usize)> = HashSet::new();
-    let mut out: Vec<EvidenceItem> = Vec::new();
-    let mut source_counts: HashMap<EvidenceSource, usize> = HashMap::new();
-    let mut file_counts: HashMap<PathBuf, usize> = HashMap::new();
-    let mut god_module_count = 0usize;
-
-    for candidate in &candidates {
-        let key = (candidate.item.file.clone(), candidate.item.line);
-        if seen.contains(&key) {
-            continue;
-        }
-        if file_counts.get(&candidate.item.file).copied().unwrap_or(0) >= FAST_EVIDENCE_PER_FILE_MAX
-        {
-            continue;
-        }
-        if source_counts
-            .get(&candidate.item.source)
-            .copied()
-            .unwrap_or(0)
-            >= source_limit(candidate.item.source)
-        {
-            continue;
-        }
-        if candidate.item.pattern_kind == Some(PatternKind::GodModule)
-            && god_module_count >= FAST_EVIDENCE_KIND_GOD_MODULE_MAX
-        {
-            continue;
-        }
-        if candidate.item.pattern_kind == Some(PatternKind::GodModule) {
-            god_module_count += 1;
-        }
-        *source_counts.entry(candidate.item.source).or_insert(0) += 1;
-        *file_counts.entry(candidate.item.file.clone()).or_insert(0) += 1;
-        seen.insert(key);
-        out.push(candidate.item.clone());
-        if out.len() >= FAST_EVIDENCE_PACK_MAX_ITEMS {
-            break;
-        }
-    }
-
-    // Second pass: if quotas were too restrictive, fill remaining slots.
-    if out.len() < FAST_EVIDENCE_PACK_MAX_ITEMS {
-        for candidate in &candidates {
-            let key = (candidate.item.file.clone(), candidate.item.line);
-            if out.len() >= FAST_EVIDENCE_PACK_MAX_ITEMS || seen.contains(&key) {
-                continue;
-            }
-            if file_counts.get(&candidate.item.file).copied().unwrap_or(0)
-                >= FAST_EVIDENCE_PER_FILE_MAX
-            {
-                continue;
-            }
-            if candidate.item.pattern_kind == Some(PatternKind::GodModule)
-                && god_module_count >= FAST_EVIDENCE_KIND_GOD_MODULE_MAX
-            {
-                continue;
-            }
-            if candidate.item.pattern_kind == Some(PatternKind::GodModule) {
-                god_module_count += 1;
-            }
-            *file_counts.entry(candidate.item.file.clone()).or_insert(0) += 1;
-            seen.insert(key);
-            out.push(candidate.item.clone());
-        }
-    }
-
-    for (id, item) in out.iter_mut().enumerate() {
-        item.id = id;
-    }
-
-    let mut stats = EvidencePackStats::default();
-    let line1 = out.iter().filter(|i| i.line == 1).count();
-    for item in &out {
-        match item.source {
-            EvidenceSource::Pattern => stats.pattern_count += 1,
-            EvidenceSource::Hotspot => stats.hotspot_count += 1,
-            EvidenceSource::Core => stats.core_count += 1,
-        }
-    }
-    if !out.is_empty() {
-        stats.line1_ratio = line1 as f64 / out.len() as f64;
-    }
-
-    (out, stats)
-}
-
 #[derive(Debug, Clone, serde::Deserialize)]
-struct FastGroundedSuggestionJson {
+struct AgenticSuggestionJson {
     #[serde(default)]
-    evidence_refs: Vec<FastGroundedEvidenceRefJson>,
+    file: String,
     #[serde(default)]
-    evidence_id: Option<usize>,
-    #[serde(default)]
-    snippet_id: Option<usize>,
+    line: Option<usize>,
     #[serde(default)]
     kind: String,
     #[serde(default)]
@@ -1344,66 +884,25 @@ struct FastGroundedSuggestionJson {
     #[serde(default)]
     confidence: String,
     #[serde(default)]
-    summary: String,
+    observed_behavior: String,
     #[serde(default)]
-    detail: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct FastGroundedResponseJson {
-    suggestions: Vec<FastGroundedSuggestionJson>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(untagged)]
-enum FastGroundedEvidenceRefJson {
-    Object {
-        #[serde(default)]
-        evidence_id: Option<usize>,
-        #[serde(default)]
-        snippet_id: Option<usize>,
-    },
-    Integer(usize),
-    String(String),
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct SuggestionValidationJson {
-    #[serde(default)]
-    validation: String,
-    #[serde(default)]
-    reason: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct SuggestionBatchValidationItemJson {
-    #[serde(default)]
-    local_index: usize,
-    #[serde(default)]
-    validation: String,
-    #[serde(default)]
-    reason: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct SuggestionBatchValidationJson {
-    #[serde(default)]
-    validations: Vec<SuggestionBatchValidationItemJson>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct OverclaimRewriteJson {
+    impact_class: String,
     #[serde(default)]
     summary: String,
     #[serde(default)]
     detail: String,
+    #[serde(default)]
+    evidence_quote: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AgenticSuggestionResponseJson {
+    suggestions: Vec<AgenticSuggestionJson>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValidationRejectClass {
-    Contradicted,
     InsufficientEvidence,
-    Transport,
     Other,
 }
 
@@ -1413,17 +912,7 @@ struct ValidationRejectionStats {
     prevalidation_contradiction_count: usize,
     validator_contradicted: usize,
     validator_insufficient_evidence: usize,
-    validator_transport: usize,
     validator_other: usize,
-    batch_missing_index_count: usize,
-    batch_no_reason_count: usize,
-    transport_retry_count: usize,
-    transport_recovered_count: usize,
-    overclaim_rewrite_count: usize,
-    overclaim_rewrite_validated_count: usize,
-    rewrite_recovered_count: usize,
-    deterministic_auto_validated: usize,
-    deadline_exceeded: bool,
 }
 
 fn build_validation_rejection_histogram(
@@ -1443,399 +932,43 @@ fn build_validation_rejection_histogram(
             "validator_insufficient_evidence".to_string(),
             stats.validator_insufficient_evidence,
         ),
-        ("validator_transport".to_string(), stats.validator_transport),
         ("validator_other".to_string(), stats.validator_other),
-        (
-            "batch_missing_index_count".to_string(),
-            stats.batch_missing_index_count,
-        ),
-        (
-            "batch_no_reason_count".to_string(),
-            stats.batch_no_reason_count,
-        ),
-        (
-            "transport_retry_count".to_string(),
-            stats.transport_retry_count,
-        ),
-        (
-            "transport_recovered_count".to_string(),
-            stats.transport_recovered_count,
-        ),
-        (
-            "rewrite_recovered_count".to_string(),
-            stats.rewrite_recovered_count,
-        ),
-        (
-            "deterministic_auto_validated".to_string(),
-            stats.deterministic_auto_validated,
-        ),
     ])
 }
 
-fn suggestion_validation_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "validation": {
-                "type": "string",
-                "enum": ["validated", "contradicted", "insufficient_evidence"]
-            },
-            "reason": { "type": "string" }
-        },
-        "required": ["validation", "reason"],
-        "additionalProperties": false
-    })
-}
-
-fn suggestion_batch_validation_schema(max_local_index: usize) -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "validations": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "local_index": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": max_local_index
-                        },
-                        "validation": {
-                            "type": "string",
-                            "enum": ["validated", "contradicted", "insufficient_evidence"]
-                        },
-                        "reason": { "type": "string" }
-                    },
-                    "required": ["local_index", "validation", "reason"],
-                    "additionalProperties": false
-                }
-            }
-        },
-        "required": ["validations"],
-        "additionalProperties": false
-    })
-}
-
-fn suggestion_overclaim_rewrite_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "summary": { "type": "string" },
-            "detail": { "type": "string" }
-        },
-        "required": ["summary", "detail"],
-        "additionalProperties": false
-    })
-}
-
-fn is_overclaim_validation_reason(reason: &str) -> bool {
-    let lower = reason.to_ascii_lowercase();
-    [
-        "assumption",
-        "beyond evidence",
-        "impact",
-        "ui behavior",
-        "business impact",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn should_attempt_rewrite_revalidation(class: ValidationRejectClass, reason: &str) -> bool {
-    matches!(class, ValidationRejectClass::InsufficientEvidence)
-        || (!matches!(class, ValidationRejectClass::Transport)
-            && is_overclaim_validation_reason(reason))
-}
-
-fn build_validation_evidence_block(suggestion: &Suggestion) -> String {
-    let mut evidence_block = String::new();
-    for (idx, reference) in suggestion.evidence_refs.iter().take(3).enumerate() {
-        evidence_block.push_str(&format!(
-            "Evidence {}: {}:{} (id={})\n",
-            idx + 1,
-            reference.file.display(),
-            reference.line,
-            reference.snippet_id
-        ));
-    }
-    if let Some(why_interesting) = suggestion.validation_metadata.why_interesting.as_deref() {
-        evidence_block.push_str(&format!("Why interesting: {}\n", why_interesting));
-    }
-    if let Some(file_loc) = suggestion.validation_metadata.file_loc {
-        evidence_block.push_str(&format!("File LOC: {}\n", file_loc));
-    }
-    if let Some(file_complexity) = suggestion.validation_metadata.file_complexity {
-        evidence_block.push_str(&format!("File complexity: {:.1}\n", file_complexity));
-    }
-    if let Some(anchor_context) = suggestion.validation_metadata.anchor_context.as_deref() {
-        evidence_block.push_str(&format!("Anchor context: {}\n", anchor_context));
-    }
-    if let Some(snippet) = &suggestion.evidence {
-        evidence_block.push_str("\nPRIMARY SNIPPET:\n");
-        evidence_block.push_str(snippet);
-        evidence_block.push('\n');
-    }
-    evidence_block
-}
-
-fn parse_validation_state(
-    validation: &str,
-) -> (SuggestionValidationState, Option<ValidationRejectClass>) {
-    let normalized = validation
-        .trim()
-        .to_ascii_lowercase()
-        .replace([' ', '-'], "_");
-
-    if normalized.contains("contradict")
-        || normalized.contains("unsupported")
-        || normalized.contains("not_supported")
-        || normalized.contains("not_valid")
-        || normalized.contains("assumption")
-    {
-        return (
-            SuggestionValidationState::Rejected,
-            Some(ValidationRejectClass::Contradicted),
-        );
-    }
-
-    if normalized.contains("insufficient")
-        || normalized.contains("not_enough_evidence")
-        || normalized.contains("insufficient_evidence")
-        || normalized.contains("unclear")
-    {
-        return (
-            SuggestionValidationState::Rejected,
-            Some(ValidationRejectClass::InsufficientEvidence),
-        );
-    }
-
-    if matches!(
-        normalized.as_str(),
-        "validated" | "valid" | "supported" | "support" | "supported_by_evidence"
-    ) || normalized.contains("validated")
-    {
-        return (SuggestionValidationState::Validated, None);
-    }
-
-    (
-        SuggestionValidationState::Rejected,
-        Some(ValidationRejectClass::Other),
-    )
-}
-
-fn reason_indicates_transport_failure(lower: &str) -> bool {
-    [
-        "validation failed",
-        "deadline exceeded",
-        "missing batch result",
-        "retry needed",
-        "rate limited",
-        "empty response",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn reason_indicates_insufficient_evidence(lower: &str) -> bool {
-    [
-        "insufficient",
-        "not enough evidence",
-        "cannot verify",
-        "unclear from evidence",
-        "does not show",
-        "doesn't show",
-        "did not show",
-        "does not demonstrate",
-        "doesn't demonstrate",
-        "did not demonstrate",
-        "does not provide evidence",
-        "doesn't provide evidence",
-        "did not provide evidence",
-        "provides no evidence",
-        "no evidence",
-        "only shows",
-        "only describes",
-        "only mentions",
-        "does not mention",
-        "not shown",
-        "not in snippet",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn reason_indicates_contradiction(lower: &str) -> bool {
-    [
-        "contradict",
-        "beyond evidence",
-        "assumption",
-        "not supported",
-        "unsupported",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn reason_has_negative_validation_marker(lower: &str) -> bool {
-    reason_indicates_transport_failure(lower)
-        || reason_indicates_insufficient_evidence(lower)
-        || reason_indicates_contradiction(lower)
-        || [
-            "not support",
-            "does not support",
-            "cannot support",
-            "fails to support",
-            "not supporting",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
-}
-
-fn reason_has_positive_support_marker(lower: &str) -> bool {
-    [
-        "evidence shows",
-        "evidence contains",
-        "supports",
-        "supported",
-        "supporting",
-        "confirm",
-        "directly shown",
-        "demonstrates",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn is_unusable_validation_reason(reason: &str) -> bool {
-    reason.trim().len() < VALIDATION_REASON_MIN_CHARS
-}
-
-fn reconcile_validation_from_reason(
-    state: SuggestionValidationState,
-    reject_class: Option<ValidationRejectClass>,
-    reason: &str,
-) -> (SuggestionValidationState, Option<ValidationRejectClass>) {
-    let lower = reason.to_ascii_lowercase();
-    if state == SuggestionValidationState::Validated
-        && reason_has_negative_validation_marker(&lower)
-    {
-        let class = if reason_indicates_transport_failure(&lower) {
-            ValidationRejectClass::Transport
-        } else if reason_indicates_insufficient_evidence(&lower) {
-            ValidationRejectClass::InsufficientEvidence
-        } else {
-            ValidationRejectClass::Contradicted
-        };
-        return (SuggestionValidationState::Rejected, Some(class));
-    }
-
-    if state == SuggestionValidationState::Rejected
-        && !matches!(reject_class, Some(ValidationRejectClass::Transport))
-        && !reason_has_negative_validation_marker(&lower)
-        && reason_has_positive_support_marker(&lower)
-    {
-        return (SuggestionValidationState::Validated, None);
-    }
-
-    if state != SuggestionValidationState::Rejected {
-        return (state, reject_class);
-    }
-
-    if reason_indicates_transport_failure(&lower) {
-        return (
-            SuggestionValidationState::Rejected,
-            Some(ValidationRejectClass::Transport),
-        );
-    }
-
-    if reason_indicates_insufficient_evidence(&lower) {
-        return (
-            SuggestionValidationState::Rejected,
-            Some(ValidationRejectClass::InsufficientEvidence),
-        );
-    }
-
-    if reason_indicates_contradiction(&lower) {
-        return (
-            SuggestionValidationState::Rejected,
-            Some(ValidationRejectClass::Contradicted),
-        );
-    }
-
-    (state, reject_class)
-}
-
-fn pack_item_by_id(pack: &[EvidenceItem], id: usize) -> Option<&EvidenceItem> {
-    pack.iter().find(|item| item.id == id)
-}
-
-fn renumber_pack(items: &[EvidenceItem]) -> (Vec<EvidenceItem>, HashMap<usize, usize>) {
-    let mut local_pack = Vec::with_capacity(items.len());
-    let mut local_to_original = HashMap::with_capacity(items.len());
-
-    for (local_id, item) in items.iter().enumerate() {
-        local_to_original.insert(local_id, item.id);
-        let mut cloned = item.clone();
-        cloned.id = local_id;
-        local_pack.push(cloned);
-    }
-
-    (local_pack, local_to_original)
-}
-
-fn remap_suggestion_to_original_ids(
-    suggestion: &mut Suggestion,
-    local_to_original: &HashMap<usize, usize>,
-    full_pack: &[EvidenceItem],
-) -> bool {
-    let mut remapped_refs = Vec::new();
-    let mut seen = HashSet::new();
-    for reference in &suggestion.evidence_refs {
-        let Some(original_id) = local_to_original.get(&reference.snippet_id).copied() else {
-            continue;
-        };
-        if !seen.insert(original_id) {
-            continue;
+fn suggestion_has_usable_evidence_quality(suggestion: &Suggestion) -> bool {
+    if let Some(top_ratio) = suggestion.validation_metadata.snippet_top_comment_ratio {
+        if top_ratio >= EVIDENCE_TOP_WINDOW_COMMENT_RATIO_MAX {
+            return false;
         }
-        let Some(item) = pack_item_by_id(full_pack, original_id) else {
-            continue;
-        };
-        remapped_refs.push(SuggestionEvidenceRef {
-            snippet_id: item.id,
-            file: item.file.clone(),
-            line: item.line,
-        });
     }
-
-    if remapped_refs.is_empty() {
-        return false;
-    }
-
-    suggestion.evidence_refs = remapped_refs;
-    if let Some(primary) = suggestion.evidence_refs.first() {
-        if let Some(item) = pack_item_by_id(full_pack, primary.snippet_id) {
-            suggestion.file = item.file.clone();
-            suggestion.line = Some(item.line);
-            suggestion.evidence = Some(item.snippet.clone());
+    if let Some(executable_ratio) = suggestion.validation_metadata.evidence_quality_score {
+        if executable_ratio < EVIDENCE_EXECUTABLE_RATIO_MIN {
+            return false;
         }
     }
     true
 }
 
-fn dedupe_and_cap_grounded_suggestions(
-    mapped: Vec<(usize, Suggestion)>,
-    cap: usize,
-) -> Vec<Suggestion> {
-    let mut seen_ids: HashSet<usize> = HashSet::new();
-    let mut unique = Vec::new();
-    for (evidence_id, suggestion) in mapped {
-        if seen_ids.insert(evidence_id) {
-            unique.push(suggestion);
+fn suggestion_claim_is_grounded_for_acceptance(suggestion: &Suggestion) -> bool {
+    let Some(snippet) = suggestion.evidence.as_deref() else {
+        return false;
+    };
+    if let Some(observed) = suggestion
+        .validation_metadata
+        .claim_observed_behavior
+        .as_deref()
+    {
+        if !observed.trim().is_empty() {
+            return claim_tokens_grounded_in_snippet(snippet, observed);
         }
     }
-    unique.truncate(cap);
-    unique
+    let fallback_claim = format!(
+        "{} {}",
+        suggestion.summary,
+        suggestion.detail.as_deref().unwrap_or("")
+    );
+    claim_tokens_grounded_in_snippet(snippet, &fallback_claim)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2114,11 +1247,20 @@ fn quick_check_targetability_score(path: &Path) -> f32 {
 }
 
 fn evidence_claim_grounding_score(suggestion: &Suggestion) -> f32 {
-    let claim_text = format!(
-        "{} {}",
-        suggestion.summary,
-        suggestion.detail.as_deref().unwrap_or("")
-    );
+    let claim_text = suggestion
+        .validation_metadata
+        .claim_observed_behavior
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "{} {}",
+                suggestion.summary,
+                suggestion.detail.as_deref().unwrap_or("")
+            )
+        });
     let claim_tokens = claim_specific_tokens(&claim_text);
     if claim_tokens.is_empty() {
         return 0.65;
@@ -2268,190 +1410,6 @@ fn has_speculative_impact_language(text: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-fn extract_metric_label(snippet: &str) -> Option<&'static str> {
-    let lower = snippet.to_ascii_lowercase();
-    if lower.contains("largest-contentful-paint") || lower.contains("lcp") {
-        Some("LCP")
-    } else if lower.contains("layout-shift") || lower.contains("cls") {
-        Some("CLS")
-    } else if lower.contains("first-contentful-paint") || lower.contains("fcp") {
-        Some("FCP")
-    } else if lower.contains("ttfb") || lower.contains("navigationtiming") {
-        Some("TTFB")
-    } else if lower.contains("inp") || lower.contains("durationthreshold") {
-        Some("INP")
-    } else {
-        None
-    }
-}
-
-fn conservative_summary_from_evidence(snippet: &str) -> Option<String> {
-    let lower = snippet.to_ascii_lowercase();
-    let has_catch = snippet_contains_empty_catch(snippet) || lower.contains("catch");
-
-    if has_catch
-        && (lower.contains("performanceobserver")
-            || lower.contains("largest-contentful-paint")
-            || lower.contains("layout-shift")
-            || lower.contains("first-contentful-paint")
-            || lower.contains("ttfb")
-            || lower.contains("inp"))
-    {
-        if let Some(metric) = extract_metric_label(snippet) {
-            return Some(format!(
-                "{metric} telemetry can be missing when this error path is silently ignored."
-            ));
-        }
-        return Some(
-            "Performance telemetry can be missing when this error path is silently ignored."
-                .to_string(),
-        );
-    }
-
-    if lower.contains("kv not configured")
-        && lower.contains("status: 'skipped'")
-        && lower.contains("reason: 'kv not configured'")
-    {
-        return Some(
-            "Requests are skipped when key-value storage is not configured, so this endpoint cannot serve cached data."
-                .to_string(),
-        );
-    }
-
-    if lower.contains("dump_alert_audience_set") || lower.contains("marketing:dump_alert:audience")
-    {
-        if lower.contains("srem(") {
-            return Some(
-                "Audience unsubscribe state can drift when this cache update fails silently."
-                    .to_string(),
-            );
-        }
-        if lower.contains("sadd(") {
-            return Some(
-                "Audience membership state can drift when this cache update fails silently."
-                    .to_string(),
-            );
-        }
-    }
-
-    if lower.contains("lock") && lower.contains(".del(") && has_catch {
-        return Some(
-            "Lock cleanup failures can leave stale locks until timeout, delaying later jobs."
-                .to_string(),
-        );
-    }
-
-    None
-}
-
-fn trim_speculative_impact_clause(summary: &str) -> String {
-    let trimmed = summary.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    let connectors = [
-        " causing ",
-        " leading to ",
-        " resulting in ",
-        " so that ",
-        " so users ",
-        " so teams ",
-    ];
-    let mut cut_at: Option<usize> = None;
-    for connector in connectors {
-        if let Some(idx) = lower.find(connector) {
-            cut_at = Some(cut_at.map(|current| current.min(idx)).unwrap_or(idx));
-        }
-    }
-    if cut_at.is_none() {
-        if let Some(idx) = trimmed.find(", so ") {
-            cut_at = Some(idx);
-        } else if let Some(idx) = trimmed.find(", which ") {
-            cut_at = Some(idx);
-        }
-    }
-
-    let core = cut_at
-        .map(|idx| trimmed[..idx].trim())
-        .unwrap_or(trimmed)
-        .trim_end_matches(['.', ',', ';', ':'])
-        .trim();
-    if core.is_empty() {
-        return String::new();
-    }
-    format!("{core}.")
-}
-
-fn filter_speculative_impact_suggestions(suggestions: Vec<Suggestion>) -> (Vec<Suggestion>, usize) {
-    if suggestions.is_empty() {
-        return (suggestions, 0);
-    }
-
-    let mut kept = Vec::with_capacity(suggestions.len());
-    let mut dropped = 0usize;
-    for mut suggestion in suggestions {
-        let summary_is_speculative = has_speculative_impact_language(&suggestion.summary);
-        let summary_is_valid =
-            summary_normalization::is_valid_grounded_summary(&suggestion.summary);
-
-        if summary_is_valid && !summary_is_speculative {
-            kept.push(suggestion);
-            continue;
-        }
-
-        if let Some(snippet) = suggestion.evidence.as_deref() {
-            if let Some(rewritten) = conservative_summary_from_evidence(snippet) {
-                let normalized = normalize_grounded_summary(
-                    &rewritten,
-                    suggestion.detail.as_deref().unwrap_or(""),
-                    suggestion.line.unwrap_or_default(),
-                );
-                if summary_normalization::is_valid_grounded_summary(&normalized)
-                    && (!has_speculative_impact_language(&normalized)
-                        || claim_tokens_grounded_in_snippet(snippet, &normalized))
-                {
-                    suggestion.summary = normalized;
-                    kept.push(suggestion);
-                    continue;
-                }
-            }
-
-            let grounded = claim_tokens_grounded_in_snippet(snippet, &suggestion.summary);
-            if summary_is_valid
-                && grounded
-                && !summary_is_speculative
-                && !has_overclaim_wording(&suggestion)
-            {
-                kept.push(suggestion);
-                continue;
-            }
-
-            let trimmed = trim_speculative_impact_clause(&suggestion.summary);
-            if !trimmed.is_empty() {
-                let normalized = normalize_grounded_summary(
-                    &trimmed,
-                    suggestion.detail.as_deref().unwrap_or(""),
-                    suggestion.line.unwrap_or_default(),
-                );
-                if summary_normalization::is_valid_grounded_summary(&normalized)
-                    && (!has_speculative_impact_language(&normalized)
-                        || claim_tokens_grounded_in_snippet(snippet, &normalized))
-                {
-                    suggestion.summary = normalized;
-                    kept.push(suggestion);
-                    continue;
-                }
-            }
-        }
-
-        dropped += 1;
-    }
-
-    (kept, dropped)
-}
-
 fn build_implementation_sketch(suggestion: &Suggestion) -> String {
     let line = suggestion.line.unwrap_or(1);
     let summary = suggestion.summary.trim();
@@ -2543,331 +1501,103 @@ fn apply_readiness_filter(
         .sum::<f64>()
         / annotated.len() as f64;
 
-    let mut kept = annotated
+    let kept = annotated
         .iter()
         .filter(|s| s.implementation_readiness_score.unwrap_or(0.0) >= min_score)
         .cloned()
         .collect::<Vec<_>>();
 
-    // Guardrail: when strict readiness filtering over-prunes, backfill top borderline items
-    // so users still get a useful set to choose from.
-    let adaptive_floor = FAST_GROUNDED_FINAL_TARGET_MIN
-        .saturating_sub(2)
-        .min(annotated.len());
-    if kept.len() < adaptive_floor {
-        let mut backfill_candidates = annotated
-            .iter()
-            .filter(|s| s.implementation_readiness_score.unwrap_or(0.0) < min_score)
-            .cloned()
-            .collect::<Vec<_>>();
-        backfill_candidates.sort_by(|a, b| {
-            b.implementation_readiness_score
-                .partial_cmp(&a.implementation_readiness_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.priority.cmp(&a.priority))
-                .then_with(|| b.confidence.cmp(&a.confidence))
-                .then_with(|| b.created_at.cmp(&a.created_at))
-        });
-
-        for mut candidate in backfill_candidates {
-            if kept.len() >= adaptive_floor {
-                break;
-            }
-            candidate
-                .implementation_risk_flags
-                .push("below_readiness_threshold_backfill".to_string());
-            kept.push(candidate);
-        }
-    }
-
     let filtered_count = annotated.len().saturating_sub(kept.len());
     (kept, filtered_count, mean)
 }
 
-fn collect_valid_evidence_refs(
-    suggestion: &FastGroundedSuggestionJson,
-    pack: &[EvidenceItem],
-) -> Vec<SuggestionEvidenceRef> {
-    fn push_evidence_id(
-        evidence_id: usize,
-        pack: &[EvidenceItem],
-        seen: &mut HashSet<usize>,
-        refs: &mut Vec<SuggestionEvidenceRef>,
-    ) {
-        if seen.insert(evidence_id) {
-            if let Some(item) = pack_item_by_id(pack, evidence_id) {
-                refs.push(SuggestionEvidenceRef {
-                    snippet_id: item.id,
-                    file: item.file.clone(),
-                    line: item.line,
-                });
-            }
-        }
+fn normalize_claim_impact_class(raw: &str) -> Option<String> {
+    let normalized = raw.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    match normalized.as_str() {
+        "correctness" | "reliability" | "security" | "performance" | "operability"
+        | "maintainability" | "data_integrity" => Some(normalized),
+        _ => None,
     }
-
-    let mut refs = Vec::new();
-    let mut seen = HashSet::new();
-
-    let parse_ref_id = |reference: &FastGroundedEvidenceRefJson| -> Option<usize> {
-        match reference {
-            FastGroundedEvidenceRefJson::Object {
-                evidence_id,
-                snippet_id,
-                ..
-            } => (*evidence_id).or(*snippet_id),
-            FastGroundedEvidenceRefJson::Integer(id) => Some(*id),
-            FastGroundedEvidenceRefJson::String(raw) => raw.trim().parse::<usize>().ok(),
-        }
-    };
-
-    for r in &suggestion.evidence_refs {
-        if let Some(id) = parse_ref_id(r) {
-            push_evidence_id(id, pack, &mut seen, &mut refs);
-        }
-    }
-
-    // Minimal compatibility for older payloads that emitted top-level ids.
-    if refs.is_empty() {
-        if let Some(id) = suggestion.evidence_id.or(suggestion.snippet_id) {
-            push_evidence_id(id, pack, &mut seen, &mut refs);
-        }
-    }
-
-    // Enforce one evidence ref per suggestion at mapping time for stability.
-    refs.truncate(1);
-    refs
 }
 
-fn convert_raw_suggestion(
-    s: FastGroundedSuggestionJson,
-    pack: &[EvidenceItem],
-) -> Option<(usize, Suggestion)> {
-    let evidence_refs = collect_valid_evidence_refs(&s, pack);
-    let evidence_id = evidence_refs.first().map(|r| r.snippet_id)?;
-    let item = pack_item_by_id(pack, evidence_id)?;
-
-    let kind = match s.kind.to_lowercase().as_str() {
-        "bugfix" => cosmos_core::suggest::SuggestionKind::BugFix,
-        "optimization" => cosmos_core::suggest::SuggestionKind::Optimization,
-        "refactoring" => cosmos_core::suggest::SuggestionKind::Refactoring,
-        "security" => cosmos_core::suggest::SuggestionKind::BugFix,
-        "reliability" => cosmos_core::suggest::SuggestionKind::Quality,
-        _ => cosmos_core::suggest::SuggestionKind::Improvement,
-    };
-    let priority = match s.priority.to_lowercase().as_str() {
-        "high" => cosmos_core::suggest::Priority::High,
-        "low" => cosmos_core::suggest::Priority::Low,
-        _ => cosmos_core::suggest::Priority::Medium,
-    };
-    let confidence = match s.confidence.to_lowercase().as_str() {
-        "high" => cosmos_core::suggest::Confidence::High,
-        _ => cosmos_core::suggest::Confidence::Medium,
-    };
-
-    let detail = normalize_grounded_detail(&s.detail, &s.summary);
-    let summary = normalize_grounded_summary(&s.summary, &detail, item.line);
-    if summary.is_empty() {
-        return None;
-    }
-
-    let suggestion = Suggestion::new(
-        kind,
-        priority,
-        item.file.clone(),
-        summary,
-        cosmos_core::suggest::SuggestionSource::LlmDeep,
+fn impact_class_is_bug_or_security(impact_class: &str) -> bool {
+    matches!(
+        impact_class,
+        "correctness" | "reliability" | "security" | "data_integrity"
     )
-    .with_confidence(confidence)
-    .with_line(item.line)
-    .with_detail(detail)
-    .with_evidence(item.snippet.clone())
-    .with_evidence_refs(evidence_refs)
-    .with_validation_metadata(SuggestionValidationMetadata {
-        why_interesting: Some(item.why_interesting.clone()),
-        file_loc: item.file_loc,
-        file_complexity: item.file_complexity,
-        anchor_context: item.anchor_context.clone(),
-    })
-    .with_validation_state(SuggestionValidationState::Pending);
-
-    Some((evidence_id, suggestion))
 }
 
-fn map_raw_items_to_grounded(
-    raw_items: Vec<FastGroundedSuggestionJson>,
-    pack: &[EvidenceItem],
-) -> (Vec<(usize, Suggestion)>, usize) {
-    let mut mapped: Vec<(usize, Suggestion)> = Vec::new();
-    let mut missing_or_invalid = 0usize;
-    for s in raw_items {
-        if let Some(converted) = convert_raw_suggestion(s, pack) {
-            mapped.push(converted);
-        } else {
-            missing_or_invalid += 1;
-        }
-    }
-    (mapped, missing_or_invalid)
-}
-
-fn should_run_mapping_rescue(raw_count: usize, mapped_count: usize) -> bool {
-    raw_count > 0 && mapped_count == 0
-}
-
-fn grounded_mapped_count(mapped: &[(usize, Suggestion)]) -> usize {
-    mapped
-        .iter()
-        .map(|(evidence_id, _)| *evidence_id)
-        .collect::<HashSet<_>>()
-        .len()
-}
-
-#[cfg(test)]
-fn should_run_generation_topup(
-    mapped_count: usize,
-    topup_calls: usize,
-    elapsed_ms: u64,
-    budget_ms: u64,
-) -> bool {
-    if mapped_count >= FAST_GROUNDED_VALIDATED_HARD_TARGET
-        || topup_calls >= GENERATION_TOPUP_MAX_CALLS
-    {
+fn suggestion_targets_bug_or_security_scope(suggestion: &Suggestion) -> bool {
+    if suggestion.kind != SuggestionKind::BugFix {
         return false;
     }
-
-    let remaining_budget_ms = budget_ms.saturating_sub(elapsed_ms);
-    remaining_budget_ms >= GENERATION_TOPUP_TIMEOUT_MS
+    suggestion
+        .validation_metadata
+        .claim_impact_class
+        .as_deref()
+        .map(impact_class_is_bug_or_security)
+        .unwrap_or(false)
 }
 
-fn generation_topup_request_count(deficit: usize) -> usize {
-    deficit.saturating_add(3).clamp(4, 10)
+fn suggestion_is_verified_bug_or_security(suggestion: &Suggestion) -> bool {
+    suggestion.validation_state == SuggestionValidationState::Validated
+        && suggestion.verification_state == VerificationState::Verified
+        && suggestion_targets_bug_or_security_scope(suggestion)
 }
 
-fn regeneration_needed(validated_count: usize) -> usize {
-    FAST_GROUNDED_VALIDATED_SOFT_FLOOR.saturating_sub(validated_count)
-}
-
-fn regeneration_needed_for_target(validated_count: usize, target: usize) -> usize {
-    target.saturating_sub(validated_count)
-}
-
-fn regeneration_request_bounds(needed: usize) -> (usize, usize) {
-    let min_requested = needed.saturating_mul(2).clamp(4, 12);
-    let max_requested = needed.saturating_mul(3).clamp(4, 14).max(min_requested);
-    (min_requested, max_requested)
-}
-
-fn choose_regeneration_phase_target(
-    validated_count: usize,
-    hard_target: usize,
-    stretch_target: usize,
-    hard_phase_attempts: usize,
-    stretch_phase_attempts: usize,
-) -> Option<usize> {
-    if validated_count < hard_target {
-        return (hard_phase_attempts < REFINEMENT_HARD_PHASE_MAX_ATTEMPTS).then_some(hard_target);
+fn impact_class_summary_clause(impact_class: &str) -> Option<&'static str> {
+    match impact_class {
+        "correctness" => Some("which can produce incorrect results"),
+        "reliability" => Some("which can fail in normal use"),
+        "security" => Some("which can open a security risk"),
+        "performance" => Some("which can slow down requests"),
+        "operability" => Some("which can make incidents harder to diagnose"),
+        "maintainability" => Some("which can make safe changes harder"),
+        "data_integrity" => Some("which can leave stored data in an inconsistent state"),
+        _ => None,
     }
-    if validated_count < stretch_target {
-        return (stretch_phase_attempts < REFINEMENT_STRETCH_PHASE_MAX_ATTEMPTS)
-            .then_some(stretch_target);
-    }
-    None
 }
 
-fn remaining_validation_budget_ms(validation_deadline: std::time::Instant) -> u64 {
-    validation_deadline
-        .saturating_duration_since(std::time::Instant::now())
-        .as_millis() as u64
+fn build_claim_summary(observed_behavior: &str, impact_class: Option<&str>) -> String {
+    let observed = normalize_grounded_summary(observed_behavior, observed_behavior, 1);
+    if observed.is_empty() {
+        return String::new();
+    }
+    let observed_core = observed
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .trim()
+        .to_string();
+    if observed_core.is_empty() {
+        return String::new();
+    }
+    let Some(impact) = impact_class.and_then(impact_class_summary_clause) else {
+        return format!("{observed_core}.");
+    };
+    let lower = observed_core.to_ascii_lowercase();
+    if lower.contains(impact) {
+        return format!("{observed_core}.");
+    }
+    format!("{observed_core}, {impact}.")
 }
 
-fn should_stop_regeneration_for_validation_budget(
-    validation_deadline_exceeded: bool,
-    remaining_validation_budget_ms: u64,
-) -> bool {
-    validation_deadline_exceeded
-        || remaining_validation_budget_ms < VALIDATION_MIN_REMAINING_BUDGET_MS
-}
-
-fn should_retry_transport_rejection(
-    class: ValidationRejectClass,
-    attempts: usize,
-    validation_deadline: std::time::Instant,
-) -> bool {
-    let remaining_budget_ms = remaining_validation_budget_ms(validation_deadline);
-    matches!(class, ValidationRejectClass::Transport)
-        && attempts < VALIDATION_RETRY_MAX_PER_SUGGESTION
-        && remaining_budget_ms >= VALIDATION_RETRY_MIN_REMAINING_BUDGET_MS
-}
-
-fn build_remaining_pack_for_regeneration(
-    pack: &[EvidenceItem],
-    used_evidence_ids: &HashSet<usize>,
-    rejected_evidence_ids: &HashSet<usize>,
-    allow_rejected_relaxation: bool,
-) -> (Vec<EvidenceItem>, bool, Vec<usize>) {
-    let mut strict = Vec::new();
-    let mut skipped_rejected_ids = Vec::new();
-
-    for item in pack {
-        if used_evidence_ids.contains(&item.id) {
-            continue;
-        }
-        if rejected_evidence_ids.contains(&item.id) {
-            skipped_rejected_ids.push(item.id);
-            continue;
-        }
-        strict.push(item.clone());
-    }
-
-    if strict.len() >= REGEN_STRICT_MIN_PACK_SIZE || !allow_rejected_relaxation {
-        return (strict, false, skipped_rejected_ids);
-    }
-
-    let relaxed = pack
-        .iter()
-        .filter(|item| !used_evidence_ids.contains(&item.id))
-        .cloned()
-        .collect::<Vec<_>>();
-    (relaxed, true, Vec::new())
-}
-
-fn build_underrepresented_pack_for_regeneration(
-    pack: &[EvidenceItem],
-    validated: &[Suggestion],
-) -> Vec<EvidenceItem> {
-    let mut file_counts: HashMap<PathBuf, usize> = HashMap::new();
-    for suggestion in validated {
-        *file_counts.entry(suggestion.file.clone()).or_insert(0) += 1;
-    }
-
-    let mut scored = pack.to_vec();
-    scored.sort_by(|a, b| {
-        let a_count = file_counts.get(&a.file).copied().unwrap_or(0);
-        let b_count = file_counts.get(&b.file).copied().unwrap_or(0);
-        a_count
-            .cmp(&b_count)
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.line.cmp(&b.line))
-    });
-
-    let mut selected = Vec::new();
-    let mut per_file: HashMap<PathBuf, usize> = HashMap::new();
-    for item in scored {
-        if per_file.get(&item.file).copied().unwrap_or(0) >= FAST_EVIDENCE_PER_FILE_MAX {
-            continue;
-        }
-        *per_file.entry(item.file.clone()).or_insert(0) += 1;
-        selected.push(item);
-        if selected.len() >= FAST_EVIDENCE_PACK_MAX_ITEMS {
-            break;
-        }
-    }
-
-    selected
+fn is_retryable_generation_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("empty response")
+        || message.contains("timed out")
+        || message.contains("rate limited")
+        || message.contains("too many requests")
+        || message.contains("server error")
+        || message.contains("503")
+        || message.contains("502")
+        || message.contains("504")
+        || message.contains("failed to parse agentic suggestions json")
+        || message.contains("structured output")
 }
 
 fn finalize_validated_suggestions(mut validated: Vec<Suggestion>) -> Vec<Suggestion> {
     // Defensive filter: refinement should only surface validated suggestions.
-    validated.retain(|s| s.validation_state == SuggestionValidationState::Validated);
+    validated.retain(suggestion_is_verified_bug_or_security);
     validated
 }
 
@@ -2910,8 +1640,7 @@ fn balance_suggestions_across_files(
     (balanced, dropped)
 }
 
-fn grounded_suggestion_schema(pack_len: usize) -> serde_json::Value {
-    let max_evidence_id = pack_len.saturating_sub(1);
+fn agentic_suggestion_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -2920,31 +1649,39 @@ fn grounded_suggestion_schema(pack_len: usize) -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "evidence_refs": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "evidence_id": {
-                                        "type": "integer",
-                                        "minimum": 0,
-                                        "maximum": max_evidence_id
-                                    }
-                                },
-                                "required": ["evidence_id"],
-                                "additionalProperties": false
-                            }
-                        },
+                        "file": { "type": "string" },
+                        "line": { "type": "integer", "minimum": 1 },
                         "kind": {
                             "type": "string",
-                            "enum": ["bugfix", "improvement", "optimization", "refactoring", "security", "reliability"]
+                            "enum": ["bugfix", "security", "reliability"]
                         },
                         "priority": { "type": "string", "enum": ["high", "medium", "low"] },
                         "confidence": { "type": "string", "enum": ["high", "medium"] },
+                        "observed_behavior": { "type": "string" },
+                        "impact_class": {
+                            "type": "string",
+                            "enum": [
+                                "correctness",
+                                "reliability",
+                                "security",
+                                "data_integrity"
+                            ]
+                        },
                         "summary": { "type": "string" },
-                        "detail": { "type": "string" }
+                        "detail": { "type": "string" },
+                        "evidence_quote": { "type": "string" }
                     },
-                    "required": ["evidence_refs", "kind", "priority", "confidence", "summary", "detail"],
+                    "required": [
+                        "file",
+                        "kind",
+                        "priority",
+                        "confidence",
+                        "observed_behavior",
+                        "impact_class",
+                        "summary",
+                        "detail",
+                        "evidence_quote"
+                    ],
                     "additionalProperties": false
                 }
             }
@@ -2954,291 +1691,219 @@ fn grounded_suggestion_schema(pack_len: usize) -> serde_json::Value {
     })
 }
 
-fn format_grounded_user_prompt(
-    memory_section: &str,
+fn resolve_agentic_file(repo_root: &Path, raw_file: &str) -> Option<PathBuf> {
+    let trimmed = raw_file.trim().trim_start_matches("./").replace('\\', "/");
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(trimmed);
+    if candidate.is_absolute() {
+        candidate
+            .strip_prefix(repo_root)
+            .ok()
+            .map(|path| path.to_path_buf())
+    } else {
+        Some(candidate)
+    }
+}
+
+fn stable_evidence_id(file: &Path, line: usize, snippet: &str) -> usize {
+    // Deterministic FNV-1a hash so evidence IDs remain stable across runs.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    };
+
+    feed(file.to_string_lossy().as_bytes());
+    feed(&line.to_le_bytes());
+    feed(snippet.as_bytes());
+
+    let masked = hash & (usize::MAX as u64);
+    masked as usize
+}
+
+fn infer_agentic_impact_class(kind: &str, summary: &str, detail: &str) -> Option<String> {
+    let text = format!("{} {}", summary, detail).to_ascii_lowercase();
+    if text.contains("security")
+        || text.contains("traversal")
+        || text.contains("injection")
+        || text.contains("unauthorized")
+        || text.contains("secret")
+        || text.contains("token")
+    {
+        return Some("security".to_string());
+    }
+    if text.contains("corrupt")
+        || text.contains("inconsistent")
+        || text.contains("duplicate")
+        || text.contains("lost")
+        || text.contains("overwrite")
+    {
+        return Some("data_integrity".to_string());
+    }
+    if text.contains("panic")
+        || text.contains("crash")
+        || text.contains("hang")
+        || text.contains("stuck")
+        || text.contains("retry")
+    {
+        return Some("reliability".to_string());
+    }
+
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "security" => Some("security".to_string()),
+        "reliability" => Some("reliability".to_string()),
+        "bugfix" => Some("correctness".to_string()),
+        _ => None,
+    }
+}
+
+fn map_agentic_suggestions(
+    repo_root: &Path,
     index: &CodebaseIndex,
-    summaries: Option<&HashMap<PathBuf, String>>,
-    items: &[EvidenceItem],
-    count_hint: &str,
-) -> String {
-    let mut user = String::new();
-    if !memory_section.trim().is_empty() {
-        user.push_str(memory_section);
-        user.push_str("\n\n");
-    }
-    if let Some(summaries) = summaries {
-        user.push_str("FILE SUMMARIES (grounding context):\n");
-        for item in items {
-            if let Some(summary) = summaries.get(&item.file) {
-                user.push_str(&format!(
-                    "- {}: {}\n",
-                    item.file.display(),
-                    truncate_str(summary, 180)
-                ));
-            } else if let Some(file_index) = index.files.get(&item.file) {
-                user.push_str(&format!(
-                    "- {}: {}\n",
-                    item.file.display(),
-                    truncate_str(&file_index.summary.purpose, 180)
-                ));
-            }
+    raw: Vec<AgenticSuggestionJson>,
+) -> Vec<Suggestion> {
+    fn resolve_index_file(index: &CodebaseIndex, candidate: &Path) -> Option<PathBuf> {
+        if index.files.contains_key(candidate) {
+            return Some(candidate.to_path_buf());
         }
-        user.push('\n');
-    }
-    user.push_str(count_hint);
-    user.push_str(
-        "\nPrefer high-signal variety across product flows and files. Avoid concentrating suggestions in one file unless the evidence pack is genuinely narrow.",
-    );
-    user.push_str("\n\nEVIDENCE PACK (internal grounding only):\n");
-    for item in items {
-        user.push_str(&format!(
-            "EVIDENCE {id}:\nSignal: {why}\nSNIPPET:\n{snippet}\n\n",
-            id = item.id,
-            why = item.why_interesting,
-            snippet = item.snippet
-        ));
-    }
-    user
-}
 
-async fn call_grounded_suggestions_with_fallback(
-    system: &str,
-    user: &str,
-    model: Model,
-    schema_name: &str,
-    schema: serde_json::Value,
-    max_tokens: u32,
-    timeout_ms: u64,
-) -> anyhow::Result<StructuredResponse<FastGroundedResponseJson>> {
-    let primary = call_llm_structured_with_provider::<FastGroundedResponseJson>(
-        system,
-        user,
-        model,
-        schema_name,
-        schema.clone(),
-        super::client::provider_cerebras_fp16(),
-        max_tokens,
-        timeout_ms,
-    )
-    .await;
-
-    match primary {
-        Ok(response) => Ok(response),
-        Err(primary_err) => {
-            let fallback = call_llm_structured_limited::<FastGroundedResponseJson>(
-                system,
-                user,
-                model,
-                schema_name,
-                schema,
-                max_tokens,
-                timeout_ms,
-            )
-            .await;
-
-            match fallback {
-                Ok(response) => Ok(response),
-                Err(fallback_err) => Err(anyhow::anyhow!(
-                    "Primary provider call failed: {} | Fallback routing failed: {}",
-                    truncate_str(&primary_err.to_string(), 700),
-                    truncate_str(&fallback_err.to_string(), 700)
-                )),
-            }
+        let candidate_str = candidate.to_string_lossy();
+        if candidate_str.is_empty() {
+            return None;
         }
+
+        index
+            .files
+            .keys()
+            .find(|path| {
+                let indexed = path.to_string_lossy();
+                indexed.ends_with(candidate_str.as_ref())
+            })
+            .cloned()
     }
-}
 
-async fn call_validation_structured_with_fallback<T>(
-    system: &str,
-    user: &str,
-    model: Model,
-    schema_name: &str,
-    schema: serde_json::Value,
-    max_tokens: u32,
-    timeout_ms: u64,
-) -> anyhow::Result<StructuredResponse<T>>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let primary_timeout_ms = timeout_ms.saturating_mul(2) / 3;
-    let primary_timeout_ms = primary_timeout_ms.clamp(1_000, timeout_ms.max(1_000));
-    let fallback_timeout_ms = timeout_ms.saturating_sub(primary_timeout_ms);
-
-    let primary = call_llm_structured_with_provider::<T>(
-        system,
-        user,
-        model,
-        schema_name,
-        schema.clone(),
-        super::client::provider_cerebras_fp16(),
-        max_tokens,
-        primary_timeout_ms,
-    )
-    .await;
-
-    match primary {
-        Ok(response) => Ok(response),
-        Err(primary_err) => {
-            if fallback_timeout_ms < 800 {
-                return Err(anyhow::anyhow!(
-                    "Primary provider call failed: {}",
-                    truncate_str(&primary_err.to_string(), 700)
-                ));
-            }
-            let fallback = call_llm_structured_limited::<T>(
-                system,
-                user,
-                model,
-                schema_name,
-                schema,
-                max_tokens,
-                fallback_timeout_ms,
-            )
-            .await;
-
-            match fallback {
-                Ok(response) => Ok(response),
-                Err(fallback_err) => Err(anyhow::anyhow!(
-                    "Primary provider call failed: {} | Fallback routing failed: {}",
-                    truncate_str(&primary_err.to_string(), 700),
-                    truncate_str(&fallback_err.to_string(), 700)
-                )),
-            }
+    let mut out = Vec::new();
+    let mut used_evidence_ids = HashSet::new();
+    for item in raw {
+        let normalized_kind = item.kind.trim().to_ascii_lowercase();
+        if !matches!(
+            normalized_kind.as_str(),
+            "bugfix" | "security" | "reliability"
+        ) {
+            continue;
         }
+
+        let Some(raw_file) = resolve_agentic_file(repo_root, &item.file) else {
+            continue;
+        };
+        let Some(file) = resolve_index_file(index, &raw_file) else {
+            continue;
+        };
+
+        let summary_seed = item.summary.trim();
+        if summary_seed.is_empty() {
+            continue;
+        }
+        let detail_seed = item.detail.trim();
+        let evidence_quote = item.evidence_quote.trim();
+        let line = item.line.unwrap_or(1).max(1);
+        if evidence_quote.is_empty() {
+            continue;
+        }
+
+        let claim_observed_seed = item.observed_behavior.trim();
+        let claim_observed_behavior = normalize_grounded_summary(
+            if claim_observed_seed.is_empty() {
+                summary_seed
+            } else {
+                claim_observed_seed
+            },
+            detail_seed,
+            line,
+        );
+        if claim_observed_behavior.is_empty() {
+            continue;
+        }
+        let claim_impact_class = normalize_claim_impact_class(&item.impact_class)
+            .or_else(|| infer_agentic_impact_class(&item.kind, summary_seed, detail_seed));
+        let Some(claim_impact_class) =
+            claim_impact_class.filter(|impact| impact_class_is_bug_or_security(impact))
+        else {
+            continue;
+        };
+        let claim_summary =
+            build_claim_summary(&claim_observed_behavior, Some(claim_impact_class.as_str()));
+        let detail = normalize_grounded_detail(
+            if detail_seed.is_empty() {
+                summary_seed
+            } else {
+                detail_seed
+            },
+            &claim_summary,
+        );
+        let summary = normalize_grounded_summary(
+            if claim_summary.is_empty() {
+                summary_seed
+            } else {
+                claim_summary.as_str()
+            },
+            &detail,
+            line,
+        );
+        if summary.is_empty() {
+            continue;
+        }
+        let quality = evidence_snippet_quality(evidence_quote);
+        if snippet_is_low_quality_for_grounding(quality) {
+            continue;
+        }
+
+        let mut evidence_id = stable_evidence_id(&file, line, evidence_quote);
+        while !used_evidence_ids.insert(evidence_id) {
+            evidence_id = evidence_id.wrapping_add(1);
+        }
+        let kind = SuggestionKind::BugFix;
+        let priority = match item.priority.to_ascii_lowercase().as_str() {
+            "high" => cosmos_core::suggest::Priority::High,
+            "low" => cosmos_core::suggest::Priority::Low,
+            _ => cosmos_core::suggest::Priority::Medium,
+        };
+        let confidence = match item.confidence.to_ascii_lowercase().as_str() {
+            "high" => cosmos_core::suggest::Confidence::High,
+            _ => cosmos_core::suggest::Confidence::Medium,
+        };
+        let suggestion = Suggestion::new(
+            kind,
+            priority,
+            file.clone(),
+            summary,
+            cosmos_core::suggest::SuggestionSource::LlmDeep,
+        )
+        .with_confidence(confidence)
+        .with_line(line)
+        .with_detail(detail)
+        .with_evidence(evidence_quote.to_string())
+        .with_evidence_refs(vec![SuggestionEvidenceRef {
+            snippet_id: evidence_id,
+            file,
+            line,
+        }])
+        .with_validation_metadata(SuggestionValidationMetadata {
+            evidence_quality_score: Some(quality.executable_ratio),
+            snippet_comment_ratio: Some(quality.comment_ratio),
+            snippet_top_comment_ratio: Some(quality.top_window_comment_ratio),
+            claim_observed_behavior: Some(claim_observed_behavior),
+            claim_impact_class: Some(claim_impact_class),
+            ..Default::default()
+        })
+        .with_validation_state(SuggestionValidationState::Pending);
+        out.push(suggestion);
     }
-}
-
-async fn validate_suggestion_with_model_budget(
-    suggestion: &Suggestion,
-    memory_section: &str,
-    validation_model: Model,
-    max_tokens: u32,
-    timeout_ms: u64,
-) -> anyhow::Result<(
-    SuggestionValidationState,
-    String,
-    Option<Usage>,
-    Option<ValidationRejectClass>,
-)> {
-    let evidence_block = build_validation_evidence_block(suggestion);
-
-    let system = r#"You are a strict evidence-grounded suggestion validator.
-Use ONLY the provided suggestion and evidence snippets.
-
-Validation rubric:
-- Mark `validated` only if the suggestion's claim is directly supported by evidence.
-- If the suggestion makes assumptions beyond the snippets (UI behavior, user state, rollback needs, business impact), mark `contradicted`.
-- If evidence hints at an issue but cannot safely support the stated claim, mark `insufficient_evidence`.
-- Do not infer unstated behavior.
-
-Return JSON:
-{
-  "validation": "validated|contradicted|insufficient_evidence",
-  "reason": "one short sentence"
-}"#;
-
-    let user = format!(
-        "{}\n\nSUGGESTION SUMMARY:\n{}\n\nTECHNICAL DETAIL:\n{}\n\nEVIDENCE:\n{}\n\nDecide whether the suggestion is supported by the evidence only.",
-        memory_section,
-        suggestion.summary,
-        suggestion.detail.as_deref().unwrap_or(""),
-        evidence_block
-    );
-
-    let response = call_validation_structured_with_fallback::<SuggestionValidationJson>(
-        system,
-        &user,
-        validation_model,
-        "suggestion_validation",
-        suggestion_validation_schema(),
-        max_tokens,
-        timeout_ms,
-    )
-    .await?;
-
-    let reason = truncate_str(response.data.reason.trim(), 180).to_string();
-    if is_unusable_validation_reason(&reason) {
-        return Ok((
-            SuggestionValidationState::Rejected,
-            BATCH_RETRY_NO_REASON_REASON.to_string(),
-            response.usage,
-            Some(ValidationRejectClass::Transport),
-        ));
-    }
-
-    let normalized = response.data.validation.trim().to_lowercase();
-    let (state, reject_class) = parse_validation_state(normalized.as_str());
-    let (state, reject_class) = reconcile_validation_from_reason(state, reject_class, &reason);
-
-    Ok((state, reason, response.usage, reject_class))
-}
-
-async fn rewrite_overclaim_suggestion_with_model(
-    suggestion: &Suggestion,
-    memory_section: &str,
-    model: Model,
-    max_tokens: u32,
-    timeout_ms: u64,
-) -> anyhow::Result<(Suggestion, Option<Usage>)> {
-    let evidence_block = build_validation_evidence_block(suggestion);
-
-    let system = r#"You rewrite suggestions to be strictly evidence-grounded.
-Use only the provided snippet evidence.
-- Keep the same core issue.
-- Remove speculative user-impact claims and assumptions.
-- Keep wording concise and concrete.
-
-Return JSON:
-{
-  "summary": "one sentence, no speculation",
-  "detail": "short technical detail grounded in evidence"
-}"#;
-
-    let user = format!(
-        "{}\n\nCURRENT SUMMARY:\n{}\n\nCURRENT DETAIL:\n{}\n\nEVIDENCE:\n{}\n\nRewrite this suggestion conservatively so every claim is directly supported by evidence.",
-        memory_section,
-        suggestion.summary,
-        suggestion.detail.as_deref().unwrap_or(""),
-        evidence_block
-    );
-
-    let response = call_llm_structured_limited::<OverclaimRewriteJson>(
-        system,
-        &user,
-        model,
-        "overclaim_rewrite",
-        suggestion_overclaim_rewrite_schema(),
-        max_tokens,
-        timeout_ms,
-    )
-    .await?;
-
-    let mut rewritten = suggestion.clone();
-    let rewritten_summary = scrub_user_summary(response.data.summary.trim());
-    let summary_seed = if rewritten_summary.is_empty() {
-        suggestion.summary.clone()
-    } else {
-        rewritten_summary
-    };
-    let rewritten_detail = response.data.detail.trim().to_string();
-    let detail_seed = if rewritten_detail.is_empty() {
-        suggestion.detail.as_deref().unwrap_or("").to_string()
-    } else {
-        rewritten_detail
-    };
-    let normalized_detail = normalize_grounded_detail(&detail_seed, &summary_seed);
-    let normalized_summary = normalize_grounded_summary(
-        &summary_seed,
-        &normalized_detail,
-        suggestion.line.unwrap_or_default(),
-    );
-    rewritten.summary = if normalized_summary.is_empty() {
-        suggestion.summary.clone()
-    } else {
-        normalized_summary
-    };
-    rewritten.detail = Some(normalized_detail);
-    Ok((rewritten, response.usage))
+    out
 }
 
 fn append_suggestion_quality_record(
@@ -3249,21 +1914,6 @@ fn append_suggestion_quality_record(
     reason: Option<String>,
     rejection_stats: Option<&ValidationRejectionStats>,
 ) {
-    let batch_missing_index_count = rejection_stats
-        .map(|stats| stats.batch_missing_index_count)
-        .unwrap_or(0);
-    let batch_no_reason_count = rejection_stats
-        .map(|stats| stats.batch_no_reason_count)
-        .unwrap_or(0);
-    let transport_retry_count = rejection_stats
-        .map(|stats| stats.transport_retry_count)
-        .unwrap_or(0);
-    let transport_recovered_count = rejection_stats
-        .map(|stats| stats.transport_recovered_count)
-        .unwrap_or(0);
-    let rewrite_recovered_count = rejection_stats
-        .map(|stats| stats.rewrite_recovered_count)
-        .unwrap_or(0);
     let prevalidation_contradiction_count = rejection_stats
         .map(|stats| stats.prevalidation_contradiction_count)
         .unwrap_or(0);
@@ -3279,557 +1929,14 @@ fn append_suggestion_quality_record(
         validation_outcome: outcome.to_string(),
         validation_reason: reason,
         user_verify_outcome: None,
-        batch_missing_index_count,
-        batch_no_reason_count,
-        transport_retry_count,
-        transport_recovered_count,
-        rewrite_recovered_count,
+        batch_missing_index_count: 0,
+        batch_no_reason_count: 0,
+        transport_retry_count: 0,
+        transport_recovered_count: 0,
+        rewrite_recovered_count: 0,
         prevalidation_contradiction_count,
     };
     let _ = cache.append_suggestion_quality(&record);
-}
-
-type ValidationOutcome = (
-    usize,
-    Suggestion,
-    usize,
-    SuggestionValidationState,
-    String,
-    Option<Usage>,
-    Option<ValidationRejectClass>,
-);
-
-type BatchValidationDecision = (
-    SuggestionValidationState,
-    String,
-    Option<ValidationRejectClass>,
-);
-
-#[derive(Debug, Clone, Default)]
-struct BatchValidationMapStats {
-    missing_index_count: usize,
-    no_reason_count: usize,
-}
-
-fn sort_validation_outcomes(outcomes: &mut [ValidationOutcome]) {
-    outcomes.sort_by_key(|(idx, _, _, _, _, _, _)| *idx);
-}
-
-fn infer_validation_reject_class(
-    reason: &str,
-    reject_class: Option<ValidationRejectClass>,
-) -> ValidationRejectClass {
-    if let Some(class) = reject_class {
-        return class;
-    }
-    let lowered = reason.to_ascii_lowercase();
-    if lowered.starts_with("validation failed:")
-        || lowered.starts_with("validation retry needed:")
-        || reason_indicates_transport_failure(&lowered)
-    {
-        ValidationRejectClass::Transport
-    } else if reason_indicates_insufficient_evidence(&lowered) {
-        ValidationRejectClass::InsufficientEvidence
-    } else if lowered.contains("assumption")
-        || lowered.contains("beyond evidence")
-        || lowered.contains("business impact")
-    {
-        ValidationRejectClass::Contradicted
-    } else if lowered.contains("insufficient") {
-        ValidationRejectClass::InsufficientEvidence
-    } else {
-        ValidationRejectClass::Other
-    }
-}
-
-fn map_batch_validation_response(
-    chunk_len: usize,
-    response: SuggestionBatchValidationJson,
-) -> (Vec<BatchValidationDecision>, BatchValidationMapStats) {
-    let mut decisions: Vec<Option<BatchValidationDecision>> = vec![None; chunk_len];
-    let mut stats = BatchValidationMapStats::default();
-
-    for item in response.validations {
-        if item.local_index >= chunk_len || decisions[item.local_index].is_some() {
-            continue;
-        }
-
-        if is_unusable_validation_reason(&item.reason) {
-            stats.no_reason_count += 1;
-            decisions[item.local_index] = Some((
-                SuggestionValidationState::Rejected,
-                BATCH_RETRY_NO_REASON_REASON.to_string(),
-                Some(ValidationRejectClass::Transport),
-            ));
-            continue;
-        }
-        let normalized = item.validation.trim().to_ascii_lowercase();
-        let reason = truncate_str(item.reason.trim(), 180).to_string();
-        let (state, reject_class) = parse_validation_state(normalized.as_str());
-        let (state, reject_class) = reconcile_validation_from_reason(state, reject_class, &reason);
-        decisions[item.local_index] = Some((state, reason, reject_class));
-    }
-
-    let mapped = decisions
-        .into_iter()
-        .map(|decision| {
-            decision.unwrap_or((
-                SuggestionValidationState::Rejected,
-                BATCH_RETRY_MISSING_RESULT_REASON.to_string(),
-                Some(ValidationRejectClass::Transport),
-            ))
-        })
-        .collect::<Vec<_>>();
-    stats.missing_index_count = mapped
-        .iter()
-        .filter(|(_, reason, class)| {
-            reason.as_str() == BATCH_RETRY_MISSING_RESULT_REASON
-                && matches!(class, Some(ValidationRejectClass::Transport))
-        })
-        .count();
-    (mapped, stats)
-}
-
-fn is_retry_needed_batch_reason(reason: &str) -> bool {
-    reason == BATCH_RETRY_MISSING_RESULT_REASON || reason == BATCH_RETRY_NO_REASON_REASON
-}
-
-async fn validate_suggestions_batch_with_model_budget(
-    chunk: &[(usize, Suggestion, usize)],
-    memory_section: &str,
-    validation_model: Model,
-    max_tokens: u32,
-    timeout_ms: u64,
-) -> anyhow::Result<(
-    Vec<BatchValidationDecision>,
-    Option<Usage>,
-    BatchValidationMapStats,
-)> {
-    if chunk.is_empty() {
-        return Ok((Vec::new(), None, BatchValidationMapStats::default()));
-    }
-
-    let system = r#"You are a strict evidence-grounded suggestion validator.
-Validate each suggestion independently using ONLY its evidence snippets.
-
-Validation rubric:
-- Mark `validated` only if the suggestion claim is directly supported by evidence.
-- If the suggestion makes assumptions beyond snippets (UI behavior, user state, rollback needs, business impact), mark `contradicted`.
-- If evidence hints at an issue but cannot safely support the stated claim, mark `insufficient_evidence`.
-- Do not infer unstated behavior.
-
-Return JSON:
-{
-  "validations": [
-    {
-      "local_index": 0,
-      "validation": "validated|contradicted|insufficient_evidence",
-      "reason": "one short sentence"
-    }
-  ]
-}"#;
-
-    let mut user = String::new();
-    user.push_str(memory_section);
-    user.push_str("\n\nValidate all items below and return one result for each local_index.\n");
-
-    for (local_index, (_idx, suggestion, _attempts)) in chunk.iter().enumerate() {
-        user.push_str(&format!(
-            "\nITEM {local_index}\nSUGGESTION SUMMARY:\n{summary}\n\nTECHNICAL DETAIL:\n{detail}\n\nEVIDENCE:\n{evidence}\n",
-            local_index = local_index,
-            summary = suggestion.summary,
-            detail = suggestion.detail.as_deref().unwrap_or(""),
-            evidence = build_validation_evidence_block(suggestion)
-        ));
-    }
-
-    let response = call_validation_structured_with_fallback::<SuggestionBatchValidationJson>(
-        system,
-        &user,
-        validation_model,
-        "suggestion_batch_validation",
-        suggestion_batch_validation_schema(chunk.len().saturating_sub(1)),
-        max_tokens,
-        timeout_ms,
-    )
-    .await?;
-
-    let (mapped, stats) = map_batch_validation_response(chunk.len(), response.data);
-    Ok((mapped, response.usage, stats))
-}
-
-async fn try_overclaim_rewrite_revalidation(
-    suggestion: &Suggestion,
-    memory_section: &str,
-    validation_model: Model,
-    validation_deadline: std::time::Instant,
-) -> Option<(
-    Suggestion,
-    String,
-    Option<Usage>,
-    SuggestionValidationState,
-    Option<ValidationRejectClass>,
-)> {
-    if std::time::Instant::now() >= validation_deadline {
-        return None;
-    }
-
-    let (rewritten, rewrite_usage) = rewrite_overclaim_suggestion_with_model(
-        suggestion,
-        memory_section,
-        Model::Speed,
-        OVERCLAIM_REWRITE_MAX_TOKENS,
-        OVERCLAIM_REWRITE_TIMEOUT_MS,
-    )
-    .await
-    .ok()?;
-
-    let remaining_ms = remaining_validation_budget_ms(validation_deadline);
-    let timeout_ms = remaining_ms.min(OVERCLAIM_REVALIDATE_TIMEOUT_MS);
-    if timeout_ms == 0 {
-        return Some((
-            rewritten,
-            "Validation failed: deadline exceeded".to_string(),
-            rewrite_usage,
-            SuggestionValidationState::Rejected,
-            Some(ValidationRejectClass::Transport),
-        ));
-    }
-
-    let validation = validate_suggestion_with_model_budget(
-        &rewritten,
-        memory_section,
-        validation_model,
-        OVERCLAIM_REVALIDATE_MAX_TOKENS,
-        timeout_ms,
-    )
-    .await;
-
-    match validation {
-        Ok((state, reason, validate_usage, reject_class)) => Some((
-            rewritten,
-            reason,
-            merge_usage(rewrite_usage, validate_usage),
-            state,
-            reject_class,
-        )),
-        Err(err) => Some((
-            rewritten,
-            format!(
-                "Validation failed after rewrite: {}",
-                truncate_str(&err.to_string(), 120)
-            ),
-            rewrite_usage,
-            SuggestionValidationState::Rejected,
-            Some(ValidationRejectClass::Transport),
-        )),
-    }
-}
-
-fn should_smart_rewrite_suggestion(
-    suggestion: &Suggestion,
-    min_implementation_readiness_score: f32,
-) -> bool {
-    let score = suggestion.implementation_readiness_score.unwrap_or(0.0);
-    (score >= min_implementation_readiness_score && score <= SMART_REWRITE_READINESS_UPPER_BOUND)
-        || has_overclaim_wording(suggestion)
-}
-
-async fn apply_selective_smart_rewrites(
-    validated: Vec<Suggestion>,
-    memory_section: &str,
-    min_implementation_readiness_score: f32,
-    max_smart_rewrites_per_run: usize,
-    validation_model: Model,
-    validation_deadline: std::time::Instant,
-) -> (Vec<Suggestion>, usize, Option<Usage>) {
-    if validated.is_empty() || max_smart_rewrites_per_run == 0 {
-        return (validated, 0, None);
-    }
-
-    let mut rewrites = 0usize;
-    let mut usage: Option<Usage> = None;
-    let mut out = Vec::with_capacity(validated.len());
-
-    for suggestion in validated {
-        if rewrites >= max_smart_rewrites_per_run
-            || !should_smart_rewrite_suggestion(&suggestion, min_implementation_readiness_score)
-        {
-            out.push(suggestion);
-            continue;
-        }
-
-        let rewrite_timeout_ms = remaining_validation_budget_ms(validation_deadline)
-            .clamp(1, SMART_BORDERLINE_REWRITE_TIMEOUT_MS);
-
-        let rewrite = rewrite_overclaim_suggestion_with_model(
-            &suggestion,
-            memory_section,
-            Model::Smart,
-            SMART_BORDERLINE_REWRITE_MAX_TOKENS,
-            rewrite_timeout_ms,
-        )
-        .await;
-        let (rewritten, rewrite_usage) = match rewrite {
-            Ok(value) => value,
-            Err(_) => {
-                out.push(suggestion);
-                continue;
-            }
-        };
-        usage = merge_usage(usage, rewrite_usage);
-
-        let validate_timeout_ms = remaining_validation_budget_ms(validation_deadline)
-            .clamp(1, OVERCLAIM_REVALIDATE_TIMEOUT_MS);
-        let revalidated = validate_suggestion_with_model_budget(
-            &rewritten,
-            memory_section,
-            validation_model,
-            OVERCLAIM_REVALIDATE_MAX_TOKENS,
-            validate_timeout_ms,
-        )
-        .await;
-        match revalidated {
-            Ok((SuggestionValidationState::Validated, _reason, validate_usage, _class)) => {
-                usage = merge_usage(usage, validate_usage);
-                rewrites += 1;
-                let mut rewritten_valid = rewritten;
-                rewritten_valid.validation_state = SuggestionValidationState::Validated;
-                out.push(rewritten_valid);
-            }
-            Ok((_state, _reason, validate_usage, _class)) => {
-                usage = merge_usage(usage, validate_usage);
-                out.push(suggestion);
-            }
-            Err(_) => {
-                out.push(suggestion);
-            }
-        }
-    }
-
-    (out, rewrites, usage)
-}
-
-async fn run_validation_attempts(
-    chunk: Vec<(usize, Suggestion, usize)>,
-    memory_section: &str,
-    validation_model: Model,
-    validation_deadline: std::time::Instant,
-    per_call_timeout_ms: u64,
-    rejection_stats: &mut ValidationRejectionStats,
-) -> Vec<ValidationOutcome> {
-    if chunk.is_empty() {
-        return Vec::new();
-    }
-
-    let remaining_budget = validation_deadline.saturating_duration_since(std::time::Instant::now());
-    if remaining_budget.is_zero() {
-        return chunk
-            .into_iter()
-            .map(|(idx, suggestion, attempts)| {
-                (
-                    idx,
-                    suggestion,
-                    attempts,
-                    SuggestionValidationState::Rejected,
-                    "Validation failed: deadline exceeded".to_string(),
-                    None,
-                    Some(ValidationRejectClass::Transport),
-                )
-            })
-            .collect();
-    }
-
-    if chunk.len() > 1 {
-        let remaining_budget_ms = remaining_budget.as_millis() as u64;
-        let batch_timeout_ms = remaining_budget_ms
-            .min(per_call_timeout_ms.saturating_add(VALIDATOR_BATCH_TIMEOUT_BUFFER_MS));
-        if batch_timeout_ms > 0 {
-            let dynamic_tokens = VALIDATOR_MAX_TOKENS.saturating_mul(chunk.len() as u32);
-            let batch_tokens =
-                dynamic_tokens.clamp(VALIDATOR_MAX_TOKENS, VALIDATOR_BATCH_MAX_TOKENS);
-            let batch_call = tokio::time::timeout(
-                std::time::Duration::from_millis(batch_timeout_ms),
-                validate_suggestions_batch_with_model_budget(
-                    &chunk,
-                    memory_section,
-                    validation_model,
-                    batch_tokens,
-                    batch_timeout_ms,
-                ),
-            )
-            .await;
-
-            if let Ok(Ok((decisions, batch_usage, map_stats))) = batch_call {
-                rejection_stats.batch_missing_index_count += map_stats.missing_index_count;
-                rejection_stats.batch_no_reason_count += map_stats.no_reason_count;
-                let mut usage_slot = batch_usage;
-                let mut outcomes: Vec<ValidationOutcome> = Vec::with_capacity(chunk.len());
-                for ((idx, suggestion, attempts), (state, reason, reject_class)) in
-                    chunk.into_iter().zip(decisions.into_iter())
-                {
-                    let mut call_usage = usage_slot.take();
-                    if state == SuggestionValidationState::Rejected
-                        && matches!(reject_class, Some(ValidationRejectClass::Transport))
-                        && is_retry_needed_batch_reason(&reason)
-                    {
-                        let remaining = validation_deadline
-                            .saturating_duration_since(std::time::Instant::now());
-                        let timeout =
-                            remaining.min(std::time::Duration::from_millis(per_call_timeout_ms));
-                        let timeout_ms = timeout.as_millis() as u64;
-                        let fallback = if timeout.is_zero() {
-                            (
-                                SuggestionValidationState::Rejected,
-                                "Validation failed: deadline exceeded".to_string(),
-                                None,
-                                Some(ValidationRejectClass::Transport),
-                            )
-                        } else {
-                            match tokio::time::timeout(
-                                timeout,
-                                validate_suggestion_with_model_budget(
-                                    &suggestion,
-                                    memory_section,
-                                    validation_model,
-                                    VALIDATOR_MAX_TOKENS,
-                                    timeout_ms,
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(Ok(result)) => result,
-                                Ok(Err(err)) => (
-                                    SuggestionValidationState::Rejected,
-                                    format!(
-                                        "Validation failed: {}",
-                                        truncate_str(&err.to_string(), 120)
-                                    ),
-                                    None,
-                                    Some(ValidationRejectClass::Transport),
-                                ),
-                                Err(_) => (
-                                    SuggestionValidationState::Rejected,
-                                    "Validation failed: deadline exceeded".to_string(),
-                                    None,
-                                    Some(ValidationRejectClass::Transport),
-                                ),
-                            }
-                        };
-                        let (fallback_state, fallback_reason, fallback_usage, fallback_class) =
-                            fallback;
-                        if attempts == 0
-                            && (fallback_state == SuggestionValidationState::Validated
-                                || !matches!(
-                                    fallback_class,
-                                    Some(ValidationRejectClass::Transport)
-                                ))
-                        {
-                            rejection_stats.transport_recovered_count += 1;
-                        }
-                        call_usage = merge_usage(call_usage, fallback_usage);
-                        outcomes.push((
-                            idx,
-                            suggestion,
-                            attempts,
-                            fallback_state,
-                            fallback_reason,
-                            call_usage,
-                            fallback_class,
-                        ));
-                        continue;
-                    }
-
-                    outcomes.push((
-                        idx,
-                        suggestion,
-                        attempts,
-                        state,
-                        reason,
-                        call_usage,
-                        reject_class,
-                    ));
-                }
-                sort_validation_outcomes(&mut outcomes);
-                return outcomes;
-            }
-        }
-    }
-
-    let memory_section_owned = memory_section.to_string();
-    let mut outcomes: Vec<ValidationOutcome> =
-        join_all(chunk.into_iter().map(|(idx, suggestion, attempts)| {
-            let memory_section = memory_section_owned.clone();
-            let deadline = validation_deadline;
-            async move {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    return (
-                        idx,
-                        suggestion,
-                        attempts,
-                        SuggestionValidationState::Rejected,
-                        "Validation failed: deadline exceeded".to_string(),
-                        None,
-                        Some(ValidationRejectClass::Transport),
-                    );
-                }
-
-                let timeout = remaining.min(std::time::Duration::from_millis(per_call_timeout_ms));
-                if timeout.is_zero() {
-                    return (
-                        idx,
-                        suggestion,
-                        attempts,
-                        SuggestionValidationState::Rejected,
-                        "Validation failed: deadline exceeded".to_string(),
-                        None,
-                        Some(ValidationRejectClass::Transport),
-                    );
-                }
-
-                let timeout_ms = timeout.as_millis() as u64;
-                let (state, reason, call_usage, reject_class) = match tokio::time::timeout(
-                    timeout,
-                    validate_suggestion_with_model_budget(
-                        &suggestion,
-                        &memory_section,
-                        validation_model,
-                        VALIDATOR_MAX_TOKENS,
-                        timeout_ms,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(err)) => (
-                        SuggestionValidationState::Rejected,
-                        format!("Validation failed: {}", truncate_str(&err.to_string(), 120)),
-                        None,
-                        Some(ValidationRejectClass::Transport),
-                    ),
-                    Err(_) => (
-                        SuggestionValidationState::Rejected,
-                        "Validation failed: deadline exceeded".to_string(),
-                        None,
-                        Some(ValidationRejectClass::Transport),
-                    ),
-                };
-
-                (
-                    idx,
-                    suggestion,
-                    attempts,
-                    state,
-                    reason,
-                    call_usage,
-                    reject_class,
-                )
-            }
-        }))
-        .await;
-    sort_validation_outcomes(&mut outcomes);
-    outcomes
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3844,21 +1951,14 @@ fn record_rejected_validation(
     rejected_evidence_ids: &mut HashSet<usize>,
 ) {
     *rejected_count += 1;
-    if reason.to_ascii_lowercase().contains("deadline exceeded") {
-        rejection_stats.deadline_exceeded = true;
-    }
     match class {
-        ValidationRejectClass::Contradicted => rejection_stats.validator_contradicted += 1,
         ValidationRejectClass::InsufficientEvidence => {
             rejection_stats.validator_insufficient_evidence += 1
         }
-        ValidationRejectClass::Transport => rejection_stats.validator_transport += 1,
         ValidationRejectClass::Other => rejection_stats.validator_other += 1,
     }
-    if !matches!(class, ValidationRejectClass::Transport) {
-        if let Some(eid) = primary_evidence_id(suggestion) {
-            rejected_evidence_ids.insert(eid);
-        }
+    if let Some(eid) = primary_evidence_id(suggestion) {
+        rejected_evidence_ids.insert(eid);
     }
     suggestion.validation_state = SuggestionValidationState::Rejected;
     let outcome = if matches!(class, ValidationRejectClass::InsufficientEvidence) {
@@ -3887,8 +1987,6 @@ fn primary_evidence_id(suggestion: &Suggestion) -> Option<usize> {
 struct PrevalidationDecision {
     reason: String,
     evidence_id: Option<usize>,
-    block_for_regeneration: bool,
-    rewrite_candidate: bool,
     is_contradiction: bool,
 }
 
@@ -3901,8 +1999,6 @@ fn prevalidation_rejection_reason(
         return Some(PrevalidationDecision {
             reason: "Missing primary evidence ref before validation".to_string(),
             evidence_id: None,
-            block_for_regeneration: false,
-            rewrite_candidate: false,
             is_contradiction: false,
         });
     };
@@ -3912,8 +2008,6 @@ fn prevalidation_rejection_reason(
             reason: "Duplicate evidence_id already validated; skipped before validation"
                 .to_string(),
             evidence_id: Some(evidence_id),
-            block_for_regeneration: false,
-            rewrite_candidate: false,
             is_contradiction: false,
         });
     }
@@ -3923,8 +2017,6 @@ fn prevalidation_rejection_reason(
             reason: "Duplicate evidence_id in validation batch; skipped before validation"
                 .to_string(),
             evidence_id: Some(evidence_id),
-            block_for_regeneration: false,
-            rewrite_candidate: false,
             is_contradiction: false,
         });
     }
@@ -3933,8 +2025,6 @@ fn prevalidation_rejection_reason(
         return Some(PrevalidationDecision {
             reason,
             evidence_id: Some(evidence_id),
-            block_for_regeneration: false,
-            rewrite_candidate: false,
             is_contradiction: true,
         });
     }
@@ -3943,8 +2033,14 @@ fn prevalidation_rejection_reason(
         return Some(PrevalidationDecision {
             reason,
             evidence_id: Some(evidence_id),
-            block_for_regeneration: false,
-            rewrite_candidate: true,
+            is_contradiction: false,
+        });
+    }
+
+    if let Some(reason) = deterministic_prevalidation_ethos_reason(suggestion) {
+        return Some(PrevalidationDecision {
+            reason,
+            evidence_id: Some(evidence_id),
             is_contradiction: false,
         });
     }
@@ -4254,6 +2350,122 @@ fn snippet_has_explicit_non_security_handling(snippet: &str) -> bool {
     explicit_error_handling || explicit_retry_handling || explicit_ordering
 }
 
+fn summary_contains_internal_references(summary: &str) -> bool {
+    let lower = summary.to_ascii_lowercase();
+    summary.contains('`')
+        || summary.contains("::")
+        || summary.contains("->")
+        || lower.contains(".rs")
+        || lower.contains(".ts")
+        || lower.contains(".js")
+        || lower.contains(".py")
+        || lower.contains("src/")
+        || lower.contains("crates/")
+        || lower.contains("line ")
+}
+
+fn summary_has_visible_runtime_outcome(summary: &str) -> bool {
+    let lower = summary.to_ascii_lowercase();
+    [
+        "fails",
+        "failure",
+        "error",
+        "errors",
+        "crash",
+        "panic",
+        "hang",
+        "stuck",
+        "timeout",
+        "times out",
+        "returns",
+        "wrong",
+        "incorrect",
+        "duplicate",
+        "missing",
+        "drops",
+        "lost",
+        "blocked",
+        "cannot",
+        "can't",
+        "does not",
+        "doesn't",
+        "slow",
+        "latency",
+        "inconsistent",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn detail_is_concrete_enough(detail: &str) -> bool {
+    if detail.trim().len() < 40 {
+        return false;
+    }
+    let lower = detail.to_ascii_lowercase();
+    [
+        "because", "when", "if", "without", "after", "before", "causes", "causing", "returns",
+        "throws", "panic", "retry", "guard", "validate", "handle", "log",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn deterministic_prevalidation_ethos_reason(suggestion: &Suggestion) -> Option<String> {
+    let has_evidence_text = suggestion
+        .evidence
+        .as_deref()
+        .map(str::trim)
+        .map(|text| !text.is_empty())
+        .unwrap_or(false);
+    if !has_evidence_text {
+        return None;
+    }
+
+    let summary = suggestion.summary.trim();
+    let detail = suggestion.detail.as_deref().unwrap_or("").trim();
+    let observed_behavior = suggestion
+        .validation_metadata
+        .claim_observed_behavior
+        .as_deref()
+        .unwrap_or("")
+        .trim();
+    if summary.is_empty() {
+        return Some("Non-actionable summary: missing user-facing description.".to_string());
+    }
+    if summary_contains_internal_references(summary) {
+        return Some(
+            "Summary violates plain-language ethos: remove file paths or code-symbol jargon."
+                .to_string(),
+        );
+    }
+    if !summary_has_visible_runtime_outcome(summary)
+        && !summary_has_visible_runtime_outcome(detail)
+        && !summary_has_visible_runtime_outcome(observed_behavior)
+    {
+        return Some(
+            "Summary lacks clear real-world outcome: explain what goes wrong for users."
+                .to_string(),
+        );
+    }
+
+    if !detail_is_concrete_enough(detail) {
+        return Some(
+            "Detail is not actionable enough: describe concrete cause and change direction."
+                .to_string(),
+        );
+    }
+
+    let specificity = description_specificity_score(suggestion);
+    if specificity < 0.60 {
+        return Some(
+            "Description is too generic for safe action; add concrete behavior and cause."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
 fn deterministic_prevalidation_contradiction_reason(suggestion: &Suggestion) -> Option<String> {
     let snippet = suggestion.evidence.as_deref()?;
     let claim = normalize_claim_text_for_matching(&format!(
@@ -4328,83 +2540,6 @@ fn deterministic_prevalidation_non_actionable_reason(suggestion: &Suggestion) ->
     None
 }
 
-fn snippet_contains_empty_catch(snippet: &str) -> bool {
-    let mut code_lines = Vec::new();
-    for line in snippet.lines() {
-        let code = snippet_code_line(line);
-        code_lines.push(code.trim().to_string());
-    }
-
-    for idx in 0..code_lines.len() {
-        let line = code_lines[idx].to_ascii_lowercase();
-        if line.contains("catch {}") || line.contains("catch{}") {
-            return true;
-        }
-        if !line.contains("catch") || !line.contains('{') {
-            continue;
-        }
-        let after_brace = line
-            .split_once('{')
-            .map(|(_, rest)| rest.trim())
-            .unwrap_or("");
-        if !after_brace.is_empty() && after_brace != "}" {
-            continue;
-        }
-
-        let mut next_idx = idx + 1;
-        while next_idx < code_lines.len() {
-            let next = code_lines[next_idx].trim();
-            if next.is_empty() || next.starts_with("//") {
-                next_idx += 1;
-                continue;
-            }
-            if next == "}" {
-                return true;
-            }
-            break;
-        }
-    }
-
-    false
-}
-
-fn has_silent_error_language(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    [
-        "silent",
-        "silently",
-        "ignored",
-        "swallow",
-        "not logged",
-        "without logging",
-        "hidden error",
-        "not captured",
-        "not reported",
-        "go unnoticed",
-        "suppressed errors",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn has_high_speculation_impact_language(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    [
-        "revenue",
-        "profit",
-        "spam",
-        "phishing",
-        "chargeback",
-        "lawsuit",
-        "financial loss",
-        "support tickets",
-        "support requests",
-        "customer churn",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
 fn snippet_identifier_tokens(snippet: &str) -> HashSet<String> {
     let mut tokens = HashSet::new();
     for line in snippet.lines() {
@@ -4465,34 +2600,8 @@ fn claim_tokens_grounded_in_snippet(snippet: &str, claim_text: &str) -> bool {
 
     let overlap = claim_tokens.intersection(&snippet_tokens).count();
     let overlap_ratio = overlap as f64 / claim_tokens.len() as f64;
-    overlap >= 1 && overlap_ratio >= 0.40
-}
-
-fn deterministic_auto_validation_reason(suggestion: &Suggestion) -> Option<String> {
-    let snippet = suggestion.evidence.as_deref()?;
-    if !snippet_contains_empty_catch(snippet) {
-        return None;
-    }
-
-    let summary = suggestion.summary.as_str();
-    let detail = suggestion.detail.as_deref().unwrap_or("");
-    let combined = format!("{} {}", summary, detail);
-    if !has_silent_error_language(&combined) {
-        return None;
-    }
-    if has_high_speculation_impact_language(summary) {
-        return None;
-    }
-    if has_overclaim_wording(suggestion) {
-        return None;
-    }
-    if !claim_tokens_grounded_in_snippet(snippet, &combined) {
-        return None;
-    }
-
-    Some(
-        "Deterministic validation: snippet shows an empty catch block, summary describes silent handling, and claim terms are grounded in snippet tokens.".to_string(),
-    )
+    let min_ratio = if claim_tokens.len() <= 8 { 0.10 } else { 0.15 };
+    overlap >= 2 || (overlap >= 1 && overlap_ratio >= min_ratio)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4502,24 +2611,10 @@ fn accept_validated_suggestion(
     mut suggestion: Suggestion,
     reason: String,
     validated: &mut Vec<Suggestion>,
-    used_evidence_ids: &mut HashSet<usize>,
     rejected_count: &mut usize,
     rejection_stats: &mut ValidationRejectionStats,
 ) -> bool {
-    if let Some(eid) = primary_evidence_id(&suggestion) {
-        if used_evidence_ids.insert(eid) {
-            suggestion.validation_state = SuggestionValidationState::Validated;
-            append_suggestion_quality_record(
-                cache,
-                run_id,
-                &suggestion,
-                "validated",
-                Some(reason),
-                Some(rejection_stats),
-            );
-            validated.push(suggestion);
-            return true;
-        }
+    if primary_evidence_id(&suggestion).is_none() {
         *rejected_count += 1;
         rejection_stats.prevalidation += 1;
         suggestion.validation_state = SuggestionValidationState::Rejected;
@@ -4528,574 +2623,235 @@ fn accept_validated_suggestion(
             run_id,
             &suggestion,
             "rejected",
-            Some("Duplicate evidence_id after validation".to_string()),
+            Some("Missing evidence refs after validation".to_string()),
             Some(rejection_stats),
         );
         return false;
     }
 
-    *rejected_count += 1;
-    rejection_stats.prevalidation += 1;
-    suggestion.validation_state = SuggestionValidationState::Rejected;
+    suggestion.validation_state = SuggestionValidationState::Validated;
+    suggestion.verification_state = VerificationState::Verified;
     append_suggestion_quality_record(
         cache,
         run_id,
         &suggestion,
-        "rejected",
-        Some("Missing evidence refs after validation".to_string()),
+        "validated",
+        Some(reason),
         Some(rejection_stats),
     );
-    false
+    validated.push(suggestion);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn validate_batch_suggestions(
-    batch: Vec<Suggestion>,
-    memory_section: &str,
-    validation_model: Model,
-    cache: &cosmos_adapters::cache::Cache,
-    run_id: &str,
-    validated: &mut Vec<Suggestion>,
-    rejected_count: &mut usize,
-    used_evidence_ids: &mut HashSet<usize>,
-    rejected_evidence_ids: &mut HashSet<usize>,
-    validation_deadline: std::time::Instant,
-    rejection_stats: &mut ValidationRejectionStats,
-) -> Option<Usage> {
-    let mut usage: Option<Usage> = None;
-    let mut queue: Vec<(usize, Suggestion, usize)> = batch
-        .into_iter()
-        .enumerate()
-        .map(|(idx, suggestion)| (idx, suggestion, 0))
-        .collect();
-    while !queue.is_empty() {
-        if std::time::Instant::now() >= validation_deadline {
-            rejection_stats.deadline_exceeded = true;
-            break;
-        }
-        if validated.len() >= FAST_GROUNDED_VALIDATED_POOL_MAX {
-            break;
-        }
-        let chunk_size = VALIDATION_CONCURRENCY.min(queue.len());
-        let raw_chunk: Vec<(usize, Suggestion, usize)> = queue.drain(..chunk_size).collect();
-        let mut chunk = Vec::new();
-        let mut chunk_seen_evidence_ids: HashSet<usize> = HashSet::new();
-
-        for (idx, mut suggestion, attempts) in raw_chunk {
-            if let Some(prevalidation) = prevalidation_rejection_reason(
-                &suggestion,
-                used_evidence_ids,
-                &mut chunk_seen_evidence_ids,
-            ) {
-                if prevalidation.rewrite_candidate {
-                    suggestion
-                        .implementation_risk_flags
-                        .push("prevalidation_non_actionable_rewrite_candidate".to_string());
-                    chunk.push((idx, suggestion, attempts));
-                    continue;
-                }
-                *rejected_count += 1;
-                rejection_stats.prevalidation += 1;
-                if prevalidation.is_contradiction {
-                    rejection_stats.prevalidation_contradiction_count += 1;
-                }
-                if prevalidation.block_for_regeneration {
-                    if let Some(eid) = prevalidation.evidence_id {
-                        rejected_evidence_ids.insert(eid);
-                    }
-                }
-                suggestion.validation_state = SuggestionValidationState::Rejected;
-                append_suggestion_quality_record(
-                    cache,
-                    run_id,
-                    &suggestion,
-                    "rejected",
-                    Some(prevalidation.reason),
-                    Some(rejection_stats),
-                );
-                continue;
-            }
-
-            if let Some(reason) = deterministic_auto_validation_reason(&suggestion) {
-                if accept_validated_suggestion(
-                    cache,
-                    run_id,
-                    suggestion,
-                    reason,
-                    validated,
-                    used_evidence_ids,
-                    rejected_count,
-                    rejection_stats,
-                ) {
-                    rejection_stats.deterministic_auto_validated += 1;
-                }
-                continue;
-            }
-            chunk.push((idx, suggestion, attempts));
-        }
-
-        if chunk.is_empty() {
-            continue;
-        }
-
-        let outcomes = run_validation_attempts(
-            chunk,
-            memory_section,
-            validation_model,
-            validation_deadline,
-            VALIDATOR_TIMEOUT_MS,
-            rejection_stats,
-        )
-        .await;
-        let mut retry_queue: Vec<(usize, Suggestion, usize)> = Vec::new();
-
-        for (idx, mut suggestion, attempts, state, reason, call_usage, reject_class) in outcomes {
-            usage = merge_usage(usage, call_usage);
-            match state {
-                SuggestionValidationState::Validated => {
-                    let _ = accept_validated_suggestion(
-                        cache,
-                        run_id,
-                        suggestion,
-                        reason,
-                        validated,
-                        used_evidence_ids,
-                        rejected_count,
-                        rejection_stats,
-                    );
-                }
-                SuggestionValidationState::Rejected => {
-                    let mut reason = reason;
-                    let mut class = infer_validation_reject_class(&reason, reject_class);
-                    if should_attempt_rewrite_revalidation(class, &reason) {
-                        rejection_stats.overclaim_rewrite_count += 1;
-                        if let Some((
-                            rewritten,
-                            rewritten_reason,
-                            rewrite_usage,
-                            rewritten_state,
-                            rewritten_reject_class,
-                        )) = try_overclaim_rewrite_revalidation(
-                            &suggestion,
-                            memory_section,
-                            validation_model,
-                            validation_deadline,
-                        )
-                        .await
-                        {
-                            usage = merge_usage(usage, rewrite_usage);
-                            if rewritten_state == SuggestionValidationState::Validated {
-                                if accept_validated_suggestion(
-                                    cache,
-                                    run_id,
-                                    rewritten,
-                                    format!("validated after rewrite: {}", rewritten_reason),
-                                    validated,
-                                    used_evidence_ids,
-                                    rejected_count,
-                                    rejection_stats,
-                                ) {
-                                    rejection_stats.overclaim_rewrite_validated_count += 1;
-                                    rejection_stats.rewrite_recovered_count += 1;
-                                }
-                                continue;
-                            }
-                            suggestion = rewritten;
-                            reason = format!("{} (after rewrite)", rewritten_reason);
-                            class = infer_validation_reject_class(&reason, rewritten_reject_class);
-                        }
-                    }
-
-                    if validated.len() < FAST_GROUNDED_VALIDATED_HARD_TARGET
-                        && should_retry_transport_rejection(class, attempts, validation_deadline)
-                    {
-                        rejection_stats.transport_retry_count += 1;
-                        retry_queue.push((idx, suggestion, attempts + 1));
-                        continue;
-                    }
-                    record_rejected_validation(
-                        cache,
-                        run_id,
-                        &mut suggestion,
-                        reason,
-                        class,
-                        rejected_count,
-                        rejection_stats,
-                        rejected_evidence_ids,
-                    );
-                }
-                SuggestionValidationState::Pending => {
-                    *rejected_count += 1;
-                    rejection_stats.validator_other += 1;
-                    if let Some(eid) = primary_evidence_id(&suggestion) {
-                        rejected_evidence_ids.insert(eid);
-                    }
-                    suggestion.validation_state = SuggestionValidationState::Rejected;
-                    append_suggestion_quality_record(
-                        cache,
-                        run_id,
-                        &suggestion,
-                        "rejected",
-                        Some("Validator returned pending".to_string()),
-                        Some(rejection_stats),
-                    );
-                }
-            }
-
-            if validated.len() >= FAST_GROUNDED_VALIDATED_HARD_TARGET {
-                break;
-            }
-        }
-
-        while !retry_queue.is_empty() {
-            if std::time::Instant::now() >= validation_deadline {
-                rejection_stats.deadline_exceeded = true;
-                break;
-            }
-            if validated.len() >= FAST_GROUNDED_VALIDATED_POOL_MAX {
-                break;
-            }
-
-            let retry_chunk_size = VALIDATION_RETRY_CONCURRENCY.min(retry_queue.len());
-            let retry_chunk: Vec<(usize, Suggestion, usize)> =
-                retry_queue.drain(..retry_chunk_size).collect();
-            let retry_outcomes = run_validation_attempts(
-                retry_chunk,
-                memory_section,
-                validation_model,
-                validation_deadline,
-                VALIDATOR_RETRY_TIMEOUT_MS,
-                rejection_stats,
-            )
-            .await;
-
-            for (_idx, mut suggestion, attempts, state, reason, call_usage, reject_class) in
-                retry_outcomes
-            {
-                usage = merge_usage(usage, call_usage);
-                match state {
-                    SuggestionValidationState::Validated => {
-                        if accept_validated_suggestion(
-                            cache,
-                            run_id,
-                            suggestion,
-                            reason,
-                            validated,
-                            used_evidence_ids,
-                            rejected_count,
-                            rejection_stats,
-                        ) && attempts > 0
-                        {
-                            rejection_stats.transport_recovered_count += 1;
-                        }
-                    }
-                    SuggestionValidationState::Rejected => {
-                        let mut reason = reason;
-                        let mut class = infer_validation_reject_class(&reason, reject_class);
-                        if should_attempt_rewrite_revalidation(class, &reason) {
-                            rejection_stats.overclaim_rewrite_count += 1;
-                            if let Some((
-                                rewritten,
-                                rewritten_reason,
-                                rewrite_usage,
-                                rewritten_state,
-                                rewritten_reject_class,
-                            )) = try_overclaim_rewrite_revalidation(
-                                &suggestion,
-                                memory_section,
-                                validation_model,
-                                validation_deadline,
-                            )
-                            .await
-                            {
-                                usage = merge_usage(usage, rewrite_usage);
-                                if rewritten_state == SuggestionValidationState::Validated {
-                                    if accept_validated_suggestion(
-                                        cache,
-                                        run_id,
-                                        rewritten,
-                                        format!("validated after rewrite: {}", rewritten_reason),
-                                        validated,
-                                        used_evidence_ids,
-                                        rejected_count,
-                                        rejection_stats,
-                                    ) {
-                                        rejection_stats.overclaim_rewrite_validated_count += 1;
-                                        rejection_stats.rewrite_recovered_count += 1;
-                                        if attempts > 0 {
-                                            rejection_stats.transport_recovered_count += 1;
-                                        }
-                                    }
-                                    continue;
-                                }
-                                suggestion = rewritten;
-                                reason = format!("{} (after rewrite)", rewritten_reason);
-                                class =
-                                    infer_validation_reject_class(&reason, rewritten_reject_class);
-                            }
-                        }
-                        record_rejected_validation(
-                            cache,
-                            run_id,
-                            &mut suggestion,
-                            reason,
-                            class,
-                            rejected_count,
-                            rejection_stats,
-                            rejected_evidence_ids,
-                        );
-                    }
-                    SuggestionValidationState::Pending => {
-                        *rejected_count += 1;
-                        rejection_stats.validator_other += 1;
-                        if let Some(eid) = primary_evidence_id(&suggestion) {
-                            rejected_evidence_ids.insert(eid);
-                        }
-                        suggestion.validation_state = SuggestionValidationState::Rejected;
-                        append_suggestion_quality_record(
-                            cache,
-                            run_id,
-                            &suggestion,
-                            "rejected",
-                            Some("Validator returned pending".to_string()),
-                            Some(rejection_stats),
-                        );
-                    }
-                }
-
-                if validated.len() >= FAST_GROUNDED_VALIDATED_HARD_TARGET {
-                    break;
-                }
-            }
-        }
-
-        if !retry_queue.is_empty() && std::time::Instant::now() >= validation_deadline {
-            rejection_stats.deadline_exceeded = true;
-            for (_idx, mut suggestion, _attempts) in retry_queue {
-                record_rejected_validation(
-                    cache,
-                    run_id,
-                    &mut suggestion,
-                    "Validation failed: deadline exceeded".to_string(),
-                    ValidationRejectClass::Transport,
-                    rejected_count,
-                    rejection_stats,
-                    rejected_evidence_ids,
-                );
-            }
-        }
-    }
-    usage
-}
-
 pub async fn analyze_codebase_fast_grounded(
     repo_root: &Path,
     index: &CodebaseIndex,
     context: &WorkContext,
-    repo_memory: Option<String>,
-    summaries: Option<&HashMap<PathBuf, String>>,
+    _repo_memory: Option<String>,
+    _summaries: Option<&HashMap<PathBuf, String>>,
     generation_model: Model,
+    generation_target: usize,
+    retry_feedback: Option<&str>,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
     let run_id = Uuid::new_v4().to_string();
-    let overall_start = std::time::Instant::now();
-    let pack_start = std::time::Instant::now();
-    let (pack, pack_stats) = build_evidence_pack(repo_root, index, context);
-    let evidence_pack_ms = pack_start.elapsed().as_millis() as u64;
-    let (sent_snippet_count, sent_bytes) = evidence_payload_metrics(&pack);
-
-    if pack.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Not enough grounded evidence items found to generate suggestions. Cosmos couldn't extract any representative code snippets from this repo."
-        ));
-    }
-
-    let memory_section =
-        format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
-    let schema = grounded_suggestion_schema(pack.len());
-    let hard_target = FAST_GROUNDED_VALIDATED_HARD_TARGET.min(pack.len());
-
-    let mut llm_ms = 0u64;
-    let mut usage = None;
-    let mut generation_errors: Vec<String> = Vec::new();
-    let mut generation_waves = 1usize;
-    let mut generation_topup_calls = 0usize;
-    let mut raw_items: Vec<FastGroundedSuggestionJson> = Vec::new();
-
-    let primary_start = std::time::Instant::now();
-    let request_max = PRIMARY_REQUEST_MAX.min(pack.len()).max(1);
-    let request_min = PRIMARY_REQUEST_MIN.min(request_max).max(1);
-    let primary_result = call_grounded_suggestions_with_fallback(
-        FAST_GROUNDED_SUGGESTIONS_SYSTEM,
-        &format_grounded_user_prompt(
-            &memory_section,
-            index,
-            summaries,
-            &pack,
-            &format!(
-                "For this request, return {} to {} suggestions.",
-                request_min, request_max
-            ),
-        ),
-        generation_model,
-        "fast_grounded_suggestions_primary",
-        schema.clone(),
-        PRIMARY_REQUEST_MAX_TOKENS,
-        PRIMARY_REQUEST_TIMEOUT_MS,
-    )
-    .await;
-    llm_ms += primary_start.elapsed().as_millis() as u64;
-
-    match primary_result {
-        Ok(r) => {
-            usage = merge_usage(usage, r.usage);
-            raw_items.extend(r.data.suggestions);
+    let target = clamp_agentic_target(generation_target);
+    let iteration_budget = agentic_iterations_for_target(target);
+    let subagent_count = subagent_count_for_target(target);
+    let focus_file_limit = subagent_count * AGENTIC_SUBAGENT_FILES_PER_AGENT;
+    let focus_files =
+        rank_top_churn_files_for_subagents(repo_root, index, context, target, focus_file_limit);
+    let focus_shards = shard_subagent_focus_files(&focus_files, subagent_count);
+    let project_ethos = load_project_ethos(repo_root);
+    let mut subagent_targets = vec![(target / subagent_count).max(2).min(4); subagent_count];
+    let mut distributed = subagent_targets.iter().sum::<usize>();
+    let mut cursor = 0usize;
+    while distributed < target {
+        if subagent_targets[cursor] < 4 {
+            subagent_targets[cursor] += 1;
+            distributed += 1;
         }
-        Err(err) => generation_errors.push(truncate_str(&err.to_string(), 700).to_string()),
-    }
-
-    let mut raw_count = raw_items.len();
-    let (mut mapped, mut missing_or_invalid) = map_raw_items_to_grounded(raw_items, &pack);
-    let mut generation_mapped_count = grounded_mapped_count(&mapped);
-
-    while generation_mapped_count < hard_target
-        && generation_topup_calls < GENERATION_TOPUP_MAX_CALLS
-        && (overall_start.elapsed().as_millis() as u64) < SUGGEST_BALANCED_BUDGET_MS
-    {
-        let mapped_before_topup = generation_mapped_count;
-        let deficit = hard_target.saturating_sub(generation_mapped_count);
-        let request_count = generation_topup_request_count(deficit);
-        let used_ids = mapped
-            .iter()
-            .map(|(evidence_id, _)| *evidence_id)
-            .collect::<HashSet<_>>();
-        let unused_ids = pack
-            .iter()
-            .map(|item| item.id)
-            .filter(|id| !used_ids.contains(id))
-            .take(24)
-            .collect::<Vec<_>>();
-        let unused_hint = if unused_ids.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " Use ONLY evidence_id values from this set for this top-up: [{}].",
-                unused_ids
-                    .iter()
-                    .map(|id| id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        generation_topup_calls += 1;
-        generation_waves += 1;
-
-        let topup_start = std::time::Instant::now();
-        let topup_result = call_grounded_suggestions_with_fallback(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM,
-            &format_grounded_user_prompt(
-                &memory_section,
-                index,
-                summaries,
-                &pack,
-                &format!(
-                    "Return {} suggestions. Prefer diverse evidence refs and avoid reusing the same evidence_id unless necessary.{}",
-                    request_count, unused_hint
-                ),
-            ),
-            generation_model,
-            "fast_grounded_suggestions_topup",
-            schema.clone(),
-            TOPUP_REQUEST_MAX_TOKENS,
-            GENERATION_TOPUP_TIMEOUT_MS,
-        )
-        .await;
-        llm_ms += topup_start.elapsed().as_millis() as u64;
-        match topup_result {
-            Ok(r) => {
-                usage = merge_usage(usage, r.usage);
-                raw_count += r.data.suggestions.len();
-                let (topup_mapped, topup_missing_or_invalid) =
-                    map_raw_items_to_grounded(r.data.suggestions, &pack);
-                mapped.extend(topup_mapped);
-                missing_or_invalid += topup_missing_or_invalid;
-                generation_mapped_count = grounded_mapped_count(&mapped);
-            }
-            Err(err) => generation_errors.push(truncate_str(&err.to_string(), 700).to_string()),
-        }
-
-        // Stop if the top-up produced no additional mapped evidence ids.
-        if generation_mapped_count <= mapped_before_topup {
+        cursor = (cursor + 1) % subagent_count;
+        if cursor == 0 && subagent_targets.iter().all(|value| *value >= 4) {
             break;
         }
     }
 
-    // If generation returned content but nothing mapped, retry once with a strict full-pack call.
-    if should_run_mapping_rescue(raw_count, generation_mapped_count) {
-        generation_waves += 1;
-        let rescue_start = std::time::Instant::now();
-        let rescue_result = call_grounded_suggestions_with_fallback(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM,
-            &format_grounded_user_prompt(
-                &memory_section,
-                index,
-                summaries,
-                &pack,
-                &format!(
-                    "Return {} to {} suggestions. Every suggestion must include exactly one evidence reference.",
-                    FAST_GROUNDED_FINAL_TARGET_MIN,
-                    FAST_GROUNDED_FINAL_TARGET_MAX
-                ),
-            ),
-            generation_model,
-            "fast_grounded_mapping_rescue",
-            schema.clone(),
-            PRIMARY_REQUEST_MAX_TOKENS,
-            PRIMARY_REQUEST_TIMEOUT_MS,
-        )
-        .await;
-        llm_ms += rescue_start.elapsed().as_millis() as u64;
-        match rescue_result {
-            Ok(r) => {
-                usage = merge_usage(usage, r.usage);
-                raw_count += r.data.suggestions.len();
-                let (rescue_mapped, rescue_missing_or_invalid) =
-                    map_raw_items_to_grounded(r.data.suggestions, &pack);
-                mapped.extend(rescue_mapped);
-                missing_or_invalid += rescue_missing_or_invalid;
-                generation_mapped_count = grounded_mapped_count(&mapped);
+    let call_start = std::time::Instant::now();
+    let response_format =
+        schema_to_response_format("agentic_suggestions", agentic_suggestion_schema());
+
+    let agent_tasks = focus_shards
+        .into_iter()
+        .enumerate()
+        .map(|(subagent_index, shard)| {
+            let repo_root = repo_root.to_path_buf();
+            let shard_for_prompt = shard.clone();
+            let subagent_target = subagent_targets
+                .get(subagent_index)
+                .copied()
+                .unwrap_or(2)
+                .clamp(2, 4);
+            let user_prompt = build_subagent_user_prompt(
+                subagent_index,
+                subagent_count,
+                subagent_target,
+                &shard_for_prompt,
+                project_ethos.as_deref(),
+                retry_feedback,
+            );
+            let response_format = response_format.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let response = call_llm_agentic(
+                    AGENTIC_SUGGESTIONS_SYSTEM,
+                    &user_prompt,
+                    generation_model,
+                    &repo_root,
+                    false,
+                    iteration_budget,
+                    Some(response_format),
+                )
+                .await;
+                (
+                    subagent_index,
+                    shard,
+                    started.elapsed().as_millis() as u64,
+                    response,
+                )
             }
-            Err(err) => generation_errors.push(truncate_str(&err.to_string(), 700).to_string()),
+        });
+
+    let agent_outputs = join_all(agent_tasks).await;
+    let llm_ms = call_start.elapsed().as_millis() as u64;
+
+    let mut usage: Option<Usage> = None;
+    let mut response_preview_parts = Vec::new();
+    let mut response_chars = 0usize;
+    let mut raw_count = 0usize;
+    let mut suggestions = Vec::new();
+    let mut missing_or_invalid = 0usize;
+    let mut parse_errors = Vec::new();
+    let mut successful_subagents = 0usize;
+    let mut tool_names = Vec::new();
+    let mut tool_exec_ms = 0u64;
+
+    for (subagent_index, shard, elapsed_ms, response_result) in agent_outputs {
+        tool_exec_ms = tool_exec_ms.saturating_add(elapsed_ms);
+        if !shard.is_empty() {
+            let scope_preview = shard
+                .iter()
+                .take(2)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            tool_names.push(format!(
+                "subagent_{}:[{}]",
+                subagent_index + 1,
+                scope_preview
+            ));
+        }
+
+        let response = match response_result {
+            Ok(value) => value,
+            Err(err) => {
+                parse_errors.push(format!(
+                    "Subagent {} failed: {}",
+                    subagent_index + 1,
+                    truncate_str(&err.to_string(), 220)
+                ));
+                continue;
+            }
+        };
+
+        successful_subagents += 1;
+        usage = merge_usage(usage, response.usage.clone());
+        response_chars = response_chars.saturating_add(response.content.len());
+        response_preview_parts.push(format!(
+            "a{}:{}",
+            subagent_index + 1,
+            truncate_str(&response.content, 80)
+        ));
+
+        match serde_json::from_str::<AgenticSuggestionResponseJson>(&response.content) {
+            Ok(parsed) => {
+                let raw_this = parsed.suggestions.len();
+                raw_count = raw_count.saturating_add(raw_this);
+                let mapped = map_agentic_suggestions(repo_root, index, parsed.suggestions);
+                missing_or_invalid =
+                    missing_or_invalid.saturating_add(raw_this.saturating_sub(mapped.len()));
+                suggestions.extend(mapped);
+            }
+            Err(err) => {
+                parse_errors.push(format!(
+                    "Subagent {} parse failure: {}",
+                    subagent_index + 1,
+                    truncate_str(&err.to_string(), 220)
+                ));
+            }
         }
     }
 
-    if mapped.is_empty() {
-        let detail = generation_errors
+    let response_preview = truncate_str(&response_preview_parts.join(" | "), 240).to_string();
+
+    let mut run_notes: Vec<String> = Vec::new();
+    let evidence_pack_ms = 0u64;
+    let sent_snippet_count = 0usize;
+    let sent_bytes = 0usize;
+
+    let provisional_cap = FAST_GROUNDED_PROVISIONAL_TARGET_MAX;
+    if suggestions.len() > provisional_cap {
+        missing_or_invalid += suggestions.len().saturating_sub(provisional_cap);
+        suggestions.truncate(provisional_cap);
+    }
+
+    if suggestions.is_empty() {
+        let parse_suffix = parse_errors
             .first()
-            .map(|e| format!(" Latest generation error: {}", e))
+            .map(|text| format!(" {}", truncate_str(text, 260)))
             .unwrap_or_default();
         return Err(anyhow::anyhow!(
-            "AI suggestions arrived without valid evidence links, so Cosmos could not safely ground them. Please try again.{}",
-            detail
+            "Suggestion generation completed but produced no usable suggestions.{}",
+            parse_suffix
         ));
     }
 
-    let suggestions =
-        dedupe_and_cap_grounded_suggestions(mapped, FAST_GROUNDED_PROVISIONAL_TARGET_MAX);
+    run_notes.push(format!("subagents_planned:{}", subagent_count));
+    run_notes.push(format!(
+        "subagents_successful:{}/{}",
+        successful_subagents, subagent_count
+    ));
+    run_notes.push(format!("churn_focus_file_count:{}", focus_files.len()));
+    if !focus_files.is_empty() {
+        let focus_preview = focus_files
+            .iter()
+            .take(6)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        run_notes.push(format!("churn_focus_preview:{}", focus_preview));
+    }
+    if !parse_errors.is_empty() {
+        run_notes.push(format!(
+            "agentic_parse_errors:{}",
+            truncate_str(&parse_errors.join(" | "), 180)
+        ));
+    }
 
     let diagnostics = SuggestionDiagnostics {
         run_id,
         model: generation_model.id().to_string(),
-        iterations: 1,
-        tool_calls: 0,
-        tool_names: Vec::new(),
-        tool_exec_ms: 0,
+        iterations: subagent_count,
+        tool_calls: iteration_budget.saturating_mul(successful_subagents.max(1)),
+        tool_names,
+        tool_exec_ms,
         llm_ms,
         batch_verify_ms: 0,
         forced_final: false,
         formatting_pass: false,
         response_format: true,
         response_healing: true,
-        parse_strategy: "fast_grounded".to_string(),
+        parse_strategy: "agentic_churn_subagents".to_string(),
         parse_stripped_markdown: false,
         parse_used_sanitized_fix: false,
         parse_used_json_fix: false,
@@ -5110,25 +2866,25 @@ pub async fn analyze_codebase_fast_grounded(
         batch_verify_errors: 0,
         truncated_count: 0,
         final_count: suggestions.len(),
-        response_chars: 0,
-        response_preview: String::new(),
+        response_chars,
+        response_preview,
         evidence_pack_ms,
         sent_snippet_count,
         sent_bytes,
-        pack_pattern_count: pack_stats.pattern_count,
-        pack_hotspot_count: pack_stats.hotspot_count,
-        pack_core_count: pack_stats.core_count,
-        pack_line1_ratio: pack_stats.line1_ratio,
+        pack_pattern_count: 0,
+        pack_hotspot_count: 0,
+        pack_core_count: 0,
+        pack_line1_ratio: 0.0,
         provisional_count: suggestions.len(),
-        generation_waves,
-        generation_topup_calls,
-        generation_mapped_count,
+        generation_waves: subagent_count,
+        generation_topup_calls: 0,
+        generation_mapped_count: suggestions.len(),
         validated_count: 0,
         rejected_count: 0,
         rejected_evidence_skipped_count: 0,
         validation_rejection_histogram: HashMap::new(),
         validation_deadline_exceeded: false,
-        validation_deadline_ms: VALIDATION_RUN_DEADLINE_MS,
+        validation_deadline_ms: 0,
         batch_missing_index_count: 0,
         batch_no_reason_count: 0,
         transport_retry_count: 0,
@@ -5159,25 +2915,131 @@ pub async fn analyze_codebase_fast_grounded(
         readiness_score_mean: 0.0,
         regeneration_attempts: 0,
         refinement_complete: false,
-        notes: Vec::new(),
+        notes: run_notes,
     };
 
     Ok((suggestions, usage, diagnostics))
 }
 
-// This orchestrator keeps all refinement controls at the callsite for deterministic gating.
+#[allow(clippy::too_many_arguments)]
+fn deterministic_validate_candidates(
+    candidates: Vec<Suggestion>,
+    cache: &cosmos_adapters::cache::Cache,
+    run_id: &str,
+    validated: &mut Vec<Suggestion>,
+    rejected_count: &mut usize,
+    rejection_stats: &mut ValidationRejectionStats,
+) {
+    let mut used_evidence_ids: HashSet<usize> = HashSet::new();
+    let mut chunk_seen_evidence_ids: HashSet<usize> = HashSet::new();
+    let mut rejected_evidence_ids: HashSet<usize> = HashSet::new();
+
+    for mut suggestion in candidates
+        .into_iter()
+        .map(annotate_implementation_readiness)
+    {
+        if validated.len() >= FAST_GROUNDED_VALIDATED_POOL_MAX {
+            break;
+        }
+
+        if let Some(decision) = prevalidation_rejection_reason(
+            &suggestion,
+            &used_evidence_ids,
+            &mut chunk_seen_evidence_ids,
+        ) {
+            *rejected_count += 1;
+            rejection_stats.prevalidation += 1;
+            if decision.is_contradiction {
+                rejection_stats.prevalidation_contradiction_count += 1;
+            }
+            if let Some(evidence_id) = decision.evidence_id {
+                rejected_evidence_ids.insert(evidence_id);
+            }
+            suggestion.validation_state = SuggestionValidationState::Rejected;
+            append_suggestion_quality_record(
+                cache,
+                run_id,
+                &suggestion,
+                "rejected",
+                Some(decision.reason),
+                Some(rejection_stats),
+            );
+            continue;
+        }
+
+        if !suggestion_targets_bug_or_security_scope(&suggestion) {
+            record_rejected_validation(
+                cache,
+                run_id,
+                &mut suggestion,
+                "Suggestion is outside scope: only bug/security findings are allowed.".to_string(),
+                ValidationRejectClass::Other,
+                rejected_count,
+                rejection_stats,
+                &mut rejected_evidence_ids,
+            );
+            continue;
+        }
+
+        if !suggestion_has_usable_evidence_quality(&suggestion) {
+            record_rejected_validation(
+                cache,
+                run_id,
+                &mut suggestion,
+                "Evidence snippet quality is too weak for safe validation.".to_string(),
+                ValidationRejectClass::InsufficientEvidence,
+                rejected_count,
+                rejection_stats,
+                &mut rejected_evidence_ids,
+            );
+            continue;
+        }
+
+        if !suggestion_claim_is_grounded_for_acceptance(&suggestion) {
+            record_rejected_validation(
+                cache,
+                run_id,
+                &mut suggestion,
+                "Claim text is not grounded in the cited code snippet.".to_string(),
+                ValidationRejectClass::InsufficientEvidence,
+                rejected_count,
+                rejection_stats,
+                &mut rejected_evidence_ids,
+            );
+            continue;
+        }
+
+        let evidence_id = primary_evidence_id(&suggestion);
+        let accepted = accept_validated_suggestion(
+            cache,
+            run_id,
+            suggestion,
+            "Validated by deterministic grounding and evidence checks.".to_string(),
+            validated,
+            rejected_count,
+            rejection_stats,
+        );
+        if accepted {
+            if let Some(evidence_id) = evidence_id {
+                used_evidence_ids.insert(evidence_id);
+            }
+        }
+    }
+}
+
+// Deterministic refinement pass: keep only evidence-grounded, actionable suggestions.
 #[allow(clippy::too_many_arguments)]
 pub async fn refine_grounded_suggestions(
     repo_root: &Path,
-    index: &CodebaseIndex,
-    context: &WorkContext,
-    repo_memory: Option<String>,
-    summaries: Option<&HashMap<PathBuf, String>>,
-    generation_model: Model,
-    validation_model: Model,
+    _index: &CodebaseIndex,
+    _context: &WorkContext,
+    _repo_memory: Option<String>,
+    _summaries: Option<&HashMap<PathBuf, String>>,
+    _generation_model: Model,
+    _validation_model: Model,
     provisional: Vec<Suggestion>,
     min_implementation_readiness_score: f32,
-    max_smart_rewrites_per_run: usize,
+    _max_smart_rewrites_per_run: usize,
     mut diagnostics: SuggestionDiagnostics,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
     if provisional.is_empty() {
@@ -5210,415 +3072,95 @@ pub async fn refine_grounded_suggestions(
         return Ok((Vec::new(), None, diagnostics));
     }
 
-    let memory_section =
-        format_repo_memory_section(repo_memory.as_deref(), "Repo conventions / decisions");
     let cache = cosmos_adapters::cache::Cache::new(repo_root);
     let refine_start = std::time::Instant::now();
-    let mut usage: Option<Usage> = None;
     let mut rejected_count = 0usize;
-    let mut regeneration_attempts = 0usize;
-    let mut used_evidence_ids: HashSet<usize> = HashSet::new();
-    let mut rejected_evidence_ids: HashSet<usize> = HashSet::new();
-    let mut rejected_evidence_skipped_ids: HashSet<usize> = HashSet::new();
-    let mut relaxed_rejected_filter_used = false;
     let mut validated: Vec<Suggestion> = Vec::new();
-    let mut notes = diagnostics.notes.clone();
-    let mut hard_phase_attempts = 0usize;
-    let mut stretch_phase_attempts = 0usize;
-    let mut regen_stopped_validation_budget = false;
-    let validation_deadline = refine_start
-        + std::time::Duration::from_millis(
-            VALIDATION_RUN_DEADLINE_MS.min(SUGGEST_BALANCED_BUDGET_MS),
-        );
+    let mut notes = vec!["deterministic_grounding_refine".to_string()];
     let mut rejection_stats = ValidationRejectionStats::default();
 
-    let batch_usage = validate_batch_suggestions(
-        provisional.clone(),
-        &memory_section,
-        validation_model,
+    let provisional_count = provisional.len();
+    deterministic_validate_candidates(
+        provisional,
         &cache,
         &diagnostics.run_id,
         &mut validated,
         &mut rejected_count,
-        &mut used_evidence_ids,
-        &mut rejected_evidence_ids,
-        validation_deadline,
         &mut rejection_stats,
-    )
-    .await;
-    usage = merge_usage(usage, batch_usage);
-
-    let (pack, pack_stats) = build_evidence_pack(repo_root, index, context);
-    let (sent_snippet_count, sent_bytes) = evidence_payload_metrics(&pack);
-    let hard_target = FAST_GROUNDED_VALIDATED_HARD_TARGET
-        .min(pack.len())
-        .min(FAST_GROUNDED_VALIDATED_POOL_MAX);
-    let stretch_target = FAST_GROUNDED_VALIDATED_STRETCH_TARGET
-        .min(pack.len())
-        .min(FAST_GROUNDED_VALIDATED_POOL_MAX);
-    while validated.len() < stretch_target {
-        let remaining_validation_budget = remaining_validation_budget_ms(validation_deadline);
-        if should_stop_regeneration_for_validation_budget(
-            rejection_stats.deadline_exceeded,
-            remaining_validation_budget,
-        ) {
-            regen_stopped_validation_budget = true;
-            notes.push("regen_stopped_validation_budget".to_string());
-            break;
-        }
-
-        if refine_start.elapsed().as_millis() as u64 >= SUGGEST_BALANCED_BUDGET_MS {
-            notes.push("regeneration_budget_reached".to_string());
-            break;
-        }
-
-        let Some(phase_target) = choose_regeneration_phase_target(
-            validated.len(),
-            hard_target,
-            stretch_target,
-            hard_phase_attempts,
-            stretch_phase_attempts,
-        ) else {
-            if validated.len() < hard_target {
-                notes.push("hard_target_attempt_budget_reached".to_string());
-            }
-            break;
-        };
-
-        if phase_target == hard_target {
-            hard_phase_attempts += 1;
-        } else {
-            let current_cost = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
-            if current_cost >= STRETCH_PHASE_MAX_COST_USD {
-                notes.push("stretch_skipped_cost_budget".to_string());
-                break;
-            }
-            if remaining_validation_budget < STRETCH_PHASE_MIN_REMAINING_VALIDATION_MS {
-                notes.push("stretch_skipped_validation_budget".to_string());
-                break;
-            }
-            stretch_phase_attempts += 1;
-        }
-
-        regeneration_attempts += 1;
-
-        let (remaining_pack_original, used_relaxed_filter, skipped_rejected_ids) =
-            build_remaining_pack_for_regeneration(
-                &pack,
-                &used_evidence_ids,
-                &rejected_evidence_ids,
-                !relaxed_rejected_filter_used,
-            );
-        if used_relaxed_filter {
-            relaxed_rejected_filter_used = true;
-        } else {
-            rejected_evidence_skipped_ids.extend(skipped_rejected_ids);
-        }
-
-        if remaining_pack_original.len() < 4 {
-            break;
-        }
-        let (remaining_pack_local, local_to_original) = renumber_pack(&remaining_pack_original);
-
-        let needed = regeneration_needed_for_target(validated.len(), phase_target);
-        if needed == 0 {
-            break;
-        }
-        let (request_min, request_max) = regeneration_request_bounds(needed);
-        let schema = grounded_suggestion_schema(remaining_pack_local.len());
-        let user = format_grounded_user_prompt(
-            &memory_section,
-            index,
-            summaries,
-            &remaining_pack_local,
-            &format!(
-                "Return {} to {} suggestions. Avoid reusing evidence ids and prioritize high-confidence issues.",
-                request_min, request_max
-            ),
-        );
-
-        let regen_response = call_grounded_suggestions_with_fallback(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM,
-            &user,
-            generation_model,
-            "fast_grounded_regeneration",
-            schema,
-            REGEN_REQUEST_MAX_TOKENS,
-            7_200,
-        )
-        .await;
-
-        let rebuilt = match regen_response {
-            Ok(response) => response,
-            Err(_) => continue,
-        };
-        usage = merge_usage(usage, rebuilt.usage);
-        let (mapped, _missing_or_invalid) =
-            map_raw_items_to_grounded(rebuilt.data.suggestions, &remaining_pack_local);
-        let mut regenerated = Vec::new();
-        for (_local_id, mut suggestion) in mapped {
-            if remap_suggestion_to_original_ids(&mut suggestion, &local_to_original, &pack) {
-                regenerated.push(suggestion);
-            }
-        }
-        if regenerated.is_empty() {
-            continue;
-        }
-
-        let batch_usage = validate_batch_suggestions(
-            regenerated,
-            &memory_section,
-            validation_model,
-            &cache,
-            &diagnostics.run_id,
-            &mut validated,
-            &mut rejected_count,
-            &mut used_evidence_ids,
-            &mut rejected_evidence_ids,
-            validation_deadline,
-            &mut rejection_stats,
-        )
-        .await;
-        usage = merge_usage(usage, batch_usage);
-    }
-
-    if validated.len() < FAST_GROUNDED_FINAL_TARGET_MIN {
-        let remaining_validation_budget = remaining_validation_budget_ms(validation_deadline);
-        if !should_stop_regeneration_for_validation_budget(
-            rejection_stats.deadline_exceeded,
-            remaining_validation_budget,
-        ) {
-            let underrepresented_pack_original =
-                build_underrepresented_pack_for_regeneration(&pack, &validated);
-            if underrepresented_pack_original.len() >= 4 {
-                regeneration_attempts += 1;
-                notes.push("underrepresented_regeneration_pass".to_string());
-                let (underrepresented_pack_local, local_to_original) =
-                    renumber_pack(&underrepresented_pack_original);
-                let needed = regeneration_needed_for_target(
-                    validated.len(),
-                    FAST_GROUNDED_FINAL_TARGET_MIN.min(FAST_GROUNDED_VALIDATED_POOL_MAX),
-                );
-                if needed > 0 {
-                    let (request_min, request_max) = regeneration_request_bounds(needed);
-                    let schema = grounded_suggestion_schema(underrepresented_pack_local.len());
-                    let user = format_grounded_user_prompt(
-                        &memory_section,
-                        index,
-                        summaries,
-                        &underrepresented_pack_local,
-                        &format!(
-                            "Return {} to {} suggestions. Prioritize files that are underrepresented in already validated suggestions.",
-                            request_min, request_max
-                        ),
-                    );
-
-                    if let Ok(response) = call_grounded_suggestions_with_fallback(
-                        FAST_GROUNDED_SUGGESTIONS_SYSTEM,
-                        &user,
-                        generation_model,
-                        "fast_grounded_regeneration_underrepresented",
-                        schema,
-                        REGEN_REQUEST_MAX_TOKENS,
-                        7_200,
-                    )
-                    .await
-                    {
-                        usage = merge_usage(usage, response.usage);
-                        let (mapped, _missing_or_invalid) = map_raw_items_to_grounded(
-                            response.data.suggestions,
-                            &underrepresented_pack_local,
-                        );
-                        let mut regenerated = Vec::new();
-                        for (_local_id, mut suggestion) in mapped {
-                            if remap_suggestion_to_original_ids(
-                                &mut suggestion,
-                                &local_to_original,
-                                &pack,
-                            ) {
-                                regenerated.push(suggestion);
-                            }
-                        }
-                        if !regenerated.is_empty() {
-                            let batch_usage = validate_batch_suggestions(
-                                regenerated,
-                                &memory_section,
-                                validation_model,
-                                &cache,
-                                &diagnostics.run_id,
-                                &mut validated,
-                                &mut rejected_count,
-                                &mut used_evidence_ids,
-                                &mut rejected_evidence_ids,
-                                validation_deadline,
-                                &mut rejection_stats,
-                            )
-                            .await;
-                            usage = merge_usage(usage, batch_usage);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let validated = finalize_validated_suggestions(validated);
-    let (semantic_deduped, semantic_dedup_dropped_count) =
-        semantic_dedupe_validated_suggestions(validated);
-    let (readiness_filtered, readiness_filtered_count, readiness_score_mean) =
-        apply_readiness_filter(semantic_deduped, min_implementation_readiness_score);
-    let (validated, smart_rewrite_count, smart_rewrite_usage) = apply_selective_smart_rewrites(
-        readiness_filtered,
-        &memory_section,
-        min_implementation_readiness_score,
-        max_smart_rewrites_per_run,
-        validation_model,
-        validation_deadline,
-    )
-    .await;
-    usage = merge_usage(usage, smart_rewrite_usage);
-    let (impact_filtered, speculative_impact_dropped_count) =
-        filter_speculative_impact_suggestions(validated);
-    let impact_filtered_len = impact_filtered.len();
-    let mut ranked_for_balance = impact_filtered;
-    ranked_for_balance.sort_by(|a, b| {
-        b.priority
-            .cmp(&a.priority)
-            .then_with(|| b.confidence.cmp(&a.confidence))
-            .then_with(|| {
-                b.implementation_readiness_score
-                    .partial_cmp(&a.implementation_readiness_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| b.created_at.cmp(&a.created_at))
-    });
-    let (mut validated, file_balance_dropped_count) = balance_suggestions_across_files(
-        ranked_for_balance,
-        DIVERSITY_FILE_BALANCE_PER_FILE_CAP,
-        FAST_GROUNDED_FINAL_TARGET_MIN.min(impact_filtered_len),
     );
+    let mut scope_filtered_count = 0usize;
+    validated.retain(|suggestion| {
+        if suggestion_is_verified_bug_or_security(suggestion) {
+            true
+        } else {
+            scope_filtered_count += 1;
+            false
+        }
+    });
+    if scope_filtered_count > 0 {
+        rejection_stats.validator_other += scope_filtered_count;
+        rejected_count += scope_filtered_count;
+        notes.push(format!(
+            "scope_filtered_non_bug_security:{}",
+            scope_filtered_count
+        ));
+    }
+    let validated_before_quality_filters = validated.len();
+    let (validated, readiness_filtered_count, readiness_score_mean) =
+        apply_readiness_filter(validated, min_implementation_readiness_score);
+    let (validated, semantic_dedup_dropped_count) =
+        semantic_dedupe_validated_suggestions(validated);
+    let (validated, file_balance_dropped_count) =
+        balance_suggestions_across_files(validated, DIVERSITY_FILE_BALANCE_PER_FILE_CAP, 0);
+    let mut validated = finalize_validated_suggestions(validated);
     validated.truncate(FAST_GROUNDED_FINAL_TARGET_MAX);
     let diversity_metrics = compute_suggestion_diversity_metrics(&validated);
+
     let refinement_ms = refine_start.elapsed().as_millis() as u64;
-    diagnostics.batch_verify_ms = refinement_ms;
+    diagnostics.batch_verify_ms = 0;
     diagnostics.llm_ms += refinement_ms;
-    diagnostics.pack_pattern_count = pack_stats.pattern_count;
-    diagnostics.pack_hotspot_count = pack_stats.hotspot_count;
-    diagnostics.pack_core_count = pack_stats.core_count;
-    diagnostics.pack_line1_ratio = pack_stats.line1_ratio;
-    diagnostics.sent_snippet_count = sent_snippet_count;
-    diagnostics.sent_bytes = sent_bytes;
-    diagnostics.provisional_count = provisional.len();
+    diagnostics.provisional_count = provisional_count;
     diagnostics.validated_count = validated
         .iter()
-        .filter(|s| s.validation_state == SuggestionValidationState::Validated)
+        .filter(|s| suggestion_is_verified_bug_or_security(s))
         .count();
     diagnostics.rejected_count = rejected_count;
-    diagnostics.rejected_evidence_skipped_count = rejected_evidence_skipped_ids.len();
+    diagnostics.rejected_evidence_skipped_count = 0;
     diagnostics.validation_rejection_histogram =
         build_validation_rejection_histogram(&rejection_stats);
-    diagnostics.validation_deadline_exceeded = rejection_stats.deadline_exceeded;
-    diagnostics.validation_deadline_ms = VALIDATION_RUN_DEADLINE_MS;
-    diagnostics.batch_missing_index_count = rejection_stats.batch_missing_index_count;
-    diagnostics.batch_no_reason_count = rejection_stats.batch_no_reason_count;
-    diagnostics.transport_retry_count = rejection_stats.transport_retry_count;
-    diagnostics.transport_recovered_count = rejection_stats.transport_recovered_count;
-    diagnostics.rewrite_recovered_count = rejection_stats.rewrite_recovered_count;
+    diagnostics.validation_deadline_exceeded = false;
+    diagnostics.validation_deadline_ms = 0;
+    diagnostics.batch_missing_index_count = 0;
+    diagnostics.batch_no_reason_count = 0;
+    diagnostics.transport_retry_count = 0;
+    diagnostics.transport_recovered_count = 0;
+    diagnostics.rewrite_recovered_count = 0;
     diagnostics.prevalidation_contradiction_count =
         rejection_stats.prevalidation_contradiction_count;
-    diagnostics.validation_transport_retry_count = rejection_stats.transport_retry_count;
-    diagnostics.validation_transport_recovered_count = rejection_stats.transport_recovered_count;
-    diagnostics.regen_stopped_validation_budget = regen_stopped_validation_budget;
-    diagnostics.overclaim_rewrite_count = rejection_stats.overclaim_rewrite_count;
-    diagnostics.overclaim_rewrite_validated_count =
-        rejection_stats.overclaim_rewrite_validated_count;
-    diagnostics.smart_rewrite_count = smart_rewrite_count;
-    diagnostics.deterministic_auto_validated_count = rejection_stats.deterministic_auto_validated;
+    diagnostics.validation_transport_retry_count = 0;
+    diagnostics.validation_transport_recovered_count = 0;
+    diagnostics.regen_stopped_validation_budget = false;
+    diagnostics.overclaim_rewrite_count = 0;
+    diagnostics.overclaim_rewrite_validated_count = 0;
+    diagnostics.smart_rewrite_count = 0;
+    diagnostics.deterministic_auto_validated_count = validated_before_quality_filters;
     diagnostics.semantic_dedup_dropped_count = semantic_dedup_dropped_count;
     diagnostics.file_balance_dropped_count = file_balance_dropped_count;
-    diagnostics.speculative_impact_dropped_count = speculative_impact_dropped_count;
+    diagnostics.speculative_impact_dropped_count = scope_filtered_count;
     diagnostics.dominant_topic_ratio = diversity_metrics.dominant_topic_ratio;
     diagnostics.unique_topic_count = diversity_metrics.unique_topic_count;
     diagnostics.dominant_file_ratio = diversity_metrics.dominant_file_ratio;
     diagnostics.unique_file_count = diversity_metrics.unique_file_count;
     diagnostics.readiness_filtered_count = readiness_filtered_count;
     diagnostics.readiness_score_mean = readiness_score_mean;
-    diagnostics.regeneration_attempts = regeneration_attempts;
+    diagnostics.regeneration_attempts = 0;
     diagnostics.refinement_complete = true;
     diagnostics.final_count = validated.len();
     diagnostics.deduped_count = validated.len();
-    diagnostics.parse_strategy = "fast_grounded_refined".to_string();
+    diagnostics.parse_strategy = "fast_grounded_deterministic_refine".to_string();
     diagnostics.notes = notes;
-    if diagnostics.readiness_filtered_count > 0 {
-        diagnostics.notes.push(format!(
-            "readiness_filtered:{}",
-            diagnostics.readiness_filtered_count
-        ));
-    }
-    if diagnostics.semantic_dedup_dropped_count > 0 {
-        diagnostics.notes.push(format!(
-            "semantic_dedup_dropped:{}",
-            diagnostics.semantic_dedup_dropped_count
-        ));
-    }
-    if diagnostics.file_balance_dropped_count > 0 {
-        diagnostics.notes.push(format!(
-            "file_balance_dropped:{}",
-            diagnostics.file_balance_dropped_count
-        ));
-    }
-    if diagnostics.speculative_impact_dropped_count > 0 {
-        diagnostics.notes.push(format!(
-            "speculative_impact_dropped:{}",
-            diagnostics.speculative_impact_dropped_count
-        ));
-    }
-    if diagnostics.dominant_topic_ratio > DIVERSITY_DOMINANT_TOPIC_RATIO_MAX {
-        diagnostics.notes.push(format!(
-            "dominant_topic_ratio:{:.2}",
-            diagnostics.dominant_topic_ratio
-        ));
-    }
-    let min_unique_topics = DIVERSITY_MIN_UNIQUE_TOPICS.min(validated.len().max(1));
-    if diagnostics.unique_topic_count < min_unique_topics {
-        diagnostics.notes.push(format!(
-            "unique_topic_count:{} below {}",
-            diagnostics.unique_topic_count, min_unique_topics
-        ));
-    }
-    if diagnostics.dominant_file_ratio > DIVERSITY_DOMINANT_FILE_RATIO_MAX {
-        diagnostics.notes.push(format!(
-            "dominant_file_ratio:{:.2}",
-            diagnostics.dominant_file_ratio
-        ));
-    }
-    let min_unique_files = DIVERSITY_MIN_UNIQUE_FILES.min(validated.len().max(1));
-    if diagnostics.unique_file_count < min_unique_files {
-        diagnostics.notes.push(format!(
-            "unique_file_count:{} below {}",
-            diagnostics.unique_file_count, min_unique_files
-        ));
-    }
-    if validated.len() < hard_target {
-        diagnostics
-            .notes
-            .push("count_below_hard_target".to_string());
-    }
-    if validated.len() < stretch_target {
-        diagnostics
-            .notes
-            .push("count_below_stretch_target".to_string());
-    }
-    if regeneration_needed(validated.len()) > 0 {
-        diagnostics.notes.push("count_below_soft_floor".to_string());
-    }
-    if diagnostics.validation_deadline_exceeded {
-        diagnostics
-            .notes
-            .push("validation_deadline_exceeded".to_string());
-    }
 
-    Ok((validated, usage, diagnostics))
+    Ok((validated, None, diagnostics))
 }
 
 fn ratio(numerator: usize, denominator: usize) -> f64 {
@@ -5629,6 +3171,13 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
     }
 }
 
+fn suggestion_meets_ethos_contract(suggestion: &Suggestion) -> bool {
+    suggestion_is_verified_bug_or_security(suggestion)
+        && suggestion_has_usable_evidence_quality(suggestion)
+        && suggestion_claim_is_grounded_for_acceptance(suggestion)
+        && deterministic_prevalidation_ethos_reason(suggestion).is_none()
+}
+
 fn build_gate_snapshot(
     config: &SuggestionQualityGateConfig,
     suggestions: &[Suggestion],
@@ -5636,9 +3185,15 @@ fn build_gate_snapshot(
     suggest_total_cost_usd: f64,
 ) -> SuggestionGateSnapshot {
     let final_count = suggestions.len();
+    let min_required_count = config.min_final_count;
     let validated_count = suggestions
         .iter()
-        .filter(|s| s.validation_state == SuggestionValidationState::Validated)
+        .filter(|s| suggestion_is_verified_bug_or_security(s))
+        .count();
+    let non_scope_count = final_count.saturating_sub(validated_count);
+    let ethos_actionable_count = suggestions
+        .iter()
+        .filter(|s| suggestion_meets_ethos_contract(s))
         .count();
     let pending_count = final_count.saturating_sub(validated_count);
     let displayed_valid_ratio = ratio(validated_count, final_count);
@@ -5654,149 +3209,108 @@ fn build_gate_snapshot(
     let min_unique_files = DIVERSITY_MIN_UNIQUE_FILES.min(final_count.max(1));
 
     let mut fail_reasons = Vec::new();
-    if final_count < config.min_final_count {
-        fail_reasons.push(format!(
-            "final_count {} below min {}",
-            final_count, config.min_final_count
-        ));
-    }
-    if final_count > config.max_final_count {
-        fail_reasons.push(format!(
-            "final_count {} above max {}",
-            final_count, config.max_final_count
-        ));
-    }
-    if displayed_valid_ratio < config.min_displayed_valid_ratio {
-        fail_reasons.push(format!(
-            "displayed_valid_ratio {:.3} below {:.3}",
-            displayed_valid_ratio, config.min_displayed_valid_ratio
-        ));
-    }
-    if pending_count > 0 {
-        fail_reasons.push(format!("pending_count {} > 0", pending_count));
-    }
-    if diversity_metrics.dominant_topic_ratio > DIVERSITY_DOMINANT_TOPIC_RATIO_MAX {
-        fail_reasons.push(format!(
-            "dominant_topic_ratio {:.3} above {:.3}",
-            diversity_metrics.dominant_topic_ratio, DIVERSITY_DOMINANT_TOPIC_RATIO_MAX
-        ));
-    }
-    if diversity_metrics.unique_topic_count < min_unique_topics {
-        fail_reasons.push(format!(
-            "unique_topic_count {} below {}",
-            diversity_metrics.unique_topic_count, min_unique_topics
-        ));
-    }
-    if diversity_metrics.dominant_file_ratio > DIVERSITY_DOMINANT_FILE_RATIO_MAX {
-        fail_reasons.push(format!(
-            "dominant_file_ratio {:.3} above {:.3}",
-            diversity_metrics.dominant_file_ratio, DIVERSITY_DOMINANT_FILE_RATIO_MAX
-        ));
-    }
-    if diversity_metrics.unique_file_count < min_unique_files {
-        fail_reasons.push(format!(
-            "unique_file_count {} below {}",
-            diversity_metrics.unique_file_count, min_unique_files
-        ));
-    }
-    if below_readiness_count > 0 {
-        fail_reasons.push(format!(
-            "implementation_readiness_below_min {} below {:.2}",
-            below_readiness_count, config.min_implementation_readiness_score
-        ));
-    }
-    if suggest_total_cost_usd > config.max_suggest_cost_usd {
-        fail_reasons.push(format!(
-            "suggest_total_cost_usd {:.6} above {:.6}",
-            suggest_total_cost_usd, config.max_suggest_cost_usd
-        ));
-    }
-    if suggest_total_ms > config.max_suggest_ms {
-        fail_reasons.push(format!(
-            "suggest_total_ms {} above {}",
-            suggest_total_ms, config.max_suggest_ms
-        ));
+    if ENFORCE_SUGGESTION_QUALITY_GATES {
+        if final_count < min_required_count {
+            fail_reasons.push(format!(
+                "final_count {} below min {}",
+                final_count, min_required_count
+            ));
+        }
+        if final_count > config.max_final_count {
+            fail_reasons.push(format!(
+                "final_count {} above max {}",
+                final_count, config.max_final_count
+            ));
+        }
+        if displayed_valid_ratio < config.min_displayed_valid_ratio {
+            fail_reasons.push(format!(
+                "displayed_valid_ratio {:.3} below {:.3}",
+                displayed_valid_ratio, config.min_displayed_valid_ratio
+            ));
+        }
+        if pending_count > 0 {
+            fail_reasons.push(format!("pending_count {} > 0", pending_count));
+        }
+        if non_scope_count > 0 {
+            fail_reasons.push(format!(
+                "non_verified_bug_security_count {} > 0",
+                non_scope_count
+            ));
+        }
+        if diversity_metrics.dominant_topic_ratio > DIVERSITY_DOMINANT_TOPIC_RATIO_MAX {
+            fail_reasons.push(format!(
+                "dominant_topic_ratio {:.3} above {:.3}",
+                diversity_metrics.dominant_topic_ratio, DIVERSITY_DOMINANT_TOPIC_RATIO_MAX
+            ));
+        }
+        if diversity_metrics.unique_topic_count < min_unique_topics {
+            fail_reasons.push(format!(
+                "unique_topic_count {} below {}",
+                diversity_metrics.unique_topic_count, min_unique_topics
+            ));
+        }
+        if diversity_metrics.dominant_file_ratio > DIVERSITY_DOMINANT_FILE_RATIO_MAX {
+            fail_reasons.push(format!(
+                "dominant_file_ratio {:.3} above {:.3}",
+                diversity_metrics.dominant_file_ratio, DIVERSITY_DOMINANT_FILE_RATIO_MAX
+            ));
+        }
+        if diversity_metrics.unique_file_count < min_unique_files {
+            fail_reasons.push(format!(
+                "unique_file_count {} below {}",
+                diversity_metrics.unique_file_count, min_unique_files
+            ));
+        }
+        if below_readiness_count > 0 {
+            fail_reasons.push(format!(
+                "implementation_readiness_below_min {} below {:.2}",
+                below_readiness_count, config.min_implementation_readiness_score
+            ));
+        }
+        if ethos_actionable_count < final_count {
+            fail_reasons.push(format!(
+                "ethos_actionable_count {} below final_count {}",
+                ethos_actionable_count, final_count
+            ));
+        }
+        if suggest_total_ms > config.max_suggest_ms {
+            fail_reasons.push(format!(
+                "suggest_total_ms {} above {}",
+                suggest_total_ms, config.max_suggest_ms
+            ));
+        }
     }
 
     SuggestionGateSnapshot {
         final_count,
         displayed_valid_ratio,
         pending_count,
+        ethos_actionable_count,
         suggest_total_ms,
         suggest_total_cost_usd,
         dominant_topic_ratio: diversity_metrics.dominant_topic_ratio,
         unique_topic_count: diversity_metrics.unique_topic_count,
         dominant_file_ratio: diversity_metrics.dominant_file_ratio,
         unique_file_count: diversity_metrics.unique_file_count,
-        passed: fail_reasons.is_empty(),
-        fail_reasons,
+        passed: if ENFORCE_SUGGESTION_QUALITY_GATES {
+            fail_reasons.is_empty()
+        } else {
+            true
+        },
+        fail_reasons: if ENFORCE_SUGGESTION_QUALITY_GATES {
+            fail_reasons
+        } else {
+            Vec::new()
+        },
     }
 }
 
-fn gate_snapshot_is_better(
-    candidate: &SuggestionGateSnapshot,
-    current: &SuggestionGateSnapshot,
-) -> bool {
-    let cand_key = (
-        candidate.passed as u8,
-        candidate.displayed_valid_ratio,
-        -(candidate.dominant_topic_ratio),
-        candidate.unique_topic_count,
-        -(candidate.dominant_file_ratio),
-        candidate.unique_file_count,
-        candidate.final_count,
-        -candidate.suggest_total_cost_usd,
-        -(candidate.suggest_total_ms as f64),
-    );
-    let curr_key = (
-        current.passed as u8,
-        current.displayed_valid_ratio,
-        -(current.dominant_topic_ratio),
-        current.unique_topic_count,
-        -(current.dominant_file_ratio),
-        current.unique_file_count,
-        current.final_count,
-        -current.suggest_total_cost_usd,
-        -(current.suggest_total_ms as f64),
-    );
-    cand_key > curr_key
-}
-
-fn should_retry_after_gate_miss(
-    config: &SuggestionQualityGateConfig,
-    gate: &SuggestionGateSnapshot,
-    attempt_cost_usd: f64,
-    remaining_budget_ms: u64,
-) -> bool {
-    if remaining_budget_ms < GATE_RETRY_MIN_REMAINING_BUDGET_MS {
-        return false;
+fn gate_attempt_model(attempt_index: usize) -> Model {
+    if attempt_index == 1 {
+        Model::Speed
+    } else {
+        Model::Smart
     }
-    if attempt_cost_usd > config.max_suggest_cost_usd * GATE_RETRY_MAX_ATTEMPT_COST_FRACTION {
-        return false;
-    }
-    gate.final_count < config.min_final_count
-        || gate.displayed_valid_ratio < config.min_displayed_valid_ratio
-        || gate.pending_count > 0
-        || gate
-            .fail_reasons
-            .iter()
-            .any(|reason| reason.starts_with("dominant_topic_ratio"))
-        || gate
-            .fail_reasons
-            .iter()
-            .any(|reason| reason.starts_with("unique_topic_count"))
-        || gate
-            .fail_reasons
-            .iter()
-            .any(|reason| reason.starts_with("dominant_file_ratio"))
-        || gate
-            .fail_reasons
-            .iter()
-            .any(|reason| reason.starts_with("unique_file_count"))
-        || gate
-            .fail_reasons
-            .iter()
-            .any(|reason| reason.starts_with("implementation_readiness_below_min"))
 }
 
 pub async fn run_fast_grounded_with_gate(
@@ -5831,185 +3345,208 @@ pub async fn run_fast_grounded_with_gate_with_progress<F>(
 where
     F: FnMut(usize, usize, &SuggestionGateSnapshot, &SuggestionDiagnostics),
 {
-    let max_attempts = gate_config.max_attempts.max(1);
-    let overall_start = std::time::Instant::now();
-    let mut cumulative_usage: Option<Usage> = None;
-    let mut best_result: Option<GatedSuggestionRunResult> = None;
-    let mut last_error: Option<anyhow::Error> = None;
-    let mut attempts_executed = 0usize;
-    let mut next_attempt_model = Model::Speed;
-    let mut forced_smart_rescue_attempted = false;
+    let total_start = std::time::Instant::now();
+    let attempt_count = gate_config.max_attempts.max(2);
+    let generation_target = clamp_agentic_target(gate_config.max_final_count);
 
-    for attempt_index in 1..=max_attempts {
-        if attempt_index > 1 {
-            let remaining_budget_ms = gate_config
-                .max_suggest_ms
-                .saturating_sub(overall_start.elapsed().as_millis() as u64);
-            if remaining_budget_ms < GATE_RETRY_MIN_REMAINING_BUDGET_MS {
+    let mut merged_usage: Option<Usage> = None;
+    let mut retry_feedback: Option<String> = None;
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut last_failed_gate: Option<SuggestionGateSnapshot> = None;
+    let mut last_failed_diagnostics: Option<SuggestionDiagnostics> = None;
+    let mut attempts_executed = 0usize;
+
+    for attempt_index in 1..=attempt_count {
+        attempts_executed = attempt_index;
+        let attempt_model = gate_attempt_model(attempt_index);
+        let elapsed_ms = total_start.elapsed().as_millis() as u64;
+        if elapsed_ms >= gate_config.max_suggest_ms {
+            break;
+        }
+        let remaining_budget_ms = gate_config.max_suggest_ms.saturating_sub(elapsed_ms).max(1);
+
+        let analyze_result = tokio::time::timeout(
+            std::time::Duration::from_millis(remaining_budget_ms),
+            analyze_codebase_fast_grounded(
+                repo_root,
+                index,
+                context,
+                repo_memory.clone(),
+                summaries,
+                attempt_model,
+                generation_target,
+                retry_feedback.as_deref(),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Generation attempt timed out after {}ms",
+                remaining_budget_ms
+            )
+        })
+        .and_then(|result| result);
+        let (provisional, usage_a, diagnostics) = match analyze_result {
+            Ok(result) => result,
+            Err(err) => {
+                let retryable = is_retryable_generation_error(&err);
+                let err_text = truncate_str(&err.to_string(), 200).to_string();
+                last_error = Some(err);
+                let elapsed_ms = total_start.elapsed().as_millis() as u64;
+                let budget_exhausted = elapsed_ms > gate_config.max_suggest_ms;
+                if !retryable || budget_exhausted || attempt_index >= attempt_count {
+                    break;
+                }
+                retry_feedback = Some(format!(
+                    "Previous generation attempt failed: {}. Recover with the same grounding bar and broader file coverage.",
+                    err_text
+                ));
+                continue;
+            }
+        };
+        let (mut suggestions, usage_b, mut diagnostics) = if ENFORCE_SUGGESTION_QUALITY_GATES {
+            let elapsed_ms = total_start.elapsed().as_millis() as u64;
+            if elapsed_ms >= gate_config.max_suggest_ms {
                 break;
             }
-        }
-        let attempt_model = if attempt_index == 1 {
-            Model::Speed
+            let remaining_budget_ms = gate_config.max_suggest_ms.saturating_sub(elapsed_ms).max(1);
+            let refine_result = tokio::time::timeout(
+                std::time::Duration::from_millis(remaining_budget_ms),
+                refine_grounded_suggestions(
+                    repo_root,
+                    index,
+                    context,
+                    repo_memory.clone(),
+                    summaries,
+                    attempt_model,
+                    attempt_model,
+                    provisional,
+                    gate_config.min_implementation_readiness_score,
+                    gate_config.max_smart_rewrites_per_run,
+                    diagnostics,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Refinement attempt timed out after {}ms",
+                    remaining_budget_ms
+                )
+            })
+            .and_then(|result| result);
+            match refine_result {
+                Ok(result) => result,
+                Err(err) => {
+                    let err_text = truncate_str(&err.to_string(), 200).to_string();
+                    last_error = Some(err);
+                    let elapsed_ms = total_start.elapsed().as_millis() as u64;
+                    if elapsed_ms > gate_config.max_suggest_ms || attempt_index >= attempt_count {
+                        break;
+                    }
+                    retry_feedback = Some(format!(
+                        "Previous refinement attempt failed: {}. Keep output plain-language and actionable.",
+                        err_text
+                    ));
+                    continue;
+                }
+            }
         } else {
-            next_attempt_model
-        };
-        let attempt_start = std::time::Instant::now();
-
-        let analyze = analyze_codebase_fast_grounded(
-            repo_root,
-            index,
-            context,
-            repo_memory.clone(),
-            summaries,
-            attempt_model,
-        )
-        .await;
-        let (provisional, usage_a, diagnostics) = match analyze {
-            Ok(result) => result,
-            Err(err) => {
-                last_error = Some(err);
-                continue;
-            }
+            let mut diagnostics = diagnostics;
+            diagnostics.refinement_complete = true;
+            diagnostics.final_count = provisional.len();
+            diagnostics.validated_count = 0;
+            diagnostics.rejected_count = 0;
+            diagnostics
+                .notes
+                .push("quality_gates_disabled_best_effort".to_string());
+            (provisional, None, diagnostics)
         };
 
-        let refine = refine_grounded_suggestions(
-            repo_root,
-            index,
-            context,
-            repo_memory.clone(),
-            summaries,
-            attempt_model,
-            attempt_model,
-            provisional,
-            gate_config.min_implementation_readiness_score,
-            gate_config.max_smart_rewrites_per_run,
-            diagnostics,
-        )
-        .await;
-        let (suggestions, usage_b, mut diagnostics) = match refine {
-            Ok(result) => result,
-            Err(err) => {
-                last_error = Some(err);
-                continue;
-            }
-        };
+        suggestions.truncate(
+            gate_config
+                .max_final_count
+                .min(FAST_GROUNDED_FINAL_TARGET_MAX),
+        );
 
-        attempts_executed += 1;
-        let attempt_usage = merge_usage(usage_a, usage_b);
-        let attempt_cost_usd = attempt_usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
-        let attempt_ms = attempt_start.elapsed().as_millis() as u64;
-        cumulative_usage = merge_usage(cumulative_usage, attempt_usage.clone());
-        let gate = build_gate_snapshot(&gate_config, &suggestions, attempt_ms, attempt_cost_usd);
+        merged_usage = merge_usage(merged_usage, merge_usage(usage_a, usage_b));
+        let total_cost_usd = merged_usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+        let total_ms = total_start.elapsed().as_millis() as u64;
+        let gate = build_gate_snapshot(&gate_config, &suggestions, total_ms, total_cost_usd);
 
         diagnostics.attempt_index = attempt_index;
-        diagnostics.attempt_count = attempts_executed;
+        diagnostics.attempt_count = attempt_count;
         diagnostics.gate_passed = gate.passed;
         diagnostics.gate_fail_reasons = gate.fail_reasons.clone();
-        diagnostics.attempt_cost_usd = attempt_cost_usd;
-        diagnostics.attempt_ms = attempt_ms;
+        diagnostics.attempt_cost_usd = total_cost_usd;
+        diagnostics.attempt_ms = total_ms;
         diagnostics.final_count = suggestions.len();
         diagnostics
             .notes
             .retain(|note| note != "quality_gate_failed");
         if !gate.passed {
             diagnostics.notes.push("quality_gate_failed".to_string());
-        }
-
-        on_progress(attempt_index, max_attempts, &gate, &diagnostics);
-        let auto_validation_overused = diagnostics.provisional_count > 0
-            && diagnostics
-                .deterministic_auto_validated_count
-                .saturating_mul(2)
-                >= diagnostics.provisional_count;
-
-        let candidate = GatedSuggestionRunResult {
-            suggestions,
-            usage: attempt_usage,
-            diagnostics,
-            gate: gate.clone(),
-        };
-
-        if best_result
-            .as_ref()
-            .map(|best| gate_snapshot_is_better(&candidate.gate, &best.gate))
-            .unwrap_or(true)
-        {
-            best_result = Some(candidate);
-        }
-
-        if gate.passed {
-            break;
-        }
-
-        if attempt_index < max_attempts {
-            let diversity_gate_failed = gate
-                .fail_reasons
-                .iter()
-                .any(|reason| reason.starts_with("dominant_topic_ratio"))
-                || gate
-                    .fail_reasons
-                    .iter()
-                    .any(|reason| reason.starts_with("unique_topic_count"))
-                || gate
-                    .fail_reasons
-                    .iter()
-                    .any(|reason| reason.starts_with("dominant_file_ratio"))
-                || gate
-                    .fail_reasons
-                    .iter()
-                    .any(|reason| reason.starts_with("unique_file_count"));
-            let remaining_budget_ms = gate_config
-                .max_suggest_ms
-                .saturating_sub(overall_start.elapsed().as_millis() as u64);
-            let needs_smart_count_rescue = gate.final_count < gate_config.min_final_count
-                && !forced_smart_rescue_attempted
-                && remaining_budget_ms >= GATE_RETRY_MIN_REMAINING_BUDGET_MS;
-            next_attempt_model =
-                if needs_smart_count_rescue || diversity_gate_failed || auto_validation_overused {
-                    Model::Smart
-                } else {
-                    Model::Speed
-                };
-            if needs_smart_count_rescue {
-                forced_smart_rescue_attempted = true;
-            }
-
-            let should_retry_after_gate = should_retry_after_gate_miss(
-                &gate_config,
-                &gate,
-                attempt_cost_usd,
-                remaining_budget_ms,
-            );
-            if !should_retry_after_gate && !needs_smart_count_rescue {
-                break;
-            }
-        }
-    }
-
-    if let Some(mut result) = best_result {
-        result.diagnostics.attempt_count = attempts_executed.max(1);
-        result.usage = cumulative_usage.clone();
-        if !result.gate.passed {
-            let reasons = if result.gate.fail_reasons.is_empty() {
+            let reasons = if gate.fail_reasons.is_empty() {
                 "unknown quality gate failure".to_string()
             } else {
-                result.gate.fail_reasons.join("; ")
+                gate.fail_reasons.join("; ")
             };
-            result.diagnostics.notes.push(format!(
+            retry_feedback = if suggestions.is_empty() {
+                Some("Previous attempt produced zero validated findings. Broaden coverage to the highest-risk code paths and return only bug/security findings backed by exact code quotes.".to_string())
+            } else {
+                Some(truncate_str(&reasons, 320).to_string())
+            };
+            diagnostics.notes.push(format!(
                 "quality_gate_missed_best_effort:{}",
                 truncate_str(&reasons, 240)
             ));
         }
-        return Ok(result);
+
+        on_progress(attempt_index, attempt_count, &gate, &diagnostics);
+
+        if gate.passed {
+            return Ok(GatedSuggestionRunResult {
+                suggestions,
+                usage: merged_usage,
+                diagnostics,
+                gate,
+            });
+        }
+
+        last_failed_gate = Some(gate);
+        last_failed_diagnostics = Some(diagnostics);
+
+        if total_ms > gate_config.max_suggest_ms {
+            break;
+        }
+    }
+
+    if let Some(gate) = last_failed_gate {
+        let reasons = if gate.fail_reasons.is_empty() {
+            "unknown quality gate failure".to_string()
+        } else {
+            gate.fail_reasons.join("; ")
+        };
+        let attempt_index = last_failed_diagnostics
+            .as_ref()
+            .map(|d| d.attempt_index)
+            .unwrap_or(attempt_count);
+        return Err(anyhow::anyhow!(
+            "Suggestion quality gate failed after {} attempt(s): {}",
+            attempt_index,
+            truncate_str(&reasons, 600)
+        ));
     }
 
     if let Some(err) = last_error {
-        return Err(err);
+        return Err(anyhow::anyhow!(
+            "Suggestion generation failed after {} attempt(s): {}",
+            attempts_executed.max(1),
+            truncate_str(&err.to_string(), 600)
+        ));
     }
 
     Err(anyhow::anyhow!(
-        "Suggestion quality gate failed without any successful generation attempts"
+        "Suggestion generation did not produce usable output."
     ))
 }
 

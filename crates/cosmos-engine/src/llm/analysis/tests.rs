@@ -2,14 +2,10 @@ use super::*;
 use chrono::Utc;
 use cosmos_adapters::config::SuggestionsProfile;
 use cosmos_core::context::WorkContext;
-use cosmos_core::index::{
-    CodebaseIndex, FileIndex, FileSummary, Language, Pattern, PatternKind, PatternReliability,
-    Symbol, SymbolKind, Visibility,
-};
+use cosmos_core::index::{CodebaseIndex, FileIndex, FileSummary, Language, Pattern, Symbol};
 use cosmos_core::suggest::{
-    Priority, SuggestionKind, SuggestionSource, SuggestionValidationMetadata,
+    Priority, SuggestionKind, SuggestionSource, SuggestionValidationMetadata, VerificationState,
 };
-use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,40 +13,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn test_suggestion(summary: &str) -> Suggestion {
     Suggestion::new(
-        SuggestionKind::Improvement,
+        SuggestionKind::BugFix,
         Priority::Medium,
         std::path::PathBuf::from("src/lib.rs"),
         summary.to_string(),
         SuggestionSource::LlmDeep,
     )
-}
-
-fn test_evidence_item(id: usize) -> EvidenceItem {
-    EvidenceItem {
-        id,
-        file: PathBuf::from(format!("src/file_{}.rs", id)),
-        line: id + 1,
-        snippet: format!("{}| let value = {};", id + 1, id),
-        why_interesting: "test".to_string(),
-        file_loc: None,
-        file_complexity: None,
-        anchor_context: None,
-        source: EvidenceSource::Pattern,
-        pattern_kind: None,
-    }
+    .with_validation_metadata(SuggestionValidationMetadata {
+        claim_impact_class: Some("correctness".to_string()),
+        ..Default::default()
+    })
+    .with_verification_state(VerificationState::Verified)
 }
 
 #[test]
-fn redacts_secret_like_tokens_from_snippets() {
-    let snippet = r#"  10| const API_KEY = "sk-1234567890abcdefghijkl";
-  11| authorization = "Bearer ghp_abcdefghijklmnopqrstuvwxyz123456";
-  12| password = "super-secret-value";
-"#;
-    let redacted = redact_obvious_secrets(snippet);
-    assert!(!redacted.contains("sk-1234567890abcdefghijkl"));
-    assert!(!redacted.contains("ghp_abcdefghijklmnopqrstuvwxyz123456"));
-    assert!(!redacted.contains("super-secret-value"));
-    assert!(redacted.contains("<redacted-secret>"));
+fn gate_attempt_model_starts_fast_then_escalates_to_smart() {
+    assert_eq!(gate_attempt_model(1), Model::Speed);
+    assert_eq!(gate_attempt_model(2), Model::Smart);
+    assert_eq!(gate_attempt_model(5), Model::Smart);
 }
 
 fn temp_root(label: &str) -> PathBuf {
@@ -122,203 +102,19 @@ fn empty_context(root: &Path) -> WorkContext {
 }
 
 #[test]
-fn parses_legacy_top_level_evidence_id_shape() {
-    let parsed: FastGroundedSuggestionJson = serde_json::from_value(json!({
-        "evidence_id": 7,
-        "kind": "bugfix",
-        "priority": "high",
-        "confidence": "high",
-        "summary": "Legacy shape",
-        "detail": "Still supported"
-    }))
-    .expect("legacy shape should deserialize");
-
-    assert_eq!(parsed.evidence_id, Some(7));
-    assert!(parsed.evidence_refs.is_empty());
-}
-
-#[test]
-fn parses_mixed_evidence_refs_shapes() {
-    let parsed: FastGroundedSuggestionJson = serde_json::from_value(json!({
-        "evidence_refs": [1, "2", {"evidence_id": 3}],
-        "kind": "improvement",
-        "priority": "medium",
-        "confidence": "medium",
-        "summary": "Mixed shape",
-        "detail": "Accepted for robustness"
-    }))
-    .expect("mixed evidence_refs shape should deserialize");
-
-    assert!(matches!(
-        parsed.evidence_refs[0],
-        FastGroundedEvidenceRefJson::Integer(1)
-    ));
-    assert!(matches!(
-        parsed.evidence_refs[1],
-        FastGroundedEvidenceRefJson::String(ref raw) if raw == "2"
-    ));
-    assert!(matches!(
-        parsed.evidence_refs[2],
-        FastGroundedEvidenceRefJson::Object {
-            evidence_id: Some(3),
-            ..
-        }
-    ));
-}
-
-#[test]
-fn parses_object_evidence_ref_with_snippet_id() {
-    let parsed: FastGroundedSuggestionJson = serde_json::from_value(json!({
-        "evidence_refs": [{
-            "snippet_id": 5,
-            "file": "src/main.rs",
-            "line": 42
-        }],
-        "kind": "reliability",
-        "priority": "high",
-        "confidence": "medium",
-        "summary": "Object shape",
-        "detail": "Should deserialize robustly"
-    }))
-    .expect("object evidence ref shape should deserialize");
-
-    match &parsed.evidence_refs[0] {
-        FastGroundedEvidenceRefJson::Object {
-            evidence_id,
-            snippet_id,
-        } => {
-            assert_eq!(*evidence_id, None);
-            assert_eq!(*snippet_id, Some(5));
-        }
-        _ => panic!("expected object evidence ref"),
-    }
-}
-
-#[test]
-fn collect_valid_evidence_refs_accepts_numeric_string_id() {
-    let pack = vec![test_evidence_item(0), test_evidence_item(4)];
-    let suggestion = FastGroundedSuggestionJson {
-        evidence_refs: vec![FastGroundedEvidenceRefJson::String("4".to_string())],
-        evidence_id: None,
-        snippet_id: None,
-        kind: "improvement".to_string(),
-        priority: "medium".to_string(),
-        confidence: "medium".to_string(),
-        summary: "test".to_string(),
-        detail: "detail".to_string(),
-    };
-
-    let refs = collect_valid_evidence_refs(&suggestion, &pack);
-    assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].snippet_id, 4);
-}
-
-#[test]
-fn grounded_finalizer_does_not_backfill_duplicates() {
-    let mapped = vec![
-        (1, test_suggestion("a")),
-        (1, test_suggestion("a-duplicate")),
-        (2, test_suggestion("b")),
-        (2, test_suggestion("b-duplicate")),
-    ];
-
-    let result = dedupe_and_cap_grounded_suggestions(mapped, FAST_GROUNDED_PROVISIONAL_TARGET_MAX);
-
-    assert_eq!(result.len(), 2);
-}
-
-#[test]
-fn grounded_finalizer_caps_results_at_provisional_target_max() {
-    let mapped: Vec<(usize, Suggestion)> = (0..120)
-        .map(|i| (i, test_suggestion(&format!("item-{}", i))))
-        .collect();
-
-    let result = dedupe_and_cap_grounded_suggestions(mapped, FAST_GROUNDED_PROVISIONAL_TARGET_MAX);
-
-    assert_eq!(result.len(), FAST_GROUNDED_PROVISIONAL_TARGET_MAX);
-}
-
-#[test]
-fn build_evidence_pack_is_deterministic_with_tie_breakers() {
-    let root = temp_root("deterministic");
+fn rank_top_churn_files_falls_back_to_risk_scoring_when_history_unavailable() {
+    let root = temp_root("churn_fallback");
     write_fixture_file(&root, "src/a.rs", 80);
     write_fixture_file(&root, "src/b.rs", 80);
     write_fixture_file(&root, "src/c.rs", 80);
 
     let mut files = HashMap::new();
-    for rel in ["src/a.rs", "src/b.rs", "src/c.rs"] {
-        let pattern = Pattern {
-            kind: PatternKind::MissingErrorHandling,
-            file: PathBuf::from(rel),
-            line: 12,
-            description: "Unchecked unwrap".to_string(),
-            reliability: PatternReliability::High,
-        };
-        let symbol = Symbol {
-            name: "handle".to_string(),
-            kind: SymbolKind::Function,
-            file: PathBuf::from(rel),
-            line: 12,
-            end_line: 30,
-            complexity: 12.0,
-            visibility: Visibility::Public,
-        };
-        let (path, index) = mk_file_index(rel, 120, 30.0, vec![pattern], vec![symbol], 3);
-        files.insert(path, index);
-    }
-    let index = CodebaseIndex {
-        root: root.clone(),
-        files,
-        index_errors: Vec::new(),
-        git_head: None,
-    };
-    let context = empty_context(&root);
-
-    let (pack_a, _) = build_evidence_pack(&root, &index, &context);
-    let (pack_b, _) = build_evidence_pack(&root, &index, &context);
-
-    let ids_a: Vec<_> = pack_a.iter().map(|i| (i.file.clone(), i.line)).collect();
-    let ids_b: Vec<_> = pack_b.iter().map(|i| (i.file.clone(), i.line)).collect();
-    assert_eq!(ids_a, ids_b);
-
-    let first_paths: Vec<_> = pack_a
-        .iter()
-        .take(3)
-        .map(|i| i.file.display().to_string())
-        .collect();
-    assert!(first_paths.windows(2).all(|w| w[0] <= w[1]));
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn build_evidence_pack_enforces_source_and_godmodule_quotas() {
-    let root = temp_root("quotas");
-    let mut files = HashMap::new();
-
-    for i in 0..24 {
-        let rel = format!("src/f{}.rs", i);
-        write_fixture_file(&root, &rel, 120);
-        let pattern = Pattern {
-            kind: PatternKind::GodModule,
-            file: PathBuf::from(&rel),
-            line: 1,
-            description: "Large module".to_string(),
-            reliability: PatternReliability::Low,
-        };
-        let symbol = Symbol {
-            name: format!("work_{}", i),
-            kind: SymbolKind::Function,
-            file: PathBuf::from(&rel),
-            line: 40,
-            end_line: 70,
-            complexity: 20.0 + i as f64,
-            visibility: Visibility::Public,
-        };
-        let (path, index) =
-            mk_file_index(&rel, 900, 40.0 + i as f64, vec![pattern], vec![symbol], 4);
-        files.insert(path, index);
-    }
+    let (a_path, a_index) = mk_file_index("src/a.rs", 120, 12.0, Vec::new(), Vec::new(), 0);
+    let (b_path, b_index) = mk_file_index("src/b.rs", 120, 45.0, Vec::new(), Vec::new(), 0);
+    let (c_path, c_index) = mk_file_index("src/c.rs", 120, 28.0, Vec::new(), Vec::new(), 0);
+    files.insert(a_path, a_index);
+    files.insert(b_path.clone(), b_index);
+    files.insert(c_path.clone(), c_index);
 
     let index = CodebaseIndex {
         root: root.clone(),
@@ -327,70 +123,59 @@ fn build_evidence_pack_enforces_source_and_godmodule_quotas() {
         git_head: None,
     };
     let context = empty_context(&root);
-    let (pack, stats) = build_evidence_pack(&root, &index, &context);
 
-    let godmodule_count = pack
-        .iter()
-        .filter(|item| item.pattern_kind == Some(PatternKind::GodModule))
-        .count();
-    assert!(stats.pattern_count <= FAST_EVIDENCE_SOURCE_PATTERN_MAX);
-    assert!(godmodule_count <= FAST_EVIDENCE_KIND_GOD_MODULE_MAX);
-    assert!(pack.len() <= FAST_EVIDENCE_PACK_MAX_ITEMS);
-    assert!(stats.line1_ratio <= 0.5);
+    let ranked = rank_top_churn_files_for_subagents(&root, &index, &context, 12, 2);
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(ranked[0], b_path);
+    assert_eq!(ranked[1], c_path);
 
     let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
-fn godmodule_anchor_prefers_complex_function_line_not_line1() {
-    let root = temp_root("godmodule_anchor");
-    let rel = "src/module.rs";
-    write_fixture_file(&root, rel, 140);
-
-    let pattern = Pattern {
-        kind: PatternKind::GodModule,
-        file: PathBuf::from(rel),
-        line: 1,
-        description: "File has many lines".to_string(),
-        reliability: PatternReliability::Low,
-    };
-    let symbol = Symbol {
-        name: "critical_path".to_string(),
-        kind: SymbolKind::Function,
-        file: PathBuf::from(rel),
-        line: 72,
-        end_line: 110,
-        complexity: 88.0,
-        visibility: Visibility::Public,
-    };
-    let (path, index_file) = mk_file_index(rel, 300, 10.0, vec![pattern], vec![symbol], 0);
-    let mut files = HashMap::new();
-    files.insert(path, index_file);
-    let index = CodebaseIndex {
-        root: root.clone(),
-        files,
-        index_errors: Vec::new(),
-        git_head: None,
-    };
-    let context = empty_context(&root);
-    let (pack, _) = build_evidence_pack(&root, &index, &context);
-
-    let godmodule_item = pack
-        .iter()
-        .find(|item| item.pattern_kind == Some(PatternKind::GodModule))
-        .expect("expected godmodule evidence item");
-    assert_eq!(godmodule_item.line, 72);
-
-    let _ = fs::remove_dir_all(&root);
+fn shard_subagent_focus_files_balances_and_backfills_empty_shards() {
+    let files = vec![
+        PathBuf::from("src/a.rs"),
+        PathBuf::from("src/b.rs"),
+        PathBuf::from("src/c.rs"),
+    ];
+    let shards = shard_subagent_focus_files(&files, 4);
+    assert_eq!(shards.len(), 4);
+    assert!(shards.iter().all(|shard| !shard.is_empty()));
+    assert_eq!(shards[0][0], PathBuf::from("src/a.rs"));
+    assert_eq!(shards[1][0], PathBuf::from("src/b.rs"));
+    assert_eq!(shards[2][0], PathBuf::from("src/c.rs"));
+    assert_eq!(shards[3][0], PathBuf::from("src/a.rs"));
 }
 
 #[test]
-fn regeneration_needed_uses_soft_floor_eighteen() {
-    assert_eq!(regeneration_needed(0), 18);
-    assert_eq!(regeneration_needed(1), 17);
-    assert_eq!(regeneration_needed(17), 1);
-    assert_eq!(regeneration_needed(18), 0);
-    assert_eq!(regeneration_needed(22), 0);
+fn verified_bug_security_scope_requires_verified_bugfix_and_allowed_impact() {
+    let good =
+        test_suggestion("Verified bug").with_validation_state(SuggestionValidationState::Validated);
+    assert!(suggestion_is_verified_bug_or_security(&good));
+
+    let wrong_kind = Suggestion::new(
+        SuggestionKind::Optimization,
+        Priority::Medium,
+        PathBuf::from("src/fast.rs"),
+        "Not a bug".to_string(),
+        SuggestionSource::LlmDeep,
+    )
+    .with_validation_metadata(SuggestionValidationMetadata {
+        claim_impact_class: Some("correctness".to_string()),
+        ..Default::default()
+    })
+    .with_verification_state(VerificationState::Verified)
+    .with_validation_state(SuggestionValidationState::Validated);
+    assert!(!suggestion_is_verified_bug_or_security(&wrong_kind));
+
+    let wrong_impact = test_suggestion("Wrong impact")
+        .with_validation_metadata(SuggestionValidationMetadata {
+            claim_impact_class: Some("maintainability".to_string()),
+            ..Default::default()
+        })
+        .with_validation_state(SuggestionValidationState::Validated);
+    assert!(!suggestion_is_verified_bug_or_security(&wrong_impact));
 }
 
 #[test]
@@ -412,242 +197,36 @@ fn finalize_validated_suggestions_drops_pending_without_capping() {
 }
 
 #[test]
-fn should_run_mapping_rescue_only_when_raw_exists_and_mapped_is_empty() {
-    assert!(should_run_mapping_rescue(3, 0));
-    assert!(!should_run_mapping_rescue(0, 0));
-    assert!(!should_run_mapping_rescue(3, 1));
+fn retryable_generation_error_matches_expected_provider_failures() {
+    assert!(is_retryable_generation_error(&anyhow::anyhow!(
+        "API returned empty response."
+    )));
+    assert!(is_retryable_generation_error(&anyhow::anyhow!(
+        "Timed out after 18000ms."
+    )));
+    assert!(is_retryable_generation_error(&anyhow::anyhow!(
+        "429 rate limited by upstream provider."
+    )));
+    assert!(!is_retryable_generation_error(&anyhow::anyhow!(
+        "Failed to parse structured response."
+    )));
 }
 
 #[test]
-fn generation_topup_decision_is_based_on_mapped_count_and_call_budget() {
-    assert!(should_run_generation_topup(
-        FAST_GROUNDED_VALIDATED_HARD_TARGET - 1,
-        0,
-        0,
-        SUGGEST_BALANCED_BUDGET_MS
-    ));
-    assert!(!should_run_generation_topup(
-        FAST_GROUNDED_VALIDATED_HARD_TARGET,
-        0,
-        0,
-        SUGGEST_BALANCED_BUDGET_MS
-    ));
-    assert!(!should_run_generation_topup(
-        0,
-        GENERATION_TOPUP_MAX_CALLS,
-        0,
-        SUGGEST_BALANCED_BUDGET_MS
-    ));
-}
+fn claim_grounding_prefers_observed_behavior_over_noisy_detail() {
+    let suggestion = test_suggestion("Users may see failures.")
+        .with_detail(
+            "This detail contains narrative language that does not mirror code tokens.".to_string(),
+        )
+        .with_evidence(
+            "10| if let Err(err) = send_metric() {\n11|     return Err(err);\n12| }".to_string(),
+        )
+        .with_validation_metadata(cosmos_core::suggest::SuggestionValidationMetadata {
+            claim_observed_behavior: Some("if let Err(err) = send_metric()".to_string()),
+            ..Default::default()
+        });
 
-#[test]
-fn generation_topup_request_count_uses_deficit_plus_padding_with_cap() {
-    assert_eq!(generation_topup_request_count(1), 4);
-    assert_eq!(generation_topup_request_count(6), 9);
-    assert_eq!(generation_topup_request_count(20), 10);
-}
-
-#[test]
-fn generation_topup_requires_remaining_budget() {
-    assert!(should_run_generation_topup(
-        FAST_GROUNDED_VALIDATED_HARD_TARGET - 1,
-        0,
-        0,
-        SUGGEST_BALANCED_BUDGET_MS
-    ));
-    assert!(!should_run_generation_topup(
-        FAST_GROUNDED_VALIDATED_HARD_TARGET - 1,
-        0,
-        SUGGEST_BALANCED_BUDGET_MS - GENERATION_TOPUP_TIMEOUT_MS + 1,
-        SUGGEST_BALANCED_BUDGET_MS
-    ));
-}
-
-#[test]
-fn regeneration_request_bounds_scale_and_clamp_to_range() {
-    assert_eq!(regeneration_request_bounds(1), (4, 4));
-    assert_eq!(regeneration_request_bounds(2), (4, 6));
-    assert_eq!(regeneration_request_bounds(4), (8, 12));
-    assert_eq!(regeneration_request_bounds(5), (10, 14));
-    assert_eq!(regeneration_request_bounds(10), (12, 14));
-}
-
-#[test]
-fn regeneration_needed_for_target_uses_target_count() {
-    assert_eq!(regeneration_needed_for_target(0, 15), 15);
-    assert_eq!(regeneration_needed_for_target(10, 15), 5);
-    assert_eq!(regeneration_needed_for_target(15, 15), 0);
-    assert_eq!(regeneration_needed_for_target(18, 15), 0);
-}
-
-#[test]
-fn choose_regeneration_phase_target_prioritizes_hard_then_stretch_target() {
-    assert_eq!(
-        choose_regeneration_phase_target(
-            9,
-            FAST_GROUNDED_VALIDATED_HARD_TARGET,
-            FAST_GROUNDED_VALIDATED_STRETCH_TARGET,
-            0,
-            0
-        ),
-        Some(FAST_GROUNDED_VALIDATED_HARD_TARGET)
-    );
-    assert_eq!(
-        choose_regeneration_phase_target(
-            9,
-            FAST_GROUNDED_VALIDATED_HARD_TARGET,
-            FAST_GROUNDED_VALIDATED_STRETCH_TARGET,
-            REFINEMENT_HARD_PHASE_MAX_ATTEMPTS,
-            0
-        ),
-        None
-    );
-    assert_eq!(
-        choose_regeneration_phase_target(
-            FAST_GROUNDED_VALIDATED_HARD_TARGET,
-            FAST_GROUNDED_VALIDATED_HARD_TARGET,
-            FAST_GROUNDED_VALIDATED_STRETCH_TARGET,
-            REFINEMENT_HARD_PHASE_MAX_ATTEMPTS,
-            0
-        ),
-        Some(FAST_GROUNDED_VALIDATED_STRETCH_TARGET)
-    );
-    assert_eq!(
-        choose_regeneration_phase_target(
-            FAST_GROUNDED_VALIDATED_HARD_TARGET,
-            FAST_GROUNDED_VALIDATED_HARD_TARGET,
-            FAST_GROUNDED_VALIDATED_STRETCH_TARGET,
-            REFINEMENT_HARD_PHASE_MAX_ATTEMPTS,
-            REFINEMENT_STRETCH_PHASE_MAX_ATTEMPTS
-        ),
-        None
-    );
-    assert_eq!(
-        choose_regeneration_phase_target(
-            FAST_GROUNDED_VALIDATED_STRETCH_TARGET,
-            FAST_GROUNDED_VALIDATED_HARD_TARGET,
-            FAST_GROUNDED_VALIDATED_STRETCH_TARGET,
-            0,
-            0
-        ),
-        None
-    );
-}
-
-#[test]
-fn build_remaining_pack_excludes_rejected_evidence_when_strict_pack_is_large_enough() {
-    let pack = (0..8).map(test_evidence_item).collect::<Vec<_>>();
-    let used = HashSet::from([0usize]);
-    let rejected = HashSet::from([1usize, 2usize]);
-
-    let (remaining, used_relaxed_filter, skipped_rejected_ids) =
-        build_remaining_pack_for_regeneration(&pack, &used, &rejected, false);
-
-    assert!(!used_relaxed_filter);
-    let remaining_ids = remaining.iter().map(|item| item.id).collect::<Vec<_>>();
-    assert_eq!(remaining_ids, vec![3, 4, 5, 6, 7]);
-    assert_eq!(skipped_rejected_ids, vec![1, 2]);
-}
-
-#[test]
-fn build_remaining_pack_relaxes_rejected_filter_once_when_strict_pack_is_too_small() {
-    let pack = (0..8).map(test_evidence_item).collect::<Vec<_>>();
-    let used = HashSet::from([0usize, 6usize, 7usize]);
-    let rejected = HashSet::from([1usize, 2usize, 3usize]);
-
-    let (remaining, used_relaxed_filter, skipped_rejected_ids) =
-        build_remaining_pack_for_regeneration(&pack, &used, &rejected, true);
-
-    assert!(used_relaxed_filter);
-    let remaining_ids = remaining.iter().map(|item| item.id).collect::<Vec<_>>();
-    assert_eq!(remaining_ids, vec![1, 2, 3, 4, 5]);
-    assert!(skipped_rejected_ids.is_empty());
-}
-
-#[test]
-fn sort_validation_outcomes_restores_input_order_for_parallel_results() {
-    let mut outcomes: Vec<ValidationOutcome> = vec![
-        (
-            2,
-            test_suggestion("c"),
-            0,
-            SuggestionValidationState::Validated,
-            "ok".to_string(),
-            None,
-            None,
-        ),
-        (
-            0,
-            test_suggestion("a"),
-            0,
-            SuggestionValidationState::Validated,
-            "ok".to_string(),
-            None,
-            None,
-        ),
-        (
-            1,
-            test_suggestion("b"),
-            0,
-            SuggestionValidationState::Rejected,
-            "no".to_string(),
-            None,
-            Some(ValidationRejectClass::Other),
-        ),
-    ];
-    sort_validation_outcomes(&mut outcomes);
-    let summaries = outcomes
-        .iter()
-        .map(|(_, suggestion, _, _, _, _, _)| suggestion.summary.clone())
-        .collect::<Vec<_>>();
-    assert_eq!(summaries, vec!["a", "b", "c"]);
-}
-
-#[test]
-fn should_stop_regeneration_for_validation_budget_blocks_deadline_or_low_budget() {
-    assert!(should_stop_regeneration_for_validation_budget(true, 10_000));
-    assert!(should_stop_regeneration_for_validation_budget(
-        false,
-        VALIDATION_MIN_REMAINING_BUDGET_MS - 1
-    ));
-    assert!(!should_stop_regeneration_for_validation_budget(
-        false,
-        VALIDATION_MIN_REMAINING_BUDGET_MS
-    ));
-}
-
-#[test]
-fn should_retry_transport_rejection_allows_single_retry_with_time_remaining() {
-    let future_deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(VALIDATION_RETRY_MIN_REMAINING_BUDGET_MS + 200);
-    let near_deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(VALIDATION_RETRY_MIN_REMAINING_BUDGET_MS - 100);
-    let past_deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
-    assert!(should_retry_transport_rejection(
-        ValidationRejectClass::Transport,
-        0,
-        future_deadline
-    ));
-    assert!(!should_retry_transport_rejection(
-        ValidationRejectClass::Transport,
-        VALIDATION_RETRY_MAX_PER_SUGGESTION,
-        future_deadline
-    ));
-    assert!(!should_retry_transport_rejection(
-        ValidationRejectClass::Contradicted,
-        0,
-        future_deadline
-    ));
-    assert!(!should_retry_transport_rejection(
-        ValidationRejectClass::Transport,
-        0,
-        past_deadline
-    ));
-    assert!(!should_retry_transport_rejection(
-        ValidationRejectClass::Transport,
-        0,
-        near_deadline
-    ));
+    assert!(suggestion_claim_is_grounded_for_acceptance(&suggestion));
 }
 
 #[test]
@@ -843,7 +422,7 @@ fn prevalidation_rejection_reason_rejects_non_actionable_safeguard_praise() {
         .reason
         .contains("Non-actionable safeguard description"));
     assert_eq!(reason.evidence_id, Some(14));
-    assert!(reason.rewrite_candidate);
+    assert!(!reason.is_contradiction);
 }
 
 #[test]
@@ -903,7 +482,7 @@ fn prevalidation_rejection_reason_rejects_non_security_clear_error_praise() {
         .reason
         .contains("Non-actionable behavior description"));
     assert_eq!(reason.evidence_id, Some(15));
-    assert!(reason.rewrite_candidate);
+    assert!(!reason.is_contradiction);
 }
 
 #[test]
@@ -935,7 +514,7 @@ fn prevalidation_rejection_reason_rejects_non_security_retry_praise() {
         .reason
         .contains("Non-actionable behavior description"));
     assert_eq!(reason.evidence_id, Some(16));
-    assert!(reason.rewrite_candidate);
+    assert!(!reason.is_contradiction);
 }
 
 #[test]
@@ -955,54 +534,58 @@ fn prevalidation_non_security_praise_filter_keeps_strong_defect_risk_claims() {
 }
 
 #[test]
-fn remap_suggestion_to_original_ids_handles_non_contiguous_ids() {
-    let full_pack = vec![
-        EvidenceItem {
-            id: 10,
-            file: PathBuf::from("src/a.rs"),
-            line: 7,
-            snippet: "7| let a = 1;".to_string(),
-            why_interesting: "pattern".to_string(),
-            file_loc: None,
-            file_complexity: None,
-            anchor_context: None,
-            source: EvidenceSource::Pattern,
-            pattern_kind: Some(PatternKind::MissingErrorHandling),
-        },
-        EvidenceItem {
-            id: 42,
-            file: PathBuf::from("src/b.rs"),
-            line: 11,
-            snippet: "11| let b = 2;".to_string(),
-            why_interesting: "hotspot".to_string(),
-            file_loc: None,
-            file_complexity: None,
-            anchor_context: None,
-            source: EvidenceSource::Hotspot,
-            pattern_kind: None,
-        },
-    ];
-    let (local_pack, local_to_original) = renumber_pack(&full_pack);
-    assert_eq!(local_pack[0].id, 0);
-    assert_eq!(local_pack[1].id, 1);
+fn prevalidation_rejection_reason_rejects_internal_jargon_summary() {
+    let mut chunk_seen_evidence_ids: HashSet<usize> = HashSet::new();
+    let used_evidence_ids: HashSet<usize> = HashSet::new();
 
-    let mut suggestion = test_suggestion("local-id")
-        .with_line(local_pack[1].line)
-        .with_evidence(local_pack[1].snippet.clone())
+    let suggestion = test_suggestion("src/cache.rs line 44 fails silently in this branch.")
+        .with_detail(
+            "When the write call returns an error, the branch swallows it without logging, so the user sees a save success state even though data is not persisted.".to_string(),
+        )
+        .with_evidence(
+            " 44| if let Err(_err) = cache.write(payload) {\n 45|     return Ok(());\n 46| }"
+                .to_string(),
+        )
         .with_evidence_refs(vec![SuggestionEvidenceRef {
-            snippet_id: 1,
-            file: local_pack[1].file.clone(),
-            line: local_pack[1].line,
+            snippet_id: 19,
+            file: PathBuf::from("src/cache.rs"),
+            line: 44,
         }]);
 
-    assert!(remap_suggestion_to_original_ids(
-        &mut suggestion,
-        &local_to_original,
-        &full_pack
-    ));
-    assert_eq!(suggestion.evidence_refs[0].snippet_id, 42);
-    assert_eq!(suggestion.file, PathBuf::from("src/b.rs"));
-    assert_eq!(suggestion.line, Some(11));
+    let reason = prevalidation_rejection_reason(
+        &suggestion,
+        &used_evidence_ids,
+        &mut chunk_seen_evidence_ids,
+    )
+    .expect("summary with internal jargon should be rejected");
+
+    assert!(reason.reason.contains("plain-language ethos"));
+    assert!(!reason.is_contradiction);
+}
+
+#[test]
+fn prevalidation_ethos_filter_accepts_plain_language_actionable_description() {
+    let suggestion = test_suggestion(
+        "When someone syncs changes, the request can time out and the save never completes.",
+    )
+    .with_detail(
+        "The network call awaits without a timeout guard, so dropped sockets keep the request open. Add a bounded timeout before awaiting and return a handled error path."
+            .to_string(),
+    )
+    .with_evidence(
+        " 91| let response = client.send(request).await?;\n 92| // missing timeout guard here"
+            .to_string(),
+    )
+    .with_evidence_refs(vec![SuggestionEvidenceRef {
+        snippet_id: 20,
+        file: PathBuf::from("src/sync.rs"),
+        line: 91,
+    }]);
+
+    assert!(
+        deterministic_prevalidation_ethos_reason(&suggestion).is_none(),
+        "clear user impact + concrete cause should pass ethos filter"
+    );
 }
 
 #[test]
@@ -1019,225 +602,84 @@ fn finalize_validated_suggestions_drops_pending_without_backfill() {
 }
 
 #[test]
-fn grounded_schema_enforces_single_evidence_ref() {
-    let schema = grounded_suggestion_schema(10);
-    let evidence_refs =
-        &schema["properties"]["suggestions"]["items"]["properties"]["evidence_refs"];
-    let evidence_id = &evidence_refs["items"]["properties"]["evidence_id"];
-    assert!(evidence_refs.get("minItems").is_none());
-    assert!(evidence_refs.get("maxItems").is_none());
-    assert_eq!(evidence_id.get("minimum").and_then(|v| v.as_u64()), Some(0));
-    assert_eq!(evidence_id.get("maximum").and_then(|v| v.as_u64()), Some(9));
-}
-
-#[test]
-fn collect_valid_evidence_refs_truncates_to_one_ref() {
-    let pack = vec![test_evidence_item(0), test_evidence_item(1)];
-    let suggestion = FastGroundedSuggestionJson {
-        evidence_refs: vec![
-            FastGroundedEvidenceRefJson::Integer(0),
-            FastGroundedEvidenceRefJson::Integer(1),
-        ],
-        evidence_id: None,
-        snippet_id: None,
-        kind: "improvement".to_string(),
-        priority: "medium".to_string(),
-        confidence: "medium".to_string(),
-        summary: "test".to_string(),
-        detail: "detail".to_string(),
-    };
-
-    let refs = collect_valid_evidence_refs(&suggestion, &pack);
-    assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].snippet_id, 0);
-}
-
-#[test]
-fn suggestion_batch_validation_schema_sets_local_index_bounds() {
-    let schema = suggestion_batch_validation_schema(5);
-    let local_index = &schema["properties"]["validations"]["items"]["properties"]["local_index"];
-    assert_eq!(local_index.get("minimum").and_then(|v| v.as_u64()), Some(0));
-    assert_eq!(local_index.get("maximum").and_then(|v| v.as_u64()), Some(5));
-}
-
-#[test]
-fn map_batch_validation_response_fills_missing_entries() {
-    let (mapped, stats) = map_batch_validation_response(
-        3,
-        SuggestionBatchValidationJson {
-            validations: vec![
-                SuggestionBatchValidationItemJson {
-                    local_index: 1,
-                    validation: "validated".to_string(),
-                    reason: "supported by snippet".to_string(),
-                },
-                SuggestionBatchValidationItemJson {
-                    local_index: 2,
-                    validation: "unexpected".to_string(),
-                    reason: String::new(),
-                },
-                SuggestionBatchValidationItemJson {
-                    local_index: 9,
-                    validation: "validated".to_string(),
-                    reason: "ignored out of range".to_string(),
-                },
-            ],
-        },
-    );
-
-    assert_eq!(mapped.len(), 3);
-    assert_eq!(stats.missing_index_count, 1);
-    assert_eq!(stats.no_reason_count, 1);
-
-    let (state0, reason0, class0) = &mapped[0];
-    assert_eq!(*state0, SuggestionValidationState::Rejected);
-    assert!(reason0.contains("retry needed"));
-    assert!(matches!(class0, Some(ValidationRejectClass::Transport)));
-
-    let (state1, _reason1, class1) = &mapped[1];
-    assert_eq!(*state1, SuggestionValidationState::Validated);
-    assert!(class1.is_none());
-
-    let (state2, reason2, class2) = &mapped[2];
-    assert_eq!(*state2, SuggestionValidationState::Rejected);
-    assert!(reason2.contains("no reason"));
-    assert!(matches!(class2, Some(ValidationRejectClass::Transport)));
-}
-
-#[test]
 fn default_gate_config_is_balanced_high_volume() {
     let config = SuggestionQualityGateConfig::default();
-    assert_eq!(config.min_final_count, 14);
-    assert_eq!(config.max_final_count, 30);
-    assert_eq!(config.max_suggest_cost_usd, 0.08);
-    assert_eq!(config.max_suggest_ms, 120_000);
-    assert_eq!(config.max_attempts, 3);
+    assert_eq!(config.min_final_count, 1);
+    assert_eq!(config.max_final_count, 12);
+    assert_eq!(config.max_suggest_cost_usd, 0.20);
+    assert_eq!(config.max_suggest_ms, 180_000);
+    assert_eq!(config.max_attempts, 4);
 }
 
 #[test]
 fn gate_profile_mapping_matches_expected_ranges() {
     let strict = suggestion_gate_config_for_profile(SuggestionsProfile::Strict);
-    assert_eq!(strict.min_final_count, 10);
-    assert_eq!(strict.max_final_count, 20);
+    assert_eq!(strict.min_final_count, 1);
+    assert_eq!(strict.max_final_count, 8);
     assert_eq!(strict.max_attempts, 3);
 
     let balanced = suggestion_gate_config_for_profile(SuggestionsProfile::BalancedHighVolume);
-    assert_eq!(balanced.min_final_count, 14);
-    assert_eq!(balanced.max_final_count, 30);
-    assert_eq!(balanced.max_attempts, 3);
+    assert_eq!(balanced.min_final_count, 1);
+    assert_eq!(balanced.max_final_count, 12);
+    assert_eq!(balanced.max_attempts, 4);
 
     let max_volume = suggestion_gate_config_for_profile(SuggestionsProfile::MaxVolume);
-    assert_eq!(max_volume.min_final_count, 24);
-    assert_eq!(max_volume.max_final_count, 30);
+    assert_eq!(max_volume.min_final_count, 2);
+    assert_eq!(max_volume.max_final_count, 16);
     assert_eq!(max_volume.max_attempts, 5);
 }
 
 #[test]
-fn rewrite_revalidation_triggers_for_insufficient_evidence() {
-    assert!(should_attempt_rewrite_revalidation(
-        ValidationRejectClass::InsufficientEvidence,
-        "insufficient evidence from snippet"
-    ));
-    assert!(should_attempt_rewrite_revalidation(
-        ValidationRejectClass::Contradicted,
-        "assumption beyond evidence about user impact"
-    ));
-    assert!(!should_attempt_rewrite_revalidation(
-        ValidationRejectClass::Transport,
-        "validation failed: deadline exceeded"
-    ));
-}
+fn gate_snapshot_is_best_effort_when_ethos_actionable_is_below_final_count() {
+    let mut config = SuggestionQualityGateConfig::default();
+    config.min_final_count = 1;
 
-#[test]
-fn validation_evidence_block_includes_deterministic_metadata() {
-    let suggestion = test_suggestion("metadata")
-        .with_evidence("12| let ok = true;".to_string())
+    let mut suggestions = Vec::new();
+    for i in 0..10usize {
+        let mut suggestion = test_suggestion(&format!(
+            "When someone saves draft {}, the action fails and the page keeps spinning.",
+            i
+        ))
+        .with_line(i + 1)
+        .with_detail(
+            "The save branch retries on network errors without a timeout, so failed sockets keep requests open. Add a timeout and return a handled error state."
+                .to_string(),
+        )
+        .with_evidence(
+            " 10| let response = client.send(req).await?;\n 11| // no timeout around this await"
+                .to_string(),
+        )
         .with_evidence_refs(vec![SuggestionEvidenceRef {
-            snippet_id: 7,
-            file: PathBuf::from("src/lib.rs"),
-            line: 12,
+            snippet_id: 100 + i,
+            file: PathBuf::from(format!("src/save_{}.rs", i)),
+            line: 10,
         }])
-        .with_validation_metadata(SuggestionValidationMetadata {
-            why_interesting: Some("Hotspot sample".to_string()),
-            file_loc: Some(240),
-            file_complexity: Some(33.4),
-            anchor_context: Some("Anchor near run:Function".to_string()),
-        });
+        .with_validation_state(SuggestionValidationState::Validated);
+        suggestion.file = PathBuf::from(format!("src/save_{}.rs", i));
+        if i == 9 {
+            suggestion.summary = "src/save_9.rs line 10 fails and this is bad.".to_string();
+        }
+        suggestions.push(suggestion);
+    }
 
-    let block = build_validation_evidence_block(&suggestion);
-    assert!(block.contains("Why interesting: Hotspot sample"));
-    assert!(block.contains("File LOC: 240"));
-    assert!(block.contains("File complexity: 33.4"));
-    assert!(block.contains("Anchor context: Anchor near run:Function"));
+    let gate = build_gate_snapshot(&config, &suggestions, 3_000, 0.01);
+    assert!(gate.passed);
+    assert!(gate.fail_reasons.is_empty());
+    assert!(gate.ethos_actionable_count < gate.final_count);
 }
 
 #[test]
-fn gate_snapshot_reports_fail_reasons_for_count_and_cost() {
-    let config = SuggestionQualityGateConfig::default();
+fn gate_snapshot_ignores_count_and_time_fail_reasons_when_disabled() {
+    let mut config = SuggestionQualityGateConfig::default();
+    config.min_final_count = 3;
     let suggestions = vec![
         test_suggestion("one").with_validation_state(SuggestionValidationState::Validated),
         test_suggestion("two").with_validation_state(SuggestionValidationState::Validated),
     ];
-    let gate = build_gate_snapshot(
-        &config,
-        &suggestions,
-        3_000,
-        config.max_suggest_cost_usd + 0.01,
-    );
-    assert!(!gate.passed);
-    assert!(gate
-        .fail_reasons
-        .iter()
-        .any(|reason| reason.contains("final_count")));
-    assert!(gate
-        .fail_reasons
-        .iter()
-        .any(|reason| reason.contains("suggest_total_cost_usd")));
-}
-
-#[test]
-fn gate_snapshot_prefers_higher_validity_and_count() {
-    let better = SuggestionGateSnapshot {
-        final_count: 12,
-        displayed_valid_ratio: 1.0,
-        pending_count: 0,
-        suggest_total_ms: 20_000,
-        suggest_total_cost_usd: 0.012,
-        dominant_topic_ratio: 0.40,
-        unique_topic_count: 6,
-        dominant_file_ratio: 0.40,
-        unique_file_count: 6,
-        passed: true,
-        fail_reasons: Vec::new(),
-    };
-    let worse = SuggestionGateSnapshot {
-        final_count: 8,
-        displayed_valid_ratio: 0.9,
-        pending_count: 0,
-        suggest_total_ms: 15_000,
-        suggest_total_cost_usd: 0.010,
-        dominant_topic_ratio: 0.90,
-        unique_topic_count: 1,
-        dominant_file_ratio: 0.90,
-        unique_file_count: 1,
-        passed: false,
-        fail_reasons: vec!["count".to_string()],
-    };
-    assert!(gate_snapshot_is_better(&better, &worse));
-    assert!(!gate_snapshot_is_better(&worse, &better));
-}
-
-#[test]
-fn overclaim_reason_detector_matches_expected_markers() {
-    assert!(is_overclaim_validation_reason(
-        "Suggestion makes assumptions beyond evidence about business impact"
-    ));
-    assert!(is_overclaim_validation_reason(
-        "Claims UI behavior without proof from snippet"
-    ));
-    assert!(!is_overclaim_validation_reason(
-        "Validation failed: deadline exceeded"
-    ));
+    let gate = build_gate_snapshot(&config, &suggestions, config.max_suggest_ms + 1, 0.01);
+    assert!(gate.passed);
+    assert!(gate.fail_reasons.is_empty());
+    assert_eq!(gate.final_count, 2);
 }
 
 #[test]
@@ -1355,7 +797,7 @@ fn readiness_annotation_keeps_grounded_specific_claims_high() {
 }
 
 #[test]
-fn apply_readiness_filter_backfills_when_threshold_is_too_strict() {
+fn apply_readiness_filter_skips_ungrounded_backfill_candidates() {
     let suggestions = (0..9)
         .map(|i| {
             let mut suggestion = test_suggestion("Users will see broken behavior in production.")
@@ -1372,104 +814,12 @@ fn apply_readiness_filter_backfills_when_threshold_is_too_strict() {
 
     let (filtered, _dropped, _mean) =
         apply_readiness_filter(suggestions, DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE);
-    let expected_floor = FAST_GROUNDED_FINAL_TARGET_MIN.saturating_sub(2);
-    assert_eq!(filtered.len(), expected_floor.min(9));
-    assert!(filtered.iter().any(|s| {
+    assert!(filtered.is_empty());
+    assert!(!filtered.iter().any(|s| {
         s.implementation_risk_flags
             .iter()
             .any(|flag| flag == "below_readiness_threshold_backfill")
     }));
-}
-
-#[test]
-fn speculative_filter_keeps_grounded_crash_claim_when_evidence_proves_it() {
-    let suggestion = test_suggestion("The process can crash when this panic path executes.")
-        .with_detail("A panic path is present and unhandled in this flow.".to_string())
-        .with_evidence(
-            " 41| if config.invalid() {\n 42|     panic!(\"invalid config\");\n 43| }\n"
-                .to_string(),
-        )
-        .with_evidence_refs(vec![SuggestionEvidenceRef {
-            snippet_id: 11,
-            file: PathBuf::from("src/runtime.rs"),
-            line: 42,
-        }]);
-
-    let (kept, dropped) = filter_speculative_impact_suggestions(vec![suggestion]);
-    assert_eq!(dropped, 0);
-    assert_eq!(kept.len(), 1);
-}
-
-#[test]
-fn speculative_filter_drops_unsupported_business_impact_claims() {
-    let suggestion =
-        test_suggestion("This path can hurt campaign reach and outreach effectiveness for teams.")
-            .with_detail("The function retries once and then returns false.".to_string())
-            .with_evidence(
-                " 12| let ok = retry_once();\n 13| if !ok {\n 14|   return false;\n 15| }\n"
-                    .to_string(),
-            )
-            .with_evidence_refs(vec![SuggestionEvidenceRef {
-                snippet_id: 12,
-                file: PathBuf::from("src/worker.rs"),
-                line: 14,
-            }]);
-
-    let (kept, dropped) = filter_speculative_impact_suggestions(vec![suggestion]);
-    assert_eq!(kept.len(), 0);
-    assert_eq!(dropped, 1);
-}
-
-#[test]
-fn deterministic_auto_validation_accepts_empty_catch_with_silent_error_language() {
-    let suggestion = test_suggestion("Errors are silently ignored in this flow.")
-        .with_detail("A catch block is empty, so failures are not logged.".to_string())
-        .with_evidence(
-            " 10| try {\n 11|   runTask();\n 12| } catch (error) {\n 13| }\n".to_string(),
-        )
-        .with_evidence_refs(vec![SuggestionEvidenceRef {
-            snippet_id: 7,
-            file: PathBuf::from("src/a.ts"),
-            line: 12,
-        }]);
-
-    let reason = deterministic_auto_validation_reason(&suggestion);
-    assert!(reason.is_some());
-}
-
-#[test]
-fn deterministic_auto_validation_rejects_non_empty_catch() {
-    let suggestion = test_suggestion("Errors are silently ignored in this flow.")
-            .with_detail("A catch block is empty, so failures are not logged.".to_string())
-            .with_evidence(
-                " 10| try {\n 11|   runTask();\n 12| } catch (error) {\n 13|   console.error(error);\n 14| }\n".to_string(),
-            )
-            .with_evidence_refs(vec![SuggestionEvidenceRef {
-                snippet_id: 7,
-                file: PathBuf::from("src/a.ts"),
-                line: 12,
-            }]);
-
-    let reason = deterministic_auto_validation_reason(&suggestion);
-    assert!(reason.is_none());
-}
-
-#[test]
-fn deterministic_auto_validation_rejects_unanchored_impact_claims() {
-    let suggestion =
-        test_suggestion("Failed lock releases can leave stale locks that block future jobs.")
-            .with_detail("A catch block is empty, so lock cleanup failures are hidden.".to_string())
-            .with_evidence(
-                " 10| try {\n 11|   runTask();\n 12| } catch (error) {\n 13| }\n".to_string(),
-            )
-            .with_evidence_refs(vec![SuggestionEvidenceRef {
-                snippet_id: 9,
-                file: PathBuf::from("src/a.ts"),
-                line: 12,
-            }]);
-
-    let reason = deterministic_auto_validation_reason(&suggestion);
-    assert!(reason.is_none());
 }
 
 #[test]
@@ -1530,60 +880,9 @@ fn file_balance_caps_dominant_file_when_alternatives_exist() {
 }
 
 #[test]
-fn speculative_impact_filter_rewrites_ungrounded_memory_claims() {
-    let speculative = test_suggestion(
-            "Leaked observers may cause memory growth, slowing the browser over time.",
-        )
-        .with_detail("Disconnect errors are ignored in cleanup.".to_string())
-        .with_evidence(
-            " 10| const po = new PerformanceObserver(() => {});\n 11| try {\n 12|   po.disconnect();\n 13| } catch {}\n"
-                .to_string(),
-        )
-        .with_validation_state(SuggestionValidationState::Validated);
-    let grounded =
-        test_suggestion("Metric updates can fail silently, so monitoring data is missing.")
-            .with_detail("Empty catch blocks can suppress metric errors.".to_string())
-            .with_evidence(" 20| try {\n 21|   sendMetric();\n 22| } catch {}\n".to_string())
-            .with_validation_state(SuggestionValidationState::Validated);
-
-    let (filtered, dropped) =
-        filter_speculative_impact_suggestions(vec![speculative, grounded.clone()]);
-    assert_eq!(dropped, 0);
-    assert_eq!(filtered.len(), 2);
-    let rewritten = filtered
-        .iter()
-        .find(|s| s.summary.to_ascii_lowercase().contains("telemetry"))
-        .expect("expected conservative telemetry rewrite");
-    assert!(!rewritten
-        .summary
-        .to_ascii_lowercase()
-        .contains("memory growth"));
-}
-
-#[test]
-fn speculative_impact_filter_rewrites_audience_claims_to_data_drift() {
-    let audience = test_suggestion(
-            "Users may miss important alerts because audience updates fail, reducing campaign reach.",
-        )
-        .with_detail("Audience set writes are best-effort.".to_string())
-        .with_evidence(
-            " 50| try {\n 51|   await redis.sadd(DUMP_ALERT_AUDIENCE_SET, userEmail);\n 52| } catch {}\n"
-                .to_string(),
-        )
-        .with_validation_state(SuggestionValidationState::Validated);
-
-    let (filtered, dropped) = filter_speculative_impact_suggestions(vec![audience]);
-    assert_eq!(dropped, 0);
-    assert_eq!(filtered.len(), 1);
-    let summary = filtered[0].summary.to_ascii_lowercase();
-    assert!(summary.contains("audience"));
-    assert!(summary.contains("drift"));
-    assert!(!summary.contains("campaign reach"));
-}
-
-#[test]
-fn gate_snapshot_fails_when_file_concentration_is_too_high() {
-    let config = SuggestionQualityGateConfig::default();
+fn gate_snapshot_keeps_diversity_metrics_without_enforcing_file_gate() {
+    let mut config = SuggestionQualityGateConfig::default();
+    config.min_final_count = 4;
     let mut suggestions = Vec::new();
     for i in 0..config.min_final_count {
         let mut suggestion = test_suggestion(&format!("Distinct issue {}", i))
@@ -1593,134 +892,8 @@ fn gate_snapshot_fails_when_file_concentration_is_too_high() {
     }
 
     let gate = build_gate_snapshot(&config, &suggestions, 10_000, 0.01);
-    assert!(!gate.passed);
-    assert!(gate
-        .fail_reasons
-        .iter()
-        .any(|reason| reason.starts_with("dominant_file_ratio")));
-    assert!(gate
-        .fail_reasons
-        .iter()
-        .any(|reason| reason.starts_with("unique_file_count")));
-}
-
-#[test]
-fn parse_validation_state_accepts_common_synonyms() {
-    let (state, class) = parse_validation_state("supported_by_evidence");
-    assert_eq!(state, SuggestionValidationState::Validated);
-    assert!(class.is_none());
-
-    let (state, class) = parse_validation_state("insufficient evidence");
-    assert_eq!(state, SuggestionValidationState::Rejected);
-    assert_eq!(class, Some(ValidationRejectClass::InsufficientEvidence));
-
-    let (state, class) = parse_validation_state("not supported");
-    assert_eq!(state, SuggestionValidationState::Rejected);
-    assert_eq!(class, Some(ValidationRejectClass::Contradicted));
-}
-
-#[test]
-fn reconcile_validation_from_reason_recovers_supported_other_label() {
-    let (state, class) = reconcile_validation_from_reason(
-        SuggestionValidationState::Rejected,
-        Some(ValidationRejectClass::Other),
-        "Evidence contains an empty catch block, confirming this suggestion is supported.",
-    );
-    assert_eq!(state, SuggestionValidationState::Validated);
-    assert!(class.is_none());
-}
-
-#[test]
-fn reconcile_validation_from_reason_recovers_supported_contradicted_label() {
-    let (state, class) = reconcile_validation_from_reason(
-        SuggestionValidationState::Rejected,
-        Some(ValidationRejectClass::Contradicted),
-        "The snippet shows a missing return path, supporting the suggestion.",
-    );
-    assert_eq!(state, SuggestionValidationState::Validated);
-    assert!(class.is_none());
-}
-
-#[test]
-fn reconcile_validation_from_reason_maps_does_not_show_to_insufficient_evidence() {
-    let (state, class) = reconcile_validation_from_reason(
-        SuggestionValidationState::Rejected,
-        Some(ValidationRejectClass::Other),
-        "The snippet does not show retry backoff behavior.",
-    );
-    assert_eq!(state, SuggestionValidationState::Rejected);
-    assert_eq!(class, Some(ValidationRejectClass::InsufficientEvidence));
-}
-
-#[test]
-fn map_batch_validation_response_treats_short_reason_as_retry_needed() {
-    let (mapped, stats) = map_batch_validation_response(
-        1,
-        SuggestionBatchValidationJson {
-            validations: vec![SuggestionBatchValidationItemJson {
-                local_index: 0,
-                validation: "contradicted".to_string(),
-                reason: "Snippet".to_string(),
-            }],
-        },
-    );
-
-    assert_eq!(stats.no_reason_count, 1);
-    let (state, reason, class) = &mapped[0];
-    assert_eq!(*state, SuggestionValidationState::Rejected);
-    assert!(reason.contains("no reason"));
-    assert_eq!(*class, Some(ValidationRejectClass::Transport));
-}
-
-#[test]
-fn infer_validation_reject_class_detects_insufficient_evidence_phrasing() {
-    let class = infer_validation_reject_class(
-        "The snippet does not provide evidence for this claim.",
-        None,
-    );
-    assert_eq!(class, ValidationRejectClass::InsufficientEvidence);
-}
-
-#[test]
-fn is_unusable_validation_reason_requires_minimum_length() {
-    assert!(is_unusable_validation_reason("Snippet"));
-    assert!(!is_unusable_validation_reason(
-        "Evidence shows the claim is directly supported."
-    ));
-}
-
-#[test]
-fn should_retry_after_gate_miss_skips_cost_only_misses() {
-    let config = SuggestionQualityGateConfig::default();
-    let gate = SuggestionGateSnapshot {
-        final_count: config.min_final_count + 1,
-        displayed_valid_ratio: config.min_displayed_valid_ratio,
-        pending_count: 0,
-        suggest_total_ms: config.max_suggest_ms + 100,
-        suggest_total_cost_usd: config.max_suggest_cost_usd + 0.001,
-        dominant_topic_ratio: 0.30,
-        unique_topic_count: config.min_final_count,
-        dominant_file_ratio: 0.30,
-        unique_file_count: config.min_final_count,
-        passed: false,
-        fail_reasons: vec!["cost".to_string(), "latency".to_string()],
-    };
-    assert!(!should_retry_after_gate_miss(
-        &config,
-        &gate,
-        config.max_suggest_cost_usd * 0.95,
-        GATE_RETRY_MIN_REMAINING_BUDGET_MS + 1
-    ));
-}
-
-#[test]
-fn choose_regeneration_phase_target_returns_stretch_after_hard_is_met() {
-    let selected = choose_regeneration_phase_target(
-        FAST_GROUNDED_VALIDATED_HARD_TARGET,
-        FAST_GROUNDED_VALIDATED_HARD_TARGET,
-        FAST_GROUNDED_VALIDATED_STRETCH_TARGET,
-        REFINEMENT_HARD_PHASE_MAX_ATTEMPTS,
-        0,
-    );
-    assert_eq!(selected, Some(FAST_GROUNDED_VALIDATED_STRETCH_TARGET));
+    assert!(gate.passed);
+    assert!(gate.fail_reasons.is_empty());
+    assert!(gate.dominant_file_ratio > DIVERSITY_DOMINANT_FILE_RATIO_MAX);
+    assert!(gate.unique_file_count < DIVERSITY_MIN_UNIQUE_FILES);
 }
