@@ -30,14 +30,14 @@ diff --git a/a.rs b/a.rs
 }
 
 #[test]
-fn model_policy_uses_speed_tier() {
-    assert_eq!(IMPLEMENTATION_MODEL.id(), "openai/gpt-oss-120b");
+fn model_policy_uses_smart_tier() {
+    assert_eq!(IMPLEMENTATION_MODEL.id(), "z-ai/glm-5");
 }
 
 #[test]
-fn model_policy_rejects_non_speed_model() {
-    assert!(ensure_implementation_model(Model::Smart).is_err());
-    assert!(ensure_implementation_model(Model::Speed).is_ok());
+fn model_policy_rejects_non_implementation_model() {
+    assert!(ensure_implementation_model(Model::Smart).is_ok());
+    assert!(ensure_implementation_model(Model::Speed).is_err());
 }
 
 #[test]
@@ -153,11 +153,11 @@ fn quick_check_policy_matrix_matches_profiles() {
     assert!(lab.require_quick_check_detectable);
     assert_eq!(
         interactive.adversarial_review_model,
-        ImplementationReviewModel::Speed
+        ImplementationReviewModel::Smart
     );
     assert_eq!(
         lab.adversarial_review_model,
-        ImplementationReviewModel::Speed
+        ImplementationReviewModel::Smart
     );
     assert!(interactive.require_independent_review_on_pass);
     assert!(!lab.require_independent_review_on_pass);
@@ -184,15 +184,15 @@ fn quick_check_policy_matrix_matches_profiles() {
 }
 
 #[test]
-fn adversarial_review_model_policy_allows_speed_and_smart_only() {
-    assert!(ensure_adversarial_review_model(Model::Speed).is_ok());
+fn adversarial_review_model_policy_allows_smart_only() {
     assert!(ensure_adversarial_review_model(Model::Smart).is_ok());
+    assert!(ensure_adversarial_review_model(Model::Speed).is_err());
 }
 
 #[test]
-fn generation_model_policy_allows_speed_and_smart_only() {
-    assert!(ensure_generation_model(Model::Speed).is_ok());
+fn generation_model_policy_allows_smart_only() {
     assert!(ensure_generation_model(Model::Smart).is_ok());
+    assert!(ensure_generation_model(Model::Speed).is_err());
 }
 
 #[test]

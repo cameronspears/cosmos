@@ -27,10 +27,16 @@ fn test_suggestion(summary: &str) -> Suggestion {
 }
 
 #[test]
-fn gate_attempt_model_starts_fast_then_escalates_to_smart() {
-    assert_eq!(gate_attempt_model(1), Model::Speed);
+fn gate_attempt_model_uses_smart_for_all_attempts() {
+    assert_eq!(gate_attempt_model(1), Model::Smart);
     assert_eq!(gate_attempt_model(2), Model::Smart);
     assert_eq!(gate_attempt_model(5), Model::Smart);
+}
+
+#[test]
+fn non_summary_model_guard_rejects_speed() {
+    assert!(ensure_non_summary_model(Model::Speed, "Suggestions").is_err());
+    assert!(ensure_non_summary_model(Model::Smart, "Suggestions").is_ok());
 }
 
 fn temp_root(label: &str) -> PathBuf {
@@ -631,8 +637,10 @@ fn gate_profile_mapping_matches_expected_ranges() {
 
 #[test]
 fn gate_snapshot_is_best_effort_when_ethos_actionable_is_below_final_count() {
-    let mut config = SuggestionQualityGateConfig::default();
-    config.min_final_count = 1;
+    let config = SuggestionQualityGateConfig {
+        min_final_count: 1,
+        ..Default::default()
+    };
 
     let mut suggestions = Vec::new();
     for i in 0..10usize {
@@ -670,8 +678,10 @@ fn gate_snapshot_is_best_effort_when_ethos_actionable_is_below_final_count() {
 
 #[test]
 fn gate_snapshot_ignores_count_and_time_fail_reasons_when_disabled() {
-    let mut config = SuggestionQualityGateConfig::default();
-    config.min_final_count = 3;
+    let config = SuggestionQualityGateConfig {
+        min_final_count: 3,
+        ..Default::default()
+    };
     let suggestions = vec![
         test_suggestion("one").with_validation_state(SuggestionValidationState::Validated),
         test_suggestion("two").with_validation_state(SuggestionValidationState::Validated),
@@ -881,8 +891,10 @@ fn file_balance_caps_dominant_file_when_alternatives_exist() {
 
 #[test]
 fn gate_snapshot_keeps_diversity_metrics_without_enforcing_file_gate() {
-    let mut config = SuggestionQualityGateConfig::default();
-    config.min_final_count = 4;
+    let config = SuggestionQualityGateConfig {
+        min_final_count: 4,
+        ..Default::default()
+    };
     let mut suggestions = Vec::new();
     for i in 0..config.min_final_count {
         let mut suggestion = test_suggestion(&format!("Distinct issue {}", i))

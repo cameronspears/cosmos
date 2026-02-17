@@ -2654,6 +2654,7 @@ pub async fn analyze_codebase_fast_grounded(
     generation_target: usize,
     retry_feedback: Option<&str>,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
+    ensure_non_summary_model(generation_model, "Suggestion generation")?;
     let run_id = Uuid::new_v4().to_string();
     let target = clamp_agentic_target(generation_target);
     let iteration_budget = agentic_iterations_for_target(target);
@@ -2663,7 +2664,7 @@ pub async fn analyze_codebase_fast_grounded(
         rank_top_churn_files_for_subagents(repo_root, index, context, target, focus_file_limit);
     let focus_shards = shard_subagent_focus_files(&focus_files, subagent_count);
     let project_ethos = load_project_ethos(repo_root);
-    let mut subagent_targets = vec![(target / subagent_count).max(2).min(4); subagent_count];
+    let mut subagent_targets = vec![(target / subagent_count).clamp(2, 4); subagent_count];
     let mut distributed = subagent_targets.iter().sum::<usize>();
     let mut cursor = 0usize;
     while distributed < target {
@@ -3035,13 +3036,15 @@ pub async fn refine_grounded_suggestions(
     _context: &WorkContext,
     _repo_memory: Option<String>,
     _summaries: Option<&HashMap<PathBuf, String>>,
-    _generation_model: Model,
-    _validation_model: Model,
+    generation_model: Model,
+    validation_model: Model,
     provisional: Vec<Suggestion>,
     min_implementation_readiness_score: f32,
     _max_smart_rewrites_per_run: usize,
     mut diagnostics: SuggestionDiagnostics,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
+    ensure_non_summary_model(generation_model, "Suggestion refinement generation")?;
+    ensure_non_summary_model(validation_model, "Suggestion refinement validation")?;
     if provisional.is_empty() {
         diagnostics.refinement_complete = true;
         diagnostics.provisional_count = 0;
@@ -3305,12 +3308,19 @@ fn build_gate_snapshot(
     }
 }
 
-fn gate_attempt_model(attempt_index: usize) -> Model {
-    if attempt_index == 1 {
-        Model::Speed
-    } else {
-        Model::Smart
+fn gate_attempt_model(_attempt_index: usize) -> Model {
+    Model::Smart
+}
+
+fn ensure_non_summary_model(model: Model, operation: &str) -> anyhow::Result<()> {
+    if model == Model::Speed {
+        return Err(anyhow::anyhow!(
+            "{} must not use {} (reserved for file summaries)",
+            operation,
+            model.id()
+        ));
     }
+    Ok(())
 }
 
 pub async fn run_fast_grounded_with_gate(

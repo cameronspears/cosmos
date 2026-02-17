@@ -138,6 +138,17 @@ fn max_tokens_for_multi_file_fix_response(model: Model) -> u32 {
     }
 }
 
+fn ensure_non_summary_model(model: Model, operation: &str) -> anyhow::Result<()> {
+    if model == Model::Speed {
+        return Err(anyhow::anyhow!(
+            "{} must not use {} (reserved for file summaries)",
+            operation,
+            model.id()
+        ));
+    }
+    Ok(())
+}
+
 fn prompt_budget_per_file(file_count: usize) -> usize {
     if file_count == 0 {
         return 0;
@@ -490,6 +501,7 @@ async fn call_llm_structured_with_fallback<T>(
 where
     T: serde::de::DeserializeOwned,
 {
+    ensure_non_summary_model(model, "Fix generation")?;
     // Default policy: prefer the excerpt to keep token usage bounded. Escalate to full-file
     // context only when the caller decides it is necessary (typically after an edit-apply error).
     let primary = if prefer_full_prompt {
@@ -2306,12 +2318,12 @@ VERIFY:
     // Use structured output to guarantee valid JSON response
     let response_format = schema_to_response_format("fix_preview", fix_preview_schema());
 
-    // Use Speed model with high reasoning effort for cost-effective fix planning
+    // Use Smart model for fix preview planning
     // 3 iterations - code already provided, minimal exploration needed
     let response = call_llm_agentic(
         FIX_PREVIEW_AGENTIC_SYSTEM,
         &user,
-        Model::Speed,
+        Model::Smart,
         repo_root,
         false,
         3, // max iterations - verification has code upfront
@@ -2651,6 +2663,12 @@ mod tests {
             SuggestionSource::LlmDeep,
         )
         .with_detail("Details".to_string())
+    }
+
+    #[test]
+    fn non_summary_model_guard_rejects_speed() {
+        assert!(ensure_non_summary_model(Model::Speed, "Fix generation").is_err());
+        assert!(ensure_non_summary_model(Model::Smart, "Fix generation").is_ok());
     }
 
     #[test]

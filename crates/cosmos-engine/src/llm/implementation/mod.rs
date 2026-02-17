@@ -45,7 +45,7 @@ use review_helpers::{
 };
 
 const APPLY_HARNESS_REPORT_DIR: &str = ".cosmos/apply_harness";
-const IMPLEMENTATION_MODEL: Model = Model::Speed;
+const IMPLEMENTATION_MODEL: Model = Model::Smart;
 const REASON_SCOPE_VIOLATION: &str = "scope_violation";
 const REASON_DIFF_BUDGET_VIOLATION: &str = "diff_budget_violation";
 const REASON_SYNTAX_VIOLATION: &str = "syntax_violation";
@@ -123,8 +123,8 @@ impl Default for ImplementationHarnessConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ImplementationReviewModel {
-    #[default]
     Speed,
+    #[default]
     Smart,
 }
 
@@ -148,7 +148,8 @@ impl ImplementationHarnessRunContext {
 impl ImplementationReviewModel {
     fn as_model(self) -> Model {
         match self {
-            ImplementationReviewModel::Speed => Model::Speed,
+            // Backward-compatible coercion: persisted "speed" settings now map to Smart.
+            ImplementationReviewModel::Speed => Model::Smart,
             ImplementationReviewModel::Smart => Model::Smart,
         }
     }
@@ -177,7 +178,7 @@ impl ImplementationHarnessConfig {
             fail_on_reduced_confidence: false,
             quick_check_fix_requires_in_scope_error: true,
             require_independent_review_on_pass: true,
-            adversarial_review_model: ImplementationReviewModel::Speed,
+            adversarial_review_model: ImplementationReviewModel::Smart,
         }
     }
 
@@ -200,7 +201,7 @@ impl ImplementationHarnessConfig {
         config.fail_on_reduced_confidence = true;
         // Loosen mode: keep review fast to establish a successful envelope first.
         config.require_independent_review_on_pass = false;
-        config.adversarial_review_model = ImplementationReviewModel::Speed;
+        config.adversarial_review_model = ImplementationReviewModel::Smart;
         config
     }
 }
@@ -1877,7 +1878,7 @@ fn ensure_implementation_model(model: Model) -> anyhow::Result<()> {
 }
 
 fn ensure_generation_model(model: Model) -> anyhow::Result<()> {
-    const ALLOWED: &[Model] = &[Model::Speed, Model::Smart];
+    const ALLOWED: &[Model] = &[Model::Smart];
     if ALLOWED.contains(&model) {
         Ok(())
     } else {
@@ -1889,7 +1890,7 @@ fn ensure_generation_model(model: Model) -> anyhow::Result<()> {
 }
 
 fn ensure_adversarial_review_model(model: Model) -> anyhow::Result<()> {
-    const ALLOWED: &[Model] = &[Model::Speed, Model::Smart];
+    const ALLOWED: &[Model] = &[Model::Smart];
     if ALLOWED.contains(&model) {
         Ok(())
     } else {

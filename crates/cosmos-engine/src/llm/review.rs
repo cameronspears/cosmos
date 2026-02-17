@@ -100,6 +100,17 @@ fn default_review_summary() -> String {
     "Review completed".to_string()
 }
 
+fn ensure_non_summary_model(model: Model, operation: &str) -> anyhow::Result<()> {
+    if model == Model::Speed {
+        return Err(anyhow::anyhow!(
+            "{} must not use {} (reserved for file summaries)",
+            operation,
+            model.id()
+        ));
+    }
+    Ok(())
+}
+
 /// JSON Schema for ReviewResponse - used for structured output
 /// This ensures the LLM returns valid, parseable JSON matching our expected format
 pub(crate) fn review_response_schema() -> serde_json::Value {
@@ -236,12 +247,12 @@ pub async fn verify_changes(
     // Use structured output to guarantee valid JSON response
     let response_format = schema_to_response_format("review_response", review_response_schema());
 
-    // Use Speed model with high reasoning effort for cost-effective review
+    // Use Smart model for default adversarial review quality.
     // 4 iterations - diff already provided, occasional context needed
     let response = call_llm_agentic(
         &system,
         &user,
-        Model::Speed,
+        Model::Smart,
         &repo_root,
         false,
         4,
@@ -283,7 +294,7 @@ pub async fn verify_changes_bounded(
         iteration,
         fixed_titles,
         fix_context,
-        Model::Speed,
+        Model::Smart,
         timeout_ms,
     )
     .await
@@ -291,8 +302,7 @@ pub async fn verify_changes_bounded(
 
 /// Same as `verify_changes_bounded`, but allows explicitly selecting the reviewer model.
 /// The strict implementation harness chooses this model explicitly:
-/// default is `Model::Smart` for independent review quality, and if callers opt into
-/// `Model::Speed` the harness can still require a final independent Smart pass.
+/// default is `Model::Smart` for independent review quality.
 pub async fn verify_changes_bounded_with_model(
     files_with_content: &[(PathBuf, String, String)], // (path, old_content, new_content)
     iteration: u32,
@@ -301,6 +311,7 @@ pub async fn verify_changes_bounded_with_model(
     model: Model,
     timeout_ms: u64,
 ) -> anyhow::Result<VerificationReview> {
+    ensure_non_summary_model(model, "Review")?;
     let system = review_system_prompt(iteration, fixed_titles, fix_context);
     let user = build_lean_review_prompt(files_with_content, fix_context);
 
@@ -662,6 +673,7 @@ pub async fn fix_review_findings_with_model(
     model: Model,
     timeout_ms: u64,
 ) -> anyhow::Result<AppliedFix> {
+    ensure_non_summary_model(model, "Review-fix generation")?;
     if findings.is_empty() {
         return Err(anyhow::anyhow!("No findings to fix"));
     }
@@ -898,6 +910,12 @@ pub async fn fix_review_findings_with_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_summary_model_guard_rejects_speed() {
+        assert!(ensure_non_summary_model(Model::Speed, "Review").is_err());
+        assert!(ensure_non_summary_model(Model::Smart, "Review").is_ok());
+    }
 
     #[test]
     fn review_fix_finding_context_section_includes_line_anchored_snippets() {
