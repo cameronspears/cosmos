@@ -37,6 +37,14 @@ fn test_apply_error_suggestion_not_validated() {
 }
 
 #[test]
+fn test_apply_error_suggestion_weak_grounding() {
+    let err = ApplyError::SuggestionWeakGrounding;
+    let msg = err.user_message();
+    assert!(msg.contains("grounding"));
+    assert!(msg.contains("failed"));
+}
+
+#[test]
 fn test_apply_error_suggestion_not_found() {
     let err = ApplyError::SuggestionNotFound;
     let msg = err.user_message();
@@ -275,6 +283,71 @@ fn enter_opens_apply_plan_without_mutation() {
     assert!(!app.armed_file_hashes.is_empty());
     assert!(matches!(app.overlay, Overlay::ApplyPlan { .. }));
     assert_eq!(app.loading, LoadingState::None);
+    assert!(app.pending_changes.is_empty());
+
+    std::env::remove_var("OPENROUTER_API_KEY");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn enter_rejects_weakly_grounded_suggestion() {
+    std::env::set_var("OPENROUTER_API_KEY", "test-key");
+    let mut root = std::env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    root.push(format!("cosmos_apply_weak_grounding_test_{}", nanos));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "fn demo() {}\n").unwrap();
+
+    let index = CodebaseIndex {
+        root: root.clone(),
+        files: HashMap::new(),
+        index_errors: Vec::new(),
+        git_head: Some("deadbeef".to_string()),
+    };
+    let mut suggestions = SuggestionEngine::new(index.clone());
+    let suggestion = cosmos_core::suggest::Suggestion::new(
+        cosmos_core::suggest::SuggestionKind::Improvement,
+        cosmos_core::suggest::Priority::High,
+        PathBuf::from("src/lib.rs"),
+        "Improve demo".to_string(),
+        cosmos_core::suggest::SuggestionSource::LlmDeep,
+    )
+    .with_validation_state(cosmos_core::suggest::SuggestionValidationState::Validated)
+    .with_implementation_risk_flags(vec!["claim_not_grounded_in_snippet".to_string()])
+    .with_line(1);
+    suggestions.suggestions.push(suggestion);
+
+    let context = WorkContext {
+        branch: "main".to_string(),
+        uncommitted_files: Vec::new(),
+        staged_files: Vec::new(),
+        untracked_files: Vec::new(),
+        inferred_focus: None,
+        modified_count: 0,
+        repo_root: root.clone(),
+    };
+    let mut app = App::new(index.clone(), suggestions, context);
+    app.workflow_step = WorkflowStep::Suggestions;
+
+    let (tx, _rx) = mpsc::channel();
+    let ctx = crate::app::RuntimeContext {
+        index: &index,
+        repo_path: &root,
+        tx: &tx,
+    };
+
+    let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    handle_normal_mode(&mut app, key, &ctx).unwrap();
+
+    match &app.overlay {
+        Overlay::Alert { message, .. } => assert!(message.contains("grounding")),
+        _ => panic!("expected alert overlay for weak grounding"),
+    }
+    assert!(app.armed_suggestion_id.is_none());
+    assert!(app.armed_file_hashes.is_empty());
     assert!(app.pending_changes.is_empty());
 
     std::env::remove_var("OPENROUTER_API_KEY");

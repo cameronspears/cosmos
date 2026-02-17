@@ -112,6 +112,16 @@ pub struct SuggestionValidationMetadata {
     pub file_complexity: Option<f64>,
     #[serde(default)]
     pub anchor_context: Option<String>,
+    #[serde(default)]
+    pub evidence_quality_score: Option<f64>,
+    #[serde(default)]
+    pub snippet_comment_ratio: Option<f64>,
+    #[serde(default)]
+    pub snippet_top_comment_ratio: Option<f64>,
+    #[serde(default)]
+    pub claim_observed_behavior: Option<String>,
+    #[serde(default)]
+    pub claim_impact_class: Option<String>,
 }
 
 /// A concrete evidence reference backing a suggestion.
@@ -231,6 +241,11 @@ impl Suggestion {
 
     pub fn with_validation_state(mut self, validation_state: SuggestionValidationState) -> Self {
         self.validation_state = validation_state;
+        self
+    }
+
+    pub fn with_verification_state(mut self, verification_state: VerificationState) -> Self {
+        self.verification_state = verification_state;
         self
     }
 

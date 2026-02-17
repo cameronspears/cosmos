@@ -330,6 +330,7 @@ dependencies = [
  "clap",
  "cosmos-adapters",
  "cosmos-core",
+ "cosmos-engine",
  "cosmos-ui",
  "tokio",
 ]

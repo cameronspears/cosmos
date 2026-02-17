@@ -480,12 +480,6 @@ fn provider_config(response_format: &Option<ResponseFormat>) -> ProviderConfig {
     }
 }
 
-// Preferred OpenRouter provider chain for gpt-oss-120b (Speed tier).
-//
-// We keep Cerebras fp16 as the elite default, and use fast, trusted fallbacks
-// when Cerebras is temporarily slow or unavailable.
-const GPT_OSS_PROVIDER_ORDER: [&str; 3] = ["cerebras/fp16", "deepinfra/turbo", "groq"];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderFailureKind {
     Timeout,
@@ -901,32 +895,9 @@ where
 }
 
 fn provider_config_for_model(
-    model: Model,
+    _model: Model,
     response_format: &Option<ResponseFormat>,
 ) -> ProviderConfig {
-    // For gpt-oss-120b we strongly prefer Cerebras fp16 (elite baseline), while
-    // still allowing a narrow, explicit fallback chain when Cerebras is unavailable.
-    if model == Model::Speed {
-        return ProviderConfig {
-            order: Some(
-                GPT_OSS_PROVIDER_ORDER
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect(),
-            ),
-            // Restrict routing to the explicit order only (Cerebras fp16 first, then
-            // explicitly-approved fallbacks). This avoids silently drifting to an
-            // unrelated provider when Cerebras is flaky.
-            allow_fallbacks: false,
-            require_parameters: response_format.as_ref().map(|_| true),
-            // With an explicit provider order, avoid secondary heuristics that could
-            // fight the "use Cerebras first" requirement.
-            preferred_max_latency: None,
-            preferred_min_throughput: None,
-            quantizations: None,
-        };
-    }
-
     provider_config(response_format)
 }
 
@@ -1556,34 +1527,8 @@ where
 }
 
 /// Call LLM API with structured output using default provider routing, while
-/// enforcing max tokens and a request timeout.
-pub(crate) async fn call_llm_structured_limited<T>(
-    system: &str,
-    user: &str,
-    model: Model,
-    schema_name: &str,
-    schema: serde_json::Value,
-    max_tokens: u32,
-    timeout_ms: u64,
-) -> anyhow::Result<StructuredResponse<T>>
-where
-    T: serde::de::DeserializeOwned,
-{
-    call_llm_structured_limited_with_reasoning(
-        system,
-        user,
-        model,
-        schema_name,
-        schema,
-        max_tokens,
-        timeout_ms,
-        true,
-    )
-    .await
-}
-
-/// Same as `call_llm_structured_limited`, but disables model reasoning.
-/// Useful for latency-sensitive review paths where structured output already constrains format.
+/// enforcing max tokens and a request timeout with reasoning disabled.
+/// Useful for latency-sensitive paths where structured output already constrains format.
 pub(crate) async fn call_llm_structured_limited_no_reasoning<T>(
     system: &str,
     user: &str,
@@ -1924,23 +1869,13 @@ mod tests {
     }
 
     #[test]
-    fn test_speed_model_prefers_cerebras_fp16_with_explicit_fallbacks() {
+    fn test_speed_model_uses_default_openrouter_routing() {
         let provider = provider_config_for_model(Model::Speed, &None);
         let value = serde_json::to_value(provider).unwrap();
-        let order = value
-            .get("order")
-            .and_then(|v| v.as_array())
-            .expect("expected explicit provider order for Model::Speed");
-        assert_eq!(
-            order
-                .first()
-                .and_then(|v| v.as_str())
-                .expect("expected first provider"),
-            "cerebras/fp16"
-        );
+        assert!(value.get("order").and_then(|v| v.as_array()).is_none());
         assert_eq!(
             value.get("allow_fallbacks").and_then(|v| v.as_bool()),
-            Some(false)
+            Some(true)
         );
     }
 

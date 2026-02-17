@@ -316,22 +316,63 @@ fn render_suggestions_content<'a>(
                 Span::styled(" │", border_style),
             ]));
         } else if has_ai {
-            lines.push(Line::from(vec![
-                Span::styled("    │ ", border_style),
-                Span::styled(
-                    center_row("No issues found"),
-                    Style::default().fg(Theme::GREY_300),
-                ),
-                Span::styled(" │", border_style),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("    │ ", border_style),
-                Span::styled(
-                    center_row("Nothing to suggest"),
-                    Style::default().fg(Theme::GREY_500),
-                ),
-                Span::styled(" │", border_style),
-            ]));
+            if app.current_suggestion_run_id.is_some() && app.suggestion_validated_count == 0 {
+                if app.suggestion_rejected_count > 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled("    │ ", border_style),
+                        Span::styled(
+                            center_row("No suggestions"),
+                            Style::default().fg(Theme::YELLOW),
+                        ),
+                        Span::styled(" │", border_style),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("    │ ", border_style),
+                        Span::styled(
+                            center_row(&format!(
+                                "{} candidate(s) rejected in last run",
+                                app.suggestion_rejected_count
+                            )),
+                            Style::default().fg(Theme::GREY_400),
+                        ),
+                        Span::styled(" │", border_style),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled("    │ ", border_style),
+                        Span::styled(
+                            center_row("No suggestions generated"),
+                            Style::default().fg(Theme::YELLOW),
+                        ),
+                        Span::styled(" │", border_style),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("    │ ", border_style),
+                        Span::styled(
+                            center_row("Try refresh to run again"),
+                            Style::default().fg(Theme::GREY_400),
+                        ),
+                        Span::styled(" │", border_style),
+                    ]));
+                }
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("    │ ", border_style),
+                    Span::styled(
+                        center_row("No issues found"),
+                        Style::default().fg(Theme::GREY_300),
+                    ),
+                    Span::styled(" │", border_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("    │ ", border_style),
+                    Span::styled(
+                        center_row("Nothing to suggest"),
+                        Style::default().fg(Theme::GREY_500),
+                    ),
+                    Span::styled(" │", border_style),
+                ]));
+            }
         } else {
             lines.push(Line::from(vec![
                 Span::styled("    │ ", border_style),

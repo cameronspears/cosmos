@@ -34,6 +34,8 @@ pub enum ApplyError {
     SuggestionNotFound,
     /// Suggestion is not in the refined validated set
     SuggestionNotValidated,
+    /// Suggestion is validated but marked as weakly grounded
+    SuggestionWeakGrounding,
     /// Failed to check git status
     GitStatusFailed(String),
     /// Working tree has uncommitted changes
@@ -60,6 +62,9 @@ impl ApplyError {
             }
             Self::SuggestionNotValidated => {
                 "Apply failed: suggestion is not in the validated set. Regenerate suggestions and try again.".into()
+            }
+            Self::SuggestionWeakGrounding => {
+                "Apply failed: suggestion grounding is too weak to apply safely. Refresh suggestions and pick a better-grounded item.".into()
             }
             Self::GitStatusFailed(e) => format!("Git error: {}. Check repo state.", e),
             Self::DirtyWorkingTree => {
@@ -102,6 +107,13 @@ pub struct ApplyContext {
     pub repo_memory_context: String,
 }
 
+fn suggestion_has_weak_grounding(suggestion: &Suggestion) -> bool {
+    suggestion
+        .implementation_risk_flags
+        .iter()
+        .any(|flag| flag == "claim_not_grounded_in_snippet")
+}
+
 /// Validates all preconditions for applying a fix from the Suggestions step.
 /// Returns an ApplyContext if all conditions are met, or an ApplyError describing what failed.
 fn validate_apply_fix(app: &App) -> std::result::Result<ApplyContext, ApplyError> {
@@ -122,6 +134,9 @@ fn validate_apply_fix(app: &App) -> std::result::Result<ApplyContext, ApplyError
 
     if suggestion.validation_state != cosmos_core::suggest::SuggestionValidationState::Validated {
         return Err(ApplyError::SuggestionNotValidated);
+    }
+    if suggestion_has_weak_grounding(&suggestion) {
+        return Err(ApplyError::SuggestionWeakGrounding);
     }
 
     let current_hashes = snapshot_suggestion_file_hashes(app, &suggestion)?;
@@ -182,12 +197,47 @@ fn snapshot_suggestion_file_hashes(
     Ok(hashes)
 }
 
+fn append_apply_plan_audit(
+    app: &App,
+    suggestion: &Suggestion,
+    preview: &FixPreview,
+    affected_files: &[PathBuf],
+    event: cosmos_adapters::cache::ApplyPlanAuditEvent,
+) {
+    let record = cosmos_adapters::cache::ApplyPlanAuditRecord {
+        timestamp: chrono::Utc::now(),
+        event,
+        run_id: app.current_suggestion_run_id.clone(),
+        suggestion_id: suggestion.id.to_string(),
+        suggestion_summary: suggestion.summary.clone(),
+        suggestion_file: suggestion.file.clone(),
+        evidence_ids: suggestion
+            .evidence_refs
+            .iter()
+            .map(|evidence| evidence.snippet_id)
+            .collect(),
+        affected_files: affected_files.to_vec(),
+        preview_friendly_title: preview.friendly_title.clone(),
+        preview_problem_summary: preview.problem_summary.clone(),
+        preview_outcome: preview.outcome.clone(),
+        preview_description: preview.description.clone(),
+        preview_verification_note: preview.verification_note.clone(),
+        preview_evidence_line: preview.evidence_line,
+        preview_evidence_snippet: preview.evidence_snippet.clone(),
+    };
+    let cache = cosmos_adapters::cache::Cache::new(&app.repo_path);
+    let _ = cache.append_apply_plan_audit(&record);
+}
+
 fn open_apply_plan_for_suggestion(
     app: &mut App,
     suggestion: &Suggestion,
 ) -> std::result::Result<(), ApplyError> {
     if suggestion.validation_state != cosmos_core::suggest::SuggestionValidationState::Validated {
         return Err(ApplyError::SuggestionNotValidated);
+    }
+    if suggestion_has_weak_grounding(suggestion) {
+        return Err(ApplyError::SuggestionWeakGrounding);
     }
 
     let hashes = snapshot_suggestion_file_hashes(app, suggestion)?;
@@ -197,6 +247,13 @@ fn open_apply_plan_for_suggestion(
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
+    append_apply_plan_audit(
+        app,
+        suggestion,
+        &preview,
+        &affected_files,
+        cosmos_adapters::cache::ApplyPlanAuditEvent::Opened,
+    );
 
     app.arm_apply_confirm(suggestion.id, hashes);
 
@@ -702,6 +759,19 @@ pub(super) fn start_apply_for_context(
 pub(super) fn confirm_apply_from_overlay(app: &mut App, ctx: &RuntimeContext) {
     match validate_apply_fix(app) {
         Ok(apply_ctx) => {
+            let affected_files = apply_ctx
+                .suggestion
+                .affected_files()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            append_apply_plan_audit(
+                app,
+                &apply_ctx.suggestion,
+                &apply_ctx.preview,
+                &affected_files,
+                cosmos_adapters::cache::ApplyPlanAuditEvent::Confirmed,
+            );
             app.close_overlay();
             start_apply_for_context(app, ctx, apply_ctx);
         }

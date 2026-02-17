@@ -15,6 +15,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use cosmos_core::index::CodebaseIndex;
+use cosmos_core::suggest::Suggestion;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -34,6 +35,8 @@ const GROUPING_AI_CACHE_FILE: &str = "grouping_ai.json";
 const PIPELINE_METRICS_FILE: &str = "pipeline_metrics.jsonl";
 const SUGGESTION_QUALITY_FILE: &str = "suggestion_quality.jsonl";
 const IMPLEMENTATION_HARNESS_FILE: &str = "implementation_harness.jsonl";
+const SUGGESTION_RUN_AUDIT_FILE: &str = "suggestion_runs.jsonl";
+const APPLY_PLAN_AUDIT_FILE: &str = "apply_plan_audit.jsonl";
 const CACHE_LOCK_TIMEOUT_SECS: u64 = 5;
 const CACHE_LOCK_RETRY_MS: u64 = 50;
 
@@ -461,6 +464,45 @@ pub struct SuggestionQualityRecord {
     pub rewrite_recovered_count: usize,
     #[serde(default)]
     pub prevalidation_contradiction_count: usize,
+}
+
+/// One finalized suggestion-run snapshot for post-run auditing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuggestionRunAuditRecord {
+    pub timestamp: DateTime<Utc>,
+    pub run_id: String,
+    pub suggestion_count: usize,
+    pub validated_count: usize,
+    pub rejected_count: usize,
+    pub suggestions: Vec<Suggestion>,
+}
+
+/// Apply-plan lifecycle event for post-run auditing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyPlanAuditEvent {
+    Opened,
+    Confirmed,
+}
+
+/// One apply-plan snapshot row capturing exactly what was shown to the user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyPlanAuditRecord {
+    pub timestamp: DateTime<Utc>,
+    pub event: ApplyPlanAuditEvent,
+    pub run_id: Option<String>,
+    pub suggestion_id: String,
+    pub suggestion_summary: String,
+    pub suggestion_file: PathBuf,
+    pub evidence_ids: Vec<usize>,
+    pub affected_files: Vec<PathBuf>,
+    pub preview_friendly_title: String,
+    pub preview_problem_summary: String,
+    pub preview_outcome: String,
+    pub preview_description: String,
+    pub preview_verification_note: String,
+    pub preview_evidence_line: Option<u32>,
+    pub preview_evidence_snippet: Option<String>,
 }
 
 /// One apply-harness execution summary row written as JSONL.
@@ -1037,6 +1079,31 @@ impl Cache {
         Ok(())
     }
 
+    /// Append one finalized suggestion-run snapshot row (JSONL).
+    pub fn append_suggestion_run_audit(
+        &self,
+        record: &SuggestionRunAuditRecord,
+    ) -> anyhow::Result<()> {
+        let _lock = self.lock(true)?;
+        let path = self.cache_dir.join(SUGGESTION_RUN_AUDIT_FILE);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let row = serde_json::to_string(record)?;
+        use std::io::Write;
+        writeln!(file, "{}", row)?;
+        Ok(())
+    }
+
+    /// Append one apply-plan snapshot row (JSONL).
+    pub fn append_apply_plan_audit(&self, record: &ApplyPlanAuditRecord) -> anyhow::Result<()> {
+        let _lock = self.lock(true)?;
+        let path = self.cache_dir.join(APPLY_PLAN_AUDIT_FILE);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let row = serde_json::to_string(record)?;
+        use std::io::Write;
+        writeln!(file, "{}", row)?;
+        Ok(())
+    }
+
     /// Load up to `limit` latest suggestion-quality records (newest last).
     pub fn load_recent_suggestion_quality(
         &self,
@@ -1073,6 +1140,50 @@ impl Cache {
         let mut records: Vec<ImplementationHarnessRecord> = content
             .lines()
             .filter_map(|line| serde_json::from_str::<ImplementationHarnessRecord>(line).ok())
+            .collect();
+        if records.len() > limit {
+            let split = records.len() - limit;
+            records.drain(0..split);
+        }
+        Ok(records)
+    }
+
+    /// Load up to `limit` latest suggestion-run audit rows (newest last).
+    pub fn load_recent_suggestion_run_audit(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SuggestionRunAuditRecord>> {
+        let path = self.cache_dir.join(SUGGESTION_RUN_AUDIT_FILE);
+        if !path.exists() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let _lock = self.lock(false)?;
+        let content = fs::read_to_string(&path)?;
+        let mut records: Vec<SuggestionRunAuditRecord> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<SuggestionRunAuditRecord>(line).ok())
+            .collect();
+        if records.len() > limit {
+            let split = records.len() - limit;
+            records.drain(0..split);
+        }
+        Ok(records)
+    }
+
+    /// Load up to `limit` latest apply-plan audit rows (newest last).
+    pub fn load_recent_apply_plan_audit(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ApplyPlanAuditRecord>> {
+        let path = self.cache_dir.join(APPLY_PLAN_AUDIT_FILE);
+        if !path.exists() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let _lock = self.lock(false)?;
+        let content = fs::read_to_string(&path)?;
+        let mut records: Vec<ApplyPlanAuditRecord> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<ApplyPlanAuditRecord>(line).ok())
             .collect();
         if records.len() > limit {
             let split = records.len() - limit;
@@ -1142,7 +1253,11 @@ impl Cache {
         for option in options {
             let files_to_remove: Vec<&str> = match option {
                 ResetOption::Index => vec![INDEX_CACHE_FILE, INDEX_META_FILE],
-                ResetOption::Suggestions => vec![SUGGESTIONS_CACHE_FILE],
+                ResetOption::Suggestions => vec![
+                    SUGGESTIONS_CACHE_FILE,
+                    SUGGESTION_RUN_AUDIT_FILE,
+                    APPLY_PLAN_AUDIT_FILE,
+                ],
                 ResetOption::Summaries => vec![LLM_SUMMARIES_CACHE_FILE],
                 ResetOption::Glossary => vec![GLOSSARY_FILE],
                 ResetOption::Memory => vec![MEMORY_FILE],
@@ -1711,6 +1826,89 @@ mod tests {
         assert_eq!(recent[1].run_id, "run-2");
         assert_eq!(recent[0].run_context, "lab");
         assert_eq!(recent[1].schema_version, 4);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn suggestion_and_apply_plan_audit_round_trip_and_reset() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_suggestion_audit_test_{}", nanos));
+        fs::create_dir_all(&root).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .expect("git init should run");
+
+        let cache = Cache::new(&root);
+        for idx in 0..3usize {
+            let suggestion = Suggestion::new(
+                cosmos_core::suggest::SuggestionKind::BugFix,
+                cosmos_core::suggest::Priority::High,
+                std::path::PathBuf::from(format!("src/lib_{}.rs", idx)),
+                format!("Fix issue {}", idx),
+                cosmos_core::suggest::SuggestionSource::LlmDeep,
+            )
+            .with_validation_state(cosmos_core::suggest::SuggestionValidationState::Validated);
+            let run_row = SuggestionRunAuditRecord {
+                timestamp: Utc::now(),
+                run_id: format!("run-{}", idx),
+                suggestion_count: 1,
+                validated_count: 1,
+                rejected_count: 0,
+                suggestions: vec![suggestion.clone()],
+            };
+            cache.append_suggestion_run_audit(&run_row).unwrap();
+
+            let apply_row = ApplyPlanAuditRecord {
+                timestamp: Utc::now(),
+                event: if idx % 2 == 0 {
+                    ApplyPlanAuditEvent::Opened
+                } else {
+                    ApplyPlanAuditEvent::Confirmed
+                },
+                run_id: Some(format!("run-{}", idx)),
+                suggestion_id: suggestion.id.to_string(),
+                suggestion_summary: suggestion.summary.clone(),
+                suggestion_file: suggestion.file.clone(),
+                evidence_ids: vec![idx + 1],
+                affected_files: vec![suggestion.file.clone()],
+                preview_friendly_title: "Fix".to_string(),
+                preview_problem_summary: format!("Problem {}", idx),
+                preview_outcome: format!("Outcome {}", idx),
+                preview_description: format!("Description {}", idx),
+                preview_verification_note: "Using pre-validated suggestion evidence.".to_string(),
+                preview_evidence_line: Some(100 + idx as u32),
+                preview_evidence_snippet: Some(format!("snippet {}", idx)),
+            };
+            cache.append_apply_plan_audit(&apply_row).unwrap();
+        }
+
+        let recent_runs = cache.load_recent_suggestion_run_audit(2).unwrap();
+        assert_eq!(recent_runs.len(), 2);
+        assert_eq!(recent_runs[0].run_id, "run-1");
+        assert_eq!(recent_runs[1].run_id, "run-2");
+        assert_eq!(recent_runs[1].suggestion_count, 1);
+
+        let recent_apply = cache.load_recent_apply_plan_audit(2).unwrap();
+        assert_eq!(recent_apply.len(), 2);
+        assert_eq!(recent_apply[0].run_id.as_deref(), Some("run-1"));
+        assert_eq!(recent_apply[1].run_id.as_deref(), Some("run-2"));
+        assert_eq!(recent_apply[1].event, ApplyPlanAuditEvent::Opened);
+
+        let cache_dir = root.join(CACHE_DIR).join(CACHE_LAYOUT_V2_DIR);
+        assert!(cache_dir.join(SUGGESTION_RUN_AUDIT_FILE).exists());
+        assert!(cache_dir.join(APPLY_PLAN_AUDIT_FILE).exists());
+
+        cache.clear_selective(&[ResetOption::Suggestions]).unwrap();
+        assert!(!cache_dir.join(SUGGESTION_RUN_AUDIT_FILE).exists());
+        assert!(!cache_dir.join(APPLY_PLAN_AUDIT_FILE).exists());
 
         let _ = fs::remove_dir_all(&root);
     }

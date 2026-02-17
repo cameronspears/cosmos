@@ -6,13 +6,31 @@
 //! to suggest improvements, bug fixes, and optimizations.
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use cosmos_adapters::{cache, config, git_ops, github, keyring};
 use cosmos_core::context::WorkContext;
 use cosmos_core::index::CodebaseIndex;
 use cosmos_core::suggest::SuggestionEngine;
+use cosmos_engine::llm;
 use cosmos_ui::app;
 use std::path::{Path, PathBuf};
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum SuggestProfileArg {
+    Strict,
+    Balanced,
+    Max,
+}
+
+impl SuggestProfileArg {
+    fn as_profile(self) -> config::SuggestionsProfile {
+        match self {
+            SuggestProfileArg::Strict => config::SuggestionsProfile::Strict,
+            SuggestProfileArg::Balanced => config::SuggestionsProfile::BalancedHighVolume,
+            SuggestProfileArg::Max => config::SuggestionsProfile::MaxVolume,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -35,6 +53,22 @@ struct Args {
     /// Authenticate with GitHub for PR creation
     #[arg(long)]
     github_login: bool,
+
+    /// Run suggestions in non-interactive mode and print quality/gate results
+    #[arg(long)]
+    suggest_audit: bool,
+
+    /// Number of full suggestion runs to execute in audit mode
+    #[arg(long, default_value_t = 1, requires = "suggest_audit")]
+    suggest_runs: usize,
+
+    /// Suggestions profile to use in audit mode
+    #[arg(long, value_enum, default_value_t = SuggestProfileArg::Balanced, requires = "suggest_audit")]
+    suggest_profile: SuggestProfileArg,
+
+    /// Print accepted suggestions in audit mode
+    #[arg(long, requires = "suggest_audit")]
+    suggest_print: bool,
 }
 
 #[tokio::main]
@@ -60,11 +94,183 @@ async fn main() -> Result<()> {
     let index = init_index(&path, &cache_manager)?;
     let context = init_context(&path)?;
 
+    if args.suggest_audit {
+        return run_suggestion_audit(
+            &path,
+            &index,
+            &context,
+            args.suggest_runs.max(1),
+            args.suggest_profile,
+            args.suggest_print,
+        )
+        .await;
+    }
+
     // Create suggestion engine (LLM suggestions generated on demand)
     let suggestions = SuggestionEngine::new(index.clone());
 
     // Run TUI with background LLM tasks
     app::run_tui(index, suggestions, context, cache_manager, path).await
+}
+
+async fn run_suggestion_audit(
+    path: &Path,
+    index: &CodebaseIndex,
+    context: &WorkContext,
+    runs: usize,
+    profile_arg: SuggestProfileArg,
+    print_suggestions: bool,
+) -> Result<()> {
+    if !llm::is_available() {
+        return Err(anyhow::anyhow!(
+            "AI is unavailable. Configure an API key with `cosmos --setup` first."
+        ));
+    }
+
+    let profile = profile_arg.as_profile();
+    let mut gate_config = llm::suggestion_gate_config_for_profile(profile);
+    gate_config.max_attempts = gate_config.max_attempts.max(4);
+
+    let mut best_result: Option<llm::GatedSuggestionRunResult> = None;
+    let mut best_key: Option<(usize, usize, usize)> = None; // (ethos_actionable_count, final_count, validated_count)
+    let mut last_error: Option<String> = None;
+
+    println!(
+        "Running suggestion audit: runs={}, profile={:?}, target={}..{}, gates=disabled",
+        runs, profile, gate_config.min_final_count, gate_config.max_final_count
+    );
+
+    for run_index in 1..=runs {
+        println!("Run {}/{}...", run_index, runs);
+        let run_timeout_ms = gate_config.max_suggest_ms.saturating_add(30_000);
+        let run_result = tokio::time::timeout(
+            std::time::Duration::from_millis(run_timeout_ms),
+            llm::run_fast_grounded_with_gate_with_progress(
+                path,
+                index,
+                context,
+                None,
+                None,
+                gate_config.clone(),
+                |attempt_index, attempt_count, gate, diagnostics| {
+                    let prevalidation = diagnostics
+                        .validation_rejection_histogram
+                        .get("prevalidation")
+                        .copied()
+                        .unwrap_or(0);
+                    let insufficient = diagnostics
+                        .validation_rejection_histogram
+                        .get("validator_insufficient_evidence")
+                        .copied()
+                        .unwrap_or(0);
+                    println!(
+                        "    attempt {}/{} final_count={} ethos_actionable_count={} pending={} provisional={} validated={} rejected={} prevalidation={} insufficient={} readiness_filtered={} semantic_dropped={} file_dropped={} strategy={}",
+                        attempt_index,
+                        attempt_count,
+                        gate.final_count,
+                        gate.ethos_actionable_count,
+                        gate.pending_count,
+                        diagnostics.provisional_count,
+                        diagnostics.validated_count,
+                        diagnostics.rejected_count,
+                        prevalidation,
+                        insufficient,
+                        diagnostics.readiness_filtered_count,
+                        diagnostics.semantic_dedup_dropped_count,
+                        diagnostics.file_balance_dropped_count,
+                        diagnostics.parse_strategy
+                    );
+                },
+            ),
+        )
+        .await;
+
+        match run_result {
+            Ok(Ok(result)) => {
+                let validated_count = result
+                    .suggestions
+                    .iter()
+                    .filter(|s| {
+                        s.validation_state
+                            == cosmos_core::suggest::SuggestionValidationState::Validated
+                    })
+                    .count();
+                println!(
+                    "  PASS final_count={} validated_count={} ethos_actionable_count={} attempts={} cost=${:.4}",
+                    result.gate.final_count,
+                    validated_count,
+                    result.gate.ethos_actionable_count,
+                    result.diagnostics.attempt_index,
+                    result.usage.as_ref().map(|u| u.cost()).unwrap_or(0.0)
+                );
+
+                let candidate_key = (
+                    result.gate.ethos_actionable_count,
+                    result.gate.final_count,
+                    validated_count,
+                );
+                let is_better = best_key
+                    .map(|current| candidate_key > current)
+                    .unwrap_or(true);
+                if is_better {
+                    best_key = Some(candidate_key);
+                    best_result = Some(result);
+                }
+            }
+            Ok(Err(err)) => {
+                let text = err.to_string();
+                println!("  FAIL {}", text);
+                last_error = Some(text);
+            }
+            Err(_) => {
+                let text = format!("run timed out after {}ms", run_timeout_ms);
+                println!("  FAIL {}", text);
+                last_error = Some(text);
+            }
+        }
+    }
+
+    let Some(best) = best_result else {
+        return Err(anyhow::anyhow!(
+            "Suggestion audit did not pass in {} run(s). Last error: {}",
+            runs,
+            last_error.unwrap_or_else(|| "unknown".to_string())
+        ));
+    };
+
+    println!(
+        "Best run: final_count={} validated_count={} ethos_actionable_count={} fail_reasons={}",
+        best.gate.final_count,
+        best.suggestions
+            .iter()
+            .filter(|s| s.validation_state
+                == cosmos_core::suggest::SuggestionValidationState::Validated)
+            .count(),
+        best.gate.ethos_actionable_count,
+        if best.gate.fail_reasons.is_empty() {
+            "none".to_string()
+        } else {
+            best.gate.fail_reasons.join("; ")
+        }
+    );
+
+    if print_suggestions {
+        println!("\nAccepted suggestions:");
+        for (idx, suggestion) in best.suggestions.iter().enumerate() {
+            let detail = suggestion.detail.as_deref().unwrap_or("");
+            println!(
+                "{}. [{}] {} ({}:{})",
+                idx + 1,
+                format!("{:?}", suggestion.priority),
+                suggestion.summary,
+                suggestion.file.display(),
+                suggestion.line.unwrap_or(1)
+            );
+            println!("   {}", detail);
+        }
+    }
+
+    Ok(())
 }
 
 /// Initialize the codebase index

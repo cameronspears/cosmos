@@ -46,6 +46,15 @@ fn maybe_prompt_api_key_overlay(app: &mut App, message: &str) -> bool {
     true
 }
 
+fn most_common_rejection_reason(
+    histogram: &std::collections::HashMap<String, usize>,
+) -> Option<(&str, usize)> {
+    histogram
+        .iter()
+        .max_by_key(|(_, count)| **count)
+        .map(|(reason, count)| (reason.as_str(), *count))
+}
+
 fn spawn_suggestions_generation(
     tx: mpsc::Sender<BackgroundMessage>,
     repo_root: PathBuf,
@@ -235,7 +244,17 @@ pub fn drain_messages(
                             == cosmos_core::suggest::SuggestionValidationState::Validated
                     })
                     .count();
-                let contradiction_counts = cache::Cache::new(&app.repo_path)
+                let cache = cache::Cache::new(&app.repo_path);
+                let run_audit = cache::SuggestionRunAuditRecord {
+                    timestamp: Utc::now(),
+                    run_id: run_id.clone(),
+                    suggestion_count: suggestions.len(),
+                    validated_count,
+                    rejected_count: diagnostics.rejected_count,
+                    suggestions: suggestions.clone(),
+                };
+                let _ = cache.append_suggestion_run_audit(&run_audit);
+                let contradiction_counts = cache
                     .recent_contradicted_evidence_counts(300)
                     .unwrap_or_default();
                 app.suggestions.replace_llm_suggestions(suggestions);
@@ -264,6 +283,22 @@ pub fn drain_messages(
                 app.suggestion_rejected_count = diagnostics.rejected_count;
                 app.clear_apply_confirm();
                 app.current_suggestion_run_id = Some(run_id);
+                if validated_count == 0 && diagnostics.rejected_count > 0 {
+                    let mut detail = format!(
+                        "No validated suggestions were produced in this run ({} candidates were rejected).",
+                        diagnostics.rejected_count
+                    );
+                    if let Some((reason, count)) =
+                        most_common_rejection_reason(&diagnostics.validation_rejection_histogram)
+                    {
+                        detail.push_str(&format!(
+                            " Top rejection: {} ({}).",
+                            truncate(reason, 120),
+                            count
+                        ));
+                    }
+                    app.open_alert("No suggestions", detail);
+                }
             }
             BackgroundMessage::SuggestionsError(e) => {
                 // If summaries are still generating, switch to that loading state
@@ -275,7 +310,7 @@ pub fn drain_messages(
                 if !maybe_prompt_api_key_overlay(app, &e) {
                     app.open_alert(
                         "Suggestions failed",
-                        format!("Couldn't generate suggestions: {}", truncate(&e, 120)),
+                        format!("Couldn't generate suggestions: {}", truncate(&e, 420)),
                     );
                 }
                 app.suggestion_refinement_in_progress = false;

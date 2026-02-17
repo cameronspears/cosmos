@@ -1859,73 +1859,6 @@ fn fallback_outcome(kind: Option<SuggestionKind>) -> String {
     }
 }
 
-fn has_problem_context(problem: &str, markers: &[&str]) -> bool {
-    let lower = problem.to_ascii_lowercase();
-    markers.iter().any(|marker| lower.contains(marker))
-}
-
-fn derive_why_it_matters_from_problem(
-    problem_summary: &str,
-    kind: Option<SuggestionKind>,
-) -> String {
-    if has_problem_context(
-        problem_summary,
-        &[
-            "pull request",
-            "pr ",
-            "reviewer",
-            "reviewers",
-            "title",
-            "summary",
-        ],
-    ) {
-        return "This matters because reviewers lose context and releases slow down when the PR description is unclear.".to_string();
-    }
-    if has_problem_context(
-        problem_summary,
-        &[
-            "git ref",
-            "reference",
-            "branch",
-            "invalid name",
-            "unsafe character",
-        ],
-    ) {
-        return "This matters because malformed branch names can cause confusing failures and reduce trust in the workflow.".to_string();
-    }
-    fallback_why_it_matters(kind)
-}
-
-fn derive_outcome_from_problem(problem_summary: &str, kind: Option<SuggestionKind>) -> String {
-    if has_problem_context(
-        problem_summary,
-        &[
-            "pull request",
-            "pr ",
-            "reviewer",
-            "reviewers",
-            "title",
-            "summary",
-        ],
-    ) {
-        return "After apply, empty pull requests include a clear title and summary so reviewers can understand intent immediately.".to_string();
-    }
-    if has_problem_context(
-        problem_summary,
-        &[
-            "git ref",
-            "reference",
-            "branch",
-            "invalid name",
-            "unsafe character",
-        ],
-    ) {
-        return "After apply, invalid Git reference names are rejected before branch creation."
-            .to_string();
-    }
-    fallback_outcome(kind)
-}
-
 fn has_implementation_markers(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains('`')
@@ -1999,7 +1932,7 @@ fn dedupe_preview_user_copy(
         || is_effectively_duplicate_preview_text(description, problem_summary)
         || has_implementation_markers(description)
     {
-        *description = derive_why_it_matters_from_problem(problem_summary, kind_hint);
+        *description = fallback_why_it_matters(kind_hint);
     }
     if outcome.is_empty()
         || is_effectively_duplicate_preview_text(outcome, problem_summary)
@@ -2007,7 +1940,7 @@ fn dedupe_preview_user_copy(
         || has_implementation_markers(outcome)
         || outcome_is_problem_framed(outcome)
     {
-        *outcome = derive_outcome_from_problem(problem_summary, kind_hint);
+        *outcome = fallback_outcome(kind_hint);
     }
 }
 
@@ -2863,6 +2796,28 @@ mod tests {
             "{outcome}"
         );
         assert!(!outcome.to_ascii_lowercase().contains(" may "), "{outcome}");
+    }
+
+    #[test]
+    fn test_keyword_mentions_do_not_override_kind_fallback_copy() {
+        let mut problem =
+            "Pull request creation fails when auth is missing and users see an error.".to_string();
+        let mut why = String::new();
+        let mut outcome =
+            "This may leave users with unclear pull request behavior and confusion.".to_string();
+
+        dedupe_preview_user_copy(
+            Some(SuggestionKind::Improvement),
+            &mut problem,
+            &mut why,
+            &mut outcome,
+        );
+
+        assert_eq!(
+            why,
+            fallback_why_it_matters(Some(SuggestionKind::Improvement))
+        );
+        assert_eq!(outcome, fallback_outcome(Some(SuggestionKind::Improvement)));
     }
 
     #[test]

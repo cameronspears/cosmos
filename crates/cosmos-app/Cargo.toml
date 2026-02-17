@@ -16,4 +16,5 @@ clap.workspace = true
 tokio.workspace = true
 cosmos-adapters = { path = "../cosmos-adapters" }
 cosmos-core = { path = "../cosmos-core" }
+cosmos-engine = { path = "../cosmos-engine" }
 cosmos-ui = { path = "../cosmos-ui" }
