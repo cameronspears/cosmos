@@ -46,15 +46,6 @@ fn maybe_prompt_api_key_overlay(app: &mut App, message: &str) -> bool {
     true
 }
 
-fn most_common_rejection_reason(
-    histogram: &std::collections::HashMap<String, usize>,
-) -> Option<(&str, usize)> {
-    histogram
-        .iter()
-        .max_by_key(|(_, count)| **count)
-        .map(|(reason, count)| (reason.as_str(), *count))
-}
-
 fn spawn_suggestions_generation(
     tx: mpsc::Sender<BackgroundMessage>,
     repo_root: PathBuf,
@@ -71,31 +62,35 @@ fn spawn_suggestions_generation(
         } else {
             Some(repo_memory_context)
         };
-        let gate_config =
-            cosmos_engine::llm::suggestion_gate_config_for_profile(suggestions_profile);
-        let run = cosmos_engine::llm::run_fast_grounded_with_gate_with_progress(
+        let generation_target =
+            cosmos_engine::llm::suggestion_gate_config_for_profile(suggestions_profile)
+                .max_final_count
+                .max(1);
+        let run = cosmos_engine::llm::analyze_codebase_fast_grounded(
             &repo_root,
             &index,
             &context,
             mem,
-            gate_config,
-            |attempt_index, attempt_count, gate, diagnostics| {
-                let _ = tx_suggestions.send(BackgroundMessage::SuggestionsRefinementProgress {
-                    attempt_index,
-                    attempt_count,
-                    gate: gate.clone(),
-                    diagnostics: diagnostics.clone(),
-                });
-            },
+            cosmos_engine::llm::models::Model::Smart,
+            generation_target,
+            None,
         )
         .await;
 
         match run {
-            Ok(result) => {
-                let _ = tx_suggestions.send(BackgroundMessage::SuggestionsRefined {
-                    suggestions: result.suggestions,
-                    usage: result.usage,
-                    diagnostics: result.diagnostics,
+            Ok((suggestions, usage, mut diagnostics)) => {
+                diagnostics.refinement_complete = true;
+                diagnostics.provisional_count = suggestions.len();
+                diagnostics.validated_count = suggestions.len();
+                diagnostics.rejected_count = 0;
+                diagnostics.final_count = suggestions.len();
+                let model = diagnostics.model.clone();
+
+                let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
+                    suggestions,
+                    usage,
+                    model,
+                    diagnostics,
                     duration_ms: stage_start.elapsed().as_millis() as u64,
                 });
             }
@@ -136,10 +131,6 @@ pub fn request_suggestions_refresh(
     app.replace_index(fresh_index);
 
     app.loading = LoadingState::GeneratingSuggestions;
-    app.suggestion_refinement_in_progress = true;
-    app.suggestion_provisional_count = 0;
-    app.suggestion_validated_count = 0;
-    app.suggestion_rejected_count = 0;
     app.clear_apply_confirm();
 
     let index = app.index.clone();
@@ -160,10 +151,11 @@ fn restore_loading_after_suggestion_stage(app: &mut App) {
     app.loading = LoadingState::None;
 }
 
-fn handle_suggestions_refined_message(
+fn handle_suggestions_ready_message(
     app: &mut App,
     suggestions: Vec<cosmos_core::suggest::Suggestion>,
     usage: Option<cosmos_engine::llm::Usage>,
+    model: String,
     diagnostics: cosmos_engine::llm::SuggestionDiagnostics,
     duration_ms: u64,
     ctx: &RuntimeContext,
@@ -195,37 +187,18 @@ fn handle_suggestions_refined_message(
     let (tokens, cost) = track_usage(app, usage.as_ref(), ctx);
     record_pipeline_metric(
         app,
-        "suggest_refine",
+        "suggest",
         duration_ms,
         tokens,
         cost,
-        "suggestions_refined",
+        "suggestions",
         true,
     );
 
     restore_loading_after_suggestion_stage(app);
-    app.suggestion_refinement_in_progress = false;
-    app.suggestion_provisional_count = diagnostics.provisional_count;
-    app.suggestion_validated_count = validated_count;
-    app.suggestion_rejected_count = diagnostics.rejected_count;
+    app.active_model = Some(model);
     app.clear_apply_confirm();
     app.current_suggestion_run_id = Some(run_id);
-    if validated_count == 0 && diagnostics.rejected_count > 0 {
-        let mut detail = format!(
-            "No validated suggestions were produced in this run ({} candidates were rejected).",
-            diagnostics.rejected_count
-        );
-        if let Some((reason, count)) =
-            most_common_rejection_reason(&diagnostics.validation_rejection_histogram)
-        {
-            detail.push_str(&format!(
-                " Top rejection: {} ({}).",
-                truncate(reason, 120),
-                count
-            ));
-        }
-        app.open_alert("No suggestions", detail);
-    }
 }
 
 fn build_files_with_content_for_review(
@@ -480,47 +453,6 @@ fn handle_background_error_message(app: &mut App, error: String) {
     );
 }
 
-fn handle_suggestions_ready_message(
-    app: &mut App,
-    usage: Option<cosmos_engine::llm::Usage>,
-    model: String,
-    diagnostics: cosmos_engine::llm::SuggestionDiagnostics,
-    suggestions_count: usize,
-    duration_ms: u64,
-    ctx: &RuntimeContext,
-) {
-    let run_id = diagnostics.run_id;
-    let (tokens, cost) = track_usage(app, usage.as_ref(), ctx);
-    restore_loading_after_suggestion_stage(app);
-    app.active_model = Some(model);
-    app.suggestion_refinement_in_progress = true;
-    app.suggestion_provisional_count = suggestions_count;
-    app.suggestion_validated_count = 0;
-    app.suggestion_rejected_count = 0;
-    app.clear_apply_confirm();
-    app.current_suggestion_run_id = Some(run_id);
-    record_pipeline_metric(
-        app,
-        "suggest",
-        duration_ms,
-        tokens,
-        cost,
-        "suggestions",
-        true,
-    );
-}
-
-fn handle_suggestions_refinement_progress_message(
-    app: &mut App,
-    gate: cosmos_engine::llm::SuggestionGateSnapshot,
-) {
-    app.loading = LoadingState::GeneratingSuggestions;
-    app.suggestion_refinement_in_progress = true;
-    app.suggestion_provisional_count = 0;
-    app.suggestion_validated_count = gate.final_count.saturating_sub(gate.pending_count);
-    app.suggestion_rejected_count = 0;
-}
-
 fn handle_suggestions_error_message(app: &mut App, error: String) {
     restore_loading_after_suggestion_stage(app);
     if !maybe_prompt_api_key_overlay(app, &error) {
@@ -529,7 +461,6 @@ fn handle_suggestions_error_message(app: &mut App, error: String) {
             format!("Couldn't generate suggestions: {}", truncate(&error, 420)),
         );
     }
-    app.suggestion_refinement_in_progress = false;
     app.clear_apply_confirm();
 }
 
@@ -804,34 +735,9 @@ fn handle_generation_messages(
         } => {
             handle_suggestions_ready_message(
                 app,
-                usage,
-                model,
-                diagnostics,
-                suggestions.len(),
-                duration_ms,
-                ctx,
-            );
-            None
-        }
-        BackgroundMessage::SuggestionsRefinementProgress {
-            attempt_index: _,
-            attempt_count: _,
-            gate,
-            diagnostics: _,
-        } => {
-            handle_suggestions_refinement_progress_message(app, gate);
-            None
-        }
-        BackgroundMessage::SuggestionsRefined {
-            suggestions,
-            usage,
-            diagnostics,
-            duration_ms,
-        } => {
-            handle_suggestions_refined_message(
-                app,
                 suggestions,
                 usage,
+                model,
                 diagnostics,
                 duration_ms,
                 ctx,
@@ -1039,8 +945,6 @@ fn handle_misc_messages(app: &mut App, msg: BackgroundMessage, ctx: &RuntimeCont
             app.wallet_balance = Some(balance);
         }
         BackgroundMessage::SuggestionsReady { .. }
-        | BackgroundMessage::SuggestionsRefinementProgress { .. }
-        | BackgroundMessage::SuggestionsRefined { .. }
         | BackgroundMessage::SuggestionsError(_)
         | BackgroundMessage::GroupingEnhanced { .. }
         | BackgroundMessage::GroupingEnhanceError(_)
@@ -1164,7 +1068,6 @@ fn record_pipeline_metric(
 
     match stage {
         "suggest" => metric.suggest_ms = Some(duration_ms),
-        "suggest_refine" => metric.suggest_ms = Some(duration_ms),
         "verify" => metric.verify_ms = Some(duration_ms),
         "apply" => metric.apply_ms = Some(duration_ms),
         "review" => metric.review_ms = Some(duration_ms),

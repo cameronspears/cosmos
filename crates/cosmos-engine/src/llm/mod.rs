@@ -12,10 +12,10 @@ pub mod review;
 pub mod tools;
 
 pub use analysis::{
-    analyze_codebase_fast_grounded, ask_question, refine_grounded_suggestions,
-    run_fast_grounded_with_gate, run_fast_grounded_with_gate_with_progress,
-    suggestion_gate_config_for_profile, GatedSuggestionRunResult, SuggestionDiagnostics,
-    SuggestionGateSnapshot, SuggestionQualityGateConfig,
+    analyze_codebase_fast_grounded, ask_question, run_fast_grounded_with_gate,
+    run_fast_grounded_with_gate_with_progress, suggestion_gate_config_for_profile,
+    GatedSuggestionRunResult, SuggestionDiagnostics, SuggestionGateSnapshot,
+    SuggestionQualityGateConfig,
 };
 pub use client::{fetch_account_balance, is_available};
 pub use fix::{

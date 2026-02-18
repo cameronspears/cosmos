@@ -367,7 +367,7 @@ fn get_primary_buttons(app: &App) -> Vec<FooterButton> {
 
     match app.workflow_step {
         WorkflowStep::Suggestions => {
-            if app.suggestion_refinement_in_progress || app.loading == LoadingState::GeneratingFix {
+            if app.loading == LoadingState::GeneratingFix {
                 vec![]
             } else {
                 vec![primary_button("↵", "preview")]

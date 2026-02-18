@@ -31,7 +31,7 @@ enum ApplyError {
     AlreadyApplying,
     /// The selected suggestion is no longer available
     SuggestionNotFound,
-    /// Suggestion is not in the refined validated set
+    /// Suggestion is not in the validated set
     SuggestionNotValidated,
     /// Suggestion is validated but marked as weakly grounded
     SuggestionWeakGrounding,
@@ -60,7 +60,7 @@ impl ApplyError {
                 "Apply failed: suggestion no longer exists. Select another.".into()
             }
             Self::SuggestionNotValidated => {
-                "Apply failed: suggestion is not in the validated set. Regenerate suggestions and try again.".into()
+                "Apply failed: suggestion is not in the validated set. Refresh suggestions and try again.".into()
             }
             Self::SuggestionWeakGrounding => {
                 "Apply failed: suggestion grounding is too weak to apply safely. Refresh suggestions and pick a better-grounded item.".into()
@@ -930,9 +930,6 @@ fn handle_enter_in_ask_panel(app: &mut App) -> bool {
 }
 
 fn handle_enter_suggestions(app: &mut App) {
-    if app.suggestion_refinement_in_progress {
-        return;
-    }
     let suggestion = app.selected_suggestion().cloned();
     if let Some(suggestion) = suggestion {
         if !llm_available_for_apply() {

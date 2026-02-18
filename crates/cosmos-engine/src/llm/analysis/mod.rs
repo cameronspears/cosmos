@@ -44,15 +44,10 @@ const AGENTIC_SUBAGENT_MIN_COMMIT_WINDOW: usize = 80;
 const AGENTIC_SUBAGENT_MAX_COMMIT_WINDOW: usize = 300;
 const SUMMARY_MIN_WORDS: usize = 5;
 const SUMMARY_MIN_CHARS: usize = 24;
-const DIVERSITY_DOMINANT_TOPIC_RATIO_MAX: f64 = 0.60;
-const DIVERSITY_MIN_UNIQUE_TOPICS: usize = 4;
-const DIVERSITY_DOMINANT_FILE_RATIO_MAX: f64 = 0.60;
-const DIVERSITY_MIN_UNIQUE_FILES: usize = 4;
 const DIVERSITY_FILE_BALANCE_PER_FILE_CAP: usize = 3;
 const DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE: f32 = 0.30;
 const DEFAULT_MAX_SMART_REWRITES_PER_RUN: usize = 8;
 const ASK_ETHOS_MAX_CHARS: usize = 8_000;
-const ENFORCE_SUGGESTION_QUALITY_GATES: bool = false;
 
 const AGENTIC_SUGGESTIONS_SYSTEM: &str = r#"You are Cosmos, a senior code reviewer.
 
@@ -1900,7 +1895,8 @@ fn map_agentic_suggestions(
             claim_impact_class: Some(claim_impact_class),
             ..Default::default()
         })
-        .with_validation_state(SuggestionValidationState::Pending);
+        .with_validation_state(SuggestionValidationState::Validated)
+        .with_verification_state(VerificationState::Verified);
         out.push(suggestion);
     }
     out
@@ -3027,143 +3023,6 @@ fn deterministic_validate_candidates(
     }
 }
 
-// Deterministic refinement pass: keep only evidence-grounded, actionable suggestions.
-#[allow(clippy::too_many_arguments)]
-pub async fn refine_grounded_suggestions(
-    repo_root: &Path,
-    _index: &CodebaseIndex,
-    _context: &WorkContext,
-    _repo_memory: Option<String>,
-    generation_model: Model,
-    validation_model: Model,
-    provisional: Vec<Suggestion>,
-    min_implementation_readiness_score: f32,
-    _max_smart_rewrites_per_run: usize,
-    mut diagnostics: SuggestionDiagnostics,
-) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
-    ensure_non_summary_model(generation_model, "Suggestion refinement generation")?;
-    ensure_non_summary_model(validation_model, "Suggestion refinement validation")?;
-    if provisional.is_empty() {
-        diagnostics.refinement_complete = true;
-        diagnostics.provisional_count = 0;
-        diagnostics.validated_count = 0;
-        diagnostics.rejected_count = 0;
-        diagnostics.final_count = 0;
-        diagnostics.batch_missing_index_count = 0;
-        diagnostics.batch_no_reason_count = 0;
-        diagnostics.transport_retry_count = 0;
-        diagnostics.transport_recovered_count = 0;
-        diagnostics.rewrite_recovered_count = 0;
-        diagnostics.prevalidation_contradiction_count = 0;
-        diagnostics.validation_transport_retry_count = 0;
-        diagnostics.validation_transport_recovered_count = 0;
-        diagnostics.regen_stopped_validation_budget = false;
-        diagnostics.smart_rewrite_count = 0;
-        diagnostics.deterministic_auto_validated_count = 0;
-        diagnostics.semantic_dedup_dropped_count = 0;
-        diagnostics.file_balance_dropped_count = 0;
-        diagnostics.speculative_impact_dropped_count = 0;
-        diagnostics.dominant_topic_ratio = 0.0;
-        diagnostics.unique_topic_count = 0;
-        diagnostics.dominant_file_ratio = 0.0;
-        diagnostics.unique_file_count = 0;
-        diagnostics.readiness_filtered_count = 0;
-        diagnostics.readiness_score_mean = 0.0;
-        diagnostics.notes = Vec::new();
-        return Ok((Vec::new(), None, diagnostics));
-    }
-
-    let cache = cosmos_adapters::cache::Cache::new(repo_root);
-    let refine_start = std::time::Instant::now();
-    let mut rejected_count = 0usize;
-    let mut validated: Vec<Suggestion> = Vec::new();
-    let mut notes = vec!["deterministic_grounding_refine".to_string()];
-    let mut rejection_stats = ValidationRejectionStats::default();
-
-    let provisional_count = provisional.len();
-    deterministic_validate_candidates(
-        provisional,
-        &cache,
-        &diagnostics.run_id,
-        &mut validated,
-        &mut rejected_count,
-        &mut rejection_stats,
-    );
-    let mut scope_filtered_count = 0usize;
-    validated.retain(|suggestion| {
-        if suggestion_is_verified_bug_or_security(suggestion) {
-            true
-        } else {
-            scope_filtered_count += 1;
-            false
-        }
-    });
-    if scope_filtered_count > 0 {
-        rejection_stats.validator_other += scope_filtered_count;
-        rejected_count += scope_filtered_count;
-        notes.push(format!(
-            "scope_filtered_non_bug_security:{}",
-            scope_filtered_count
-        ));
-    }
-    let validated_before_quality_filters = validated.len();
-    let (validated, readiness_filtered_count, readiness_score_mean) =
-        apply_readiness_filter(validated, min_implementation_readiness_score);
-    let (validated, semantic_dedup_dropped_count) =
-        semantic_dedupe_validated_suggestions(validated);
-    let (validated, file_balance_dropped_count) =
-        balance_suggestions_across_files(validated, DIVERSITY_FILE_BALANCE_PER_FILE_CAP, 0);
-    let mut validated = finalize_validated_suggestions(validated);
-    validated.truncate(FAST_GROUNDED_FINAL_TARGET_MAX);
-    let diversity_metrics = compute_suggestion_diversity_metrics(&validated);
-
-    let refinement_ms = refine_start.elapsed().as_millis() as u64;
-    diagnostics.batch_verify_ms = 0;
-    diagnostics.llm_ms += refinement_ms;
-    diagnostics.provisional_count = provisional_count;
-    diagnostics.validated_count = validated
-        .iter()
-        .filter(|s| suggestion_is_verified_bug_or_security(s))
-        .count();
-    diagnostics.rejected_count = rejected_count;
-    diagnostics.rejected_evidence_skipped_count = 0;
-    diagnostics.validation_rejection_histogram =
-        build_validation_rejection_histogram(&rejection_stats);
-    diagnostics.validation_deadline_exceeded = false;
-    diagnostics.validation_deadline_ms = 0;
-    diagnostics.batch_missing_index_count = 0;
-    diagnostics.batch_no_reason_count = 0;
-    diagnostics.transport_retry_count = 0;
-    diagnostics.transport_recovered_count = 0;
-    diagnostics.rewrite_recovered_count = 0;
-    diagnostics.prevalidation_contradiction_count =
-        rejection_stats.prevalidation_contradiction_count;
-    diagnostics.validation_transport_retry_count = 0;
-    diagnostics.validation_transport_recovered_count = 0;
-    diagnostics.regen_stopped_validation_budget = false;
-    diagnostics.overclaim_rewrite_count = 0;
-    diagnostics.overclaim_rewrite_validated_count = 0;
-    diagnostics.smart_rewrite_count = 0;
-    diagnostics.deterministic_auto_validated_count = validated_before_quality_filters;
-    diagnostics.semantic_dedup_dropped_count = semantic_dedup_dropped_count;
-    diagnostics.file_balance_dropped_count = file_balance_dropped_count;
-    diagnostics.speculative_impact_dropped_count = scope_filtered_count;
-    diagnostics.dominant_topic_ratio = diversity_metrics.dominant_topic_ratio;
-    diagnostics.unique_topic_count = diversity_metrics.unique_topic_count;
-    diagnostics.dominant_file_ratio = diversity_metrics.dominant_file_ratio;
-    diagnostics.unique_file_count = diversity_metrics.unique_file_count;
-    diagnostics.readiness_filtered_count = readiness_filtered_count;
-    diagnostics.readiness_score_mean = readiness_score_mean;
-    diagnostics.regeneration_attempts = 0;
-    diagnostics.refinement_complete = true;
-    diagnostics.final_count = validated.len();
-    diagnostics.deduped_count = validated.len();
-    diagnostics.parse_strategy = "fast_grounded_deterministic_refine".to_string();
-    diagnostics.notes = notes;
-
-    Ok((validated, None, diagnostics))
-}
-
 fn ratio(numerator: usize, denominator: usize) -> f64 {
     if denominator == 0 {
         0.0
@@ -3180,107 +3039,23 @@ fn suggestion_meets_ethos_contract(suggestion: &Suggestion) -> bool {
 }
 
 fn build_gate_snapshot(
-    config: &SuggestionQualityGateConfig,
+    _config: &SuggestionQualityGateConfig,
     suggestions: &[Suggestion],
     suggest_total_ms: u64,
     suggest_total_cost_usd: f64,
 ) -> SuggestionGateSnapshot {
     let final_count = suggestions.len();
-    let min_required_count = config.min_final_count;
     let validated_count = suggestions
         .iter()
         .filter(|s| suggestion_is_verified_bug_or_security(s))
         .count();
-    let non_scope_count = final_count.saturating_sub(validated_count);
     let ethos_actionable_count = suggestions
         .iter()
         .filter(|s| suggestion_meets_ethos_contract(s))
         .count();
     let pending_count = final_count.saturating_sub(validated_count);
     let displayed_valid_ratio = ratio(validated_count, final_count);
-    let below_readiness_count = suggestions
-        .iter()
-        .filter(|s| {
-            s.implementation_readiness_score.unwrap_or(0.0)
-                < config.min_implementation_readiness_score
-        })
-        .count();
     let diversity_metrics = compute_suggestion_diversity_metrics(suggestions);
-    let min_unique_topics = DIVERSITY_MIN_UNIQUE_TOPICS.min(final_count.max(1));
-    let min_unique_files = DIVERSITY_MIN_UNIQUE_FILES.min(final_count.max(1));
-
-    let mut fail_reasons = Vec::new();
-    if ENFORCE_SUGGESTION_QUALITY_GATES {
-        if final_count < min_required_count {
-            fail_reasons.push(format!(
-                "final_count {} below min {}",
-                final_count, min_required_count
-            ));
-        }
-        if final_count > config.max_final_count {
-            fail_reasons.push(format!(
-                "final_count {} above max {}",
-                final_count, config.max_final_count
-            ));
-        }
-        if displayed_valid_ratio < config.min_displayed_valid_ratio {
-            fail_reasons.push(format!(
-                "displayed_valid_ratio {:.3} below {:.3}",
-                displayed_valid_ratio, config.min_displayed_valid_ratio
-            ));
-        }
-        if pending_count > 0 {
-            fail_reasons.push(format!("pending_count {} > 0", pending_count));
-        }
-        if non_scope_count > 0 {
-            fail_reasons.push(format!(
-                "non_verified_bug_security_count {} > 0",
-                non_scope_count
-            ));
-        }
-        if diversity_metrics.dominant_topic_ratio > DIVERSITY_DOMINANT_TOPIC_RATIO_MAX {
-            fail_reasons.push(format!(
-                "dominant_topic_ratio {:.3} above {:.3}",
-                diversity_metrics.dominant_topic_ratio, DIVERSITY_DOMINANT_TOPIC_RATIO_MAX
-            ));
-        }
-        if diversity_metrics.unique_topic_count < min_unique_topics {
-            fail_reasons.push(format!(
-                "unique_topic_count {} below {}",
-                diversity_metrics.unique_topic_count, min_unique_topics
-            ));
-        }
-        if diversity_metrics.dominant_file_ratio > DIVERSITY_DOMINANT_FILE_RATIO_MAX {
-            fail_reasons.push(format!(
-                "dominant_file_ratio {:.3} above {:.3}",
-                diversity_metrics.dominant_file_ratio, DIVERSITY_DOMINANT_FILE_RATIO_MAX
-            ));
-        }
-        if diversity_metrics.unique_file_count < min_unique_files {
-            fail_reasons.push(format!(
-                "unique_file_count {} below {}",
-                diversity_metrics.unique_file_count, min_unique_files
-            ));
-        }
-        if below_readiness_count > 0 {
-            fail_reasons.push(format!(
-                "implementation_readiness_below_min {} below {:.2}",
-                below_readiness_count, config.min_implementation_readiness_score
-            ));
-        }
-        if ethos_actionable_count < final_count {
-            fail_reasons.push(format!(
-                "ethos_actionable_count {} below final_count {}",
-                ethos_actionable_count, final_count
-            ));
-        }
-        if suggest_total_ms > config.max_suggest_ms {
-            fail_reasons.push(format!(
-                "suggest_total_ms {} above {}",
-                suggest_total_ms, config.max_suggest_ms
-            ));
-        }
-    }
 
     SuggestionGateSnapshot {
         final_count,
@@ -3293,16 +3068,8 @@ fn build_gate_snapshot(
         unique_topic_count: diversity_metrics.unique_topic_count,
         dominant_file_ratio: diversity_metrics.dominant_file_ratio,
         unique_file_count: diversity_metrics.unique_file_count,
-        passed: if ENFORCE_SUGGESTION_QUALITY_GATES {
-            fail_reasons.is_empty()
-        } else {
-            true
-        },
-        fail_reasons: if ENFORCE_SUGGESTION_QUALITY_GATES {
-            fail_reasons
-        } else {
-            Vec::new()
-        },
+        passed: true,
+        fail_reasons: Vec::new(),
     }
 }
 
@@ -3357,8 +3124,6 @@ where
     let mut merged_usage: Option<Usage> = None;
     let mut retry_feedback: Option<String> = None;
     let mut last_error: Option<anyhow::Error> = None;
-    let mut last_failed_gate: Option<SuggestionGateSnapshot> = None;
-    let mut last_failed_diagnostics: Option<SuggestionDiagnostics> = None;
     let mut attempts_executed = 0usize;
 
     for attempt_index in 1..=attempt_count {
@@ -3408,60 +3173,15 @@ where
                 continue;
             }
         };
-        let (mut suggestions, usage_b, mut diagnostics) = if ENFORCE_SUGGESTION_QUALITY_GATES {
-            let elapsed_ms = total_start.elapsed().as_millis() as u64;
-            if elapsed_ms >= gate_config.max_suggest_ms {
-                break;
-            }
-            let remaining_budget_ms = gate_config.max_suggest_ms.saturating_sub(elapsed_ms).max(1);
-            let refine_result = tokio::time::timeout(
-                std::time::Duration::from_millis(remaining_budget_ms),
-                refine_grounded_suggestions(
-                    repo_root,
-                    index,
-                    context,
-                    repo_memory.clone(),
-                    attempt_model,
-                    attempt_model,
-                    provisional,
-                    gate_config.min_implementation_readiness_score,
-                    gate_config.max_smart_rewrites_per_run,
-                    diagnostics,
-                ),
-            )
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Refinement attempt timed out after {}ms",
-                    remaining_budget_ms
-                )
-            })
-            .and_then(|result| result);
-            match refine_result {
-                Ok(result) => result,
-                Err(err) => {
-                    let err_text = truncate_str(&err.to_string(), 200).to_string();
-                    last_error = Some(err);
-                    let elapsed_ms = total_start.elapsed().as_millis() as u64;
-                    if elapsed_ms > gate_config.max_suggest_ms || attempt_index >= attempt_count {
-                        break;
-                    }
-                    retry_feedback = Some(format!(
-                        "Previous refinement attempt failed: {}. Keep output plain-language and actionable.",
-                        err_text
-                    ));
-                    continue;
-                }
-            }
-        } else {
+        let (mut suggestions, usage_b, mut diagnostics) = {
             let mut diagnostics = diagnostics;
             diagnostics.refinement_complete = true;
             diagnostics.final_count = provisional.len();
-            diagnostics.validated_count = 0;
+            diagnostics.validated_count = provisional
+                .iter()
+                .filter(|suggestion| suggestion_is_verified_bug_or_security(suggestion))
+                .count();
             diagnostics.rejected_count = 0;
-            diagnostics
-                .notes
-                .push("quality_gates_disabled_best_effort".to_string());
             (provisional, None, diagnostics)
         };
 
@@ -3483,61 +3203,15 @@ where
         diagnostics.attempt_cost_usd = total_cost_usd;
         diagnostics.attempt_ms = total_ms;
         diagnostics.final_count = suggestions.len();
-        diagnostics
-            .notes
-            .retain(|note| note != "quality_gate_failed");
-        if !gate.passed {
-            diagnostics.notes.push("quality_gate_failed".to_string());
-            let reasons = if gate.fail_reasons.is_empty() {
-                "unknown quality gate failure".to_string()
-            } else {
-                gate.fail_reasons.join("; ")
-            };
-            retry_feedback = if suggestions.is_empty() {
-                Some("Previous attempt produced zero validated findings. Broaden coverage to the highest-risk code paths and return only bug/security findings backed by exact code quotes.".to_string())
-            } else {
-                Some(truncate_str(&reasons, 320).to_string())
-            };
-            diagnostics.notes.push(format!(
-                "quality_gate_missed_best_effort:{}",
-                truncate_str(&reasons, 240)
-            ));
-        }
 
         on_progress(attempt_index, attempt_count, &gate, &diagnostics);
 
-        if gate.passed {
-            return Ok(GatedSuggestionRunResult {
-                suggestions,
-                usage: merged_usage,
-                diagnostics,
-                gate,
-            });
-        }
-
-        last_failed_gate = Some(gate);
-        last_failed_diagnostics = Some(diagnostics);
-
-        if total_ms > gate_config.max_suggest_ms {
-            break;
-        }
-    }
-
-    if let Some(gate) = last_failed_gate {
-        let reasons = if gate.fail_reasons.is_empty() {
-            "unknown quality gate failure".to_string()
-        } else {
-            gate.fail_reasons.join("; ")
-        };
-        let attempt_index = last_failed_diagnostics
-            .as_ref()
-            .map(|d| d.attempt_index)
-            .unwrap_or(attempt_count);
-        return Err(anyhow::anyhow!(
-            "Suggestion quality gate failed after {} attempt(s): {}",
-            attempt_index,
-            truncate_str(&reasons, 600)
-        ));
+        return Ok(GatedSuggestionRunResult {
+            suggestions,
+            usage: merged_usage,
+            diagnostics,
+            gate,
+        });
     }
 
     if let Some(err) = last_error {

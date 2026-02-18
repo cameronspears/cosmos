@@ -136,7 +136,7 @@ async fn run_suggestion_audit(
     let mut last_error: Option<String> = None;
 
     println!(
-        "Running suggestion audit: runs={}, profile={:?}, target={}..{}, gates=disabled",
+        "Running suggestion audit: runs={}, profile={:?}, target={}..{}",
         runs, profile, gate_config.min_final_count, gate_config.max_final_count
     );
 

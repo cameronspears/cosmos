@@ -134,51 +134,6 @@ fn test_apply_error_is_clone() {
 }
 
 #[test]
-fn enter_is_blocked_while_suggestion_refinement_in_progress() {
-    let mut root = std::env::temp_dir();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    root.push(format!("cosmos_normal_mode_test_{}", nanos));
-    std::fs::create_dir_all(&root).unwrap();
-
-    let index = CodebaseIndex {
-        root: root.clone(),
-        files: HashMap::new(),
-        index_errors: Vec::new(),
-        git_head: Some("deadbeef".to_string()),
-    };
-    let suggestions = SuggestionEngine::new(index.clone());
-    let context = WorkContext {
-        branch: "main".to_string(),
-        uncommitted_files: Vec::new(),
-        staged_files: Vec::new(),
-        untracked_files: Vec::new(),
-        inferred_focus: None,
-        modified_count: 0,
-        repo_root: root.clone(),
-    };
-    let mut app = App::new(index.clone(), suggestions, context);
-    app.workflow_step = WorkflowStep::Suggestions;
-    app.suggestion_refinement_in_progress = true;
-
-    let (tx, _rx) = mpsc::channel();
-    let ctx = crate::app::RuntimeContext {
-        index: &index,
-        repo_path: &root,
-        tx: &tx,
-    };
-
-    let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-    handle_normal_mode(&mut app, key, &ctx).unwrap();
-
-    assert_eq!(app.workflow_step, WorkflowStep::Suggestions);
-    assert_eq!(app.overlay, Overlay::None);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
 fn k_opens_api_key_overlay() {
     let mut root = std::env::temp_dir();
     let nanos = SystemTime::now()

@@ -177,14 +177,6 @@ pub struct App {
     pub git_refresh_error: Option<String>,
     /// Last time we surfaced a git refresh error
     pub git_refresh_error_at: Option<Instant>,
-    /// Whether background refinement is still validating/regenerating suggestions.
-    pub suggestion_refinement_in_progress: bool,
-    /// Number of provisional suggestions from fast pass.
-    pub suggestion_provisional_count: usize,
-    /// Number of validated suggestions after refinement.
-    pub suggestion_validated_count: usize,
-    /// Number of rejected suggestions from refinement.
-    pub suggestion_rejected_count: usize,
     /// Run identifier for the latest suggestion generation cycle.
     pub current_suggestion_run_id: Option<String>,
     /// Rolling precision from recent verify outcomes.
@@ -290,10 +282,6 @@ impl App {
             ask_cosmos_state: None,
             git_refresh_error: None,
             git_refresh_error_at: None,
-            suggestion_refinement_in_progress: false,
-            suggestion_provisional_count: 0,
-            suggestion_validated_count: 0,
-            suggestion_rejected_count: 0,
             current_suggestion_run_id: None,
             rolling_verify_precision: None,
             armed_suggestion_id: None,
