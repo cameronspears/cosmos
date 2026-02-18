@@ -103,7 +103,7 @@ fn default_review_summary() -> String {
 fn ensure_non_summary_model(model: Model, operation: &str) -> anyhow::Result<()> {
     if model == Model::Speed {
         return Err(anyhow::anyhow!(
-            "{} must not use {} (reserved for file summaries)",
+            "{} must not use {} (speed tier is not allowed for this workflow)",
             operation,
             model.id()
         ));

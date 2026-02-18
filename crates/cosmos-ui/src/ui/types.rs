@@ -63,7 +63,6 @@ pub enum LoadingState {
     #[default]
     None,
     GeneratingSuggestions,
-    GeneratingSummaries,
     GeneratingPreview,   // Fast preview generation (<1s)
     GeneratingFix,       // Full fix generation (slower)
     ReviewingChanges,    // Adversarial review or PR review

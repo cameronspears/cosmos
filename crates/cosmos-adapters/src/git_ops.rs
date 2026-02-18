@@ -113,7 +113,6 @@ pub fn checkout_branch(repo_path: &Path, name: &str) -> Result<()> {
 
 /// Create a new branch from main (or master) and check it out
 /// Used for creating fix branches before applying changes
-#[allow(dead_code)]
 pub fn create_fix_branch_from_main(repo_path: &Path, branch_name: &str) -> Result<String> {
     let repo = open_repo_discover(repo_path)?;
 

@@ -49,7 +49,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Overlay::Help { scroll } => render_help(frame, *scroll),
         Overlay::FileDetail { path, scroll } => {
             if let Some(file_index) = app.index.files.get(path) {
-                render_file_detail(frame, path, file_index, app.get_llm_summary(path), *scroll);
+                render_file_detail(frame, path, file_index, *scroll);
             }
         }
         Overlay::ApiKeySetup {

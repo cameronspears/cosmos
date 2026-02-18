@@ -13,7 +13,6 @@ use cosmos_engine::llm::{
 use crossterm::event::{KeyCode, KeyEvent};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use uuid::Uuid;
 
 mod refresh;
 use refresh::{llm_available_for_apply, prompt_api_key_setup, refresh_suggestions_now};
@@ -25,7 +24,7 @@ use refresh::{llm_available_for_apply, prompt_api_key_setup, refresh_suggestions
 /// Errors that can occur when validating the apply fix action.
 /// Each variant has a user-friendly message.
 #[derive(Debug, Clone)]
-pub enum ApplyError {
+enum ApplyError {
     /// Apply has not been armed by the first Enter press
     ApplyNotConfirmed,
     /// Fix is already being applied
@@ -50,7 +49,7 @@ pub enum ApplyError {
 
 impl ApplyError {
     /// Returns a user-friendly message for display in user-facing error UI
-    pub fn user_message(&self) -> String {
+    fn user_message(&self) -> String {
         match self {
             Self::ApplyNotConfirmed => {
                 "Apply pending: open the scope preview and confirm to apply this suggestion."
@@ -99,12 +98,11 @@ impl ApplyError {
 }
 
 /// Context needed to apply a fix, validated and ready to use
-pub struct ApplyContext {
-    pub preview: FixPreview,
-    pub suggestion: Suggestion,
-    pub suggestion_id: Uuid,
-    pub repo_path: PathBuf,
-    pub repo_memory_context: String,
+struct ApplyContext {
+    preview: FixPreview,
+    suggestion: Suggestion,
+    repo_path: PathBuf,
+    repo_memory_context: String,
 }
 
 fn suggestion_has_weak_grounding(suggestion: &Suggestion) -> bool {
@@ -167,7 +165,6 @@ fn validate_apply_fix(app: &App) -> std::result::Result<ApplyContext, ApplyError
     let preview = cosmos_engine::llm::build_fix_preview_from_validated_suggestion(&suggestion);
     Ok(ApplyContext {
         preview,
-        suggestion_id: suggestion.id,
         suggestion,
         repo_path: app.repo_path.clone(),
         repo_memory_context: app.repo_memory.to_prompt_context(12, 900),
@@ -428,153 +425,182 @@ fn has_repo_mutations(repo_path: &std::path::Path) -> bool {
         .unwrap_or(true)
 }
 
+fn apply_finalization_failure(
+    message: String,
+    status: ImplementationFinalizationStatus,
+    mutation_on_failure: bool,
+) -> ApplyFinalizationFailure {
+    ApplyFinalizationFailure {
+        message,
+        status,
+        mutation_on_failure,
+    }
+}
+
+fn rollback_finalization_failure(
+    repo_path: &std::path::Path,
+    source_branch: &str,
+    created_branch: &str,
+    created_new_branch: bool,
+    touched_files: &[PathBuf],
+    message: String,
+) -> ApplyFinalizationFailure {
+    let rollback_detail = rollback_finalization(
+        repo_path,
+        source_branch,
+        created_branch,
+        created_new_branch,
+        touched_files,
+    );
+    apply_finalization_failure(
+        format!("{message} ({rollback_detail})"),
+        ImplementationFinalizationStatus::RolledBack,
+        has_repo_mutations(repo_path),
+    )
+}
+
+fn validate_finalization_repo_state(
+    repo_path: &std::path::Path,
+    source_branch: &str,
+) -> std::result::Result<(), ApplyFinalizationFailure> {
+    let status = git_ops::current_status(repo_path).map_err(|error| {
+        apply_finalization_failure(
+            format!(
+                "Finalization stopped because git status could not be read: {}",
+                error
+            ),
+            ImplementationFinalizationStatus::FailedBeforeFinalize,
+            true,
+        )
+    })?;
+
+    if !source_branch.is_empty() && source_branch != "unknown" && status.branch != source_branch {
+        return Err(apply_finalization_failure(
+            format!(
+                "Finalization stopped because the active branch changed from '{}' to '{}' while apply was running.",
+                source_branch, status.branch
+            ),
+            ImplementationFinalizationStatus::FailedBeforeFinalize,
+            false,
+        ));
+    }
+    if !(status.staged.is_empty() && status.modified.is_empty()) {
+        return Err(apply_finalization_failure(
+            "Finalization stopped because repository state changed while preparing apply."
+                .to_string(),
+            ImplementationFinalizationStatus::FailedBeforeFinalize,
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn apply_finalized_file_on_branch(
+    repo_path: &std::path::Path,
+    source_branch: &str,
+    branch_outcome: &git_ops::BranchCreateOutcome,
+    touched_files: &mut Vec<PathBuf>,
+    file: &ImplementationAppliedFile,
+) -> std::result::Result<(PathBuf, String), ApplyFinalizationFailure> {
+    let resolved = resolve_repo_path_allow_new(repo_path, &file.path).map_err(|error| {
+        rollback_finalization_failure(
+            repo_path,
+            source_branch,
+            &branch_outcome.branch_name,
+            branch_outcome.created_new,
+            touched_files,
+            format!(
+                "Finalization failed due to unsafe file path {}: {}",
+                file.path.display(),
+                error
+            ),
+        )
+    })?;
+
+    if let Some(parent) = resolved.absolute.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            rollback_finalization_failure(
+                repo_path,
+                source_branch,
+                &branch_outcome.branch_name,
+                branch_outcome.created_new,
+                touched_files,
+                format!(
+                    "Finalization failed while preparing {}: {}",
+                    file.path.display(),
+                    error
+                ),
+            )
+        })?;
+    }
+
+    touched_files.push(resolved.relative.clone());
+
+    std::fs::write(&resolved.absolute, &file.content).map_err(|error| {
+        rollback_finalization_failure(
+            repo_path,
+            source_branch,
+            &branch_outcome.branch_name,
+            branch_outcome.created_new,
+            touched_files,
+            format!(
+                "Finalization failed while writing {}: {}",
+                file.path.display(),
+                error
+            ),
+        )
+    })?;
+
+    git_ops::stage_file(repo_path, &resolved.relative.to_string_lossy()).map_err(|error| {
+        rollback_finalization_failure(
+            repo_path,
+            source_branch,
+            &branch_outcome.branch_name,
+            branch_outcome.created_new,
+            touched_files,
+            format!(
+                "Finalization failed while staging {}: {}",
+                file.path.display(),
+                error
+            ),
+        )
+    })?;
+
+    Ok((file.path.clone(), file.summary.clone()))
+}
+
 fn finalize_harness_result_on_branch(
     repo_path: &std::path::Path,
     source_branch: &str,
     suggestion: &Suggestion,
     files: &[ImplementationAppliedFile],
 ) -> std::result::Result<(String, Vec<(PathBuf, String)>), ApplyFinalizationFailure> {
-    let status = match git_ops::current_status(repo_path) {
-        Ok(status) => status,
-        Err(error) => {
-            return Err(ApplyFinalizationFailure {
-                message: format!(
-                    "Finalization stopped because git status could not be read: {}",
-                    error
-                ),
-                status: ImplementationFinalizationStatus::FailedBeforeFinalize,
-                mutation_on_failure: true,
-            });
-        }
-    };
-
-    if !source_branch.is_empty() && source_branch != "unknown" && status.branch != source_branch {
-        return Err(ApplyFinalizationFailure {
-            message: format!(
-                "Finalization stopped because the active branch changed from '{}' to '{}' while apply was running.",
-                source_branch, status.branch
-            ),
-            status: ImplementationFinalizationStatus::FailedBeforeFinalize,
-            mutation_on_failure: false,
-        });
-    }
-
-    if !(status.staged.is_empty() && status.modified.is_empty()) {
-        return Err(ApplyFinalizationFailure {
-            message: "Finalization stopped because repository state changed while preparing apply."
-                .to_string(),
-            status: ImplementationFinalizationStatus::FailedBeforeFinalize,
-            mutation_on_failure: true,
-        });
-    }
+    validate_finalization_repo_state(repo_path, source_branch)?;
 
     let branch_name =
         git_ops::generate_fix_branch_name(&suggestion.id.to_string(), &suggestion.summary);
     let branch_outcome =
-        match git_ops::create_fix_branch_from_current_with_outcome(repo_path, &branch_name) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return Err(ApplyFinalizationFailure {
-                    message: format!("Could not create fix branch: {}", error),
-                    status: ImplementationFinalizationStatus::FailedBeforeFinalize,
-                    mutation_on_failure: false,
-                });
-            }
-        };
+        git_ops::create_fix_branch_from_current_with_outcome(repo_path, &branch_name).map_err(
+            |error| {
+                apply_finalization_failure(
+                    format!("Could not create fix branch: {}", error),
+                    ImplementationFinalizationStatus::FailedBeforeFinalize,
+                    false,
+                )
+            },
+        )?;
 
     let mut touched_files = Vec::new();
     let mut final_file_changes = Vec::new();
     for file in files {
-        let resolved = match resolve_repo_path_allow_new(repo_path, &file.path) {
-            Ok(path) => path,
-            Err(error) => {
-                let rollback_detail = rollback_finalization(
-                    repo_path,
-                    source_branch,
-                    &branch_outcome.branch_name,
-                    branch_outcome.created_new,
-                    &touched_files,
-                );
-                return Err(ApplyFinalizationFailure {
-                    message: format!(
-                        "Finalization failed due to unsafe file path {}: {} ({})",
-                        file.path.display(),
-                        error,
-                        rollback_detail
-                    ),
-                    status: ImplementationFinalizationStatus::RolledBack,
-                    mutation_on_failure: has_repo_mutations(repo_path),
-                });
-            }
-        };
-
-        if let Some(parent) = resolved.absolute.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                let rollback_detail = rollback_finalization(
-                    repo_path,
-                    source_branch,
-                    &branch_outcome.branch_name,
-                    branch_outcome.created_new,
-                    &touched_files,
-                );
-                return Err(ApplyFinalizationFailure {
-                    message: format!(
-                        "Finalization failed while preparing {}: {} ({})",
-                        file.path.display(),
-                        error,
-                        rollback_detail
-                    ),
-                    status: ImplementationFinalizationStatus::RolledBack,
-                    mutation_on_failure: has_repo_mutations(repo_path),
-                });
-            }
-        }
-
-        touched_files.push(resolved.relative.clone());
-
-        if let Err(error) = std::fs::write(&resolved.absolute, &file.content) {
-            let rollback_detail = rollback_finalization(
-                repo_path,
-                source_branch,
-                &branch_outcome.branch_name,
-                branch_outcome.created_new,
-                &touched_files,
-            );
-            return Err(ApplyFinalizationFailure {
-                message: format!(
-                    "Finalization failed while writing {}: {} ({})",
-                    file.path.display(),
-                    error,
-                    rollback_detail
-                ),
-                status: ImplementationFinalizationStatus::RolledBack,
-                mutation_on_failure: has_repo_mutations(repo_path),
-            });
-        }
-
-        if let Err(error) = git_ops::stage_file(repo_path, &resolved.relative.to_string_lossy()) {
-            let rollback_detail = rollback_finalization(
-                repo_path,
-                source_branch,
-                &branch_outcome.branch_name,
-                branch_outcome.created_new,
-                &touched_files,
-            );
-            return Err(ApplyFinalizationFailure {
-                message: format!(
-                    "Finalization failed while staging {}: {} ({})",
-                    file.path.display(),
-                    error,
-                    rollback_detail
-                ),
-                status: ImplementationFinalizationStatus::RolledBack,
-                mutation_on_failure: has_repo_mutations(repo_path),
-            });
-        }
-
-        final_file_changes.push((file.path.clone(), file.summary.clone()));
+        final_file_changes.push(apply_finalized_file_on_branch(
+            repo_path,
+            source_branch,
+            &branch_outcome,
+            &mut touched_files,
+            file,
+        )?);
     }
-
     Ok((branch_outcome.branch_name, final_file_changes))
 }
 
@@ -608,11 +634,158 @@ fn rollback_finalization(
     }
 }
 
-pub(super) fn start_apply_for_context(
-    app: &mut App,
-    ctx: &RuntimeContext,
-    apply_ctx: ApplyContext,
+fn optional_repo_memory_context(repo_memory_context: String) -> Option<String> {
+    if repo_memory_context.trim().is_empty() {
+        None
+    } else {
+        Some(repo_memory_context)
+    }
+}
+
+fn apply_harness_progress_detail(
+    diagnostics: &cosmos_engine::llm::ImplementationAttemptDiagnostics,
+) -> String {
+    if diagnostics.passed {
+        return "attempt passed all gates".to_string();
+    }
+    if diagnostics.fail_reasons.is_empty() {
+        return "attempt completed".to_string();
+    }
+    format!(
+        "{} gate miss(es): {}",
+        diagnostics.fail_reasons.len(),
+        diagnostics
+            .fail_reasons
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+fn record_interactive_finalization_outcome(
+    repo_path: &std::path::Path,
+    diagnostics: &mut cosmos_engine::llm::ImplementationRunDiagnostics,
+    status: ImplementationFinalizationStatus,
+    detail: Option<String>,
+    mutation_on_failure: bool,
 ) {
+    let _ = cosmos_engine::llm::record_harness_finalization_outcome(
+        repo_path,
+        diagnostics,
+        status,
+        detail,
+        Some(mutation_on_failure),
+        ImplementationHarnessRunContext::Interactive,
+        None,
+    );
+}
+
+fn send_apply_harness_failed(
+    tx_apply: &std::sync::mpsc::Sender<BackgroundMessage>,
+    summary: String,
+    fail_reasons: Vec<String>,
+    report_path: Option<PathBuf>,
+) {
+    let _ = tx_apply.send(BackgroundMessage::ApplyHarnessFailed {
+        summary,
+        fail_reasons,
+        report_path,
+    });
+}
+
+fn send_apply_harness_reduced_confidence(
+    tx_apply: &std::sync::mpsc::Sender<BackgroundMessage>,
+    report_path: Option<PathBuf>,
+) {
+    let _ = tx_apply.send(BackgroundMessage::ApplyHarnessReducedConfidence {
+        detail: "Quick checks were unavailable, so Cosmos could not automatically run your project checks. Treat this apply as lower confidence and consider running your tests before shipping.".to_string(),
+        report_path,
+    });
+}
+
+fn handle_non_passing_harness_result(
+    tx_apply: &std::sync::mpsc::Sender<BackgroundMessage>,
+    repo_path: &std::path::Path,
+    result: &mut cosmos_engine::llm::ImplementationRunResult,
+) {
+    record_interactive_finalization_outcome(
+        repo_path,
+        &mut result.diagnostics,
+        ImplementationFinalizationStatus::FailedBeforeFinalize,
+        Some("Harness did not produce a passing attempt".to_string()),
+        false,
+    );
+    send_apply_harness_failed(
+        tx_apply,
+        result.description.clone(),
+        result.diagnostics.fail_reasons.clone(),
+        result.diagnostics.report_path.clone(),
+    );
+}
+
+fn handle_passing_harness_result(
+    tx_apply: &std::sync::mpsc::Sender<BackgroundMessage>,
+    repo_path: &std::path::Path,
+    source_branch: &str,
+    suggestion: &Suggestion,
+    preview: &FixPreview,
+    stage_start: std::time::Instant,
+    result: &mut cosmos_engine::llm::ImplementationRunResult,
+) {
+    match finalize_harness_result_on_branch(
+        repo_path,
+        source_branch,
+        suggestion,
+        &result.file_changes,
+    ) {
+        Ok((created_branch, file_changes)) => {
+            record_interactive_finalization_outcome(
+                repo_path,
+                &mut result.diagnostics,
+                ImplementationFinalizationStatus::Applied,
+                Some("Applied passing harness result on fix branch".to_string()),
+                false,
+            );
+            if result.diagnostics.reduced_confidence {
+                send_apply_harness_reduced_confidence(
+                    tx_apply,
+                    result.diagnostics.report_path.clone(),
+                );
+            }
+            let _ = tx_apply.send(BackgroundMessage::DirectFixApplied {
+                suggestion_id: suggestion.id,
+                file_changes,
+                description: result.description.clone(),
+                usage: result.usage.clone(),
+                branch_name: created_branch,
+                source_branch: source_branch.to_string(),
+                friendly_title: preview.friendly_title.clone(),
+                problem_summary: preview.problem_summary.clone(),
+                outcome: preview.outcome.clone(),
+                duration_ms: stage_start.elapsed().as_millis() as u64,
+            });
+        }
+        Err(finalize_error) => {
+            record_interactive_finalization_outcome(
+                repo_path,
+                &mut result.diagnostics,
+                finalize_error.status,
+                Some(finalize_error.message.clone()),
+                finalize_error.mutation_on_failure,
+            );
+            send_apply_harness_failed(
+                tx_apply,
+                "Harness found a safe fix but finalization could not complete.".to_string(),
+                vec![finalize_error.message],
+                result.diagnostics.report_path.clone(),
+            );
+        }
+    }
+}
+
+fn start_apply_for_context(app: &mut App, ctx: &RuntimeContext, apply_ctx: ApplyContext) {
     app.loading = LoadingState::GeneratingFix;
     app.clear_apply_confirm();
 
@@ -620,7 +793,6 @@ pub(super) fn start_apply_for_context(
     let repo_path = apply_ctx.repo_path;
     let preview = apply_ctx.preview;
     let suggestion = apply_ctx.suggestion;
-    let sid = apply_ctx.suggestion_id;
     let repo_memory_context = apply_ctx.repo_memory_context;
 
     background::spawn_background(ctx.tx.clone(), "apply_fix", async move {
@@ -628,12 +800,7 @@ pub(super) fn start_apply_for_context(
         let source_branch = git_ops::current_status(&repo_path)
             .map(|s| s.branch)
             .unwrap_or_else(|_| "unknown".to_string());
-
-        let mem = if repo_memory_context.trim().is_empty() {
-            None
-        } else {
-            Some(repo_memory_context)
-        };
+        let mem = optional_repo_memory_context(repo_memory_context);
 
         let config = cosmos_engine::llm::ImplementationHarnessConfig::interactive_strict();
         let _ = tx_apply.send(BackgroundMessage::ApplyHarnessProgress {
@@ -650,104 +817,29 @@ pub(super) fn start_apply_for_context(
             mem,
             config,
             |attempt_index, attempt_count, diagnostics| {
-                let detail = if diagnostics.passed {
-                    "attempt passed all gates".to_string()
-                } else if diagnostics.fail_reasons.is_empty() {
-                    "attempt completed".to_string()
-                } else {
-                    format!(
-                        "{} gate miss(es): {}",
-                        diagnostics.fail_reasons.len(),
-                        diagnostics
-                            .fail_reasons
-                            .iter()
-                            .take(2)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    )
-                };
                 let _ = tx_progress.send(BackgroundMessage::ApplyHarnessProgress {
                     attempt_index,
                     attempt_count,
-                    detail,
+                    detail: apply_harness_progress_detail(diagnostics),
                 });
             },
         )
         .await
         {
             Ok(mut result) => {
-                if result.diagnostics.passed {
-                    match finalize_harness_result_on_branch(
-                        &repo_path,
-                        &source_branch,
-                        &suggestion,
-                        &result.file_changes,
-                    ) {
-                        Ok((created_branch, file_changes)) => {
-                            let _ = cosmos_engine::llm::record_harness_finalization_outcome(
-                                &repo_path,
-                                &mut result.diagnostics,
-                                ImplementationFinalizationStatus::Applied,
-                                Some("Applied passing harness result on fix branch".to_string()),
-                                Some(false),
-                                ImplementationHarnessRunContext::Interactive,
-                                None,
-                            );
-                            if result.diagnostics.reduced_confidence {
-                                let _ = tx_apply.send(BackgroundMessage::ApplyHarnessReducedConfidence {
-                                    detail: "Quick checks were unavailable, so Cosmos could not automatically run your project checks. Treat this apply as lower confidence and consider running your tests before shipping.".to_string(),
-                                    report_path: result.diagnostics.report_path.clone(),
-                                });
-                            }
-                            let _ = tx_apply.send(BackgroundMessage::DirectFixApplied {
-                                suggestion_id: sid,
-                                file_changes,
-                                description: result.description,
-                                usage: result.usage,
-                                branch_name: created_branch,
-                                source_branch: source_branch.clone(),
-                                friendly_title: preview.friendly_title.clone(),
-                                problem_summary: preview.problem_summary.clone(),
-                                outcome: preview.outcome.clone(),
-                                duration_ms: stage_start.elapsed().as_millis() as u64,
-                            });
-                        }
-                        Err(finalize_error) => {
-                            let _ = cosmos_engine::llm::record_harness_finalization_outcome(
-                                &repo_path,
-                                &mut result.diagnostics,
-                                finalize_error.status,
-                                Some(finalize_error.message.clone()),
-                                Some(finalize_error.mutation_on_failure),
-                                ImplementationHarnessRunContext::Interactive,
-                                None,
-                            );
-                            let _ = tx_apply.send(BackgroundMessage::ApplyHarnessFailed {
-                                summary:
-                                    "Harness found a safe fix but finalization could not complete."
-                                        .to_string(),
-                                fail_reasons: vec![finalize_error.message],
-                                report_path: result.diagnostics.report_path.clone(),
-                            });
-                        }
-                    }
-                } else {
-                    let _ = cosmos_engine::llm::record_harness_finalization_outcome(
-                        &repo_path,
-                        &mut result.diagnostics,
-                        ImplementationFinalizationStatus::FailedBeforeFinalize,
-                        Some("Harness did not produce a passing attempt".to_string()),
-                        Some(false),
-                        ImplementationHarnessRunContext::Interactive,
-                        None,
-                    );
-                    let _ = tx_apply.send(BackgroundMessage::ApplyHarnessFailed {
-                        summary: result.description,
-                        fail_reasons: result.diagnostics.fail_reasons,
-                        report_path: result.diagnostics.report_path.clone(),
-                    });
+                if !result.diagnostics.passed {
+                    handle_non_passing_harness_result(&tx_apply, &repo_path, &mut result);
+                    return;
                 }
+                handle_passing_harness_result(
+                    &tx_apply,
+                    &repo_path,
+                    &source_branch,
+                    &suggestion,
+                    &preview,
+                    stage_start,
+                    &mut result,
+                );
             }
             Err(e) => {
                 let _ = tx_apply.send(BackgroundMessage::DirectFixError(e.to_string()));
@@ -783,246 +875,199 @@ pub(super) fn confirm_apply_from_overlay(app: &mut App, ctx: &RuntimeContext) {
     }
 }
 
+fn review_interaction_ready(app: &App) -> bool {
+    app.workflow_step == WorkflowStep::Review
+        && !app.review_state.reviewing
+        && !app.review_state.fixing
+}
+
+fn handle_down_key(app: &mut App) {
+    if app.active_panel == ActivePanel::Ask {
+        if app.is_ask_cosmos_mode() {
+            app.ask_cosmos_scroll_down();
+        }
+        return;
+    }
+    match app.workflow_step {
+        WorkflowStep::Review if review_interaction_ready(app) => app.review_cursor_down(),
+        WorkflowStep::Ship => app.ship_scroll_down(),
+        WorkflowStep::Suggestions => app.navigate_down(),
+        _ => {}
+    }
+}
+
+fn handle_up_key(app: &mut App) {
+    if app.active_panel == ActivePanel::Ask {
+        if app.is_ask_cosmos_mode() {
+            app.ask_cosmos_scroll_up();
+        }
+        return;
+    }
+    match app.workflow_step {
+        WorkflowStep::Review if review_interaction_ready(app) => app.review_cursor_up(),
+        WorkflowStep::Ship => app.ship_scroll_up(),
+        WorkflowStep::Suggestions => app.navigate_up(),
+        _ => {}
+    }
+}
+
+fn handle_enter_in_ask_panel(app: &mut App) -> bool {
+    if app.active_panel != ActivePanel::Ask {
+        return false;
+    }
+    if app.workflow_step != WorkflowStep::Suggestions {
+        return true;
+    }
+    if !cosmos_engine::llm::is_available() {
+        prompt_api_key_setup(
+            app,
+            "No API key configured yet. Add your OpenRouter key to ask questions.",
+        );
+    } else {
+        app.start_question();
+    }
+    true
+}
+
+fn handle_enter_suggestions(app: &mut App) {
+    if app.suggestion_refinement_in_progress {
+        return;
+    }
+    let suggestion = app.selected_suggestion().cloned();
+    if let Some(suggestion) = suggestion {
+        if !llm_available_for_apply() {
+            prompt_api_key_setup(
+                app,
+                "No API key configured yet. Add your OpenRouter key to continue.",
+            );
+        } else if let Err(e) = open_apply_plan_for_suggestion(app, &suggestion) {
+            app.open_alert("Couldn't open preview", e.user_message());
+        }
+    }
+}
+
+fn handle_enter_review(app: &mut App, ctx: &RuntimeContext) {
+    if !review_interaction_ready(app) {
+        return;
+    }
+    if !app.review_state.selected.is_empty() {
+        start_review_fix_for_selected_findings(app, ctx);
+        return;
+    }
+    if app.review_passed() {
+        app.start_ship();
+        return;
+    }
+    if app.review_state.confirm_ship {
+        app.review_state.confirm_ship = false;
+        app.start_ship();
+        return;
+    }
+    app.review_state.confirm_ship = true;
+}
+
+fn start_ship_confirm(app: &mut App, ctx: &RuntimeContext) {
+    let repo_path = app.repo_path.clone();
+    let branch_name = app.ship_state.branch_name.clone();
+    let commit_message = app.ship_state.commit_message.clone();
+    let (pr_title, pr_body) = app.generate_pr_content();
+    let tx_ship = ctx.tx.clone();
+
+    app.set_ship_step(ShipStep::Committing);
+
+    background::spawn_background(ctx.tx.clone(), "ship_confirm", async move {
+        let _ = tx_ship.send(BackgroundMessage::ShipProgress(ShipStep::Committing));
+        if let Err(e) = git_ops::commit(&repo_path, &commit_message) {
+            let _ = tx_ship.send(BackgroundMessage::ShipError(e.to_string()));
+            return;
+        }
+
+        let _ = tx_ship.send(BackgroundMessage::ShipProgress(ShipStep::Pushing));
+        if let Err(e) = git_ops::push_branch(&repo_path, &branch_name) {
+            let _ = tx_ship.send(BackgroundMessage::ShipError(e.to_string()));
+            return;
+        }
+
+        let _ = tx_ship.send(BackgroundMessage::ShipProgress(ShipStep::CreatingPR));
+        match git_ops::create_pr(&repo_path, &pr_title, &pr_body).await {
+            Ok(url) => {
+                let _ = tx_ship.send(BackgroundMessage::ShipComplete(url));
+            }
+            Err(e) => {
+                let _ = tx_ship.send(BackgroundMessage::ShipError(e.to_string()));
+            }
+        }
+    });
+}
+
+fn handle_enter_ship(app: &mut App, ctx: &RuntimeContext) {
+    match app.ship_state.step {
+        ShipStep::Confirm => start_ship_confirm(app, ctx),
+        ShipStep::Done => {
+            if let Some(url) = &app.ship_state.pr_url {
+                let _ = git_ops::open_url(url);
+            }
+            app.workflow_complete();
+        }
+        _ => {}
+    }
+}
+
+fn handle_enter_key(app: &mut App, ctx: &RuntimeContext) {
+    if handle_enter_in_ask_panel(app) {
+        return;
+    }
+    if let Some(url) = app.pr_url.take() {
+        let _ = git_ops::open_url(&url);
+        return;
+    }
+    match app.workflow_step {
+        WorkflowStep::Suggestions => handle_enter_suggestions(app),
+        WorkflowStep::Review => handle_enter_review(app, ctx),
+        WorkflowStep::Ship => handle_enter_ship(app, ctx),
+    }
+}
+
+fn handle_escape_key(app: &mut App) {
+    if app.active_panel == ActivePanel::Ask && app.is_ask_cosmos_mode() {
+        app.exit_ask_cosmos();
+    } else if app.workflow_step == WorkflowStep::Suggestions && app.armed_suggestion_id.is_some() {
+        app.clear_apply_confirm();
+    } else if app.workflow_step != WorkflowStep::Suggestions {
+        app.workflow_back();
+    } else if !app.search_query.is_empty() {
+        app.exit_search();
+    } else if app.overlay != Overlay::None {
+        app.close_overlay();
+    }
+}
+
 /// Handle key events in normal mode (no special input active)
 pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeContext) -> Result<()> {
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Down => {
-            if app.active_panel == ActivePanel::Ask {
-                if app.is_ask_cosmos_mode() {
-                    app.ask_cosmos_scroll_down();
-                }
-                return Ok(());
-            }
-
-            // Handle navigation based on workflow step
-            match app.workflow_step {
-                WorkflowStep::Review if !app.review_state.reviewing && !app.review_state.fixing => {
-                    app.review_cursor_down();
-                }
-                WorkflowStep::Ship => {
-                    app.ship_scroll_down();
-                }
-                WorkflowStep::Suggestions => app.navigate_down(),
-                _ => {}
-            }
-        }
-        KeyCode::Up => {
-            if app.active_panel == ActivePanel::Ask {
-                if app.is_ask_cosmos_mode() {
-                    app.ask_cosmos_scroll_up();
-                }
-                return Ok(());
-            }
-
-            // Handle navigation based on workflow step
-            match app.workflow_step {
-                WorkflowStep::Review if !app.review_state.reviewing && !app.review_state.fixing => {
-                    app.review_cursor_up();
-                }
-                WorkflowStep::Ship => {
-                    app.ship_scroll_up();
-                }
-                WorkflowStep::Suggestions => app.navigate_up(),
-                _ => {}
-            }
-        }
+        KeyCode::Down => handle_down_key(app),
+        KeyCode::Up => handle_up_key(app),
         KeyCode::Char(' ') => {
-            // Space toggles finding selection in Review step
-            if app.workflow_step == WorkflowStep::Review
-                && !app.review_state.reviewing
-                && !app.review_state.fixing
-            {
+            if review_interaction_ready(app) {
                 app.review_toggle_finding();
             }
         }
         KeyCode::Char('f') => {
-            // Fix selected findings in Review step
-            if app.workflow_step == WorkflowStep::Review
-                && !app.review_state.reviewing
-                && !app.review_state.fixing
-                && !app.review_state.selected.is_empty()
-            {
+            if review_interaction_ready(app) && !app.review_state.selected.is_empty() {
                 start_review_fix_for_selected_findings(app, ctx);
             }
         }
-        KeyCode::Enter => {
-            if app.active_panel == ActivePanel::Ask {
-                if app.workflow_step != WorkflowStep::Suggestions {
-                    return Ok(());
-                }
-
-                if !cosmos_engine::llm::is_available() {
-                    prompt_api_key_setup(
-                        app,
-                        "No API key configured yet. Add your OpenRouter key to ask questions.",
-                    );
-                } else {
-                    app.start_question();
-                }
-                return Ok(());
-            }
-
-            // If PR URL is pending, open it in browser
-            if let Some(url) = app.pr_url.take() {
-                let _ = git_ops::open_url(&url);
-            } else {
-                // Handle based on workflow step
-                match app.workflow_step {
-                    WorkflowStep::Suggestions => {
-                        if app.suggestion_refinement_in_progress {
-                            return Ok(());
-                        }
-                        let suggestion = app.selected_suggestion().cloned();
-                        if let Some(suggestion) = suggestion {
-                            if !llm_available_for_apply() {
-                                prompt_api_key_setup(
-                                    app,
-                                    "No API key configured yet. Add your OpenRouter key to continue.",
-                                );
-                            } else {
-                                match open_apply_plan_for_suggestion(app, &suggestion) {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        app.open_alert("Couldn't open preview", e.user_message())
-                                    }
-                                };
-                            }
-                        }
-                    }
-                    WorkflowStep::Review => {
-                        if !app.review_state.reviewing && !app.review_state.fixing {
-                            if !app.review_state.selected.is_empty() {
-                                // Fix selected findings (same as 'f' key)
-                                start_review_fix_for_selected_findings(app, ctx);
-                            } else if app.review_passed() {
-                                // Review passed - move to Ship
-                                app.start_ship();
-                            } else if app.review_state.verification_failed {
-                                if app.review_state.confirm_ship {
-                                    app.review_state.confirm_ship = false;
-                                    app.start_ship();
-                                } else {
-                                    app.review_state.confirm_ship = true;
-                                }
-                            } else if app.review_state.confirm_ship {
-                                app.review_state.confirm_ship = false;
-                                app.start_ship();
-                            } else {
-                                app.review_state.confirm_ship = true;
-                            }
-                        }
-                    }
-                    WorkflowStep::Ship => {
-                        // Execute ship based on current step
-                        match app.ship_state.step {
-                            ShipStep::Confirm => {
-                                // Start the ship process
-                                let repo_path = app.repo_path.clone();
-                                let branch_name = app.ship_state.branch_name.clone();
-                                let commit_message = app.ship_state.commit_message.clone();
-                                let (pr_title, pr_body) = app.generate_pr_content();
-                                let tx_ship = ctx.tx.clone();
-
-                                app.set_ship_step(ShipStep::Committing);
-
-                                background::spawn_background(
-                                    ctx.tx.clone(),
-                                    "ship_confirm",
-                                    async move {
-                                        // Execute ship workflow
-                                        let _ = tx_ship.send(BackgroundMessage::ShipProgress(
-                                            ShipStep::Committing,
-                                        ));
-
-                                        // Commit (files are already staged)
-                                        if let Err(e) = git_ops::commit(&repo_path, &commit_message)
-                                        {
-                                            let _ = tx_ship
-                                                .send(BackgroundMessage::ShipError(e.to_string()));
-                                            return;
-                                        }
-
-                                        let _ = tx_ship.send(BackgroundMessage::ShipProgress(
-                                            ShipStep::Pushing,
-                                        ));
-
-                                        // Push
-                                        if let Err(e) =
-                                            git_ops::push_branch(&repo_path, &branch_name)
-                                        {
-                                            let _ = tx_ship
-                                                .send(BackgroundMessage::ShipError(e.to_string()));
-                                            return;
-                                        }
-
-                                        let _ = tx_ship.send(BackgroundMessage::ShipProgress(
-                                            ShipStep::CreatingPR,
-                                        ));
-
-                                        // Create PR with human-friendly content
-                                        match git_ops::create_pr(&repo_path, &pr_title, &pr_body)
-                                            .await
-                                        {
-                                            Ok(url) => {
-                                                let _ = tx_ship
-                                                    .send(BackgroundMessage::ShipComplete(url));
-                                            }
-                                            Err(e) => {
-                                                let _ = tx_ship.send(BackgroundMessage::ShipError(
-                                                    e.to_string(),
-                                                ));
-                                            }
-                                        }
-                                    },
-                                );
-                            }
-                            ShipStep::Done => {
-                                // Open PR in browser and complete workflow
-                                if let Some(url) = &app.ship_state.pr_url {
-                                    let _ = git_ops::open_url(url);
-                                }
-                                app.workflow_complete();
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-        KeyCode::Esc => {
-            // Handle ask cosmos mode exit first
-            if app.active_panel == ActivePanel::Ask && app.is_ask_cosmos_mode() {
-                app.exit_ask_cosmos();
-            } else if app.workflow_step == WorkflowStep::Suggestions
-                && app.armed_suggestion_id.is_some()
-            {
-                app.clear_apply_confirm();
-            } else if app.workflow_step != WorkflowStep::Suggestions {
-                // Handle workflow back navigation
-                app.workflow_back();
-            } else if !app.search_query.is_empty() {
-                app.exit_search();
-            } else if app.overlay != Overlay::None {
-                app.close_overlay();
-            }
-        }
+        KeyCode::Enter => handle_enter_key(app, ctx),
+        KeyCode::Esc => handle_escape_key(app),
         KeyCode::Char('?') => app.toggle_help(),
         KeyCode::Char('a') => {
-            // Select all findings in Review step
-            if app.active_panel == ActivePanel::Suggestions
-                && app.workflow_step == WorkflowStep::Review
-                && !app.review_state.reviewing
-                && !app.review_state.fixing
-            {
+            if app.active_panel == ActivePanel::Suggestions && review_interaction_ready(app) {
                 app.review_select_all();
             }
         }
-        KeyCode::Char('k') => {
-            app.open_api_key_overlay(None);
-        }
+        KeyCode::Char('k') => app.open_api_key_overlay(None),
         KeyCode::Char('u') => {
-            // Undo the last applied change (restore from git)
             if let Err(e) = app.undo_last_pending_change() {
                 app.open_alert("Couldn't undo", e);
             }
@@ -1034,12 +1079,8 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                 refresh_suggestions_now(app, ctx, "Manual refresh");
             }
         }
-        KeyCode::Char('R') => {
-            // Open reset cosmos overlay
-            app.open_reset_overlay();
-        }
+        KeyCode::Char('R') => app.open_reset_overlay(),
         KeyCode::Char('U') => {
-            // Show update overlay if update is available
             if let Some(target_version) = app.update_available.clone() {
                 app.show_update_overlay(
                     cosmos_adapters::update::CURRENT_VERSION.to_string(),
@@ -1049,7 +1090,6 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
         }
         _ => {}
     }
-
     Ok(())
 }
 

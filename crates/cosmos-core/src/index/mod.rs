@@ -210,37 +210,13 @@ pub struct FileSummary {
 
 impl FileSummary {
     /// Generate a static summary from file index data
-    pub fn from_file_index(file_index: &FileIndex, rel_path: &Path, root: &Path) -> Self {
-        // Infer purpose from filename and exports
-        let purpose = infer_purpose(rel_path, &file_index.symbols, file_index.language);
-
-        // Get public exports
-        let exports: Vec<String> = file_index
-            .symbols
-            .iter()
-            .filter(|s| s.visibility == Visibility::Public)
-            .map(|s| s.name.clone())
-            .take(10)
-            .collect();
-
-        // depends_on will be populated by the codebase index
-        let depends_on: Vec<PathBuf> = file_index
-            .dependencies
-            .iter()
-            .filter(|d| !d.is_external)
-            .filter_map(|d| resolve_import_path(&d.import_path, rel_path, root))
-            .collect();
-
-        Self {
-            purpose,
-            exports,
-            used_by: Vec::new(), // Populated later by build_dependency_graph
-            depends_on,
-        }
+    pub fn from_file_index(_file_index: &FileIndex, _rel_path: &Path, _root: &Path) -> Self {
+        Self::default()
     }
 }
 
 /// Infer the purpose of a file from its name and exports
+#[allow(dead_code)]
 fn infer_purpose(path: &Path, symbols: &[Symbol], _language: Language) -> String {
     let filename = path
         .file_stem()
@@ -376,6 +352,7 @@ fn infer_purpose(path: &Path, symbols: &[Symbol], _language: Language) -> String
 }
 
 /// Infer purpose from filename patterns (camelCase, snake_case, etc.)
+#[allow(dead_code)]
 fn infer_from_filename(filename: &str, parent: &str) -> String {
     let lower = filename.to_lowercase();
 
@@ -527,6 +504,7 @@ fn infer_from_filename(filename: &str, parent: &str) -> String {
 }
 
 /// Convert camelCase or PascalCase to human-readable form
+#[allow(dead_code)]
 fn humanize_camel_case(s: &str) -> String {
     let mut result = String::new();
     let mut prev_was_upper = false;
@@ -556,6 +534,7 @@ fn humanize_camel_case(s: &str) -> String {
 }
 
 /// Humanize a symbol name for display
+#[allow(dead_code)]
 fn humanize_name(name: &str) -> String {
     let char_count = name.chars().count();
     // Keep short names as-is
@@ -571,6 +550,7 @@ fn humanize_name(name: &str) -> String {
 }
 
 /// Capitalize the first letter of a string
+#[allow(dead_code)]
 fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
@@ -580,6 +560,7 @@ fn capitalize(s: &str) -> String {
 }
 
 /// Try to resolve an import path to a file path
+#[allow(dead_code)]
 fn resolve_import_path(import: &str, from_file: &Path, root: &Path) -> Option<PathBuf> {
     // Handle relative imports
     if import.starts_with('.') {

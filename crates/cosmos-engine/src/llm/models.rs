@@ -3,7 +3,7 @@ use serde::Deserialize;
 /// Models available for suggestions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Model {
-    /// Speed tier - fast, cheap model reserved for file summaries (gpt-oss-120b)
+    /// Speed tier - fast, cheap model kept for limited internal workflows (gpt-oss-120b)
     Speed,
     /// Smart tier - best reasoning for code generation (glm-5)
     Smart,

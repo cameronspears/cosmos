@@ -150,7 +150,6 @@ async fn run_suggestion_audit(
                 index,
                 context,
                 None,
-                None,
                 gate_config.clone(),
                 |attempt_index, attempt_count, gate, diagnostics| {
                     let prevalidation = diagnostics
@@ -259,9 +258,9 @@ async fn run_suggestion_audit(
         for (idx, suggestion) in best.suggestions.iter().enumerate() {
             let detail = suggestion.detail.as_deref().unwrap_or("");
             println!(
-                "{}. [{}] {} ({}:{})",
+                "{}. [{:?}] {} ({}:{})",
                 idx + 1,
-                format!("{:?}", suggestion.priority),
+                suggestion.priority,
                 suggestion.summary,
                 suggestion.file.display(),
                 suggestion.line.unwrap_or(1)

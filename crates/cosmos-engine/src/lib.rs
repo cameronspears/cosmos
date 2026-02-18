@@ -28,7 +28,6 @@ impl EngineContract for CosmosEngine {
                 &repo.index,
                 &repo.context,
                 None,
-                None,
                 llm::SuggestionQualityGateConfig::default(),
             )
             .await?;

@@ -2649,7 +2649,6 @@ pub async fn analyze_codebase_fast_grounded(
     index: &CodebaseIndex,
     context: &WorkContext,
     _repo_memory: Option<String>,
-    _summaries: Option<&HashMap<PathBuf, String>>,
     generation_model: Model,
     generation_target: usize,
     retry_feedback: Option<&str>,
@@ -3035,7 +3034,6 @@ pub async fn refine_grounded_suggestions(
     _index: &CodebaseIndex,
     _context: &WorkContext,
     _repo_memory: Option<String>,
-    _summaries: Option<&HashMap<PathBuf, String>>,
     generation_model: Model,
     validation_model: Model,
     provisional: Vec<Suggestion>,
@@ -3315,7 +3313,7 @@ fn gate_attempt_model(_attempt_index: usize) -> Model {
 fn ensure_non_summary_model(model: Model, operation: &str) -> anyhow::Result<()> {
     if model == Model::Speed {
         return Err(anyhow::anyhow!(
-            "{} must not use {} (reserved for file summaries)",
+            "{} must not use {} (speed tier is not allowed for this workflow)",
             operation,
             model.id()
         ));
@@ -3328,7 +3326,6 @@ pub async fn run_fast_grounded_with_gate(
     index: &CodebaseIndex,
     context: &WorkContext,
     repo_memory: Option<String>,
-    summaries: Option<&HashMap<PathBuf, String>>,
     gate_config: SuggestionQualityGateConfig,
 ) -> anyhow::Result<GatedSuggestionRunResult> {
     run_fast_grounded_with_gate_with_progress(
@@ -3336,7 +3333,6 @@ pub async fn run_fast_grounded_with_gate(
         index,
         context,
         repo_memory,
-        summaries,
         gate_config,
         |_, _, _, _| {},
     )
@@ -3348,7 +3344,6 @@ pub async fn run_fast_grounded_with_gate_with_progress<F>(
     index: &CodebaseIndex,
     context: &WorkContext,
     repo_memory: Option<String>,
-    summaries: Option<&HashMap<PathBuf, String>>,
     gate_config: SuggestionQualityGateConfig,
     mut on_progress: F,
 ) -> anyhow::Result<GatedSuggestionRunResult>
@@ -3382,7 +3377,6 @@ where
                 index,
                 context,
                 repo_memory.clone(),
-                summaries,
                 attempt_model,
                 generation_target,
                 retry_feedback.as_deref(),
@@ -3427,7 +3421,6 @@ where
                     index,
                     context,
                     repo_memory.clone(),
-                    summaries,
                     attempt_model,
                     attempt_model,
                     provisional,

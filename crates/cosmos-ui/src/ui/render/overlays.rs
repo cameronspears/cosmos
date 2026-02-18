@@ -164,13 +164,10 @@ pub(super) fn render_file_detail(
     frame: &mut Frame,
     path: &Path,
     file_index: &cosmos_core::index::FileIndex,
-    llm_summary: Option<&String>,
     _scroll: usize,
 ) {
     let area = centered_rect(70, 75, frame.area());
     frame.render_widget(Clear, area);
-
-    let inner_width = area.width.saturating_sub(12) as usize;
 
     // File name header
     let filename = path
@@ -199,48 +196,6 @@ pub(super) fn render_file_detail(
         )]),
         Line::from(""),
     ];
-
-    // Summary card
-    lines.push(Line::from(vec![
-        Span::styled("    ╭─ ", Style::default().fg(Theme::GREY_600)),
-        Span::styled("Summary", Style::default().fg(Theme::GREY_300)),
-        Span::styled(
-            " ─".to_string() + &"─".repeat(inner_width.saturating_sub(15)) + "╮",
-            Style::default().fg(Theme::GREY_600),
-        ),
-    ]));
-    lines.push(Line::from(vec![Span::styled(
-        "    │",
-        Style::default().fg(Theme::GREY_600),
-    )]));
-
-    if let Some(summary) = llm_summary {
-        let wrapped = wrap_text(summary, inner_width.saturating_sub(6));
-        for line in &wrapped {
-            lines.push(Line::from(vec![
-                Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
-                Span::styled(line.to_string(), Style::default().fg(Theme::GREY_50)),
-            ]));
-        }
-    } else {
-        let wrapped = wrap_text(&file_index.summary.purpose, inner_width.saturating_sub(6));
-        for line in &wrapped {
-            lines.push(Line::from(vec![
-                Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
-                Span::styled(line.to_string(), Style::default().fg(Theme::GREY_100)),
-            ]));
-        }
-    }
-
-    lines.push(Line::from(vec![Span::styled(
-        "    │",
-        Style::default().fg(Theme::GREY_600),
-    )]));
-    lines.push(Line::from(vec![Span::styled(
-        "    ╰".to_string() + &"─".repeat(inner_width.saturating_sub(4)) + "╯",
-        Style::default().fg(Theme::GREY_600),
-    )]));
-    lines.push(Line::from(""));
 
     // Metrics bar
     let func_count = file_index
@@ -283,121 +238,6 @@ pub(super) fn render_file_detail(
         Span::styled(" structs", Style::default().fg(Theme::GREY_400)),
     ]));
     lines.push(Line::from(""));
-
-    // Dependencies section
-    if !file_index.summary.exports.is_empty()
-        || !file_index.summary.used_by.is_empty()
-        || !file_index.summary.depends_on.is_empty()
-    {
-        lines.push(Line::from(vec![
-            Span::styled("    ╭─ ", Style::default().fg(Theme::GREY_600)),
-            Span::styled("Dependencies", Style::default().fg(Theme::GREY_300)),
-            Span::styled(
-                " ─".to_string() + &"─".repeat(inner_width.saturating_sub(19)) + "╮",
-                Style::default().fg(Theme::GREY_600),
-            ),
-        ]));
-
-        // Exports
-        if !file_index.summary.exports.is_empty() {
-            let exports_str = file_index.summary.exports.join(", ");
-            let label = "↗ Exports: ";
-            let label_width = label.chars().count();
-            let content_width = inner_width.saturating_sub(6 + label_width);
-            let wrapped = wrap_text(&exports_str, content_width);
-
-            for (i, line) in wrapped.iter().enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
-                        Span::styled(label, Style::default().fg(Theme::GREY_400)),
-                        Span::styled(line.to_string(), Style::default().fg(Theme::GREY_200)),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
-                        Span::styled(" ".repeat(label_width), Style::default()),
-                        Span::styled(line.to_string(), Style::default().fg(Theme::GREY_200)),
-                    ]));
-                }
-            }
-        }
-
-        // Used by
-        if !file_index.summary.used_by.is_empty() {
-            let used_by_str: Vec<_> = file_index
-                .summary
-                .used_by
-                .iter()
-                .filter_map(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|s| s.to_string())
-                })
-                .collect();
-            let used_by_full = used_by_str.join(", ");
-            let label = "← Used by: ";
-            let label_width = label.chars().count();
-            let content_width = inner_width.saturating_sub(6 + label_width);
-            let wrapped = wrap_text(&used_by_full, content_width);
-
-            for (i, line) in wrapped.iter().enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
-                        Span::styled(label, Style::default().fg(Theme::GREY_400)),
-                        Span::styled(line.to_string(), Style::default().fg(Theme::GREY_200)),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
-                        Span::styled(" ".repeat(label_width), Style::default()),
-                        Span::styled(line.to_string(), Style::default().fg(Theme::GREY_200)),
-                    ]));
-                }
-            }
-        }
-
-        // Depends on
-        if !file_index.summary.depends_on.is_empty() {
-            let deps_str: Vec<_> = file_index
-                .summary
-                .depends_on
-                .iter()
-                .filter_map(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|s| s.to_string())
-                })
-                .collect();
-            let deps_full = deps_str.join(", ");
-            let label = "→ Depends: ";
-            let label_width = label.chars().count();
-            let content_width = inner_width.saturating_sub(6 + label_width);
-            let wrapped = wrap_text(&deps_full, content_width);
-
-            for (i, line) in wrapped.iter().enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
-                        Span::styled(label, Style::default().fg(Theme::GREY_400)),
-                        Span::styled(line.to_string(), Style::default().fg(Theme::GREY_200)),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::styled("    │  ", Style::default().fg(Theme::GREY_600)),
-                        Span::styled(" ".repeat(label_width), Style::default()),
-                        Span::styled(line.to_string(), Style::default().fg(Theme::GREY_200)),
-                    ]));
-                }
-            }
-        }
-
-        lines.push(Line::from(vec![Span::styled(
-            "    ╰".to_string() + &"─".repeat(inner_width.saturating_sub(4)) + "╯",
-            Style::default().fg(Theme::GREY_600),
-        )]));
-    }
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![

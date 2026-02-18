@@ -111,11 +111,6 @@ pub async fn run_tui(
         }
         Err(_) => app.index.clone(),
     };
-    let startup_context = app.context.clone();
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  SMART SUMMARY CACHING
-    // ═══════════════════════════════════════════════════════════════════════
 
     // Compute file hashes for change detection
     let file_hashes = cache::compute_file_hashes(&startup_index);
@@ -134,30 +129,6 @@ pub async fn run_tui(
             app.apply_grouping_update(grouping);
         }
     }
-
-    // Load cached LLM summaries and apply immediately
-    let mut llm_cache = cache_manager.load_llm_summaries_cache().unwrap_or_default();
-    if llm_cache.normalize_paths(&startup_index.root) {
-        let _ = cache_manager.save_llm_summaries_cache(&llm_cache);
-    }
-
-    // Get all valid cached summaries and load them immediately (instant startup!)
-    let cached_summaries = llm_cache.get_all_valid_summaries(&file_hashes);
-
-    if !cached_summaries.is_empty() {
-        app.update_summaries(cached_summaries);
-    }
-
-    // Discover project context (for better quality summaries)
-    let project_context = cosmos_engine::llm::discover_project_context(&startup_index);
-    llm_cache.set_project_context(project_context.clone());
-
-    // Find files that need new/updated summaries
-    let files_needing_summary = llm_cache.get_files_needing_summary(&file_hashes);
-    let needs_summary_count = files_needing_summary.len();
-
-    // Track if we need to generate summaries (used to control loading state)
-    app.needs_summary_generation = needs_summary_count > 0;
 
     // ═══════════════════════════════════════════════════════════════════════
     //  BACKGROUND VERSION CHECK
@@ -277,154 +248,13 @@ pub async fn run_tui(
     // ═══════════════════════════════════════════════════════════════════════
     //  SUGGESTION GENERATION: Always generate fresh suggestions on startup
     // ═══════════════════════════════════════════════════════════════════════
-    //
-    // Unlike summaries (which are expensive and file-content-dependent), suggestions
-    // benefit from fresh analysis each session. The model may find different issues
-    // based on its exploration path, and users expect new insights on restart.
-
-    let suggestions_from_cache = false;
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  SEQUENTIAL INIT: Summaries first (builds glossary), then suggestions
-    // ═══════════════════════════════════════════════════════════════════════
-
-    if ai_enabled && !suggestions_from_cache {
-        if !files_needing_summary.is_empty() {
-            // Phase 1: Summaries needed - generate them first, suggestions come after
-            app.loading = LoadingState::GeneratingSummaries;
-            app.pending_suggestions_on_init = true;
-            app.summary_progress = Some((0, needs_summary_count));
-
-            let index_clone2 = startup_index.clone();
-            let context_clone2 = startup_context.clone();
-            let tx_summaries = tx.clone();
-            let cache_path = repo_path.clone();
-            let file_hashes_clone = file_hashes.clone();
-
-            // Prioritize files for generation
-            let (high_priority, medium_priority, low_priority) =
-                cosmos_engine::llm::prioritize_files_for_summary(
-                    &index_clone2,
-                    &context_clone2,
-                    &files_needing_summary,
-                );
-
-            // Calculate total file count for progress
-            let total_to_process = high_priority.len() + medium_priority.len() + low_priority.len();
-
-            background::spawn_background(tx.clone(), "summary_generation", async move {
-                let stage_start = std::time::Instant::now();
-                let cache = cache::Cache::new(&cache_path);
-
-                // Load existing cache to update incrementally
-                let mut llm_cache = cache.load_llm_summaries_cache().unwrap_or_default();
-
-                // Load existing glossary to merge new terms into
-                let mut glossary = cache.load_glossary().unwrap_or_default();
-
-                let mut all_summaries = HashMap::new();
-                let mut total_usage = cosmos_engine::llm::Usage::default();
-                let mut completed_count = 0usize;
-                let mut failed_files: Vec<PathBuf> = Vec::new();
-
-                // Process all priority tiers with parallel batching within each tier
-                let priority_tiers = [
-                    ("high", high_priority),
-                    ("medium", medium_priority),
-                    ("low", low_priority),
-                ];
-
-                for (_tier_name, files) in priority_tiers {
-                    if files.is_empty() {
-                        continue;
-                    }
-
-                    let batch_size = cosmos_engine::llm::SUMMARY_BATCH_SIZE;
-                    let batches: Vec<_> = files.chunks(batch_size).collect();
-
-                    // Process batches sequentially (llm.rs handles internal parallelism)
-                    for batch in batches {
-                        let batch_files: Vec<PathBuf> = batch.to_vec();
-                        match cosmos_engine::llm::generate_summaries_for_files(
-                            &index_clone2,
-                            batch,
-                            &project_context,
-                        )
-                        .await
-                        {
-                            Ok((summaries, batch_glossary, usage, batch_failed)) => {
-                                // Update cache with new summaries
-                                for (path, summary) in &summaries {
-                                    if let Some(hash) = file_hashes_clone.get(path) {
-                                        llm_cache.set_summary(
-                                            path.clone(),
-                                            summary.clone(),
-                                            hash.clone(),
-                                        );
-                                    }
-                                }
-                                // Merge new terms into glossary
-                                glossary.merge(&batch_glossary);
-
-                                // Save cache incrementally after each batch
-                                let _ = cache.save_llm_summaries_cache(&llm_cache);
-                                let _ = cache.save_glossary(&glossary);
-
-                                completed_count += summaries.len() + batch_failed.len();
-                                failed_files.extend(batch_failed);
-
-                                // Send progress update with new summaries
-                                let _ = tx_summaries.send(BackgroundMessage::SummaryProgress {
-                                    completed: completed_count,
-                                    total: total_to_process,
-                                    summaries: summaries.clone(),
-                                });
-
-                                all_summaries.extend(summaries);
-                                if let Some(u) = usage {
-                                    total_usage.prompt_tokens += u.prompt_tokens;
-                                    total_usage.completion_tokens += u.completion_tokens;
-                                    total_usage.total_tokens += u.total_tokens;
-                                }
-                            }
-                            Err(_e) => {
-                                // Batch failed - track failed files for retry
-                                // Error details are logged internally; user sees retry prompt
-                                completed_count += batch_files.len();
-                                failed_files.extend(batch_files);
-                                let _ = tx_summaries.send(BackgroundMessage::SummaryProgress {
-                                    completed: completed_count,
-                                    total: total_to_process,
-                                    summaries: HashMap::new(),
-                                });
-                            }
-                        }
-                    }
-                }
-
-                let final_usage = if total_usage.total_tokens > 0 {
-                    Some(total_usage)
-                } else {
-                    None
-                };
-
-                // Send final message (summaries already sent via progress, so send empty)
-                let _ = tx_summaries.send(BackgroundMessage::SummariesReady {
-                    summaries: HashMap::new(),
-                    usage: final_usage,
-                    failed_files,
-                    duration_ms: stage_start.elapsed().as_millis() as u64,
-                });
-            });
-        } else {
-            // Phase 2 only: All summaries cached - generate suggestions directly with cached glossary
-            let _ = background::request_suggestions_refresh(
-                &mut app,
-                tx.clone(),
-                repo_path.clone(),
-                "Startup",
-            );
-        }
+    if ai_enabled {
+        let _ = background::request_suggestions_refresh(
+            &mut app,
+            tx.clone(),
+            repo_path.clone(),
+            "Startup",
+        );
     }
 
     // Main loop with async event handling

@@ -47,8 +47,6 @@ pub enum ResetOption {
     Index,
     /// Clear suggestions.json - generated suggestions
     Suggestions,
-    /// Clear llm_summaries.json - file summaries
-    Summaries,
     /// Clear glossary.json - domain terminology
     Glossary,
     /// Clear memory.json - repo decisions/conventions
@@ -73,7 +71,6 @@ impl ResetOption {
         match self {
             ResetOption::Index => "Index & Symbols",
             ResetOption::Suggestions => "Suggestions",
-            ResetOption::Summaries => "File Summaries",
             ResetOption::Glossary => "Domain Glossary",
             ResetOption::Memory => "Repo Memory",
             ResetOption::GroupingAi => "Grouping AI",
@@ -90,7 +87,6 @@ impl ResetOption {
         match self {
             ResetOption::Index => "rebuild file tree",
             ResetOption::Suggestions => "regenerate with AI",
-            ResetOption::Summaries => "regenerate with AI",
             ResetOption::Glossary => "extract terminology",
             ResetOption::Memory => "decisions/conventions",
             ResetOption::GroupingAi => "rebuild AI grouping",
@@ -107,7 +103,6 @@ impl ResetOption {
         vec![
             ResetOption::Index,
             ResetOption::Suggestions,
-            ResetOption::Summaries,
             ResetOption::Glossary,
             ResetOption::Memory,
             ResetOption::GroupingAi,
@@ -124,15 +119,11 @@ impl ResetOption {
         vec![
             ResetOption::Index,
             ResetOption::Suggestions,
-            ResetOption::Summaries,
             ResetOption::Glossary,
             ResetOption::GroupingAi,
         ]
     }
 }
-
-/// Cache validity durations
-const LLM_SUMMARY_CACHE_DAYS: i64 = 30;
 
 /// Flag file indicating user has seen the welcome overlay
 const WELCOME_SEEN_FILE: &str = "welcome_seen";
@@ -242,36 +233,8 @@ fn hash_question(question: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  LLM SUMMARY CACHE - Persistent storage for AI-generated summaries
-// ═══════════════════════════════════════════════════════════════════════════
-
-const LLM_SUMMARIES_CACHE_FILE: &str = "llm_summaries.json";
-
-/// A single LLM-generated summary entry with hash for change detection
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LlmSummaryEntry {
-    /// The AI-generated summary text
-    pub summary: String,
-    /// Hash of file content (LOC + symbols) for change detection
-    pub file_hash: String,
-    /// When this summary was generated
-    pub generated_at: DateTime<Utc>,
-}
-
-/// Cached LLM-generated file summaries
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LlmSummaryCache {
-    /// Map of file paths to their summary entries
-    pub summaries: HashMap<PathBuf, LlmSummaryEntry>,
-    /// Cached project context (from README, etc.)
-    pub project_context: Option<String>,
-    /// When the cache was last updated
-    pub cached_at: DateTime<Utc>,
-}
-
-/// Normalize summary cache keys to repo-relative paths.
-pub fn normalize_summary_path(path: &Path, root: &Path) -> PathBuf {
+/// Normalize cache keys to repo-relative paths.
+pub fn normalize_cache_path(path: &Path, root: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     let mut cleaned = raw.replace('\\', "/");
     while cleaned.starts_with("./") {
@@ -288,118 +251,6 @@ pub fn normalize_summary_path(path: &Path, root: &Path) -> PathBuf {
     }
 
     out
-}
-
-impl LlmSummaryCache {
-    /// Create a new empty cache
-    pub fn new() -> Self {
-        Self {
-            summaries: HashMap::new(),
-            project_context: None,
-            cached_at: Utc::now(),
-        }
-    }
-
-    /// Check if a file's summary is still valid (not changed and not too old)
-    pub fn is_file_valid(&self, path: &PathBuf, current_hash: &str) -> bool {
-        if let Some(entry) = self.summaries.get(path) {
-            // Check if hash matches (file unchanged)
-            if entry.file_hash != current_hash {
-                return false;
-            }
-            // Check if not too old
-            let age = Utc::now() - entry.generated_at;
-            age < Duration::days(LLM_SUMMARY_CACHE_DAYS)
-        } else {
-            false
-        }
-    }
-
-    /// Get summary for a file if valid
-    /// Update or insert a summary
-    pub fn set_summary(&mut self, path: PathBuf, summary: String, file_hash: String) {
-        self.summaries.insert(
-            path,
-            LlmSummaryEntry {
-                summary,
-                file_hash,
-                generated_at: Utc::now(),
-            },
-        );
-        self.cached_at = Utc::now();
-    }
-
-    /// Set the project context
-    pub fn set_project_context(&mut self, context: String) {
-        self.project_context = Some(context);
-    }
-
-    /// Get all valid summaries as a HashMap for the UI
-    pub fn get_all_valid_summaries(
-        &self,
-        file_hashes: &HashMap<PathBuf, String>,
-    ) -> HashMap<PathBuf, String> {
-        self.summaries
-            .iter()
-            .filter(|(path, _)| {
-                if let Some(current_hash) = file_hashes.get(*path) {
-                    self.is_file_valid(path, current_hash)
-                } else {
-                    false
-                }
-            })
-            .map(|(path, entry)| (path.clone(), entry.summary.clone()))
-            .collect()
-    }
-
-    /// Get files that need regeneration (changed or missing)
-    pub fn get_files_needing_summary(
-        &self,
-        file_hashes: &HashMap<PathBuf, String>,
-    ) -> Vec<PathBuf> {
-        file_hashes
-            .iter()
-            .filter(|(path, hash)| !self.is_file_valid(path, hash))
-            .map(|(path, _)| path.clone())
-            .collect()
-    }
-
-    /// Normalize cached paths to match current index keys.
-    pub fn normalize_paths(&mut self, root: &Path) -> bool {
-        if self.summaries.is_empty() {
-            return false;
-        }
-
-        let mut normalized: HashMap<PathBuf, LlmSummaryEntry> = HashMap::new();
-        let mut changed = false;
-
-        for (path, entry) in self.summaries.iter() {
-            let key = normalize_summary_path(path, root);
-            if &key != path {
-                changed = true;
-            }
-
-            match normalized.get(&key) {
-                Some(existing) if existing.generated_at >= entry.generated_at => {}
-                _ => {
-                    normalized.insert(key, entry.clone());
-                }
-            }
-        }
-
-        if changed {
-            self.summaries = normalized;
-            self.cached_at = Utc::now();
-        }
-
-        changed
-    }
-}
-
-impl Default for LlmSummaryCache {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -427,7 +278,6 @@ pub struct GroupingAiCache {
 pub struct PipelineMetricRecord {
     pub timestamp: DateTime<Utc>,
     pub stage: String,
-    pub summary_ms: Option<u64>,
     pub suggest_ms: Option<u64>,
     pub verify_ms: Option<u64>,
     pub apply_ms: Option<u64>,
@@ -581,7 +431,7 @@ impl GroupingAiCache {
         let mut changed = false;
 
         for (path, entry) in self.entries.iter() {
-            let key = normalize_summary_path(path, root);
+            let key = normalize_cache_path(path, root);
             if &key != path {
                 changed = true;
             }
@@ -914,27 +764,6 @@ impl Cache {
         None
     }
 
-    /// Load LLM-generated summaries cache
-    pub fn load_llm_summaries_cache(&self) -> Option<LlmSummaryCache> {
-        let path = self.cache_dir.join(LLM_SUMMARIES_CACHE_FILE);
-        if !path.exists() {
-            return None;
-        }
-
-        let _lock = self.lock(false).ok()?;
-        let content = fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&content).ok()
-    }
-
-    /// Save LLM-generated summaries cache
-    pub fn save_llm_summaries_cache(&self, cache: &LlmSummaryCache) -> anyhow::Result<()> {
-        let _lock = self.lock(true)?;
-        let path = self.cache_dir.join(LLM_SUMMARIES_CACHE_FILE);
-        let content = serde_json::to_string(cache)?;
-        write_atomic(&path, &content)?;
-        Ok(())
-    }
-
     /// Load grouping AI cache
     pub fn load_grouping_ai_cache(&self) -> Option<GroupingAiCache> {
         let path = self.cache_dir.join(GROUPING_AI_CACHE_FILE);
@@ -1258,7 +1087,6 @@ impl Cache {
                     SUGGESTION_RUN_AUDIT_FILE,
                     APPLY_PLAN_AUDIT_FILE,
                 ],
-                ResetOption::Summaries => vec![LLM_SUMMARIES_CACHE_FILE],
                 ResetOption::Glossary => vec![GLOSSARY_FILE],
                 ResetOption::Memory => vec![MEMORY_FILE],
                 ResetOption::GroupingAi => vec![GROUPING_AI_CACHE_FILE],
@@ -1628,9 +1456,8 @@ mod tests {
 
         let metric = PipelineMetricRecord {
             timestamp: Utc::now(),
-            stage: "summary".to_string(),
-            summary_ms: Some(10),
-            suggest_ms: None,
+            stage: "suggest".to_string(),
+            suggest_ms: Some(10),
             verify_ms: None,
             apply_ms: None,
             review_ms: None,

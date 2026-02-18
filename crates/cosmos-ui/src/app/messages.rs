@@ -29,18 +29,6 @@ pub enum BackgroundMessage {
         duration_ms: u64,
     },
     SuggestionsError(String),
-    SummariesReady {
-        summaries: HashMap<PathBuf, String>,
-        usage: Option<cosmos_engine::llm::Usage>,
-        failed_files: Vec<PathBuf>,
-        duration_ms: u64,
-    },
-    /// Incremental summary progress update
-    SummaryProgress {
-        completed: usize,
-        total: usize,
-        summaries: HashMap<PathBuf, String>,
-    },
     /// AI-assisted grouping update ready
     GroupingEnhanced {
         grouping: cosmos_core::grouping::CodebaseGrouping,

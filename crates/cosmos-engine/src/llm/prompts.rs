@@ -213,25 +213,6 @@ RULES:
 - Unsure = "unknown" with low confidence
 - No explanations or extra fields"#;
 
-pub const SUMMARY_BATCH_SYSTEM: &str = r#"Write 2-6 sentence summaries per file: what it IS, what it DOES, how it FITS.
-Also extract domain terminology unique to this codebase.
-
-Use PROJECT CONTEXT to understand purpose. Be specific - reference function/struct names.
-
-OUTPUT (JSON):
-{
-  "summaries": {"src/main.rs": "Application entry point that..."},
-  "terms": {"DumpAlert": "Price drop notification for watched items"},
-  "terms_by_file": {"src/main.rs": {"DumpAlert": "..."}}
-}
-
-RULES:
-- Include a summary for EVERY file listed in FILES TO SUMMARIZE.
-- If a file is unclear, still return a best-effort short summary instead of omitting it.
-- 3-8 domain terms per batch (skip generic: Controller, Service, Handler)
-- terms_by_file: only terms from that specific file
-- Omit files with no terms from terms_by_file"#;
-
 use super::review::FixContext;
 
 /// Shared review output format

@@ -1,7 +1,7 @@
 use super::client::{call_llm_structured, StructuredResponse};
 use super::models::{Model, Usage};
 use super::prompts::GROUPING_CLASSIFY_SYSTEM;
-use cosmos_adapters::cache::normalize_summary_path;
+use cosmos_adapters::cache::normalize_cache_path;
 use cosmos_core::grouping::Layer;
 use cosmos_core::index::{CodebaseIndex, Language};
 use serde::{Deserialize, Serialize};
@@ -102,7 +102,7 @@ pub async fn classify_grouping_candidates(
 
     let mut suggestions = Vec::new();
     for file in parsed.files {
-        let path = normalize_summary_path(Path::new(file.path.trim()), &index.root);
+        let path = normalize_cache_path(Path::new(file.path.trim()), &index.root);
         if !index.files.contains_key(&path) {
             continue;
         }

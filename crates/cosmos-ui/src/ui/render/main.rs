@@ -187,34 +187,11 @@ fn render_suggestions_content<'a>(
 
     // Check for loading states relevant to suggestions panel
     let loading_message: Option<String> = match app.loading {
-        LoadingState::GeneratingSuggestions => {
-            if let Some((completed, total)) = app.summary_progress {
-                Some(format!(
-                    "Generating suggestions... (summaries: {}/{})",
-                    completed, total
-                ))
-            } else {
-                Some("Generating suggestions...".to_string())
-            }
-        }
-        LoadingState::GeneratingSummaries => {
-            if let Some((completed, total)) = app.summary_progress {
-                Some(format!("Summarizing files... ({}/{})", completed, total))
-            } else {
-                Some("Summarizing files...".to_string())
-            }
-        }
+        LoadingState::GeneratingSuggestions => Some("Generating suggestions...".to_string()),
         LoadingState::Resetting => Some("Resetting cache...".to_string()),
         LoadingState::SwitchingBranch => Some("Switching to main branch...".to_string()),
         LoadingState::None => None,
-        _ => {
-            // For other active loading states, show context if available
-            if app.pending_suggestions_on_init {
-                Some("Preparing suggestions...".to_string())
-            } else {
-                None
-            }
-        }
+        _ => None,
     };
 
     if let Some(message) = loading_message {
@@ -229,8 +206,6 @@ fn render_suggestions_content<'a>(
 
     if suggestions.is_empty() {
         let has_ai = cosmos_engine::llm::is_available();
-        let summaries_incomplete =
-            app.needs_summary_generation && !app.summary_failed_files.is_empty();
 
         let border_style = Style::default().fg(Theme::GREY_700);
         let card_width = inner_width.saturating_sub(12).clamp(26, 40);
@@ -259,43 +234,7 @@ fn render_suggestions_content<'a>(
             Span::styled(" │", border_style),
         ]));
 
-        if summaries_incomplete {
-            lines.push(Line::from(vec![
-                Span::styled("    │ ", border_style),
-                Span::styled(
-                    center_row("Summaries incomplete"),
-                    Style::default().fg(Theme::YELLOW),
-                ),
-                Span::styled(" │", border_style),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("    │ ", border_style),
-                Span::styled(
-                    center_row(&format!(
-                        "{} file(s) failed",
-                        app.summary_failed_files.len()
-                    )),
-                    Style::default().fg(Theme::GREY_400),
-                ),
-                Span::styled(" │", border_style),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("    │ ", border_style),
-                Span::styled(
-                    center_row("Press R to open Reset Cosmos"),
-                    Style::default().fg(Theme::GREY_300),
-                ),
-                Span::styled(" │", border_style),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("    │ ", border_style),
-                Span::styled(
-                    center_row("Then restart to regenerate"),
-                    Style::default().fg(Theme::GREY_500),
-                ),
-                Span::styled(" │", border_style),
-            ]));
-        } else if app.suggestion_refinement_in_progress {
+        if app.suggestion_refinement_in_progress {
             lines.push(Line::from(vec![
                 Span::styled("    │ ", border_style),
                 Span::styled(
@@ -1019,7 +958,7 @@ fn render_ask_panel(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![];
 
     if let Some(ask_state) = &app.ask_cosmos_state {
-        render_ask_cosmos_content(&mut lines, ask_state, app, content_height, inner_width);
+        render_ask_cosmos_content(&mut lines, ask_state, content_height, inner_width);
     } else {
         // Always show input + suggested questions by default (no Enter gate/idle state).
         render_question_mode_content(&mut lines, app, content_height, inner_width, is_active);
@@ -1228,12 +1167,9 @@ fn suggestion_window(total: usize, selected: usize, list_height: usize) -> (usiz
 fn render_ask_cosmos_content<'a>(
     lines: &mut Vec<Line<'a>>,
     ask_state: &AskCosmosState,
-    app: &App,
     visible_height: usize,
     inner_width: usize,
 ) {
-    let _ = app; // silence unused warning
-
     // Top padding for breathing room (matching other panels)
     lines.push(Line::from(""));
 

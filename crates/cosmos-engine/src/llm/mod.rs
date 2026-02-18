@@ -9,7 +9,6 @@ pub mod parse;
 pub mod prompt_utils;
 pub mod prompts;
 pub mod review;
-pub mod summaries;
 pub mod tools;
 
 pub use analysis::{
@@ -37,8 +36,4 @@ pub use models::Usage;
 pub use review::{
     fix_review_findings, fix_review_findings_with_model, verify_changes,
     verify_changes_bounded_with_model, FixContext, ReviewFinding,
-};
-pub use summaries::{
-    discover_project_context, generate_summaries_for_files, prioritize_files_for_summary,
-    SUMMARY_BATCH_SIZE,
 };

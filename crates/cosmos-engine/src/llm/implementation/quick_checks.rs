@@ -819,7 +819,6 @@ pub(super) fn ensure_node_modules_present(
 
     #[cfg(not(unix))]
     {
-        let _ = source_root; // avoid unused warnings on windows builds
         notes.push("node_modules_missing_on_non_unix".to_string());
         Ok(())
     }

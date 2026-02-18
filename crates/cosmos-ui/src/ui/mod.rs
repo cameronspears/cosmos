@@ -26,7 +26,7 @@ use cosmos_core::index::{CodebaseIndex, FlatTreeEntry};
 use cosmos_core::suggest::{Suggestion, SuggestionEngine};
 use helpers::lowercase_first;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 use tree::{build_file_tree, build_grouped_tree};
 
@@ -126,9 +126,6 @@ pub struct App {
     pub loading: LoadingState,
     pub loading_frame: usize,
 
-    // LLM-generated file summaries
-    pub llm_summaries: std::collections::HashMap<PathBuf, String>,
-
     // Personal repo memory (local)
     pub repo_memory: cosmos_adapters::cache::RepoMemory,
 
@@ -143,14 +140,6 @@ pub struct App {
     pub session_tokens: u32,          // Total tokens used this session
     pub active_model: Option<String>, // Current/last model used
     pub wallet_balance: Option<f64>,  // Remaining credits in OpenRouter account
-
-    // Track if summaries need generation (to avoid showing loading state when all cached)
-    pub needs_summary_generation: bool,
-
-    // Summary generation progress (completed, total)
-    pub summary_progress: Option<(usize, usize)>,
-    /// Files that failed summary generation (for retry visibility)
-    pub summary_failed_files: Vec<PathBuf>,
 
     // Cached data for display
     pub file_tree: Vec<FlatTreeEntry>,
@@ -204,9 +193,6 @@ pub struct App {
     pub armed_suggestion_id: Option<uuid::Uuid>,
     /// File hash snapshot captured when apply confirmation was armed.
     pub armed_file_hashes: HashMap<PathBuf, String>,
-
-    // Flag: generate suggestions once summaries complete (used at init and after reset)
-    pub pending_suggestions_on_init: bool,
 
     // Self-update state
     /// Available update version (None if up to date or not yet checked)
@@ -276,7 +262,6 @@ impl App {
             next_ask_request_id: 1,
             loading: LoadingState::None,
             loading_frame: 0,
-            llm_summaries: std::collections::HashMap::new(),
             repo_memory: cosmos_adapters::cache::RepoMemory::default(),
             glossary: cosmos_adapters::cache::DomainGlossary::default(),
             question_cache: cosmos_adapters::cache::QuestionCache::default(),
@@ -284,9 +269,6 @@ impl App {
             session_tokens: 0,
             active_model: None,
             wallet_balance: None,
-            needs_summary_generation: false,
-            summary_progress: None,
-            summary_failed_files: Vec::new(),
             file_tree,
             filtered_tree_indices,
             flat_search_entries,
@@ -306,7 +288,6 @@ impl App {
             review_state: ReviewState::default(),
             ship_state: ShipState::default(),
             ask_cosmos_state: None,
-            pending_suggestions_on_init: false,
             git_refresh_error: None,
             git_refresh_error_at: None,
             suggestion_refinement_in_progress: false,
@@ -419,17 +400,6 @@ impl App {
         if self.loading.is_loading() {
             self.loading_frame = self.loading_frame.wrapping_add(1);
         }
-    }
-
-    /// Update file summaries from LLM (merges with existing, doesn't replace)
-    pub fn update_summaries(&mut self, summaries: std::collections::HashMap<PathBuf, String>) {
-        // IMPORTANT: Extend, don't replace! This preserves cached summaries
-        self.llm_summaries.extend(summaries);
-    }
-
-    /// Get LLM summary for a file
-    pub fn get_llm_summary(&self, path: &Path) -> Option<&String> {
-        self.llm_summaries.get(path)
     }
 
     /// Enter search mode
