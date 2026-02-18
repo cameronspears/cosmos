@@ -13,14 +13,21 @@ cargo fmt --all
 
 # Check if there are formatting changes
 if ! git diff --quiet --cached; then
-    # Re-add any formatted files that were already staged
-    git diff --name-only --cached | xargs -I {} git add {}
+    # Re-add only non-deleted staged files (deleted paths fail `git add`)
+    STAGED_FILES=$(git diff --name-only --cached --diff-filter=ACMR || true)
+    if [ -n "$STAGED_FILES" ]; then
+        printf '%s\n' "$STAGED_FILES" | while IFS= read -r file; do
+            [ -n "$file" ] && git add -- "$file"
+        done
+    fi
 fi
 
 # Also add any formatting changes to unstaged files that are partially staged
 STAGED_RS_FILES=$(git diff --name-only --cached --diff-filter=ACM | grep '\.rs$' || true)
 if [ -n "$STAGED_RS_FILES" ]; then
-    echo "$STAGED_RS_FILES" | xargs -I {} git add {}
+    printf '%s\n' "$STAGED_RS_FILES" | while IFS= read -r file; do
+        [ -n "$file" ] && git add -- "$file"
+    done
 fi
 
 exit 0
