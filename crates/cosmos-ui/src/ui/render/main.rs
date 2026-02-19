@@ -199,6 +199,32 @@ fn render_suggestions_content<'a>(
             Span::styled(format!("{} ", spinner), Style::default().fg(Theme::WHITE)),
             Span::styled(message, Style::default().fg(Theme::GREY_300)),
         ]));
+        if app.loading == LoadingState::GeneratingSuggestions {
+            let stream_width = inner_width.saturating_sub(8).max(20);
+            let mut stream_lines = Vec::new();
+            for raw in &app.suggestion_stream_lines {
+                let wrapped = wrap_text(raw, stream_width);
+                if wrapped.is_empty() {
+                    continue;
+                }
+                for (idx, segment) in wrapped.into_iter().enumerate() {
+                    if idx == 0 {
+                        stream_lines.push(format!("    {}", segment));
+                    } else {
+                        stream_lines.push(format!("      {}", segment));
+                    }
+                }
+            }
+
+            let available = visible_height.saturating_sub(lines.len() + 1);
+            let start = stream_lines.len().saturating_sub(available);
+            for line in stream_lines.into_iter().skip(start) {
+                lines.push(Line::from(vec![Span::styled(
+                    line,
+                    Style::default().fg(Theme::GREY_500),
+                )]));
+            }
+        }
         return;
     }
 

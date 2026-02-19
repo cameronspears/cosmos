@@ -6,8 +6,7 @@ use crate::ui::{App, LoadingState, Overlay, StartupAction, StartupMode};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-const OPENROUTER_KEYS_URL: &str = "https://openrouter.ai/settings/keys";
-const OPENROUTER_CREDITS_URL: &str = "https://openrouter.ai/settings/credits";
+const GROQ_KEYS_URL: &str = "https://console.groq.com/keys";
 
 fn normalize_api_key_input(raw: &str) -> String {
     let trimmed = raw.trim();
@@ -15,12 +14,12 @@ fn normalize_api_key_input(raw: &str) -> String {
     unquoted.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-fn open_openrouter_link(app: &mut App, url: &str, label: &str) {
+fn open_provider_link(app: &mut App, url: &str, label: &str) {
     match cosmos_adapters::git_ops::open_url(url) {
         Ok(()) => {}
         Err(_) => {
             let message = format!(
-                "Couldn't open browser. Visit {} to open OpenRouter {} page.",
+                "Couldn't open browser. Visit {} to open Groq {} page.",
                 url, label
             );
             if let Overlay::ApiKeySetup { error, .. } = &mut app.overlay {
@@ -115,10 +114,7 @@ fn handle_api_key_overlay_input(app: &mut App, key: &KeyEvent, ctx: &RuntimeCont
             app.close_overlay();
         }
         KeyCode::Char('k') if has_control_or_command(key.modifiers) => {
-            open_openrouter_link(app, OPENROUTER_KEYS_URL, "keys");
-        }
-        KeyCode::Char('b') if has_control_or_command(key.modifiers) => {
-            open_openrouter_link(app, OPENROUTER_CREDITS_URL, "credits");
+            open_provider_link(app, GROQ_KEYS_URL, "keys");
         }
         KeyCode::Backspace => {
             if let Overlay::ApiKeySetup {
@@ -154,7 +150,7 @@ fn handle_api_key_overlay_input(app: &mut App, key: &KeyEvent, ctx: &RuntimeCont
 
             if candidate.is_empty() {
                 if let Overlay::ApiKeySetup { error, .. } = &mut app.overlay {
-                    *error = Some("Paste an OpenRouter API key to continue.".to_string());
+                    *error = Some("Paste a Groq API key to continue.".to_string());
                 }
                 return;
             }
@@ -167,7 +163,7 @@ fn handle_api_key_overlay_input(app: &mut App, key: &KeyEvent, ctx: &RuntimeCont
                 {
                     *save_armed = true;
                     *error = Some(
-                        "This key does not start with sk-. Press Enter again to save anyway, or keep editing."
+                        "This key does not start with gsk_ or sk-. Press Enter again to save anyway, or keep editing."
                             .to_string(),
                     );
                 }
@@ -178,7 +174,6 @@ fn handle_api_key_overlay_input(app: &mut App, key: &KeyEvent, ctx: &RuntimeCont
             match cfg.set_api_key(&candidate) {
                 Ok(()) => {
                     app.close_overlay();
-                    crate::app::background::spawn_balance_refresh(ctx.tx.clone());
                     let _ = crate::app::background::request_suggestions_refresh(
                         app,
                         ctx.tx.clone(),

@@ -81,8 +81,7 @@ pub async fn run_tui(
     let ai_enabled = cosmos_engine::llm::is_available();
     if !ai_enabled {
         app.open_api_key_overlay(Some(
-            "No OpenRouter API key configured yet. Paste your key to start AI suggestions."
-                .to_string(),
+            "No Groq API key configured yet. Paste your key to start AI suggestions.".to_string(),
         ));
     }
 
@@ -136,13 +135,6 @@ pub async fn run_tui(
                 });
             }
         });
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  FETCH INITIAL WALLET BALANCE
-    // ═══════════════════════════════════════════════════════════════════════
-    if ai_enabled {
-        background::spawn_balance_refresh(tx.clone());
     }
 
     // AI grouping enhancement: low-confidence files only, capped for safety

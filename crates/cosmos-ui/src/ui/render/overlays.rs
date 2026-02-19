@@ -188,7 +188,7 @@ pub(super) fn render_help(frame: &mut Frame, scroll: usize) {
     help_text.push(section_spacer());
     help_text.push(key_row("↵", "Open apply plan / confirm"));
     help_text.push(key_row("r", "Refresh suggestions"));
-    help_text.push(key_row("k", "Open OpenRouter setup guide"));
+    help_text.push(key_row("k", "Open Groq setup guide"));
     help_text.push(key_row("?", "Show help"));
     help_text.push(key_row("q", "Quit"));
     help_text.push(section_spacer());
@@ -333,7 +333,7 @@ pub(super) fn render_api_key_overlay(
     let mut lines: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Connect OpenRouter to enable AI suggestions in Cosmos.",
+            "  Connect Groq to enable AI suggestions in Cosmos.",
             Style::default()
                 .fg(Theme::WHITE)
                 .add_modifier(Modifier::BOLD),
@@ -352,40 +352,19 @@ pub(super) fn render_api_key_overlay(
             Span::styled("      ", Style::default()),
             Span::styled("Press ", Style::default().fg(Theme::GREY_500)),
             Span::styled(
-                crate::ui::openrouter_keys_shortcut_display(),
+                crate::ui::provider_keys_shortcut_display(),
                 Style::default().fg(Theme::GREY_400),
             ),
-            Span::styled(" for OpenRouter keys", Style::default().fg(Theme::GREY_500)),
+            Span::styled(" for Groq keys", Style::default().fg(Theme::GREY_500)),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::styled("  2) ", Style::default().fg(Theme::GREEN)),
-            Span::styled("Add credits", Style::default().fg(Theme::GREY_200)),
-            Span::styled(
-                " (required for model usage)",
-                Style::default().fg(Theme::GREY_400),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("      ", Style::default()),
-            Span::styled("Press ", Style::default().fg(Theme::GREY_500)),
-            Span::styled(
-                crate::ui::openrouter_credits_shortcut_display(),
-                Style::default().fg(Theme::GREY_400),
-            ),
-            Span::styled(
-                " for OpenRouter credits",
-                Style::default().fg(Theme::GREY_500),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  3) ", Style::default().fg(Theme::GREEN)),
             Span::styled(
                 "Paste your API key below (it usually starts with ",
                 Style::default().fg(Theme::GREY_400),
             ),
-            Span::styled("sk-", Style::default().fg(Theme::GREY_200)),
+            Span::styled("gsk_", Style::default().fg(Theme::GREY_200)),
             Span::styled(")", Style::default().fg(Theme::GREY_400)),
         ]),
         Line::from(""),
@@ -398,19 +377,25 @@ pub(super) fn render_api_key_overlay(
         .filter(|c| !c.is_whitespace())
         .collect();
     let key_len = normalized_key.chars().count();
-    let has_sk_prefix = normalized_key.starts_with("sk-");
+    let visible_prefix = if normalized_key.starts_with("gsk_") {
+        Some("gsk_")
+    } else if normalized_key.starts_with("sk-") {
+        Some("sk-")
+    } else {
+        None
+    };
     let mask = if key_len == 0 {
         "█".to_string()
     } else {
-        let hidden_count = if has_sk_prefix {
-            key_len.saturating_sub(3)
+        let hidden_count = if let Some(prefix) = visible_prefix {
+            key_len.saturating_sub(prefix.chars().count())
         } else {
             key_len
         };
         let shown = hidden_count.min(48);
         let hidden = "•".repeat(shown);
-        if has_sk_prefix {
-            format!("sk-{}█", hidden)
+        if let Some(prefix) = visible_prefix {
+            format!("{}{}█", prefix, hidden)
         } else {
             format!("{}█", hidden)
         }
@@ -448,10 +433,10 @@ pub(super) fn render_api_key_overlay(
     }
 
     if key_len > 0 {
-        let prefix_status = if has_sk_prefix {
-            "prefix sk- detected"
+        let prefix_status = if visible_prefix.is_some() {
+            "prefix detected"
         } else {
-            "prefix sk- not detected"
+            "prefix gsk_/sk- not detected"
         };
         lines.push(Line::from(vec![
             Span::styled("  Key check: ", Style::default().fg(Theme::GREY_500)),
@@ -460,11 +445,11 @@ pub(super) fn render_api_key_overlay(
                 Style::default().fg(Theme::GREY_300),
             ),
         ]));
-        if !has_sk_prefix {
+        if visible_prefix.is_none() {
             lines.push(Line::from(vec![
                 Span::styled("  ! ", Style::default().fg(Theme::YELLOW)),
                 Span::styled(
-                    "OpenRouter keys usually start with sk-",
+                    "Groq keys usually start with gsk_ (or sk-)",
                     Style::default().fg(Theme::GREY_300),
                 ),
             ]));
@@ -487,7 +472,7 @@ pub(super) fn render_api_key_overlay(
         Style::default().fg(Theme::GREY_500),
     )]));
     lines.push(Line::from(vec![Span::styled(
-        "  Data use: selected snippets + file paths may be sent to OpenRouter.",
+        "  Data use: selected snippets + file paths may be sent to Groq.",
         Style::default().fg(Theme::GREY_500),
     )]));
     lines.push(Line::from(""));
@@ -508,15 +493,10 @@ pub(super) fn render_api_key_overlay(
         ),
         Span::styled(enter_label, Style::default().fg(Theme::GREY_300)),
         Span::styled(
-            crate::ui::openrouter_keys_shortcut_chip(),
+            crate::ui::provider_keys_shortcut_chip(),
             Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
         ),
         Span::styled(" keys  ", Style::default().fg(Theme::GREY_400)),
-        Span::styled(
-            crate::ui::openrouter_credits_shortcut_chip(),
-            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
-        ),
-        Span::styled(" credits  ", Style::default().fg(Theme::GREY_400)),
         Span::styled(
             " Backspace ",
             Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
@@ -692,7 +672,7 @@ pub(super) fn render_apply_plan(
             ),
         ]));
         for line in wrap_text(
-            "Cosmos may send selected code snippets and file paths to OpenRouter to generate and validate suggestions. Local cache stays in .cosmos and can be cleared with Reset.",
+            "Cosmos may send selected code snippets and file paths to Groq to generate and validate suggestions. Local cache stays in .cosmos and can be cleared with Reset.",
             text_width,
         ) {
             lines.push(Line::from(vec![
@@ -1285,7 +1265,7 @@ pub(super) fn render_welcome(frame: &mut Frame) {
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Data use: Cosmos sends selected code snippets + file paths to OpenRouter for AI generation and validation.",
+            "  Data use: Cosmos sends selected code snippets + file paths to Groq for AI generation and validation.",
             Style::default().fg(Theme::GREY_400),
         )]),
         Line::from(vec![Span::styled(

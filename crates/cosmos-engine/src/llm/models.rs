@@ -50,7 +50,7 @@ impl Model {
     }
 }
 
-/// API usage information from OpenRouter
+/// API usage information from the LLM provider.
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct Usage {
     #[serde(default)]
@@ -59,15 +59,15 @@ pub struct Usage {
     pub completion_tokens: u32,
     #[serde(default)]
     pub total_tokens: u32,
-    /// Actual cost in USD as reported by OpenRouter.
-    /// OpenRouter returns this as `total_cost` in the usage object.
+    /// Actual cost in USD as reported by the provider.
+    /// The provider returns this as `total_cost` in the usage object.
     #[serde(default, alias = "total_cost")]
     pub cost: Option<f64>,
 }
 
 impl Usage {
-    /// Get the actual cost for this usage from OpenRouter.
-    /// Returns the cost reported by OpenRouter, or 0.0 if not available.
+    /// Get the actual cost for this usage from the provider.
+    /// Returns the cost reported by the provider, or 0.0 if not available.
     /// We don't estimate costs - hardcoded rates are always wrong.
     pub fn cost(&self) -> f64 {
         self.cost.unwrap_or(0.0)
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn test_usage_deserialize_with_total_cost() {
-        // OpenRouter returns "total_cost" in the usage object
+        // Provider returns "total_cost" in the usage object
         let json = r#"{"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150, "total_cost": 0.0025}"#;
         let usage: Usage = serde_json::from_str(json).unwrap();
         assert_eq!(usage.prompt_tokens, 100);

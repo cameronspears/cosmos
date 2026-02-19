@@ -62,7 +62,7 @@ pub enum ResetOption {
     SuggestionQuality,
     /// Clear implementation_harness.jsonl - apply harness telemetry
     ImplementationHarness,
-    /// Clear data_notice_seen - OpenRouter data use acknowledgement
+    /// Clear data_notice_seen - provider data use acknowledgement
     DataNotice,
 }
 
@@ -128,7 +128,7 @@ impl ResetOption {
 
 /// Flag file indicating user has seen the welcome overlay
 const WELCOME_SEEN_FILE: &str = "welcome_seen";
-/// Flag file indicating user has acknowledged the OpenRouter data-use notice.
+/// Flag file indicating user has acknowledged the provider data-use notice.
 const DATA_NOTICE_SEEN_FILE: &str = "data_notice_seen";
 
 /// Question answer cache file
@@ -932,12 +932,12 @@ impl Cache {
         Ok(())
     }
 
-    /// Check if user has acknowledged the OpenRouter data-use notice.
+    /// Check if user has acknowledged the provider data-use notice.
     pub fn has_seen_data_notice(&self) -> bool {
         self.cache_dir.join(DATA_NOTICE_SEEN_FILE).exists()
     }
 
-    /// Mark that user has acknowledged the OpenRouter data-use notice.
+    /// Mark that user has acknowledged the provider data-use notice.
     pub fn mark_data_notice_seen(&self) -> anyhow::Result<()> {
         self.ensure_dir()?;
         let path = self.cache_dir.join(DATA_NOTICE_SEEN_FILE);

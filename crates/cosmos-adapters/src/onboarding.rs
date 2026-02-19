@@ -1,6 +1,6 @@
 //! First-run onboarding experience
 //!
-//! Runs the setup flows for OpenRouter API key and GitHub authentication.
+//! Runs the setup flows for Groq API key and GitHub authentication.
 //! The API key is required; GitHub auth is optional but recommended.
 
 use crate::config::Config;
@@ -19,12 +19,12 @@ pub fn needs_onboarding() -> bool {
 pub async fn run_onboarding() -> Result<(), String> {
     if !io::stdin().is_terminal() {
         return Err(
-            "Setup requires an interactive terminal. Run `cosmos --setup` or set OPENROUTER_API_KEY."
+            "Setup requires an interactive terminal. Run `cosmos --setup` or set GROQ_API_KEY."
                 .to_string(),
         );
     }
 
-    // Step 1: OpenRouter API key (required)
+    // Step 1: Groq API key (required)
     loop {
         match crate::config::setup_api_key_interactive() {
             Ok(_) => break,
@@ -32,7 +32,7 @@ pub async fn run_onboarding() -> Result<(), String> {
                 println!();
                 println!("  An API key is required to continue.");
                 println!(
-                    "  Cosmos uses OpenRouter and may send selected code snippets + file paths for AI analysis."
+                    "  Cosmos uses Groq and may send selected code snippets + file paths for AI analysis."
                 );
                 print!("  Press Enter to try again, or Ctrl+C to exit...");
                 io::stdout().flush().map_err(|e| e.to_string())?;
@@ -143,20 +143,20 @@ mod tests {
     #[test]
     fn test_needs_onboarding_with_env_vars() {
         // Save original state
-        let orig_openrouter = std::env::var("OPENROUTER_API_KEY").ok();
+        let orig_groq = std::env::var("GROQ_API_KEY").ok();
         let orig_github = std::env::var("GITHUB_TOKEN").ok();
 
         // Set both env vars
-        std::env::set_var("OPENROUTER_API_KEY", "sk-test-key");
+        std::env::set_var("GROQ_API_KEY", "gsk_test-key");
         std::env::set_var("GITHUB_TOKEN", "ghp_test-token");
 
         // With both set, should not need onboarding
         assert!(!needs_onboarding());
 
         // Restore original state
-        match orig_openrouter {
-            Some(val) => std::env::set_var("OPENROUTER_API_KEY", val),
-            None => std::env::remove_var("OPENROUTER_API_KEY"),
+        match orig_groq {
+            Some(val) => std::env::set_var("GROQ_API_KEY", val),
+            None => std::env::remove_var("GROQ_API_KEY"),
         }
         match orig_github {
             Some(val) => std::env::set_var("GITHUB_TOKEN", val),
@@ -167,11 +167,11 @@ mod tests {
     #[test]
     fn test_needs_onboarding_missing_api_key() {
         // Save original state
-        let orig_openrouter = std::env::var("OPENROUTER_API_KEY").ok();
+        let orig_groq = std::env::var("GROQ_API_KEY").ok();
         let orig_github = std::env::var("GITHUB_TOKEN").ok();
 
         // Only set GitHub token, not API key
-        std::env::remove_var("OPENROUTER_API_KEY");
+        std::env::remove_var("GROQ_API_KEY");
         std::env::set_var("GITHUB_TOKEN", "ghp_test-token");
 
         // Without API key, should need onboarding (unless keyring has it)
@@ -181,9 +181,9 @@ mod tests {
         let _: bool = result;
 
         // Restore original state
-        match orig_openrouter {
-            Some(val) => std::env::set_var("OPENROUTER_API_KEY", val),
-            None => std::env::remove_var("OPENROUTER_API_KEY"),
+        match orig_groq {
+            Some(val) => std::env::set_var("GROQ_API_KEY", val),
+            None => std::env::remove_var("GROQ_API_KEY"),
         }
         match orig_github {
             Some(val) => std::env::set_var("GITHUB_TOKEN", val),
@@ -194,11 +194,11 @@ mod tests {
     #[test]
     fn test_needs_onboarding_missing_github_token() {
         // Save original state
-        let orig_openrouter = std::env::var("OPENROUTER_API_KEY").ok();
+        let orig_groq = std::env::var("GROQ_API_KEY").ok();
         let orig_github = std::env::var("GITHUB_TOKEN").ok();
 
         // Only set API key, not GitHub token
-        std::env::set_var("OPENROUTER_API_KEY", "sk-test-key");
+        std::env::set_var("GROQ_API_KEY", "gsk_test-key");
         std::env::remove_var("GITHUB_TOKEN");
 
         // Without GitHub token, should need onboarding (unless keyring has it)
@@ -208,9 +208,9 @@ mod tests {
         let _: bool = result;
 
         // Restore original state
-        match orig_openrouter {
-            Some(val) => std::env::set_var("OPENROUTER_API_KEY", val),
-            None => std::env::remove_var("OPENROUTER_API_KEY"),
+        match orig_groq {
+            Some(val) => std::env::set_var("GROQ_API_KEY", val),
+            None => std::env::remove_var("GROQ_API_KEY"),
         }
         match orig_github {
             Some(val) => std::env::set_var("GITHUB_TOKEN", val),

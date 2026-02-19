@@ -24,12 +24,13 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 fn is_api_key_error(message: &str) -> bool {
     let lowered = message.to_ascii_lowercase();
     lowered.contains("no api key configured")
         || lowered.contains("invalid api key")
-        || (lowered.contains("openrouter") && lowered.contains("api key"))
+        || (lowered.contains("groq") && lowered.contains("api key"))
         || lowered.contains("run 'cosmos --setup'")
 }
 
@@ -38,9 +39,9 @@ fn maybe_prompt_api_key_overlay(app: &mut App, message: &str) -> bool {
         return false;
     }
     let detail = if message.to_ascii_lowercase().contains("invalid api key") {
-        "OpenRouter rejected this API key. Paste a valid key to continue."
+        "Groq rejected this API key. Paste a valid key to continue."
     } else {
-        "Cosmos needs an OpenRouter API key to run AI actions."
+        "Cosmos needs a Groq API key to run AI actions."
     };
     app.open_api_key_overlay(Some(detail.to_string()));
     true
@@ -61,12 +62,19 @@ fn spawn_suggestions_generation(
         } else {
             Some(repo_memory_context)
         };
-        let run = cosmos_engine::llm::run_fast_grounded_with_gate(
+        let stream_sink = Arc::new(
+            move |worker: String, kind: cosmos_engine::llm::AgenticStreamKind, line: String| {
+                let _ = tx.send(BackgroundMessage::SuggestionsStream { worker, kind, line });
+            },
+        );
+        let run = cosmos_engine::llm::run_fast_grounded_with_gate_with_progress_and_stream(
             &repo_root,
             &index,
             &context,
             mem,
             cosmos_engine::llm::SuggestionQualityGateConfig::default(),
+            Some(stream_sink),
+            |_, _, _, _| {},
         )
         .await;
 
@@ -123,6 +131,7 @@ pub fn request_suggestions_refresh(
     app.replace_index(fresh_index);
 
     app.loading = LoadingState::GeneratingSuggestions;
+    app.clear_suggestion_stream();
     app.clear_apply_confirm();
 
     let index = app.index.clone();
@@ -463,6 +472,23 @@ fn handle_suggestions_error_message(app: &mut App, error: String) {
     app.clear_apply_confirm();
 }
 
+fn handle_suggestions_stream_message(
+    app: &mut App,
+    worker: String,
+    kind: cosmos_engine::llm::AgenticStreamKind,
+    line: String,
+) {
+    if app.loading != LoadingState::GeneratingSuggestions {
+        return;
+    }
+    let kind_label = match kind {
+        cosmos_engine::llm::AgenticStreamKind::Reasoning => "reasoning",
+        cosmos_engine::llm::AgenticStreamKind::Tool => "tool",
+        cosmos_engine::llm::AgenticStreamKind::Notice => "notice",
+    };
+    app.push_suggestion_stream_line(format!("[{}|{}] {}", worker, kind_label, line));
+}
+
 fn handle_grouping_enhanced_message(
     app: &mut App,
     grouping: cosmos_core::grouping::CodebaseGrouping,
@@ -747,6 +773,10 @@ fn handle_generation_messages(
             handle_suggestions_error_message(app, error);
             None
         }
+        BackgroundMessage::SuggestionsStream { worker, kind, line } => {
+            handle_suggestions_stream_message(app, worker, kind, line);
+            None
+        }
         BackgroundMessage::GroupingEnhanced {
             grouping,
             updated_files,
@@ -940,11 +970,9 @@ fn handle_misc_messages(app: &mut App, msg: BackgroundMessage, ctx: &RuntimeCont
         BackgroundMessage::UpdateError(error) => {
             handle_update_error_message(app, error);
         }
-        BackgroundMessage::WalletBalanceUpdated { balance } => {
-            app.wallet_balance = Some(balance);
-        }
         BackgroundMessage::SuggestionsReady { .. }
         | BackgroundMessage::SuggestionsError(_)
+        | BackgroundMessage::SuggestionsStream { .. }
         | BackgroundMessage::GroupingEnhanced { .. }
         | BackgroundMessage::GroupingEnhanceError(_)
         | BackgroundMessage::PreviewReady { .. }
@@ -1015,7 +1043,7 @@ fn track_usage_for_ask(
 fn track_usage_internal(
     app: &mut App,
     usage: Option<&cosmos_engine::llm::Usage>,
-    ctx: &RuntimeContext,
+    _ctx: &RuntimeContext,
     show_budget_guardrails: bool,
 ) -> (u32, f64) {
     let Some(usage) = usage else {
@@ -1025,7 +1053,6 @@ fn track_usage_internal(
     let cost = usage.cost();
     app.session_cost += cost;
     app.session_tokens += usage.total_tokens;
-    spawn_balance_refresh(ctx.tx.clone());
     if show_budget_guardrails {
         maybe_show_budget_guardrails(app);
     }
@@ -1074,16 +1101,6 @@ fn record_pipeline_metric(
     }
 
     let _ = cache.append_pipeline_metric(&metric);
-}
-
-/// Spawn a background task to fetch the wallet balance
-pub fn spawn_balance_refresh(tx: mpsc::Sender<BackgroundMessage>) {
-    spawn_background(tx.clone(), "balance_fetch", async move {
-        if let Ok(balance) = cosmos_engine::llm::fetch_account_balance().await {
-            let _ = tx.send(BackgroundMessage::WalletBalanceUpdated { balance });
-        }
-        // Silently ignore errors - balance display is optional
-    });
 }
 
 pub fn spawn_background<F>(tx: mpsc::Sender<BackgroundMessage>, task_name: &'static str, fut: F)

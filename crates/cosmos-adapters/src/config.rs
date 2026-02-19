@@ -10,17 +10,11 @@ use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
-    /// Anonymous per-install identifier used for OpenRouter request stickiness.
-    /// Cosmos may send selected code snippets + file paths to OpenRouter to generate/validate AI output.
-    pub openrouter_user_id: Option<String>,
-}
+pub struct Config {}
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            openrouter_user_id: None,
-        }
+        Self {}
     }
 }
 
@@ -102,22 +96,20 @@ impl Config {
         Ok(())
     }
 
-    /// Get the OpenRouter API key (from environment or keychain)
+    /// Get the Groq API key (keyring first, environment fallback).
     pub fn get_api_key(&mut self) -> Option<String> {
-        // Environment variable takes precedence
-        if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
-            return Some(key);
-        }
-
-        // Try keychain (migration from legacy entries happens automatically)
+        // Keyring/store has precedence for the default "just works" path.
         match keyring::get_api_key() {
             Ok(Some(key)) => return Some(key),
-            Ok(None) => {} // No key stored, continue
+            Ok(None) => {} // No key stored, continue to env fallback.
             Err(err) => {
                 keyring::warn_keychain_error_once("API key", &err);
             }
         }
-        None
+        std::env::var("GROQ_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("GROQ_API_TOKEN").ok())
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
     }
 
     /// Set and save the API key
@@ -126,7 +118,7 @@ impl Config {
         keyring::set_api_key(key).map_err(|e| {
             format!(
                 "Failed to store API key in {}: {}. \
-                 You can set the OPENROUTER_API_KEY environment variable instead.",
+                 You can set the GROQ_API_KEY environment variable instead.",
                 keyring::credentials_store_label(),
                 e
             )
@@ -137,17 +129,17 @@ impl Config {
             Ok(Some(stored_key)) if stored_key == key => self.save(),
             Ok(Some(_)) => Err(format!(
                 "API key verification failed: stored key doesn't match in {}. \
-                     You can set the OPENROUTER_API_KEY environment variable instead.",
+                     You can set the GROQ_API_KEY environment variable instead.",
                 keyring::credentials_store_label()
             )),
             Ok(None) => Err(format!(
                 "API key verification failed: key was not persisted to {}. \
-                     You can set the OPENROUTER_API_KEY environment variable instead.",
+                     You can set the GROQ_API_KEY environment variable instead.",
                 keyring::credentials_store_label()
             )),
             Err(read_err) => Err(format!(
                 "API key verification failed: couldn't read back from {} ({}). \
-                     You can set the OPENROUTER_API_KEY environment variable instead.",
+                     You can set the GROQ_API_KEY environment variable instead.",
                 keyring::credentials_store_label(),
                 read_err
             )),
@@ -156,9 +148,6 @@ impl Config {
 
     /// Check if API key is configured
     pub fn has_api_key(&self) -> bool {
-        if std::env::var("OPENROUTER_API_KEY").is_ok() {
-            return true;
-        }
         match keyring::get_api_key() {
             Ok(Some(_)) => return true,
             Ok(None) => {} // No key stored
@@ -166,12 +155,15 @@ impl Config {
                 keyring::warn_keychain_error_once("API key", &err);
             }
         }
-        false
+        std::env::var("GROQ_API_KEY").is_ok()
+            || std::env::var("GROQ_API_TOKEN").is_ok()
+            || std::env::var("OPENAI_API_KEY").is_ok()
     }
 
-    /// Validate API key format (should start with sk-)
+    /// Validate API key format.
     pub fn validate_api_key_format(key: &str) -> bool {
-        key.starts_with("sk-")
+        let key = key.trim();
+        !key.is_empty() && (key.starts_with("gsk_") || key.starts_with("sk-"))
     }
 
     /// Get the config file location for display
@@ -191,15 +183,15 @@ pub fn setup_api_key_interactive() -> Result<String, String> {
     println!("  │  COSMOS SETUP                                           │");
     println!("  └─────────────────────────────────────────────────────────┘");
     println!();
-    println!("  Cosmos uses OpenRouter for AI-powered suggestions.");
+    println!("  Cosmos uses Groq for AI-powered suggestions.");
     println!("  Quick setup takes about a minute.");
     println!();
     println!("  Steps:");
-    println!("    1) Create a key at https://openrouter.ai/keys");
-    println!("    2) Add funds in OpenRouter (required to use Cosmos)");
+    println!("    1) Create a key at https://console.groq.com/keys");
+    println!("    2) Ensure your Groq account is active");
     println!("    3) Paste the key below and press Enter");
     println!();
-    println!("  Data use notice: Cosmos sends selected code snippets and file paths to OpenRouter");
+    println!("  Data use notice: Cosmos sends selected code snippets and file paths to Groq");
     println!("  to generate and validate suggestions. Local cache stays in .cosmos.");
     println!();
     println!(
@@ -207,7 +199,7 @@ pub fn setup_api_key_interactive() -> Result<String, String> {
         keyring::credentials_store_label()
     );
     println!("  You can update it later with `cosmos --setup`.");
-    println!("  Prefer env vars? Set OPENROUTER_API_KEY and rerun.");
+    println!("  Prefer env vars? Set GROQ_API_KEY and rerun.");
     println!();
     print!("  API Key: ");
     io::stdout().flush().map_err(|e| e.to_string())?;
@@ -223,7 +215,7 @@ pub fn setup_api_key_interactive() -> Result<String, String> {
     // Validate key format
     if !Config::validate_api_key_format(&key) {
         println!();
-        println!("  Warning: Key doesn't look like an OpenRouter key (should start with sk-)");
+        println!("  Warning: Key doesn't look like a Groq key (usually starts with gsk_)");
         println!("     Saving anyway...");
     }
 
@@ -284,23 +276,20 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        assert!(config.openrouter_user_id.is_none());
+        let encoded = serde_json::to_string(&config).unwrap();
+        assert_eq!(encoded, "{}");
     }
 
     #[test]
     fn test_config_deserializes_legacy_shape_with_defaults() {
         let legacy = r#"{"openrouter_user_id":"anon-123","suggestions_profile":"strict","suggestions_display_cap":5}"#;
-        let parsed: Config = serde_json::from_str(legacy).unwrap();
-        assert_eq!(parsed.openrouter_user_id.as_deref(), Some("anon-123"));
+        let _parsed: Config = serde_json::from_str(legacy).unwrap();
     }
 
     #[test]
     fn test_config_round_trip() {
-        let config = Config {
-            openrouter_user_id: Some("anon-456".to_string()),
-        };
+        let config = Config {};
         let encoded = serde_json::to_string(&config).unwrap();
-        let decoded: Config = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.openrouter_user_id.as_deref(), Some("anon-456"));
+        let _decoded: Config = serde_json::from_str(&encoded).unwrap();
     }
 }

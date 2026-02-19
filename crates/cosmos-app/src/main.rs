@@ -29,7 +29,7 @@ struct Args {
     #[arg(default_value = ".")]
     path: PathBuf,
 
-    /// Set up OpenRouter API key for AI features (BYOK mode)
+    /// Set up Groq API key for AI features (BYOK mode)
     #[arg(long)]
     setup: bool,
 
@@ -57,19 +57,9 @@ struct Args {
     #[arg(long, requires = "suggest_audit")]
     suggest_stream_reasoning: bool,
 
-    /// LLM backend to use (`openrouter` or direct `groq`)
-    #[arg(long, value_enum)]
-    llm_backend: Option<LlmBackendArg>,
-
-    /// Groq service tier when using `--llm-backend groq`
+    /// Groq service tier override (optional). If omitted, Groq default routing is used.
     #[arg(long, value_enum)]
     groq_service_tier: Option<GroqServiceTierArg>,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum LlmBackendArg {
-    Openrouter,
-    Groq,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -99,13 +89,6 @@ impl GroqServiceTierArg {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    if let Some(backend) = args.llm_backend {
-        let value = match backend {
-            LlmBackendArg::Openrouter => "openrouter",
-            LlmBackendArg::Groq => "groq",
-        };
-        std::env::set_var("COSMOS_LLM_BACKEND", value);
-    }
     if let Some(tier) = args.groq_service_tier {
         std::env::set_var("COSMOS_GROQ_SERVICE_TIER", tier.as_str());
     }
@@ -162,7 +145,7 @@ async fn run_suggestion_audit(
 ) -> Result<()> {
     if !llm::is_available() {
         return Err(anyhow::anyhow!(
-            "AI is unavailable. Configure an API key first (`cosmos --setup` for OpenRouter, or set GROQ_API_KEY for `--llm-backend groq`)."
+            "AI is unavailable. Configure an API key first (`cosmos --setup` or set GROQ_API_KEY)."
         ));
     }
 
@@ -462,8 +445,8 @@ fn setup_api_key() -> Result<()> {
                 keyring::credentials_store_label()
             );
             eprintln!();
-            eprintln!("  Workaround: Set the OPENROUTER_API_KEY environment variable:");
-            eprintln!("    export OPENROUTER_API_KEY=\"your-key-here\"");
+            eprintln!("  Workaround: Set the GROQ_API_KEY environment variable:");
+            eprintln!("    export GROQ_API_KEY=\"your-key-here\"");
             eprintln!();
             return Err(anyhow::anyhow!("API key verification failed"));
         }

@@ -14,6 +14,11 @@ pub enum BackgroundMessage {
         diagnostics: cosmos_engine::llm::SuggestionDiagnostics,
         duration_ms: u64,
     },
+    SuggestionsStream {
+        worker: String,
+        kind: cosmos_engine::llm::AgenticStreamKind,
+        line: String,
+    },
     SuggestionsError(String),
     /// AI-assisted grouping update ready
     GroupingEnhanced {
@@ -135,8 +140,4 @@ pub enum BackgroundMessage {
     },
     /// Update failed
     UpdateError(String),
-    /// Wallet balance updated
-    WalletBalanceUpdated {
-        balance: f64,
-    },
 }

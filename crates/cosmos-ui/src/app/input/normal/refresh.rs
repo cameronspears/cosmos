@@ -25,7 +25,7 @@ pub(super) fn refresh_suggestions_now(app: &mut App, ctx: &RuntimeContext, reaso
     {
         prompt_api_key_setup(
             app,
-            "No API key configured yet. Add your OpenRouter key to continue.",
+            "No API key configured yet. Add your Groq key to continue.",
         );
     }
 }

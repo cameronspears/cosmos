@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use tree::{build_file_tree, build_grouped_tree};
 
-pub fn openrouter_keys_shortcut_display() -> &'static str {
+pub fn provider_keys_shortcut_display() -> &'static str {
     if cfg!(target_os = "macos") {
         "control + k"
     } else {
@@ -37,27 +37,11 @@ pub fn openrouter_keys_shortcut_display() -> &'static str {
     }
 }
 
-pub fn openrouter_credits_shortcut_display() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "control + b"
-    } else {
-        "Ctrl + b"
-    }
-}
-
-pub fn openrouter_keys_shortcut_chip() -> &'static str {
+pub fn provider_keys_shortcut_chip() -> &'static str {
     if cfg!(target_os = "macos") {
         " control+k "
     } else {
         " Ctrl+k "
-    }
-}
-
-pub fn openrouter_credits_shortcut_chip() -> &'static str {
-    if cfg!(target_os = "macos") {
-        " control+b "
-    } else {
-        " Ctrl+b "
     }
 }
 
@@ -66,6 +50,7 @@ pub(crate) const ASK_STARTER_QUESTIONS: [&str; 3] = [
     "Where are the biggest reliability risks for users right now?",
     "What are the top 3 improvements with the biggest user impact?",
 ];
+const SUGGESTION_STREAM_LINE_CAP: usize = 120;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  APP STATE
@@ -135,7 +120,7 @@ pub struct App {
     pub session_cost: f64,            // Total USD spent this session
     pub session_tokens: u32,          // Total tokens used this session
     pub active_model: Option<String>, // Current/last model used
-    pub wallet_balance: Option<f64>,  // Remaining credits in OpenRouter account
+    pub suggestion_stream_lines: Vec<String>,
 
     // Cached data for display
     pub file_tree: Vec<FlatTreeEntry>,
@@ -237,7 +222,7 @@ impl App {
             session_cost: 0.0,
             session_tokens: 0,
             active_model: None,
-            wallet_balance: None,
+            suggestion_stream_lines: Vec::new(),
             file_tree,
             filtered_tree_indices,
             flat_search_entries,
@@ -364,6 +349,26 @@ impl App {
         if self.loading.is_loading() {
             self.loading_frame = self.loading_frame.wrapping_add(1);
         }
+    }
+
+    pub fn clear_suggestion_stream(&mut self) {
+        self.suggestion_stream_lines.clear();
+        self.needs_redraw = true;
+    }
+
+    pub fn push_suggestion_stream_line(&mut self, line: String) {
+        if line.trim().is_empty() {
+            return;
+        }
+        self.suggestion_stream_lines.push(line);
+        if self.suggestion_stream_lines.len() > SUGGESTION_STREAM_LINE_CAP {
+            let overflow = self
+                .suggestion_stream_lines
+                .len()
+                .saturating_sub(SUGGESTION_STREAM_LINE_CAP);
+            self.suggestion_stream_lines.drain(..overflow);
+        }
+        self.needs_redraw = true;
     }
 
     /// Enter search mode

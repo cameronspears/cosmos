@@ -5,8 +5,7 @@
 
 use super::client::{
     api_key, apply_backend_headers, chat_completions_url, create_http_client, groq_service_tier,
-    is_openrouter_backend, missing_api_key_message, model_id_for_backend, openrouter_user,
-    send_with_retry, REQUEST_TIMEOUT_SECS,
+    missing_api_key_message, model_id_for_backend, send_with_retry, REQUEST_TIMEOUT_SECS,
 };
 use super::models::{merge_usage, Model, Usage};
 use super::tools::{
@@ -50,6 +49,21 @@ pub struct AgenticReportBackResponse {
     pub usage: Option<Usage>,
     pub trace: AgenticTrace,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgenticStreamKind {
+    Reasoning,
+    Tool,
+    Notice,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgenticStreamEvent {
+    pub kind: AgenticStreamKind,
+    pub line: String,
+}
+
+pub type AgenticStreamSink = Arc<dyn Fn(AgenticStreamEvent) + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgenticTrace {
@@ -311,7 +325,6 @@ struct ProviderConfig {
     quantizations: Option<Vec<String>>,
 }
 
-/// OpenRouter reasoning configuration for extended thinking
 #[derive(Serialize, Clone)]
 struct ReasoningConfig {
     effort: String,
@@ -333,14 +346,9 @@ pub fn schema_to_response_format(name: &str, schema: serde_json::Value) -> Respo
 }
 
 fn reasoning_config_for_model(model: Model, include_output: bool) -> Option<ReasoningConfig> {
-    if !is_openrouter_backend() {
-        // Groq rejects OpenRouter-specific reasoning objects on some routes.
-        return None;
-    }
-    model.reasoning_effort().map(|effort| ReasoningConfig {
-        effort: effort.to_string(),
-        exclude: !include_output,
-    })
+    let _ = (model, include_output);
+    // Groq's OpenAI-compatible endpoint can reject non-standard reasoning fields.
+    None
 }
 
 fn reasoning_config(model: Model) -> Option<ReasoningConfig> {
@@ -503,106 +511,6 @@ fn invalid_report_back_action(retries: u32, within_time_budget: bool) -> Invalid
     }
 }
 
-fn response_healing_plugins() -> Vec<PluginConfig> {
-    vec![PluginConfig {
-        id: "response-healing".to_string(),
-    }]
-}
-
-const SPEED_PRIMARY_PROVIDER: &str = "groq";
-const SPEED_FALLBACK_PROVIDER: &str = "cerebras/fp16";
-const GPT_OSS_PROVIDER_ORDER: [&str; 2] = [SPEED_PRIMARY_PROVIDER, SPEED_FALLBACK_PROVIDER];
-
-fn provider_single(provider: &str, require_parameters: bool) -> ProviderConfig {
-    let require_parameters = if require_parameters { Some(true) } else { None };
-    ProviderConfig {
-        order: Some(vec![provider.to_string()]),
-        allow_fallbacks: false,
-        require_parameters,
-        preferred_max_latency: None,
-        preferred_min_throughput: None,
-        quantizations: None,
-    }
-}
-
-fn provider_config(model: Model, require_parameters: bool) -> ProviderConfig {
-    let require_parameters = if require_parameters { Some(true) } else { None };
-
-    // For gpt-oss-120b (Speed tier), prefer Groq first with explicit Cerebras fallback.
-    if model == Model::Speed {
-        return ProviderConfig {
-            order: Some(
-                GPT_OSS_PROVIDER_ORDER
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect(),
-            ),
-            // Restrict routing to the explicit order only (Groq first, then Cerebras/fp16).
-            allow_fallbacks: false,
-            require_parameters,
-            preferred_max_latency: None,
-            preferred_min_throughput: None,
-            quantizations: None,
-        };
-    }
-
-    ProviderConfig {
-        order: None,
-        allow_fallbacks: true,
-        require_parameters,
-        preferred_max_latency: Some(ProviderThresholds {
-            p50: None,
-            p75: None,
-            p90: Some(8.0),
-            p99: None,
-        }),
-        preferred_min_throughput: Some(ProviderThresholds {
-            p50: None,
-            p75: None,
-            p90: Some(15.0),
-            p99: None,
-        }),
-        quantizations: None,
-    }
-}
-
-fn provider_config_for_backend(model: Model, require_parameters: bool) -> Option<ProviderConfig> {
-    if is_openrouter_backend() {
-        Some(provider_config(model, require_parameters))
-    } else {
-        None
-    }
-}
-
-fn is_no_endpoints_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("no endpoints found")
-        || (message.contains("404")
-            && message.contains("not found")
-            && message.contains("endpoint"))
-}
-
-fn is_rate_limited_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("429")
-        || message.contains("too many requests")
-        || message.contains("rate limited")
-        || message.contains("rate-limited")
-}
-
-fn is_provider_unavailable_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("no provider available")
-        || message.contains("provider is unavailable")
-        || (message.contains("503") && message.contains("provider"))
-}
-
-fn is_route_or_capacity_error(error: &anyhow::Error) -> bool {
-    is_no_endpoints_error(error)
-        || is_rate_limited_error(error)
-        || is_provider_unavailable_error(error)
-}
-
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
@@ -748,6 +656,7 @@ fn process_sse_payload(
     usage: &mut Option<Usage>,
     stream_reasoning: bool,
     print_state: &mut StreamPrintState,
+    stream_sink: Option<&AgenticStreamSink>,
 ) -> anyhow::Result<bool> {
     let payload = payload.trim();
     if payload.is_empty() {
@@ -777,8 +686,21 @@ fn process_sse_payload(
                 reasoning.push_str(&text);
                 if stream_reasoning {
                     if let Some(output) = format_streamed_reasoning_chunk(&text, print_state) {
-                        eprint!("{}", output);
-                        let _ = std::io::stderr().flush();
+                        if let Some(sink) = stream_sink {
+                            for line in output.lines() {
+                                let trimmed = line.trim();
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+                                sink(AgenticStreamEvent {
+                                    kind: AgenticStreamKind::Reasoning,
+                                    line: trimmed.to_string(),
+                                });
+                            }
+                        } else {
+                            eprint!("{}", output);
+                            let _ = std::io::stderr().flush();
+                        }
                     }
                 }
             }
@@ -788,7 +710,14 @@ fn process_sse_payload(
             if stream_reasoning && !names.is_empty() {
                 let tool_line = names.join(", ");
                 if print_state.last_tool_line.as_deref() != Some(tool_line.as_str()) {
-                    eprintln!("\n[tool] {}", tool_line);
+                    if let Some(sink) = stream_sink {
+                        sink(AgenticStreamEvent {
+                            kind: AgenticStreamKind::Tool,
+                            line: tool_line.clone(),
+                        });
+                    } else {
+                        eprintln!("\n[tool] {}", tool_line);
+                    }
                     print_state.last_tool_line = Some(tool_line);
                 }
             }
@@ -801,6 +730,7 @@ async fn send_streaming_chat_request(
     client: &reqwest::Client,
     api_key: &str,
     request: &ChatRequest,
+    stream_sink: Option<&AgenticStreamSink>,
 ) -> anyhow::Result<ChatResponse> {
     let request_builder = client.post(chat_completions_url()).json(request);
     let response = apply_backend_headers(request_builder, api_key)
@@ -822,7 +752,7 @@ async fn send_streaming_chat_request(
     let mut tool_calls = Vec::new();
     let mut refusal = None;
     let mut usage = None;
-    let stream_reasoning = stream_reasoning_output_enabled();
+    let stream_reasoning = stream_reasoning_output_enabled() || stream_sink.is_some();
     let mut printed_header = false;
     let mut print_state = StreamPrintState::default();
 
@@ -841,7 +771,14 @@ async fn send_streaming_chat_request(
             if line.is_empty() {
                 if !event_data.is_empty() {
                     if stream_reasoning && !printed_header {
-                        eprintln!("\n[reasoning-stream]");
+                        if let Some(sink) = stream_sink {
+                            sink(AgenticStreamEvent {
+                                kind: AgenticStreamKind::Notice,
+                                line: "reasoning-stream".to_string(),
+                            });
+                        } else {
+                            eprintln!("\n[reasoning-stream]");
+                        }
                         printed_header = true;
                     }
                     if process_sse_payload(
@@ -853,8 +790,9 @@ async fn send_streaming_chat_request(
                         &mut usage,
                         stream_reasoning,
                         &mut print_state,
+                        stream_sink,
                     )? {
-                        if stream_reasoning && printed_header {
+                        if stream_reasoning && printed_header && stream_sink.is_none() {
                             eprintln!();
                         }
                         return Ok(ChatResponse {
@@ -906,9 +844,10 @@ async fn send_streaming_chat_request(
             &mut usage,
             stream_reasoning,
             &mut print_state,
+            stream_sink,
         )?;
     }
-    if stream_reasoning && printed_header {
+    if stream_reasoning && printed_header && stream_sink.is_none() {
         eprintln!();
     }
 
@@ -940,52 +879,11 @@ async fn send_streaming_chat_request(
 async fn send_report_back_text_with_speed_fallback(
     client: &reqwest::Client,
     api_key: &str,
-    model: Model,
-    include_reasoning_output: bool,
+    _model: Model,
+    _include_reasoning_output: bool,
     request: &mut ChatRequest,
 ) -> anyhow::Result<String> {
-    if !is_openrouter_backend() {
-        return send_with_retry(client, api_key, request).await;
-    }
-    match send_with_retry(client, api_key, request).await {
-        Ok(text) => Ok(text),
-        Err(primary_err) => {
-            if model != Model::Speed || !is_route_or_capacity_error(&primary_err) {
-                return Err(primary_err);
-            }
-
-            // Fallback 1: keep model, remove provider pin to allow OpenRouter routing.
-            request.provider = None;
-            match send_with_retry(client, api_key, request).await {
-                Ok(text) => Ok(text),
-                Err(unpinned_err) => {
-                    if !is_route_or_capacity_error(&unpinned_err) {
-                        return Err(anyhow::anyhow!(
-                            "Pinned provider was unavailable ({}), and unpinned routing failed: {}",
-                            primary_err,
-                            unpinned_err
-                        ));
-                    }
-
-                    // Fallback 2: stay on gpt-oss-120b and force the explicit Cerebras route.
-                    request.model = model_id_for_backend(model);
-                    request.max_tokens = model.max_tokens();
-                    request.reasoning = reasoning_config_for_model(model, include_reasoning_output);
-                    request.provider = Some(provider_single(SPEED_FALLBACK_PROVIDER, false));
-                    send_with_retry(client, api_key, request)
-                        .await
-                        .map_err(|cerebras_err| {
-                            anyhow::anyhow!(
-                                "No routes available for {} (ordered and unpinned). Explicit fallback provider {} also failed: {}",
-                                model.id(),
-                                SPEED_FALLBACK_PROVIDER,
-                                cerebras_err
-                            )
-                        })
-                }
-            }
-        }
-    }
+    send_with_retry(client, api_key, request).await
 }
 
 /// Call LLM with tool-calling capability.
@@ -1048,7 +946,7 @@ pub async fn call_llm_agentic(
         let request = ChatRequest {
             model: model_id_for_backend(model),
             messages: messages.clone(),
-            user: openrouter_user(),
+            user: None,
             max_tokens: model.max_tokens(),
             stream: false,
             response_format: None,
@@ -1057,7 +955,7 @@ pub async fn call_llm_agentic(
             tools: Some(tools.clone()),
             tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
             parallel_tool_calls: Some(true),
-            provider: provider_config_for_backend(model, false),
+            provider: None,
             service_tier: groq_service_tier(),
         };
 
@@ -1195,20 +1093,16 @@ pub async fn call_llm_agentic(
             let format_request = ChatRequest {
                 model: model_id_for_backend(model),
                 messages: messages.clone(),
-                user: openrouter_user(),
+                user: None,
                 max_tokens: model.max_tokens(),
                 stream: false,
                 response_format: final_response_format.clone(),
                 reasoning: reasoning_config(model),
-                plugins: if is_openrouter_backend() {
-                    Some(response_healing_plugins())
-                } else {
-                    None
-                },
+                plugins: None,
                 tools: None,
                 tool_choice: None,
                 parallel_tool_calls: None,
-                provider: provider_config_for_backend(model, true),
+                provider: None,
                 service_tier: groq_service_tier(),
             };
 
@@ -1264,24 +1158,19 @@ pub async fn call_llm_agentic(
 
     // Final call: no tools at all, just ask for the response
     // Don't include tools or structured output to maximize compatibility
-    let use_structured_output = final_response_format.is_some();
     let final_request = ChatRequest {
         model: model_id_for_backend(model),
         messages: messages.clone(),
-        user: openrouter_user(),
+        user: None,
         max_tokens: model.max_tokens(),
         stream: false,
         response_format: final_response_format,
         reasoning: reasoning_config(model),
-        plugins: if use_structured_output {
-            Some(response_healing_plugins())
-        } else {
-            None
-        },
+        plugins: None,
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
-        provider: provider_config_for_backend(model, use_structured_output),
+        provider: None,
         service_tier: groq_service_tier(),
     };
     // Use shared retry helper for final request too, plus a few retries for empty content.
@@ -1366,6 +1255,7 @@ pub async fn call_llm_agentic_report_back_only(
     model: Model,
     repo_root: &Path,
     max_iterations: usize,
+    stream_sink: Option<AgenticStreamSink>,
 ) -> anyhow::Result<AgenticReportBackResponse> {
     let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
     let client = create_http_client(REQUEST_TIMEOUT_SECS)?;
@@ -1398,8 +1288,8 @@ pub async fn call_llm_agentic_report_back_only(
     let max_total_iterations = max_iterations.saturating_add(REPORT_BACK_GRACE_ROUNDS);
     let mut forced_report_back_mode = false;
     let mut trace = AgenticTrace::default();
-    let mut stream_reasoning = stream_reasoning_output_enabled();
-    let mut include_reasoning = include_reasoning_output();
+    let mut stream_reasoning = stream_reasoning_output_enabled() || stream_sink.is_some();
+    let include_reasoning = include_reasoning_output() || stream_sink.is_some();
     let mut stream_fallback_logged = false;
 
     loop {
@@ -1439,7 +1329,7 @@ pub async fn call_llm_agentic_report_back_only(
         let request = ChatRequest {
             model: model_id_for_backend(model),
             messages: messages.clone(),
-            user: openrouter_user(),
+            user: None,
             max_tokens: model.max_tokens(),
             stream: stream_reasoning,
             response_format: None,
@@ -1457,81 +1347,41 @@ pub async fn call_llm_agentic_report_back_only(
                 ToolChoice::Mode(ToolChoiceMode::Auto)
             }),
             parallel_tool_calls: Some(!finalization_round),
-            provider: provider_config_for_backend(model, stream_reasoning),
+            provider: None,
             service_tier: groq_service_tier(),
         };
         let mut request = request;
         let parsed: ChatResponse = if stream_reasoning {
-            match send_streaming_chat_request(&client, &api_key, &request).await {
+            match send_streaming_chat_request(&client, &api_key, &request, stream_sink.as_ref())
+                .await
+            {
                 Ok(parsed) => parsed,
                 Err(stream_err) => {
-                    let mut final_stream_error = stream_err;
-                    if is_route_or_capacity_error(&final_stream_error) && request.provider.is_some()
-                    {
-                        // Retry once with relaxed capability matching before buffered fallback.
-                        request.provider = provider_config_for_backend(model, false);
-                        match send_streaming_chat_request(&client, &api_key, &request).await {
-                            Ok(parsed) => {
-                                // Keep streaming enabled for future iterations now that relaxed streaming works.
-                                parsed
-                            }
-                            Err(relaxed_stream_err) => {
-                                final_stream_error = relaxed_stream_err;
-                                if !stream_fallback_logged {
-                                    eprintln!(
-                                        "\n[reasoning-stream] fallback to buffered mode: strict+relaxed stream failed: {}",
-                                        final_stream_error
-                                    );
-                                    stream_fallback_logged = true;
-                                }
-                                stream_reasoning = false;
-                                if is_route_or_capacity_error(&final_stream_error) {
-                                    include_reasoning = false;
-                                }
-                                request.stream = false;
-                                request.provider = provider_config_for_backend(model, false);
-                                request.reasoning =
-                                    reasoning_config_for_model(model, include_reasoning);
-                                let text = send_report_back_text_with_speed_fallback(
-                                    &client,
-                                    &api_key,
-                                    model,
-                                    include_reasoning,
-                                    &mut request,
-                                )
-                                .await?;
-                                serde_json::from_str(&text).map_err(|e| {
-                                    anyhow::anyhow!("Failed to parse response: {}\n{}", e, text)
-                                })?
-                            }
+                    if !stream_fallback_logged {
+                        let line = format!("fallback to buffered mode: {}", stream_err);
+                        if let Some(sink) = stream_sink.as_ref() {
+                            sink(AgenticStreamEvent {
+                                kind: AgenticStreamKind::Notice,
+                                line,
+                            });
+                        } else {
+                            eprintln!("\n[reasoning-stream] {}", line);
                         }
-                    } else {
-                        if !stream_fallback_logged {
-                            eprintln!(
-                                "\n[reasoning-stream] fallback to buffered mode: {}",
-                                final_stream_error
-                            );
-                            stream_fallback_logged = true;
-                        }
-                        stream_reasoning = false;
-                        if is_route_or_capacity_error(&final_stream_error) {
-                            include_reasoning = false;
-                        }
-                        request.stream = false;
-                        request.provider = provider_config_for_backend(model, false);
-                        request.reasoning = reasoning_config_for_model(model, include_reasoning);
-                        let text = send_report_back_text_with_speed_fallback(
-                            &client,
-                            &api_key,
-                            model,
-                            include_reasoning,
-                            &mut request,
-                        )
-                        .await?;
-                        serde_json::from_str(&text).map_err(|e| {
-                            anyhow::anyhow!("Failed to parse response: {}\n{}", e, text)
-                        })?
+                        stream_fallback_logged = true;
                     }
+                    stream_reasoning = false;
+                    request.stream = false;
+                    request.reasoning = reasoning_config_for_model(model, include_reasoning);
+                    let text = send_report_back_text_with_speed_fallback(
+                        &client,
+                        &api_key,
+                        model,
+                        include_reasoning,
+                        &mut request,
+                    )
+                    .await?;
+                    serde_json::from_str(&text)
+                        .map_err(|e| anyhow::anyhow!("Failed to parse response: {}\n{}", e, text))?
                 }
             }
         } else {
@@ -1947,33 +1797,36 @@ mod tests {
     }
 
     #[test]
-    fn test_reasoning_config_for_all_models() {
+    fn test_reasoning_config_disabled_for_direct_groq() {
         use super::Model;
-
-        // Speed gets high, Smart xhigh
-        let speed = reasoning_config(Model::Speed).expect("Speed should have reasoning");
-        assert_eq!(speed.effort, "high");
-        assert!(speed.exclude);
-
-        let smart = reasoning_config(Model::Smart).expect("Smart should have reasoning");
-        assert_eq!(smart.effort, "xhigh");
+        assert!(reasoning_config(Model::Speed).is_none());
+        assert!(reasoning_config(Model::Smart).is_none());
     }
 
     #[test]
-    fn test_speed_provider_prefers_groq_then_cerebras() {
-        let provider = provider_config(Model::Speed, false);
-        let value = serde_json::to_value(&provider).expect("serialize provider");
-        let order = value
-            .get("order")
-            .and_then(|v| v.as_array())
-            .expect("order array");
-        assert_eq!(order.len(), 2);
-        assert_eq!(order[0].as_str(), Some("groq"));
-        assert_eq!(order[1].as_str(), Some("cerebras/fp16"));
-        assert_eq!(
-            value.get("allow_fallbacks").and_then(|v| v.as_bool()),
-            Some(false)
-        );
+    fn test_chat_request_without_provider_when_none() {
+        let request = ChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some("hi".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            user: None,
+            max_tokens: 64,
+            stream: false,
+            response_format: None,
+            reasoning: None,
+            plugins: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            provider: None,
+            service_tier: None,
+        };
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert!(value.get("provider").is_none());
     }
 
     #[test]

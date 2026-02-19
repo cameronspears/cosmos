@@ -1,61 +1,23 @@
 use super::models::{Model, Usage};
 use cosmos_adapters::config::Config;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    sync::{Mutex, OnceLock},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 use tokio::time::timeout;
-use uuid::Uuid;
 
-/// OpenRouter direct API URL (BYOK mode)
-pub(crate) const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-/// Groq OpenAI-compatible API URL (direct mode)
+/// Groq OpenAI-compatible API URL (direct mode).
 pub(crate) const GROQ_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LlmBackend {
-    OpenRouter,
-    Groq,
-}
-
-fn parse_llm_backend(value: Option<&str>) -> LlmBackend {
-    match value
-        .map(|v| v.trim().to_ascii_lowercase())
-        .as_deref()
-        .unwrap_or("openrouter")
-    {
-        "groq" => LlmBackend::Groq,
-        _ => LlmBackend::OpenRouter,
-    }
-}
-
-pub(crate) fn llm_backend() -> LlmBackend {
-    parse_llm_backend(std::env::var("COSMOS_LLM_BACKEND").ok().as_deref())
-}
-
-pub(crate) fn is_openrouter_backend() -> bool {
-    llm_backend() == LlmBackend::OpenRouter
-}
-
 fn backend_label() -> &'static str {
-    match llm_backend() {
-        LlmBackend::OpenRouter => "OpenRouter",
-        LlmBackend::Groq => "Groq",
-    }
+    "Groq"
 }
 
 pub(crate) fn chat_completions_url() -> &'static str {
-    match llm_backend() {
-        LlmBackend::OpenRouter => OPENROUTER_URL,
-        LlmBackend::Groq => GROQ_URL,
-    }
+    GROQ_URL
 }
 
-fn model_id_for_backend_impl(model: Model, backend: LlmBackend) -> String {
+fn model_id_for_backend_impl(model: Model) -> String {
     let id = model.id();
-    if backend == LlmBackend::Groq && id.starts_with("openai/gpt-oss-120b") {
+    if id.starts_with("openai/gpt-oss-120b") || model == Model::Smart {
         "openai/gpt-oss-120b".to_string()
     } else {
         id.to_string()
@@ -63,7 +25,7 @@ fn model_id_for_backend_impl(model: Model, backend: LlmBackend) -> String {
 }
 
 pub(crate) fn model_id_for_backend(model: Model) -> String {
-    model_id_for_backend_impl(model, llm_backend())
+    model_id_for_backend_impl(model)
 }
 
 fn normalize_groq_service_tier(value: Option<&str>) -> String {
@@ -74,28 +36,17 @@ fn normalize_groq_service_tier(value: Option<&str>) -> String {
 }
 
 pub(crate) fn groq_service_tier() -> Option<String> {
-    if llm_backend() != LlmBackend::Groq {
-        return None;
-    }
-    let tier =
-        normalize_groq_service_tier(std::env::var("COSMOS_GROQ_SERVICE_TIER").ok().as_deref());
-    Some(tier)
+    let raw = std::env::var("COSMOS_GROQ_SERVICE_TIER").ok()?;
+    Some(normalize_groq_service_tier(Some(raw.as_str())))
 }
 
 pub(crate) fn apply_backend_headers(
     builder: reqwest::RequestBuilder,
     api_key: &str,
 ) -> reqwest::RequestBuilder {
-    let builder = builder
+    builder
         .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key));
-    if is_openrouter_backend() {
-        builder
-            .header("HTTP-Referer", "https://cosmos.dev")
-            .header("X-Title", "Cosmos")
-    } else {
-        builder
-    }
+        .header("Authorization", format!("Bearer {}", api_key))
 }
 
 /// Maximum length for error content in surfaced messages.
@@ -111,7 +62,7 @@ fn sanitize_api_response(content: &str) -> String {
         "password",
         "credential",
         "bearer",
-        "sk-", // OpenAI/OpenRouter key prefix
+        "sk-", // common secret prefix
     ];
 
     // Check if the content might contain secrets
@@ -279,45 +230,16 @@ where
 
 /// Get the configured API key for the active backend.
 pub(crate) fn api_key() -> Option<String> {
-    match llm_backend() {
-        LlmBackend::OpenRouter => {
-            let mut config = Config::load();
-            config.get_api_key()
-        }
-        LlmBackend::Groq => std::env::var("GROQ_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("GROQ_API_TOKEN").ok())
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok()),
-    }
+    let mut config = Config::load();
+    config
+        .get_api_key()
+        .or_else(|| std::env::var("GROQ_API_KEY").ok())
+        .or_else(|| std::env::var("GROQ_API_TOKEN").ok())
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
 }
 
 pub(crate) fn missing_api_key_message() -> String {
-    match llm_backend() {
-        LlmBackend::OpenRouter => {
-            "No API key configured. Run 'cosmos --setup' to get started.".to_string()
-        }
-        LlmBackend::Groq => {
-            "No Groq API key configured. Set GROQ_API_KEY (or GROQ_API_TOKEN).".to_string()
-        }
-    }
-}
-
-/// Stable anonymous identifier for OpenRouter's `user` field.
-///
-/// OpenRouter uses this for user tracking to improve routing stickiness and caching.
-/// We store an anonymous UUID in config so the same user gets consistent routing.
-pub(crate) fn openrouter_user() -> Option<String> {
-    if cfg!(test) || !is_openrouter_backend() {
-        return None;
-    }
-    let mut config = Config::load();
-    if let Some(id) = config.openrouter_user_id.clone() {
-        return Some(id);
-    }
-    let id = format!("cosmos_{}", Uuid::new_v4());
-    config.openrouter_user_id = Some(id.clone());
-    let _ = config.save();
-    Some(id)
+    "No Groq API key configured. Run 'cosmos --setup' or set GROQ_API_KEY.".to_string()
 }
 
 /// Response from LLM including content and usage stats
@@ -340,55 +262,7 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    plugins: Option<Vec<PluginConfig>>,
-    /// OpenRouter provider configuration for automatic fallback
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<ProviderConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     service_tier: Option<String>,
-}
-
-/// OpenRouter provider configuration
-#[derive(Serialize, Clone)]
-struct ProviderThresholds {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    p50: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    p75: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    p90: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    p99: Option<f64>,
-}
-
-/// OpenRouter provider routing preferences
-///
-/// See: https://openrouter.ai/docs/guides/routing/provider-selection
-#[derive(Serialize, Clone)]
-pub(crate) struct ProviderConfig {
-    /// List of provider slugs to try in order (e.g. ["cerebras/fp16"])
-    #[serde(skip_serializing_if = "Option::is_none")]
-    order: Option<Vec<String>>,
-    /// Allow OpenRouter to try other providers if the primary fails
-    allow_fallbacks: bool,
-    /// Only use providers that support all parameters in the request
-    #[serde(skip_serializing_if = "Option::is_none")]
-    require_parameters: Option<bool>,
-    /// Prefer providers below this latency (seconds). Deprioritizes slow providers.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    preferred_max_latency: Option<ProviderThresholds>,
-    /// Prefer providers above this throughput (tokens/sec). Deprioritizes slow providers.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    preferred_min_throughput: Option<ProviderThresholds>,
-    /// Filter by quantization levels (e.g. ["fp16"])
-    #[serde(skip_serializing_if = "Option::is_none")]
-    quantizations: Option<Vec<String>>,
-}
-
-/// OpenRouter plugin configuration
-#[derive(Serialize)]
-struct PluginConfig {
-    id: String,
 }
 
 /// Reasoning configuration for models that support it.
@@ -398,7 +272,7 @@ struct ReasoningConfig {
     exclude: bool,
 }
 
-/// Response format configuration for OpenRouter
+/// Response format configuration for structured output parsing.
 /// Supports both simple JSON mode and structured output with schema
 #[derive(Serialize)]
 struct ResponseFormat {
@@ -478,10 +352,6 @@ struct CachedChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    plugins: Option<Vec<PluginConfig>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<ProviderConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     service_tier: Option<String>,
 }
 
@@ -537,10 +407,9 @@ pub(crate) const INITIAL_BACKOFF_MS: u64 = 2000; // 2 seconds
 pub(crate) const BACKOFF_MULTIPLIER: u64 = 2; // Exponential backoff
 pub(crate) const REQUEST_TIMEOUT_SECS: u64 = 60;
 
-/// Extract retry-after hint from OpenRouter response (if present)
+/// Extract retry-after hint from provider response text (if present).
 fn parse_retry_after(text: &str) -> Option<u64> {
-    // OpenRouter may include retry-after in response body or we estimate
-    // Look for patterns like "retry after X seconds" or "wait X seconds"
+    // Look for patterns like "retry after X seconds" or "wait X seconds".
     let text_lower = text.to_lowercase();
     if let Some(pos) = text_lower.find("retry") {
         // Try to extract a number after "retry"
@@ -571,32 +440,6 @@ pub(crate) fn is_retryable_network_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect()
 }
 
-const RESPONSE_HEALING_PLUGIN_ID: &str = "response-healing";
-
-fn provider_config(response_format: &Option<ResponseFormat>) -> ProviderConfig {
-    // Default routing for non-Speed models.
-    ProviderConfig {
-        order: None,
-        allow_fallbacks: true,
-        require_parameters: response_format.as_ref().map(|_| true),
-        // Soft routing preferences to reduce cold-start/no-content responses without
-        // hard-pinning to a single provider.
-        preferred_max_latency: Some(ProviderThresholds {
-            p50: None,
-            p75: None,
-            p90: Some(8.0),
-            p99: None,
-        }),
-        preferred_min_throughput: Some(ProviderThresholds {
-            p50: None,
-            p75: None,
-            p90: Some(15.0),
-            p99: None,
-        }),
-        quantizations: None,
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderFailureKind {
     Timeout,
@@ -606,32 +449,12 @@ enum ProviderFailureKind {
     Other,
 }
 
-#[derive(Clone, Debug, Default)]
-struct ProviderCircuitState {
-    consecutive_timeouts: u32,
-    consecutive_failures: u32,
-    open_until: Option<Instant>,
-}
-
-impl ProviderCircuitState {
-    fn is_open(&self, now: Instant) -> bool {
-        self.open_until.is_some_and(|until| until > now)
-    }
-}
-
-static PROVIDER_CIRCUITS: OnceLock<Mutex<HashMap<String, ProviderCircuitState>>> = OnceLock::new();
-
-fn provider_circuits() -> &'static Mutex<HashMap<String, ProviderCircuitState>> {
-    PROVIDER_CIRCUITS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn classify_provider_error(message: &str) -> ProviderFailureKind {
     let lower = message.to_ascii_lowercase();
     if lower.contains("timed out after") || lower.contains("request timed out") {
         ProviderFailureKind::Timeout
     } else if lower.contains("no endpoints found") || lower.contains("404 not found") {
-        // OpenRouter uses 404 for "no endpoints match the constraints", which is
-        // effectively a provider-side incompatibility/outage for this request shape.
+        // Some backends use 404 for routing/capability mismatches.
         ProviderFailureKind::ServerError
     } else if lower.contains("rate limited") {
         ProviderFailureKind::RateLimited
@@ -644,140 +467,17 @@ fn classify_provider_error(message: &str) -> ProviderFailureKind {
     }
 }
 
-fn record_provider_success(provider: &str) {
-    let circuits = provider_circuits();
-    let mut guard = circuits.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(state) = guard.get_mut(provider) {
-        *state = ProviderCircuitState::default();
+fn provider_outcome_kind(kind: ProviderFailureKind) -> &'static str {
+    match kind {
+        ProviderFailureKind::Timeout => "timeout",
+        ProviderFailureKind::RateLimited => "rate_limited",
+        ProviderFailureKind::ServerError => "server_error",
+        ProviderFailureKind::NetworkError => "network_error",
+        ProviderFailureKind::Other => "other",
     }
 }
 
-fn record_provider_failure(provider: &str, kind: ProviderFailureKind) {
-    // Conservative circuit breaker:
-    // - Keep Cerebras as the default unless we see repeated timeouts.
-    // - Open briefly to avoid hammering a degraded provider during a single run.
-    const OPEN_ON_TIMEOUTS: u32 = 2;
-    const OPEN_ON_FAILURES: u32 = 3;
-    const OPEN_TIMEOUT_SECS: u64 = 30;
-    const OPEN_RATE_LIMIT_SECS: u64 = 60;
-
-    let circuits = provider_circuits();
-    let mut guard = circuits.lock().unwrap_or_else(|e| e.into_inner());
-    let state = guard.entry(provider.to_string()).or_default();
-
-    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-    if kind == ProviderFailureKind::Timeout || kind == ProviderFailureKind::NetworkError {
-        state.consecutive_timeouts = state.consecutive_timeouts.saturating_add(1);
-    }
-
-    let now = Instant::now();
-    let open_for = match kind {
-        ProviderFailureKind::RateLimited => Some(Duration::from_secs(OPEN_RATE_LIMIT_SECS)),
-        ProviderFailureKind::Timeout | ProviderFailureKind::NetworkError => {
-            if state.consecutive_timeouts >= OPEN_ON_TIMEOUTS {
-                Some(Duration::from_secs(OPEN_TIMEOUT_SECS))
-            } else {
-                None
-            }
-        }
-        ProviderFailureKind::ServerError => Some(Duration::from_secs(OPEN_TIMEOUT_SECS)),
-        ProviderFailureKind::Other => None,
-    };
-
-    if state.consecutive_failures >= OPEN_ON_FAILURES {
-        state.open_until = Some(now + Duration::from_secs(OPEN_TIMEOUT_SECS));
-        return;
-    }
-    if let Some(dur) = open_for {
-        state.open_until = Some(now + dur);
-    }
-}
-
-fn provider_is_open(provider: &str) -> bool {
-    let circuits = provider_circuits();
-    let guard = circuits.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .get(provider)
-        .is_some_and(|state| state.is_open(Instant::now()))
-}
-
-fn provider_single(provider: &str, require_parameters: bool) -> ProviderConfig {
-    ProviderConfig {
-        order: Some(vec![provider.to_string()]),
-        allow_fallbacks: false,
-        require_parameters: if require_parameters { Some(true) } else { None },
-        preferred_max_latency: None,
-        preferred_min_throughput: None,
-        quantizations: None,
-    }
-}
-
-fn allocate_time_slices_ms(total_ms: u64, slots: usize) -> Vec<u64> {
-    // Split the total timeout across sequential provider attempts, giving the first
-    // provider (Cerebras) most of the time while still reserving meaningful time for fallbacks.
-    if slots == 0 {
-        return Vec::new();
-    }
-    if slots == 1 {
-        return vec![total_ms.max(1)];
-    }
-
-    const MIN_FALLBACK_MS: u64 = 2_000;
-    const MIN_PRIMARY_MS: u64 = 2_500;
-    const MAX_PRIMARY_MS: u64 = 20_000;
-    const PRIMARY_FRACTION_NUM: u64 = 70;
-    const PRIMARY_FRACTION_DEN: u64 = 100;
-
-    let total_ms = total_ms.max(1);
-    let min_needed =
-        MIN_PRIMARY_MS.saturating_add(MIN_FALLBACK_MS.saturating_mul((slots - 1) as u64));
-    if total_ms < min_needed {
-        // Not enough time to meaningfully try multiple providers. Spend the whole
-        // budget on the first provider in the chain.
-        return vec![total_ms];
-    }
-
-    // Reserve minimum time for each fallback provider, then distribute the remaining
-    // time in a Cerebras-first way.
-    let max_primary_ms =
-        total_ms.saturating_sub(MIN_FALLBACK_MS.saturating_mul((slots - 1) as u64));
-    let primary_target = total_ms
-        .saturating_mul(PRIMARY_FRACTION_NUM)
-        .saturating_div(PRIMARY_FRACTION_DEN);
-    let primary_ms = primary_target
-        .clamp(MIN_PRIMARY_MS, max_primary_ms.max(MIN_PRIMARY_MS))
-        .clamp(MIN_PRIMARY_MS, MAX_PRIMARY_MS);
-
-    let mut out = Vec::with_capacity(slots);
-    out.push(primary_ms);
-
-    // Give each fallback its minimum slice first.
-    let mut remaining_ms = total_ms.saturating_sub(primary_ms);
-    let fallback_slots = slots - 1;
-    out.extend(std::iter::repeat_n(MIN_FALLBACK_MS, fallback_slots));
-    remaining_ms =
-        remaining_ms.saturating_sub(MIN_FALLBACK_MS.saturating_mul(fallback_slots as u64));
-
-    // Distribute any remainder evenly across fallback providers.
-    if fallback_slots > 0 && remaining_ms > 0 {
-        let per = remaining_ms / fallback_slots as u64;
-        let mut extra = remaining_ms.saturating_sub(per.saturating_mul(fallback_slots as u64));
-        for i in 0..fallback_slots {
-            out[i + 1] = out[i + 1].saturating_add(per);
-            if extra > 0 {
-                out[i + 1] = out[i + 1].saturating_add(1);
-                extra -= 1;
-            }
-        }
-    }
-
-    out
-}
-
-/// Structured LLM call for the Speed tier with latency-aware provider failover.
-///
-/// This keeps Cerebras fp16 as the default, but ensures we don't burn the entire
-/// caller-provided timeout waiting on a slow/unstable provider.
+/// Structured LLM call for the Speed tier with normalized diagnostics.
 pub(crate) async fn call_llm_structured_limited_speed_with_failover<T>(
     system: &str,
     user: &str,
@@ -789,303 +489,75 @@ pub(crate) async fn call_llm_structured_limited_speed_with_failover<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    #[derive(Clone)]
-    struct AttemptConfig {
-        slug: &'static str,
-        provider: ProviderConfig,
-        mode: AttemptMode,
-    }
-
-    #[derive(Clone, Copy)]
-    enum AttemptMode {
-        JsonSchema,
-        JsonObjectNoReasoning,
-    }
-
-    let providers_all: Vec<AttemptConfig> = vec![
-        AttemptConfig {
-            slug: "cerebras/fp16",
-            provider: provider_cerebras_fp16(),
-            mode: AttemptMode::JsonSchema,
-        },
-        AttemptConfig {
-            slug: "deepinfra/turbo",
-            provider: provider_single("deepinfra/turbo", true),
-            mode: AttemptMode::JsonObjectNoReasoning,
-        },
-        AttemptConfig {
-            slug: "groq",
-            provider: provider_single("groq", true),
-            mode: AttemptMode::JsonObjectNoReasoning,
-        },
-    ];
-
-    // If a provider is temporarily circuit-open, skip it. If everything is open,
-    // fall back to trying the full chain anyway.
-    let mut providers: Vec<AttemptConfig> = providers_all
-        .iter()
-        .filter(|cfg| !provider_is_open(cfg.slug))
-        .cloned()
-        .collect();
-    if providers.is_empty() {
-        providers = providers_all.clone();
-    }
-
     let call_start = Instant::now();
     let mut diagnostics = SpeedFailoverDiagnostics {
         total_timeout_ms: timeout_ms,
         attempts: Vec::new(),
         selected_provider: None,
     };
-    let mut errs: Vec<String> = Vec::new();
-    let mut failed_kinds: Vec<ProviderFailureKind> = Vec::new();
 
-    // Kept explicit to keep retry diagnostics and budget propagation in one place.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_chain<T>(
-        providers: Vec<AttemptConfig>,
-        chain_budget_ms: u64,
-        system: &str,
-        user: &str,
-        schema_name: &str,
-        schema: &serde_json::Value,
-        max_tokens: u32,
-        diagnostics: &mut SpeedFailoverDiagnostics,
-        errs: &mut Vec<String>,
-        failed_kinds: &mut Vec<ProviderFailureKind>,
-    ) -> Result<StructuredResponse<T>, ()>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let slices = allocate_time_slices_ms(chain_budget_ms, providers.len());
-        for (cfg, slice_ms) in providers.into_iter().zip(slices.into_iter()) {
-            if slice_ms < 800 {
-                continue;
-            }
-            let start = Instant::now();
-            let mode = match cfg.mode {
-                AttemptMode::JsonSchema => "json_schema",
-                AttemptMode::JsonObjectNoReasoning => "json_object",
-            };
-            let result = match cfg.mode {
-                AttemptMode::JsonSchema => {
-                    call_llm_structured_with_provider::<T>(
-                        system,
-                        user,
-                        Model::Speed,
-                        schema_name,
-                        schema.clone(),
-                        cfg.provider,
-                        max_tokens,
-                        slice_ms,
-                    )
-                    .await
-                }
-                AttemptMode::JsonObjectNoReasoning => {
-                    call_llm_json_mode_with_provider::<T>(
-                        system,
-                        user,
-                        Model::Speed,
-                        cfg.provider,
-                        max_tokens,
-                        slice_ms,
-                        false,
-                    )
-                    .await
-                }
-            };
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-
-            match result {
-                Ok(mut resp) => {
-                    record_provider_success(cfg.slug);
-                    diagnostics.selected_provider = Some(cfg.slug.to_string());
-                    diagnostics.attempts.push(ProviderAttemptDiagnostics {
-                        provider_slug: cfg.slug.to_string(),
-                        mode: mode.to_string(),
-                        slice_timeout_ms: slice_ms,
-                        elapsed_ms,
-                        outcome_kind: "success".to_string(),
-                        error_tail: None,
-                    });
-                    resp.speed_failover = Some(diagnostics.clone());
-                    return Ok(resp);
-                }
-                Err(err) => {
-                    let msg = err.to_string();
-                    let display_msg = sanitize_api_response(&msg);
-                    let kind = classify_provider_error(&msg);
-                    record_provider_failure(cfg.slug, kind);
-                    failed_kinds.push(kind);
-
-                    let outcome_kind = match kind {
-                        ProviderFailureKind::Timeout => "timeout",
-                        ProviderFailureKind::RateLimited => "rate_limited",
-                        ProviderFailureKind::ServerError => "server_error",
-                        ProviderFailureKind::NetworkError => "network_error",
-                        ProviderFailureKind::Other => "other",
-                    };
-                    diagnostics.attempts.push(ProviderAttemptDiagnostics {
-                        provider_slug: cfg.slug.to_string(),
-                        mode: mode.to_string(),
-                        slice_timeout_ms: slice_ms,
-                        elapsed_ms,
-                        outcome_kind: outcome_kind.to_string(),
-                        error_tail: Some(display_msg.clone()),
-                    });
-                    errs.push(format!("{} ({}ms): {}", cfg.slug, elapsed_ms, display_msg));
-                }
-            }
-        }
-
-        Err(())
-    }
-
-    // First pass.
-    if let Ok(resp) = run_chain::<T>(
-        providers.clone(),
-        timeout_ms,
+    match call_llm_structured_limited_with_reasoning::<T>(
         system,
         user,
+        Model::Speed,
         schema_name,
-        &schema,
+        schema,
         max_tokens,
-        &mut diagnostics,
-        &mut errs,
-        &mut failed_kinds,
+        timeout_ms,
+        false,
     )
     .await
     {
-        return Ok(resp);
-    }
-
-    // Optional second pass, only when the failures look like timeouts/rate limits and we still
-    // have meaningful time left (some errors return immediately, leaving budget unused).
-    let elapsed_total_ms = call_start.elapsed().as_millis() as u64;
-    let remaining_ms = timeout_ms.saturating_sub(elapsed_total_ms);
-    let retryable_only = !failed_kinds.is_empty()
-        && failed_kinds.iter().all(|k| {
-            matches!(
-                k,
-                ProviderFailureKind::Timeout | ProviderFailureKind::RateLimited
-            )
-        });
-    if retryable_only && remaining_ms >= 2_500 {
-        let mut providers_retry: Vec<AttemptConfig> = providers_all
-            .iter()
-            .filter(|cfg| !provider_is_open(cfg.slug))
-            .cloned()
-            .collect();
-        if providers_retry.is_empty() {
-            providers_retry = providers_all;
+        Ok(mut response) => {
+            diagnostics.selected_provider = Some("groq".to_string());
+            diagnostics.attempts.push(ProviderAttemptDiagnostics {
+                provider_slug: "groq".to_string(),
+                mode: "json_schema".to_string(),
+                slice_timeout_ms: timeout_ms,
+                elapsed_ms: call_start.elapsed().as_millis() as u64,
+                outcome_kind: "success".to_string(),
+                error_tail: None,
+            });
+            response.speed_failover = Some(diagnostics);
+            Ok(response)
         }
-        if let Ok(resp) = run_chain::<T>(
-            providers_retry,
-            remaining_ms,
-            system,
-            user,
-            schema_name,
-            &schema,
-            max_tokens,
-            &mut diagnostics,
-            &mut errs,
-            &mut failed_kinds,
-        )
-        .await
-        {
-            return Ok(resp);
+        Err(err) => {
+            let err_text = err.to_string();
+            let kind = classify_provider_error(&err_text);
+            diagnostics.attempts.push(ProviderAttemptDiagnostics {
+                provider_slug: "groq".to_string(),
+                mode: "json_schema".to_string(),
+                slice_timeout_ms: timeout_ms,
+                elapsed_ms: call_start.elapsed().as_millis() as u64,
+                outcome_kind: provider_outcome_kind(kind).to_string(),
+                error_tail: Some(sanitize_api_response(&err_text)),
+            });
+
+            Err(anyhow::Error::new(SpeedFailoverError {
+                diagnostics,
+                message: format!(
+                    "Groq call failed for openai/gpt-oss-120b: {}",
+                    sanitize_api_response(&err_text)
+                ),
+            }))
         }
-    }
-
-    let message = format!(
-        "All providers failed for openai/gpt-oss-120b. {}",
-        errs.join(" | ")
-    );
-    Err(anyhow::Error::new(SpeedFailoverError {
-        diagnostics,
-        message,
-    }))
-}
-
-fn provider_config_for_model(
-    _model: Model,
-    response_format: &Option<ResponseFormat>,
-) -> ProviderConfig {
-    provider_config(response_format)
-}
-
-fn provider_for_backend(
-    model: Model,
-    response_format: &Option<ResponseFormat>,
-) -> Option<ProviderConfig> {
-    if is_openrouter_backend() {
-        Some(provider_config_for_model(model, response_format))
-    } else {
-        None
-    }
-}
-
-pub(crate) fn provider_cerebras_fp16() -> ProviderConfig {
-    ProviderConfig {
-        order: Some(vec!["cerebras/fp16".to_string()]),
-        allow_fallbacks: false,
-        require_parameters: Some(true),
-        preferred_max_latency: None,
-        preferred_min_throughput: None,
-        quantizations: Some(vec!["fp16".to_string()]),
-    }
-}
-
-fn response_healing_plugins(
-    response_format: &Option<ResponseFormat>,
-    stream: bool,
-) -> Option<Vec<PluginConfig>> {
-    if !is_openrouter_backend() {
-        return None;
-    }
-    if response_format.is_some() && !stream {
-        Some(vec![PluginConfig {
-            id: RESPONSE_HEALING_PLUGIN_ID.to_string(),
-        }])
-    } else {
-        None
     }
 }
 
 fn reasoning_config(model: Model) -> Option<ReasoningConfig> {
-    if llm_backend() == LlmBackend::Groq {
-        // Groq's OpenAI-compatible endpoint can reject non-standard reasoning config fields.
-        return None;
-    }
-    model.reasoning_effort().map(|effort| ReasoningConfig {
-        effort: effort.to_string(),
-        exclude: !include_reasoning_output(),
-    })
+    let _ = model;
+    // Groq's OpenAI-compatible endpoint can reject non-standard reasoning config fields.
+    None
 }
 
-fn include_reasoning_output() -> bool {
-    if cfg!(test) {
-        return false;
-    }
-    std::env::var("COSMOS_INCLUDE_REASONING")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-/// OpenRouter error response (can come with 200 status for upstream errors)
+/// Generic provider error envelope (can arrive with HTTP 200 from proxy layers).
 #[derive(Deserialize)]
-pub(crate) struct OpenRouterError {
-    pub error: OpenRouterApiError,
+pub(crate) struct ProviderErrorEnvelope {
+    pub error: ProviderApiError,
 }
 
 #[derive(Deserialize)]
-pub(crate) struct OpenRouterApiError {
+pub(crate) struct ProviderApiError {
     pub message: String,
     #[serde(default)]
     pub code: Option<i32>,
@@ -1097,7 +569,7 @@ pub(crate) struct OpenRouterApiError {
 /// - Network errors (timeout, connection failures)
 /// - Rate limits (429)
 /// - Server errors (5xx)
-/// - OpenRouter's 200-with-error responses
+/// - 200-with-error payloads from upstream proxy layers
 ///
 /// Returns the response text on success, or an error after all retries exhausted.
 pub(crate) async fn send_with_retry<T: Serialize>(
@@ -1140,9 +612,8 @@ pub(crate) async fn send_with_retry<T: Serialize>(
         };
 
         if status.is_success() {
-            // OpenRouter sometimes returns errors with 200 status (upstream provider issues).
-            // Parsing is safe for Groq too (shape-compatible `error.message` objects).
-            if let Ok(err_resp) = serde_json::from_str::<OpenRouterError>(&text) {
+            // Some upstream layers return provider errors with HTTP 200.
+            if let Ok(err_resp) = serde_json::from_str::<ProviderErrorEnvelope>(&text) {
                 let is_retryable = err_resp
                     .error
                     .code
@@ -1186,14 +657,8 @@ pub(crate) async fn send_with_retry<T: Serialize>(
 
         // Non-retryable error or max retries exceeded
         let error_msg = match status.as_u16() {
-            401 => match llm_backend() {
-                LlmBackend::OpenRouter => {
-                    "Invalid API key. Run 'cosmos --setup' to update it.".to_string()
-                }
-                LlmBackend::Groq => {
-                    "Invalid Groq API key. Set GROQ_API_KEY and try again.".to_string()
-                }
-            },
+            401 => "Invalid Groq API key. Run 'cosmos --setup' or set GROQ_API_KEY and try again."
+                .to_string(),
             429 => format!(
                 "Rate limited by {} after {} retries. Try again in a few minutes. (Press 'e' to view error log)",
                 backend_label(),
@@ -1213,7 +678,7 @@ pub(crate) async fn send_with_retry<T: Serialize>(
     Err(anyhow::anyhow!("{}", last_error))
 }
 
-/// Create a configured HTTP client for OpenRouter requests
+/// Create a configured HTTP client for LLM requests.
 pub(crate) fn create_http_client(timeout_secs: u64) -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
@@ -1250,8 +715,6 @@ pub(crate) async fn call_llm_with_usage(
     };
 
     let stream = false;
-    let plugins = response_healing_plugins(&response_format, stream);
-    let provider = provider_for_backend(model, &response_format);
     let reasoning = reasoning_config(model);
 
     let request = ChatRequest {
@@ -1266,13 +729,11 @@ pub(crate) async fn call_llm_with_usage(
                 content: user.to_string(),
             },
         ],
-        user: openrouter_user(),
+        user: None,
         max_tokens: model.max_tokens(),
         stream,
         response_format,
         reasoning,
-        plugins,
-        provider,
         service_tier: groq_service_tier(),
     };
 
@@ -1362,226 +823,10 @@ impl std::fmt::Display for SpeedFailoverError {
 
 impl std::error::Error for SpeedFailoverError {}
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn call_llm_structured_with_provider<T>(
-    system: &str,
-    user: &str,
-    model: Model,
-    schema_name: &str,
-    schema: serde_json::Value,
-    provider: ProviderConfig,
-    max_tokens: u32,
-    timeout_ms: u64,
-) -> anyhow::Result<StructuredResponse<T>>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
-
-    if !model.supports_structured_outputs() {
-        return Err(anyhow::anyhow!(
-            "Structured outputs aren't supported for {}. Try a different model.",
-            model.id()
-        ));
-    }
-
-    let client = create_http_client(REQUEST_TIMEOUT_SECS)?;
-
-    let response_format = Some(ResponseFormat {
-        format_type: "json_schema".to_string(),
-        json_schema: Some(JsonSchemaWrapper {
-            name: schema_name.to_string(),
-            strict: true,
-            schema,
-        }),
-    });
-
-    let stream = false;
-    let plugins = response_healing_plugins(&response_format, stream);
-    let reasoning = reasoning_config(model);
-
-    let request = ChatRequest {
-        model: model_id_for_backend(model),
-        messages: vec![
-            Message {
-                role: "system".to_string(),
-                content: system.to_string(),
-            },
-            Message {
-                role: "user".to_string(),
-                content: user.to_string(),
-            },
-        ],
-        user: openrouter_user(),
-        max_tokens,
-        stream,
-        response_format,
-        reasoning,
-        plugins,
-        provider: if is_openrouter_backend() {
-            Some(provider)
-        } else {
-            None
-        },
-        service_tier: groq_service_tier(),
-    };
-
-    let text = timeout(
-        Duration::from_millis(timeout_ms),
-        send_with_retry(&client, &api_key, &request),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Timed out after {}ms.", timeout_ms))??;
-
-    let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse {} response: {}\n{}",
-            backend_label(),
-            e,
-            sanitize_api_response(&text)
-        )
-    })?;
-
-    let choice = parsed.choices.first();
-    if let Some(c) = choice {
-        if let Some(refusal) = &c.message.refusal {
-            return Err(anyhow::anyhow!(
-                "Request was refused: {}",
-                truncate_str(refusal, 200)
-            ));
-        }
-    }
-
-    let content = choice
-        .and_then(|c| c.message.content.clone())
-        .unwrap_or_default();
-    if content.is_empty() {
-        return Err(anyhow::anyhow!(
-            "API returned empty response. The model may have been rate limited or failed to generate content. Please try again."
-        ));
-    }
-
-    let data: T = parse_structured_content(&content)?;
-
-    Ok(StructuredResponse {
-        data,
-        usage: parsed.usage,
-        speed_failover: None,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn call_llm_json_mode_with_provider<T>(
-    system: &str,
-    user: &str,
-    model: Model,
-    provider: ProviderConfig,
-    max_tokens: u32,
-    timeout_ms: u64,
-    include_reasoning: bool,
-) -> anyhow::Result<StructuredResponse<T>>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
-
-    if !model.supports_json_mode() {
-        return Err(anyhow::anyhow!(
-            "JSON mode isn't supported for {}. Try a different model.",
-            model.id()
-        ));
-    }
-
-    let client = create_http_client(REQUEST_TIMEOUT_SECS)?;
-
-    let response_format = Some(ResponseFormat {
-        format_type: "json_object".to_string(),
-        json_schema: None,
-    });
-
-    let stream = false;
-    let plugins = response_healing_plugins(&response_format, stream);
-    let reasoning = if include_reasoning {
-        reasoning_config(model)
-    } else {
-        None
-    };
-
-    let request = ChatRequest {
-        model: model_id_for_backend(model),
-        messages: vec![
-            Message {
-                role: "system".to_string(),
-                content: system.to_string(),
-            },
-            Message {
-                role: "user".to_string(),
-                content: user.to_string(),
-            },
-        ],
-        user: openrouter_user(),
-        max_tokens,
-        stream,
-        response_format,
-        reasoning,
-        plugins,
-        provider: if is_openrouter_backend() {
-            Some(provider)
-        } else {
-            None
-        },
-        service_tier: groq_service_tier(),
-    };
-
-    let text = timeout(
-        Duration::from_millis(timeout_ms),
-        send_with_retry(&client, &api_key, &request),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Timed out after {}ms.", timeout_ms))??;
-
-    let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse {} response: {}\n{}",
-            backend_label(),
-            e,
-            sanitize_api_response(&text)
-        )
-    })?;
-
-    let choice = parsed.choices.first();
-    if let Some(c) = choice {
-        if let Some(refusal) = &c.message.refusal {
-            return Err(anyhow::anyhow!(
-                "Request was refused: {}",
-                truncate_str(refusal, 200)
-            ));
-        }
-    }
-
-    let content = choice
-        .and_then(|c| c.message.content.clone())
-        .unwrap_or_default();
-    if content.is_empty() {
-        return Err(anyhow::anyhow!(
-            "API returned empty response. The model may have been rate limited or failed to generate content. Please try again."
-        ));
-    }
-
-    let data: T = parse_structured_content(&content)?;
-
-    Ok(StructuredResponse {
-        data,
-        usage: parsed.usage,
-        speed_failover: None,
-    })
-}
-
 /// Call LLM API with structured output (strict JSON schema).
 ///
-/// Uses OpenRouter's structured outputs feature (`json_schema`) and Response Healing.
-/// This is the preferred path for JSON responses that should not rely on custom
-/// "ask the model to fix JSON" retries.
+/// This is the preferred path for JSON responses that should not rely on
+/// custom "ask the model to fix JSON" retries.
 pub(crate) async fn call_llm_structured<T>(
     system: &str,
     user: &str,
@@ -1613,8 +858,6 @@ where
     });
 
     let stream = false;
-    let plugins = response_healing_plugins(&response_format, stream);
-    let provider = provider_for_backend(model, &response_format);
     let reasoning = reasoning_config(model);
 
     let request = ChatRequest {
@@ -1629,13 +872,11 @@ where
                 content: user.to_string(),
             },
         ],
-        user: openrouter_user(),
+        user: None,
         max_tokens: model.max_tokens(),
         stream,
         response_format,
         reasoning,
-        plugins,
-        provider,
         service_tier: groq_service_tier(),
     };
 
@@ -1682,7 +923,7 @@ where
     })
 }
 
-/// Call LLM API with structured output using default provider routing, while
+/// Call LLM API with structured output while
 /// enforcing max tokens and a request timeout with reasoning disabled.
 /// Useful for latency-sensitive paths where structured output already constrains format.
 pub(crate) async fn call_llm_structured_limited_no_reasoning<T>(
@@ -1746,8 +987,6 @@ where
     });
 
     let stream = false;
-    let plugins = response_healing_plugins(&response_format, stream);
-    let provider = provider_for_backend(model, &response_format);
     let reasoning = if include_reasoning {
         reasoning_config(model)
     } else {
@@ -1766,13 +1005,11 @@ where
                 content: user.to_string(),
             },
         ],
-        user: openrouter_user(),
+        user: None,
         max_tokens,
         stream,
         response_format,
         reasoning,
-        plugins,
-        provider,
         service_tier: groq_service_tier(),
     };
 
@@ -1820,19 +1057,12 @@ where
     })
 }
 
-/// Call LLM API with structured output AND Anthropic prompt caching.
-///
-/// This variant enables prompt caching for Anthropic models (Claude), which:
-/// - Reduces costs by ~90% on cached prompt reads (0.1x pricing)
-/// - Potentially improves reliability (OpenRouter routes to same provider)
-/// - Has 5-minute cache TTL by default
-///
-/// Use this for repeated calls with the same system prompt (like fix generation).
+/// Call LLM API with structured output and cache hints for repeated prompts.
 ///
 /// # Arguments
 /// * `system` - System prompt (will be cached)
 /// * `user` - User message (not cached - changes each call)
-/// * `model` - Model to use (caching only works with Anthropic models)
+/// * `model` - Model to use
 /// * `schema_name` - Name for the schema (e.g., "fix_content")
 /// * `schema` - JSON Schema definition
 ///
@@ -1869,21 +1099,17 @@ where
     });
 
     let stream = false;
-    let plugins = response_healing_plugins(&response_format, stream);
-    let provider = provider_for_backend(model, &response_format);
     let reasoning = reasoning_config(model);
 
     // Use cached messages with cache_control on system prompt
     let request = CachedChatRequest {
         model: model_id_for_backend(model),
         messages: build_cached_messages(system, user),
-        user: openrouter_user(),
+        user: None,
         max_tokens: model.max_tokens(),
         stream,
         response_format,
         reasoning,
-        plugins,
-        provider,
         service_tier: groq_service_tier(),
     };
 
@@ -1958,53 +1184,6 @@ pub(crate) fn truncate_str(s: &str, max_chars: usize) -> &str {
     }
 }
 
-/// OpenRouter credits API URL
-const OPENROUTER_CREDITS_URL: &str = "https://openrouter.ai/api/v1/credits";
-
-/// Response from OpenRouter credits endpoint
-#[derive(Deserialize)]
-struct CreditsResponse {
-    data: CreditsData,
-}
-
-#[derive(Deserialize)]
-struct CreditsData {
-    total_credits: f64,
-    total_usage: f64,
-}
-
-/// Fetch the current account balance from OpenRouter.
-/// Returns the remaining credits (total_credits - total_usage).
-pub async fn fetch_account_balance() -> anyhow::Result<f64> {
-    if !is_openrouter_backend() {
-        return Err(anyhow::anyhow!(
-            "Account balance lookup is only supported for the OpenRouter backend."
-        ));
-    }
-    let api_key = api_key().ok_or_else(|| anyhow::anyhow!("No API key configured"))?;
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    let response = client
-        .get(OPENROUTER_CREDITS_URL)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to fetch balance: {}",
-            response.status()
-        ));
-    }
-
-    let credits: CreditsResponse = response.json().await?;
-    let remaining = credits.data.total_credits - credits.data.total_usage;
-    Ok(remaining)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2015,52 +1194,11 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_requires_parameters_only_with_response_format() {
-        let provider = provider_config_for_model(Model::Smart, &None);
-        let value = serde_json::to_value(provider).unwrap();
-        assert!(value.get("require_parameters").is_none());
-
-        let response_format = Some(ResponseFormat {
-            format_type: "json_object".to_string(),
-            json_schema: None,
-        });
-        let provider = provider_config_for_model(Model::Smart, &response_format);
-        let value = serde_json::to_value(provider).unwrap();
-        assert_eq!(
-            value.get("require_parameters").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn test_speed_model_uses_default_openrouter_routing() {
-        let provider = provider_config_for_model(Model::Speed, &None);
-        let value = serde_json::to_value(provider).unwrap();
-        assert!(value.get("order").and_then(|v| v.as_array()).is_none());
-        assert_eq!(
-            value.get("allow_fallbacks").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn test_parse_llm_backend_defaults_openrouter() {
-        assert_eq!(parse_llm_backend(None), LlmBackend::OpenRouter);
-        assert_eq!(
-            parse_llm_backend(Some("openrouter")),
-            LlmBackend::OpenRouter
-        );
-        assert_eq!(parse_llm_backend(Some("groq")), LlmBackend::Groq);
-        assert_eq!(parse_llm_backend(Some("GROQ")), LlmBackend::Groq);
-    }
-
-    #[test]
-    fn test_model_id_normalization_for_groq_backend() {
-        let openrouter_id = model_id_for_backend_impl(Model::Speed, LlmBackend::OpenRouter);
-        assert_eq!(openrouter_id, "openai/gpt-oss-120b:exacto");
-
-        let groq_id = model_id_for_backend_impl(Model::Speed, LlmBackend::Groq);
+    fn test_model_id_normalization_for_groq_backend_and_smart_model() {
+        let groq_id = model_id_for_backend_impl(Model::Speed);
         assert_eq!(groq_id, "openai/gpt-oss-120b");
+        let smart_id = model_id_for_backend_impl(Model::Smart);
+        assert_eq!(smart_id, "openai/gpt-oss-120b");
     }
 
     #[test]
@@ -2075,25 +1213,9 @@ mod tests {
     }
 
     #[test]
-    fn test_response_healing_plugins_only_for_non_streaming_json() {
-        let response_format = Some(ResponseFormat {
-            format_type: "json_object".to_string(),
-            json_schema: None,
-        });
-
-        let plugins = response_healing_plugins(&response_format, false).expect("expected plugin");
-        assert_eq!(plugins.len(), 1);
-        assert_eq!(plugins[0].id, RESPONSE_HEALING_PLUGIN_ID);
-
-        assert!(response_healing_plugins(&response_format, true).is_none());
-        assert!(response_healing_plugins(&None, false).is_none());
-    }
-
-    #[test]
-    fn test_reasoning_config_excludes_output() {
-        let reasoning = reasoning_config(Model::Speed).expect("expected reasoning config");
-        let value = serde_json::to_value(reasoning).unwrap();
-        assert_eq!(value.get("exclude").and_then(|v| v.as_bool()), Some(true));
+    fn test_reasoning_config_disabled_for_direct_groq() {
+        assert!(reasoning_config(Model::Speed).is_none());
+        assert!(reasoning_config(Model::Smart).is_none());
     }
 
     #[test]
@@ -2130,41 +1252,5 @@ mod tests {
                 description: "hello".to_string()
             }
         );
-    }
-
-    #[test]
-    fn allocate_time_slices_primary_only_when_budget_too_small() {
-        let slices = allocate_time_slices_ms(5_000, 3);
-        assert_eq!(slices, vec![5_000]);
-    }
-
-    #[test]
-    fn allocate_time_slices_sums_to_total_for_typical_speed_call() {
-        let slices = allocate_time_slices_ms(35_000, 3);
-        assert_eq!(slices.iter().sum::<u64>(), 35_000);
-        assert_eq!(slices.len(), 3);
-        // With the current policy, a 35s budget should give Cerebras a big slice, bounded at 20s.
-        assert_eq!(slices[0], 20_000);
-        assert!(slices[1] >= 2_000);
-        assert!(slices[2] >= 2_000);
-    }
-
-    #[test]
-    fn allocate_time_slices_reserves_meaningful_fallback_time() {
-        let slices = allocate_time_slices_ms(10_000, 3);
-        assert_eq!(slices.iter().sum::<u64>(), 10_000);
-        assert_eq!(slices.len(), 3);
-        assert_eq!(slices[0], 6_000);
-        assert_eq!(slices[1], 2_000);
-        assert_eq!(slices[2], 2_000);
-    }
-
-    #[test]
-    fn allocate_time_slices_two_providers() {
-        let slices = allocate_time_slices_ms(20_000, 2);
-        assert_eq!(slices.iter().sum::<u64>(), 20_000);
-        assert_eq!(slices.len(), 2);
-        assert!(slices[0] >= 2_500);
-        assert!(slices[1] >= 2_000);
     }
 }

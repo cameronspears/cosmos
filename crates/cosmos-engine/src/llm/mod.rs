@@ -11,13 +11,15 @@ pub mod prompts;
 pub mod review;
 pub mod tools;
 
+pub use agentic::AgenticStreamKind;
 pub use analysis::{
     analyze_codebase_dual_agent_reviewed, analyze_codebase_fast_grounded, ask_question,
     run_fast_grounded_with_gate, run_fast_grounded_with_gate_with_progress,
-    GatedSuggestionRunResult, SuggestionDiagnostics, SuggestionGateSnapshot,
-    SuggestionQualityGateConfig,
+    run_fast_grounded_with_gate_with_progress_and_stream, GatedSuggestionRunResult,
+    SuggestionDiagnostics, SuggestionGateSnapshot, SuggestionQualityGateConfig,
+    SuggestionStreamSink,
 };
-pub use client::{fetch_account_balance, is_available};
+pub use client::is_available;
 pub use fix::{
     build_fix_preview_from_validated_suggestion, generate_fix_content,
     generate_fix_content_with_model, generate_fix_preview_agentic, generate_multi_file_fix,

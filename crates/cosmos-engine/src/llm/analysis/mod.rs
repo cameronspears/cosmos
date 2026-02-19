@@ -1,5 +1,6 @@
 use super::agentic::{
-    call_llm_agentic, call_llm_agentic_report_back_only, schema_to_response_format, AgenticTrace,
+    call_llm_agentic, call_llm_agentic_report_back_only, schema_to_response_format,
+    AgenticStreamEvent, AgenticStreamSink, AgenticTrace,
 };
 use super::client::{call_llm_with_usage, truncate_str};
 use super::models::merge_usage;
@@ -18,6 +19,7 @@ use futures::future::join_all;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use uuid::Uuid;
 
 mod context_limits;
@@ -32,8 +34,6 @@ use summary_normalization::{normalize_grounded_detail, normalize_grounded_summar
 
 const EVIDENCE_TOP_WINDOW_COMMENT_RATIO_MAX: f64 = 0.80;
 const EVIDENCE_EXECUTABLE_RATIO_MIN: f64 = 0.20;
-const FAST_GROUNDED_FINAL_TARGET_MAX: usize = 16;
-const FAST_GROUNDED_VALIDATED_POOL_MAX: usize = 32;
 const FAST_GROUNDED_PROVISIONAL_TARGET_MAX: usize = 24;
 const AGENTIC_SUGGESTION_TARGET_MIN: usize = 4;
 const AGENTIC_SUGGESTION_TARGET_MAX: usize = 16;
@@ -46,7 +46,6 @@ const AGENTIC_SUBAGENT_MIN_COMMIT_WINDOW: usize = 80;
 const AGENTIC_SUBAGENT_MAX_COMMIT_WINDOW: usize = 300;
 const SUMMARY_MIN_WORDS: usize = 5;
 const SUMMARY_MIN_CHARS: usize = 24;
-const DIVERSITY_FILE_BALANCE_PER_FILE_CAP: usize = 3;
 const DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE: f32 = 0.30;
 const DEFAULT_MAX_SMART_REWRITES_PER_RUN: usize = 8;
 const ASK_ETHOS_MAX_CHARS: usize = 8_000;
@@ -105,34 +104,6 @@ When done, call report_back exactly once.
     "verified_findings": []
   }
 - files must include supporting ranges for each reported finding."#;
-
-const RELACE_FINAL_REVIEWER_SYSTEM: &str = r#"You are the final verification reviewer.
-
-You receive candidate findings from specialized agents.
-You must independently verify each claim using tools and keep only strictly verified issues.
-
-Verification bar:
-- Every accepted finding must include file, line, and non-empty evidence_quote copied from code.
-- Reject any speculative or weakly supported claim.
-- Category must be bug or security.
-- Criticality must be critical/high/medium/low.
-
-When done, call report_back exactly once.
-- explanation MUST be a JSON object (not a quoted string):
-  {
-    "role": "final_reviewer",
-    "findings": [],
-    "verified_findings": [{
-      "file": "relative/path",
-      "line": 123,
-      "category": "bug|security",
-      "criticality": "critical|high|medium|low",
-      "summary": "...",
-      "detail": "...",
-      "evidence_quote": "..."
-    }]
-  }
-- files must include supporting ranges for accepted findings."#;
 
 const AGENTIC_SUGGESTIONS_SYSTEM: &str = r#"You are Cosmos, a senior code reviewer.
 
@@ -1033,6 +1004,9 @@ impl Default for SuggestionQualityGateConfig {
     }
 }
 
+pub type SuggestionStreamSink =
+    Arc<dyn Fn(String, super::agentic::AgenticStreamKind, String) + Send + Sync>;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct SuggestionGateSnapshot {
     pub final_count: usize,
@@ -1068,6 +1042,14 @@ struct EvidenceSnippetQuality {
     comment_ratio: f64,
     top_window_comment_ratio: f64,
     executable_ratio: f64,
+}
+
+fn snippet_code_line(line: &str) -> &str {
+    if let Some((_, rest)) = line.split_once('|') {
+        rest
+    } else {
+        line
+    }
 }
 
 fn snippet_code_is_comment_or_blank(line: &str) -> bool {
@@ -1181,43 +1163,6 @@ struct AgenticSuggestionResponseJson {
 
 type ReportFindingJson = super::tools::ReportBackFinding;
 type AgentReportEnvelopeJson = super::tools::ReportBackExplanation;
-type ReviewerReportEnvelopeJson = super::tools::ReportBackExplanation;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValidationRejectClass {
-    InsufficientEvidence,
-    Other,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ValidationRejectionStats {
-    prevalidation: usize,
-    prevalidation_contradiction_count: usize,
-    validator_contradicted: usize,
-    validator_insufficient_evidence: usize,
-    validator_other: usize,
-}
-
-fn build_validation_rejection_histogram(
-    stats: &ValidationRejectionStats,
-) -> HashMap<String, usize> {
-    HashMap::from([
-        ("prevalidation".to_string(), stats.prevalidation),
-        (
-            "prevalidation_contradiction_count".to_string(),
-            stats.prevalidation_contradiction_count,
-        ),
-        (
-            "validator_contradicted".to_string(),
-            stats.validator_contradicted,
-        ),
-        (
-            "validator_insufficient_evidence".to_string(),
-            stats.validator_insufficient_evidence,
-        ),
-        ("validator_other".to_string(), stats.validator_other),
-    ])
-}
 
 fn suggestion_has_usable_evidence_quality(suggestion: &Suggestion) -> bool {
     if let Some(top_ratio) = suggestion.validation_metadata.snippet_top_comment_ratio {
@@ -1346,101 +1291,6 @@ fn suggestion_topic_key(suggestion: &Suggestion) -> String {
             tokens.join("_")
         )
     }
-}
-
-fn suggestion_similarity_tokens(suggestion: &Suggestion) -> HashSet<String> {
-    collect_similarity_tokens(&format!(
-        "{} {}",
-        suggestion.summary,
-        suggestion.detail.as_deref().unwrap_or("")
-    ))
-}
-
-fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-    let intersection = a.intersection(b).count();
-    let union = a.len() + b.len() - intersection;
-    if union == 0 {
-        0.0
-    } else {
-        intersection as f64 / union as f64
-    }
-}
-
-fn overlap_coefficient(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-    let intersection = a.intersection(b).count();
-    let min_size = a.len().min(b.len());
-    if min_size == 0 {
-        0.0
-    } else {
-        intersection as f64 / min_size as f64
-    }
-}
-
-fn suggestions_semantically_overlap(a: &Suggestion, b: &Suggestion) -> bool {
-    if a.file == b.file {
-        if let (Some(a_line), Some(b_line)) = (a.line, b.line) {
-            if a_line.abs_diff(b_line) <= 4 {
-                return true;
-            }
-        }
-    }
-
-    let a_tokens = suggestion_similarity_tokens(a);
-    let b_tokens = suggestion_similarity_tokens(b);
-    let similarity = jaccard_similarity(&a_tokens, &b_tokens);
-    let overlap_count = a_tokens.intersection(&b_tokens).count();
-    let overlap_score = overlap_coefficient(&a_tokens, &b_tokens);
-
-    if similarity >= 0.84 {
-        return true;
-    }
-    if a.kind == b.kind && similarity >= 0.66 {
-        return true;
-    }
-    if a.kind == b.kind && overlap_count >= 4 && overlap_score >= 0.5 {
-        return true;
-    }
-    if a.file == b.file && similarity >= 0.58 {
-        return true;
-    }
-    false
-}
-
-fn semantic_dedupe_validated_suggestions(
-    mut validated: Vec<Suggestion>,
-) -> (Vec<Suggestion>, usize) {
-    validated.sort_by(|a, b| {
-        b.priority
-            .cmp(&a.priority)
-            .then_with(|| b.confidence.cmp(&a.confidence))
-            .then_with(|| {
-                b.implementation_readiness_score
-                    .partial_cmp(&a.implementation_readiness_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| b.created_at.cmp(&a.created_at))
-    });
-
-    let mut deduped = Vec::new();
-    let mut dropped = 0usize;
-    for suggestion in validated {
-        if deduped
-            .iter()
-            .any(|existing| suggestions_semantically_overlap(existing, &suggestion))
-        {
-            dropped += 1;
-            continue;
-        }
-        deduped.push(suggestion);
-    }
-
-    (deduped, dropped)
 }
 
 fn compute_suggestion_diversity_metrics(suggestions: &[Suggestion]) -> SuggestionDiversityMetrics {
@@ -1766,34 +1616,6 @@ fn annotate_implementation_readiness(mut suggestion: Suggestion) -> Suggestion {
     suggestion
 }
 
-fn apply_readiness_filter(
-    validated: Vec<Suggestion>,
-    min_score: f32,
-) -> (Vec<Suggestion>, usize, f64) {
-    if validated.is_empty() {
-        return (Vec::new(), 0, 0.0);
-    }
-
-    let annotated = validated
-        .into_iter()
-        .map(annotate_implementation_readiness)
-        .collect::<Vec<_>>();
-    let mean = annotated
-        .iter()
-        .map(|s| s.implementation_readiness_score.unwrap_or(0.0) as f64)
-        .sum::<f64>()
-        / annotated.len() as f64;
-
-    let kept = annotated
-        .iter()
-        .filter(|s| s.implementation_readiness_score.unwrap_or(0.0) >= min_score)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    let filtered_count = annotated.len().saturating_sub(kept.len());
-    (kept, filtered_count, mean)
-}
-
 fn normalize_claim_impact_class(raw: &str) -> Option<String> {
     let normalized = raw.trim().to_ascii_lowercase().replace([' ', '-'], "_");
     match normalized.as_str() {
@@ -1882,51 +1704,6 @@ fn is_retryable_generation_error(error: &anyhow::Error) -> bool {
         || message.contains("did not call report_back within iteration/time budget")
         || message.contains("did not call report_back")
         || message.contains("text instead of calling report_back")
-}
-
-fn finalize_validated_suggestions(mut validated: Vec<Suggestion>) -> Vec<Suggestion> {
-    // Defensive filter: refinement should only surface validated suggestions.
-    validated.retain(suggestion_is_verified_bug_or_security);
-    validated
-}
-
-fn balance_suggestions_across_files(
-    suggestions: Vec<Suggestion>,
-    per_file_cap: usize,
-    min_count: usize,
-) -> (Vec<Suggestion>, usize) {
-    if suggestions.is_empty() || per_file_cap == 0 {
-        return (suggestions, 0);
-    }
-
-    let original_len = suggestions.len();
-    let mut per_file_counts: HashMap<PathBuf, usize> = HashMap::new();
-    let mut balanced = Vec::with_capacity(original_len);
-    let mut overflow = Vec::new();
-
-    for suggestion in suggestions {
-        let file = suggestion.file.clone();
-        let count = per_file_counts.entry(file).or_insert(0);
-        if *count < per_file_cap {
-            *count += 1;
-            balanced.push(suggestion);
-        } else {
-            overflow.push(suggestion);
-        }
-    }
-
-    let target_min_count = min_count.min(original_len);
-    if balanced.len() < target_min_count {
-        for suggestion in overflow {
-            if balanced.len() >= target_min_count {
-                break;
-            }
-            balanced.push(suggestion);
-        }
-    }
-
-    let dropped = original_len.saturating_sub(balanced.len());
-    (balanced, dropped)
 }
 
 fn agentic_suggestion_schema() -> serde_json::Value {
@@ -2326,459 +2103,6 @@ fn map_report_findings_to_suggestions(
     out
 }
 
-fn map_reviewer_verified_findings_to_suggestions(
-    repo_root: &Path,
-    index: &CodebaseIndex,
-    _payload: &super::tools::ReportBackPayload,
-    findings: Vec<ReportFindingJson>,
-) -> Vec<Suggestion> {
-    map_report_findings_to_suggestions(repo_root, index, findings)
-}
-
-fn append_suggestion_quality_record(
-    cache: &cosmos_adapters::cache::Cache,
-    run_id: &str,
-    suggestion: &Suggestion,
-    outcome: &str,
-    reason: Option<String>,
-    rejection_stats: Option<&ValidationRejectionStats>,
-) {
-    let prevalidation_contradiction_count = rejection_stats
-        .map(|stats| stats.prevalidation_contradiction_count)
-        .unwrap_or(0);
-    let record = cosmos_adapters::cache::SuggestionQualityRecord {
-        timestamp: Utc::now(),
-        run_id: run_id.to_string(),
-        suggestion_id: suggestion.id.to_string(),
-        evidence_ids: suggestion
-            .evidence_refs
-            .iter()
-            .map(|r| r.snippet_id)
-            .collect::<Vec<_>>(),
-        validation_outcome: outcome.to_string(),
-        validation_reason: reason,
-        user_verify_outcome: None,
-        batch_missing_index_count: 0,
-        batch_no_reason_count: 0,
-        transport_retry_count: 0,
-        transport_recovered_count: 0,
-        rewrite_recovered_count: 0,
-        prevalidation_contradiction_count,
-    };
-    let _ = cache.append_suggestion_quality(&record);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_rejected_validation(
-    cache: &cosmos_adapters::cache::Cache,
-    run_id: &str,
-    suggestion: &mut Suggestion,
-    reason: String,
-    class: ValidationRejectClass,
-    rejected_count: &mut usize,
-    rejection_stats: &mut ValidationRejectionStats,
-    rejected_evidence_ids: &mut HashSet<usize>,
-) {
-    *rejected_count += 1;
-    match class {
-        ValidationRejectClass::InsufficientEvidence => {
-            rejection_stats.validator_insufficient_evidence += 1
-        }
-        ValidationRejectClass::Other => rejection_stats.validator_other += 1,
-    }
-    if let Some(eid) = primary_evidence_id(suggestion) {
-        rejected_evidence_ids.insert(eid);
-    }
-    suggestion.validation_state = SuggestionValidationState::Rejected;
-    let outcome = if matches!(class, ValidationRejectClass::InsufficientEvidence) {
-        "insufficient_evidence"
-    } else {
-        "rejected"
-    };
-    append_suggestion_quality_record(
-        cache,
-        run_id,
-        suggestion,
-        outcome,
-        Some(reason),
-        Some(rejection_stats),
-    );
-}
-
-fn primary_evidence_id(suggestion: &Suggestion) -> Option<usize> {
-    suggestion
-        .evidence_refs
-        .first()
-        .map(|reference| reference.snippet_id)
-}
-
-#[derive(Debug, Clone)]
-struct PrevalidationDecision {
-    reason: String,
-    evidence_id: Option<usize>,
-    is_contradiction: bool,
-}
-
-fn prevalidation_rejection_reason(
-    suggestion: &Suggestion,
-    used_evidence_ids: &HashSet<usize>,
-    chunk_seen_evidence_ids: &mut HashSet<usize>,
-) -> Option<PrevalidationDecision> {
-    let Some(evidence_id) = primary_evidence_id(suggestion) else {
-        return Some(PrevalidationDecision {
-            reason: "Missing primary evidence ref before validation".to_string(),
-            evidence_id: None,
-            is_contradiction: false,
-        });
-    };
-
-    if used_evidence_ids.contains(&evidence_id) {
-        return Some(PrevalidationDecision {
-            reason: "Duplicate evidence_id already validated; skipped before validation"
-                .to_string(),
-            evidence_id: Some(evidence_id),
-            is_contradiction: false,
-        });
-    }
-
-    if !chunk_seen_evidence_ids.insert(evidence_id) {
-        return Some(PrevalidationDecision {
-            reason: "Duplicate evidence_id in validation batch; skipped before validation"
-                .to_string(),
-            evidence_id: Some(evidence_id),
-            is_contradiction: false,
-        });
-    }
-
-    if let Some(reason) = deterministic_prevalidation_contradiction_reason(suggestion) {
-        return Some(PrevalidationDecision {
-            reason,
-            evidence_id: Some(evidence_id),
-            is_contradiction: true,
-        });
-    }
-
-    if let Some(reason) = deterministic_prevalidation_non_actionable_reason(suggestion) {
-        return Some(PrevalidationDecision {
-            reason,
-            evidence_id: Some(evidence_id),
-            is_contradiction: false,
-        });
-    }
-
-    if let Some(reason) = deterministic_prevalidation_ethos_reason(suggestion) {
-        return Some(PrevalidationDecision {
-            reason,
-            evidence_id: Some(evidence_id),
-            is_contradiction: false,
-        });
-    }
-
-    None
-}
-
-fn normalize_claim_text_for_matching(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut prev_space = true;
-    for ch in text.chars() {
-        let mapped = if ch.is_ascii_alphanumeric() {
-            ch.to_ascii_lowercase()
-        } else {
-            ' '
-        };
-        if mapped == ' ' {
-            if prev_space {
-                continue;
-            }
-            prev_space = true;
-        } else {
-            prev_space = false;
-        }
-        out.push(mapped);
-    }
-    out
-}
-
-fn snippet_code_line(line: &str) -> &str {
-    if let Some((_, rest)) = line.split_once('|') {
-        rest
-    } else {
-        line
-    }
-}
-
-fn parse_leading_quoted_literal(rhs: &str) -> Option<String> {
-    let mut chars = rhs.chars();
-    let quote = chars.next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let mut value = String::new();
-    let mut escaped = false;
-    for ch in chars {
-        if escaped {
-            value.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if ch == quote {
-            return Some(value);
-        }
-        value.push(ch);
-    }
-    None
-}
-
-fn is_placeholder_client_id(value: &str) -> bool {
-    let lower = value.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return true;
-    }
-    [
-        "your_client_id_here",
-        "client_id_here",
-        "placeholder",
-        "replace",
-        "changeme",
-        "todo",
-        "example",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn snippet_has_configured_client_id_literal(snippet: &str) -> bool {
-    for raw_line in snippet.lines() {
-        let code = snippet_code_line(raw_line).trim();
-        let lower = code.to_ascii_lowercase();
-        if !lower.contains("client_id") {
-            continue;
-        }
-        let Some((_, rhs)) = code.split_once('=') else {
-            continue;
-        };
-        let Some(value) = parse_leading_quoted_literal(rhs.trim()) else {
-            continue;
-        };
-        if !is_placeholder_client_id(&value) {
-            return true;
-        }
-    }
-    false
-}
-
-fn claim_targets_unconfigured_client_id(claim: &str) -> bool {
-    claim.contains("client id")
-        && (claim.contains("not configured")
-            || claim.contains("missing")
-            || claim.contains("placeholder")
-            || claim.contains("not replaced"))
-}
-
-fn claim_targets_absolute_path_guard(claim: &str) -> bool {
-    if !claim.contains("absolute path") {
-        return false;
-    }
-    [
-        "error", "fail", "cannot", "cant", "blocking", "stopping", "break", "trigger", "prevent",
-    ]
-    .iter()
-    .any(|marker| claim.contains(marker))
-}
-
-fn snippet_has_absolute_path_guard(snippet: &str) -> bool {
-    let lower = snippet.to_ascii_lowercase();
-    lower.contains("is_absolute()") && lower.contains("absolute paths are not allowed")
-}
-
-fn claim_targets_cache_dir_creation(claim: &str) -> bool {
-    let mentions_cache_dir = claim.contains("cache directory")
-        || claim.contains("cache dir")
-        || claim.contains("cache folder");
-    if !mentions_cache_dir {
-        return false;
-    }
-    claim.contains("not automatically created")
-        || claim.contains("not created")
-        || claim.contains("missing")
-}
-
-fn snippet_has_cache_dir_creation(snippet: &str) -> bool {
-    let lower = snippet.to_ascii_lowercase();
-    let mentions_cache_dir = lower.contains("cache_dir") || lower.contains("cache directory");
-    let creates_or_ensures = lower.contains("create_dir_all")
-        || lower.contains("ensure_dir()?")
-        || lower.contains("ensure_dir()");
-    mentions_cache_dir && creates_or_ensures
-}
-
-fn claim_is_safeguard_praise(claim: &str) -> bool {
-    let has_positive_guard_word = [
-        "prevent",
-        "prevents",
-        "protect",
-        "protects",
-        "blocks",
-        "refuses",
-        "rejects",
-        "stops",
-        "ensures",
-        "guards",
-        "mitigat",
-        "secure",
-        "safeguard",
-    ]
-    .iter()
-    .any(|marker| claim.contains(marker));
-    if !has_positive_guard_word {
-        return false;
-    }
-
-    [
-        "attacker",
-        "malicious",
-        "traversal",
-        "arbitrary file",
-        "security",
-        "unsafe path",
-        "outside the repository",
-        "outside repository",
-        "path validation",
-        "path guard",
-    ]
-    .iter()
-    .any(|marker| claim.contains(marker))
-}
-
-fn claim_mentions_defect_risk(claim: &str) -> bool {
-    [
-        "bypass",
-        "bypassed",
-        "missing",
-        "fails",
-        "failure",
-        "broken",
-        "bug",
-        "vulnerab",
-        "unsafe",
-        "panic",
-        "crash",
-        "incorrect",
-        "regression",
-        "not validated",
-        "not checked",
-        "can still",
-        "allows",
-        "allowing",
-        "exposes",
-        "exploitable",
-    ]
-    .iter()
-    .any(|marker| claim.contains(marker))
-}
-
-fn claim_has_strong_defect_risk(claim: &str) -> bool {
-    [
-        "vulnerab",
-        "exploitable",
-        "bypass",
-        "data loss",
-        "corrupt",
-        "panic",
-        "crash",
-        "race condition",
-        "deadlock",
-        "stale lock",
-        "unsafe write",
-        "arbitrary file",
-    ]
-    .iter()
-    .any(|marker| claim.contains(marker))
-}
-
-fn claim_is_non_security_praise(claim: &str) -> bool {
-    [
-        "clear error",
-        "readable error",
-        "friendly error",
-        "helpful error",
-        "clear message",
-        "readable message",
-        "instead of hanging",
-        "instead of a silent failure",
-        "instead of silent failure",
-        "doesn t fail silently",
-        "doesnt fail silently",
-        "prevents silent",
-        "preventing silent",
-        "automatically retried",
-        "retries automatically",
-        "retried automatically",
-        "now reflects",
-        "now shows",
-        "no longer result in confusing",
-        "no longer produces confusing",
-        "prevents confusion",
-    ]
-    .iter()
-    .any(|marker| claim.contains(marker))
-}
-
-fn snippet_has_explicit_guard_check(snippet: &str) -> bool {
-    let lower = snippet.to_ascii_lowercase();
-    let has_guard_signal = [
-        "is_absolute()",
-        "absolute paths are not allowed",
-        "parent traversal is not allowed",
-        "path escapes repository",
-        "symlinks are not allowed",
-        "path contains symlink",
-        "resolve_repo_path_allow_new",
-        "component::parentdir",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
-    if !has_guard_signal {
-        return false;
-    }
-
-    [
-        "return err",
-        "return false",
-        "not allowed",
-        "escapes repository",
-        "invalid path",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn snippet_has_explicit_non_security_handling(snippet: &str) -> bool {
-    let lower = snippet.to_ascii_lowercase();
-    let explicit_error_handling = [
-        "return err(",
-        ".map_err(",
-        "anyhow::anyhow!",
-        "show_notice(",
-        "show_toast(",
-        "prompt_api_key_setup(",
-        "failed to",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
-    let explicit_retry_handling = ["retry", "send_with_retry", "attempt", "backoff"]
-        .iter()
-        .any(|marker| lower.contains(marker));
-    let explicit_ordering = ["sort_by(", "sort_by_key(", ".cmp("]
-        .iter()
-        .any(|marker| lower.contains(marker));
-    explicit_error_handling || explicit_retry_handling || explicit_ordering
-}
-
 fn summary_contains_internal_references(summary: &str) -> bool {
     let lower = summary.to_ascii_lowercase();
     summary.contains('`')
@@ -2895,80 +2219,6 @@ fn deterministic_prevalidation_ethos_reason(suggestion: &Suggestion) -> Option<S
     None
 }
 
-fn deterministic_prevalidation_contradiction_reason(suggestion: &Suggestion) -> Option<String> {
-    let snippet = suggestion.evidence.as_deref()?;
-    let claim = normalize_claim_text_for_matching(&format!(
-        "{} {}",
-        suggestion.summary,
-        suggestion.detail.as_deref().unwrap_or("")
-    ));
-    let snippet_lower = snippet.to_ascii_lowercase();
-    let lexical_anchor_overlap = (claim.contains("client id")
-        && snippet_lower.contains("client_id"))
-        || (claim.contains("absolute path") && snippet_lower.contains("is_absolute"))
-        || (claim.contains("cache directory")
-            && (snippet_lower.contains("cache_dir") || snippet_lower.contains("cache directory")));
-    if !claim_tokens_grounded_in_snippet(snippet, &claim) && !lexical_anchor_overlap {
-        return None;
-    }
-
-    if claim_targets_unconfigured_client_id(&claim)
-        && snippet_has_configured_client_id_literal(snippet)
-    {
-        return Some(
-            "Contradicted by evidence: client ID appears configured with a concrete value in the snippet."
-                .to_string(),
-        );
-    }
-
-    if claim_targets_absolute_path_guard(&claim) && snippet_has_absolute_path_guard(snippet) {
-        return Some(
-            "Contradicted by evidence: snippet shows an explicit absolute-path security guard."
-                .to_string(),
-        );
-    }
-
-    if claim_targets_cache_dir_creation(&claim) && snippet_has_cache_dir_creation(snippet) {
-        return Some(
-            "Contradicted by evidence: snippet already includes cache-directory creation/ensure logic."
-                .to_string(),
-        );
-    }
-
-    None
-}
-
-fn deterministic_prevalidation_non_actionable_reason(suggestion: &Suggestion) -> Option<String> {
-    let snippet = suggestion.evidence.as_deref()?;
-    let claim = normalize_claim_text_for_matching(&format!(
-        "{} {}",
-        suggestion.summary,
-        suggestion.detail.as_deref().unwrap_or("")
-    ));
-
-    if claim_is_safeguard_praise(&claim)
-        && !claim_mentions_defect_risk(&claim)
-        && snippet_has_explicit_guard_check(snippet)
-    {
-        return Some(
-            "Non-actionable safeguard description: snippet shows intentional guard behavior rather than a defect."
-                .to_string(),
-        );
-    }
-
-    if claim_is_non_security_praise(&claim)
-        && !claim_has_strong_defect_risk(&claim)
-        && snippet_has_explicit_non_security_handling(snippet)
-    {
-        return Some(
-            "Non-actionable behavior description: suggestion praises existing handling rather than identifying a concrete defect."
-                .to_string(),
-        );
-    }
-
-    None
-}
-
 fn snippet_identifier_tokens(snippet: &str) -> HashSet<String> {
     let mut tokens = HashSet::new();
     for line in snippet.lines() {
@@ -3031,45 +2281,6 @@ fn claim_tokens_grounded_in_snippet(snippet: &str, claim_text: &str) -> bool {
     let overlap_ratio = overlap as f64 / claim_tokens.len() as f64;
     let min_ratio = if claim_tokens.len() <= 8 { 0.10 } else { 0.15 };
     overlap >= 2 || (overlap >= 1 && overlap_ratio >= min_ratio)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn accept_validated_suggestion(
-    cache: &cosmos_adapters::cache::Cache,
-    run_id: &str,
-    mut suggestion: Suggestion,
-    reason: String,
-    validated: &mut Vec<Suggestion>,
-    rejected_count: &mut usize,
-    rejection_stats: &mut ValidationRejectionStats,
-) -> bool {
-    if primary_evidence_id(&suggestion).is_none() {
-        *rejected_count += 1;
-        rejection_stats.prevalidation += 1;
-        suggestion.validation_state = SuggestionValidationState::Rejected;
-        append_suggestion_quality_record(
-            cache,
-            run_id,
-            &suggestion,
-            "rejected",
-            Some("Missing evidence refs after validation".to_string()),
-            Some(rejection_stats),
-        );
-        return false;
-    }
-
-    suggestion.validation_state = SuggestionValidationState::Validated;
-    suggestion.verification_state = VerificationState::Verified;
-    append_suggestion_quality_record(
-        cache,
-        run_id,
-        &suggestion,
-        "validated",
-        Some(reason),
-        Some(rejection_stats),
-    );
-    validated.push(suggestion);
-    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3350,112 +2561,6 @@ pub async fn analyze_codebase_fast_grounded(
     Ok((suggestions, usage, diagnostics))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn deterministic_validate_candidates(
-    candidates: Vec<Suggestion>,
-    cache: &cosmos_adapters::cache::Cache,
-    run_id: &str,
-    validated: &mut Vec<Suggestion>,
-    rejected_count: &mut usize,
-    rejection_stats: &mut ValidationRejectionStats,
-) {
-    let mut used_evidence_ids: HashSet<usize> = HashSet::new();
-    let mut chunk_seen_evidence_ids: HashSet<usize> = HashSet::new();
-    let mut rejected_evidence_ids: HashSet<usize> = HashSet::new();
-
-    for mut suggestion in candidates
-        .into_iter()
-        .map(annotate_implementation_readiness)
-    {
-        if validated.len() >= FAST_GROUNDED_VALIDATED_POOL_MAX {
-            break;
-        }
-
-        if let Some(decision) = prevalidation_rejection_reason(
-            &suggestion,
-            &used_evidence_ids,
-            &mut chunk_seen_evidence_ids,
-        ) {
-            *rejected_count += 1;
-            rejection_stats.prevalidation += 1;
-            if decision.is_contradiction {
-                rejection_stats.prevalidation_contradiction_count += 1;
-            }
-            if let Some(evidence_id) = decision.evidence_id {
-                rejected_evidence_ids.insert(evidence_id);
-            }
-            suggestion.validation_state = SuggestionValidationState::Rejected;
-            append_suggestion_quality_record(
-                cache,
-                run_id,
-                &suggestion,
-                "rejected",
-                Some(decision.reason),
-                Some(rejection_stats),
-            );
-            continue;
-        }
-
-        if !suggestion_targets_bug_or_security_scope(&suggestion) {
-            record_rejected_validation(
-                cache,
-                run_id,
-                &mut suggestion,
-                "Suggestion is outside scope: only bug/security findings are allowed.".to_string(),
-                ValidationRejectClass::Other,
-                rejected_count,
-                rejection_stats,
-                &mut rejected_evidence_ids,
-            );
-            continue;
-        }
-
-        if !suggestion_has_usable_evidence_quality(&suggestion) {
-            record_rejected_validation(
-                cache,
-                run_id,
-                &mut suggestion,
-                "Evidence snippet quality is too weak for safe validation.".to_string(),
-                ValidationRejectClass::InsufficientEvidence,
-                rejected_count,
-                rejection_stats,
-                &mut rejected_evidence_ids,
-            );
-            continue;
-        }
-
-        if !suggestion_claim_is_grounded_for_acceptance(&suggestion) {
-            record_rejected_validation(
-                cache,
-                run_id,
-                &mut suggestion,
-                "Claim text is not grounded in the cited code snippet.".to_string(),
-                ValidationRejectClass::InsufficientEvidence,
-                rejected_count,
-                rejection_stats,
-                &mut rejected_evidence_ids,
-            );
-            continue;
-        }
-
-        let evidence_id = primary_evidence_id(&suggestion);
-        let accepted = accept_validated_suggestion(
-            cache,
-            run_id,
-            suggestion,
-            "Validated by deterministic grounding and evidence checks.".to_string(),
-            validated,
-            rejected_count,
-            rejection_stats,
-        );
-        if accepted {
-            if let Some(evidence_id) = evidence_id {
-                used_evidence_ids.insert(evidence_id);
-            }
-        }
-    }
-}
-
 fn ratio(numerator: usize, denominator: usize) -> f64 {
     if denominator == 0 {
         0.0
@@ -3552,32 +2657,6 @@ Focus on these candidate files first (you may inspect related files as needed):\
     prompt
 }
 
-fn build_reviewer_user_prompt(
-    candidate_files: &[PathBuf],
-    bug_findings: &[ReportFindingJson],
-    security_findings: &[ReportFindingJson],
-) -> String {
-    let mut prompt = String::from(
-        "I have uploaded a code repository in the /repo directory.\n\n\
-You are performing strict final verification of candidate findings.\n\
-Candidate files:\n",
-    );
-    for path in candidate_files {
-        prompt.push_str("- ");
-        prompt.push_str(&path.display().to_string());
-        prompt.push('\n');
-    }
-
-    let findings_json = serde_json::json!({
-        "bug_findings": bug_findings,
-        "security_findings": security_findings,
-    });
-    prompt.push_str("\nCandidate findings JSON:\n");
-    prompt.push_str(&findings_json.to_string());
-    prompt.push_str("\n\nKeep only strictly verified findings and finish via report_back.");
-    prompt
-}
-
 fn parse_agent_report(
     payload: &super::tools::ReportBackPayload,
 ) -> anyhow::Result<AgentReportEnvelopeJson> {
@@ -3598,60 +2677,6 @@ fn validate_agent_report(
         parsed.findings.append(&mut parsed.verified_findings);
     }
     Ok(parsed)
-}
-
-fn parse_reviewer_report(
-    payload: &super::tools::ReportBackPayload,
-) -> anyhow::Result<ReviewerReportEnvelopeJson> {
-    validate_reviewer_report(payload.explanation.clone())
-}
-
-fn validate_reviewer_report(
-    parsed: ReviewerReportEnvelopeJson,
-) -> anyhow::Result<ReviewerReportEnvelopeJson> {
-    if parsed.role.trim().to_ascii_lowercase() != "final_reviewer" {
-        return Err(anyhow::anyhow!(
-            "Reviewer report role must be final_reviewer (got '{}')",
-            parsed.role
-        ));
-    }
-    if !parsed.findings.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Reviewer report must keep findings empty and only populate verified_findings"
-        ));
-    }
-    Ok(parsed)
-}
-
-fn supported_ranges_from_report_back(
-    repo_root: &Path,
-    index: &CodebaseIndex,
-    payload: &super::tools::ReportBackPayload,
-) -> HashMap<PathBuf, Vec<(usize, usize)>> {
-    let mut supported = HashMap::new();
-    for (file_key, ranges) in &payload.files {
-        let Some(raw_file) = resolve_agentic_file(repo_root, file_key) else {
-            continue;
-        };
-        let Some(file) = resolve_index_file(index, &raw_file) else {
-            continue;
-        };
-
-        let entry = supported.entry(file).or_insert_with(Vec::new);
-        for (start, end) in ranges {
-            let Ok(start_u) = usize::try_from(*start) else {
-                continue;
-            };
-            let Ok(end_u) = usize::try_from(*end) else {
-                continue;
-            };
-            if start_u == 0 || end_u < start_u {
-                continue;
-            }
-            entry.push((start_u, end_u));
-        }
-    }
-    supported
 }
 
 fn summarize_agentic_trace(trace: &AgenticTrace) -> String {
@@ -3743,6 +2768,7 @@ pub async fn analyze_codebase_dual_agent_reviewed(
     context: &WorkContext,
     _repo_memory: Option<String>,
     retry_feedback: Option<&str>,
+    stream_sink: Option<SuggestionStreamSink>,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
     let run_id = Uuid::new_v4().to_string();
     let project_ethos = load_project_ethos(repo_root);
@@ -3808,23 +2834,34 @@ pub async fn analyze_codebase_dual_agent_reviewed(
     let mut dual_results = Vec::with_capacity(jobs.len());
     for batch in jobs.chunks(DUAL_ROLE_MAX_INFLIGHT.max(1)) {
         let batch_results = join_all(batch.iter().cloned().map(
-            |(role, batch_idx, files, system, prompt)| async move {
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_millis(DUAL_ROLE_WORKER_TIMEOUT_MS),
-                    call_llm_agentic_report_back_only(
-                        &system,
-                        &prompt,
-                        Model::Speed,
-                        repo_root,
-                        dual_iteration_budget,
-                    ),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("worker timed out after {}ms", DUAL_ROLE_WORKER_TIMEOUT_MS)
-                })
-                .and_then(|inner| inner);
-                (role, batch_idx, files, result)
+            |(role, batch_idx, files, system, prompt)| {
+                let stream_sink = stream_sink.clone();
+                async move {
+                    let worker_stream_sink = stream_sink.as_ref().map(|sink| {
+                        let sink = Arc::clone(sink);
+                        let worker = format!("{}#{}", role, batch_idx + 1);
+                        Arc::new(move |event: AgenticStreamEvent| {
+                            sink(worker.clone(), event.kind, event.line);
+                        }) as AgenticStreamSink
+                    });
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_millis(DUAL_ROLE_WORKER_TIMEOUT_MS),
+                        call_llm_agentic_report_back_only(
+                            &system,
+                            &prompt,
+                            Model::Speed,
+                            repo_root,
+                            dual_iteration_budget,
+                            worker_stream_sink,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("worker timed out after {}ms", DUAL_ROLE_WORKER_TIMEOUT_MS)
+                    })
+                    .and_then(|inner| inner);
+                    (role, batch_idx, files, result)
+                }
             },
         ))
         .await;
@@ -4117,6 +3154,30 @@ pub async fn run_fast_grounded_with_gate_with_progress<F>(
     context: &WorkContext,
     repo_memory: Option<String>,
     gate_config: SuggestionQualityGateConfig,
+    on_progress: F,
+) -> anyhow::Result<GatedSuggestionRunResult>
+where
+    F: FnMut(usize, usize, &SuggestionGateSnapshot, &SuggestionDiagnostics),
+{
+    run_fast_grounded_with_gate_with_progress_and_stream(
+        repo_root,
+        index,
+        context,
+        repo_memory,
+        gate_config,
+        None,
+        on_progress,
+    )
+    .await
+}
+
+pub async fn run_fast_grounded_with_gate_with_progress_and_stream<F>(
+    repo_root: &Path,
+    index: &CodebaseIndex,
+    context: &WorkContext,
+    repo_memory: Option<String>,
+    gate_config: SuggestionQualityGateConfig,
+    stream_sink: Option<SuggestionStreamSink>,
     mut on_progress: F,
 ) -> anyhow::Result<GatedSuggestionRunResult>
 where
@@ -4146,6 +3207,7 @@ where
                 context,
                 repo_memory.clone(),
                 retry_feedback.as_deref(),
+                stream_sink.clone(),
             ),
         )
         .await
