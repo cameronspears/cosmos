@@ -20,7 +20,6 @@ pub use types::{
     ViewMode, WorkflowStep, SPINNER_FRAMES,
 };
 
-use cosmos_adapters::config::SuggestionsProfile;
 use cosmos_core::context::WorkContext;
 use cosmos_core::index::{CodebaseIndex, FlatTreeEntry};
 use cosmos_core::suggest::{Suggestion, SuggestionEngine};
@@ -67,7 +66,6 @@ pub(crate) const ASK_STARTER_QUESTIONS: [&str; 3] = [
     "Where are the biggest reliability risks for users right now?",
     "What are the top 3 improvements with the biggest user impact?",
 ];
-const MAX_UI_SUGGESTIONS_DISPLAY_CAP: usize = 30;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  APP STATE
@@ -98,8 +96,6 @@ pub struct App {
     pub index: CodebaseIndex,
     pub suggestions: SuggestionEngine,
     pub context: WorkContext,
-    pub suggestions_profile: SuggestionsProfile,
-    pub suggestions_display_cap: usize,
 
     // UI state
     pub active_panel: ActivePanel,
@@ -202,22 +198,6 @@ pub struct App {
 impl App {
     /// Create a new Cosmos app
     pub fn new(index: CodebaseIndex, suggestions: SuggestionEngine, context: WorkContext) -> Self {
-        Self::new_with_suggestion_preferences(
-            index,
-            suggestions,
-            context,
-            SuggestionsProfile::BalancedHighVolume,
-            MAX_UI_SUGGESTIONS_DISPLAY_CAP,
-        )
-    }
-
-    pub fn new_with_suggestion_preferences(
-        index: CodebaseIndex,
-        suggestions: SuggestionEngine,
-        context: WorkContext,
-        suggestions_profile: SuggestionsProfile,
-        suggestions_display_cap: usize,
-    ) -> Self {
         let file_tree = build_file_tree(&index);
         let flat_search_entries = build_flat_search_entries(&file_tree);
         let filtered_tree_indices = (0..file_tree.len()).collect();
@@ -234,9 +214,6 @@ impl App {
             index,
             suggestions,
             context,
-            suggestions_profile,
-            suggestions_display_cap: suggestions_display_cap
-                .clamp(1, MAX_UI_SUGGESTIONS_DISPLAY_CAP),
             active_panel: ActivePanel::Suggestions,
             project_scroll: 0,
             project_selected: 0,
@@ -295,8 +272,7 @@ impl App {
     }
 
     fn active_suggestions_for_display(&self) -> Vec<&Suggestion> {
-        self.suggestions
-            .active_suggestions_with_limit(self.suggestions_display_cap)
+        self.suggestions.active_suggestions()
     }
 
     /// Apply a new grouping and rebuild grouped trees.
@@ -958,6 +934,7 @@ impl App {
         self.overlay = Overlay::Alert {
             title: title.into(),
             message: message.into(),
+            scroll: 0,
         };
         self.needs_redraw = true;
     }
@@ -1211,7 +1188,9 @@ impl App {
     /// Scroll overlay down
     pub fn overlay_scroll_down(&mut self) {
         match &mut self.overlay {
-            Overlay::Help { scroll } | Overlay::FileDetail { scroll, .. } => {
+            Overlay::Alert { scroll, .. }
+            | Overlay::Help { scroll }
+            | Overlay::FileDetail { scroll, .. } => {
                 *scroll += 1;
             }
             _ => {}
@@ -1221,7 +1200,9 @@ impl App {
     /// Scroll overlay up
     pub fn overlay_scroll_up(&mut self) {
         match &mut self.overlay {
-            Overlay::Help { scroll } | Overlay::FileDetail { scroll, .. } => {
+            Overlay::Alert { scroll, .. }
+            | Overlay::Help { scroll }
+            | Overlay::FileDetail { scroll, .. } => {
                 *scroll = scroll.saturating_sub(1);
             }
             _ => {}
@@ -1978,5 +1959,31 @@ mod tests {
             app.startup_check_selected_action(),
             Some(StartupAction::SaveStartFresh)
         );
+    }
+
+    #[test]
+    fn alert_overlay_scroll_state_is_tracked() {
+        let mut app = make_test_app();
+        app.open_alert("Failure", "Long error body");
+
+        if let Overlay::Alert { scroll, .. } = &app.overlay {
+            assert_eq!(*scroll, 0);
+        } else {
+            panic!("expected alert overlay");
+        }
+
+        app.overlay_scroll_down();
+        if let Overlay::Alert { scroll, .. } = &app.overlay {
+            assert_eq!(*scroll, 1);
+        } else {
+            panic!("expected alert overlay");
+        }
+
+        app.overlay_scroll_up();
+        if let Overlay::Alert { scroll, .. } = &app.overlay {
+            assert_eq!(*scroll, 0);
+        } else {
+            panic!("expected alert overlay");
+        }
     }
 }

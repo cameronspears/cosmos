@@ -178,9 +178,7 @@ fn render_suggestions_content<'a>(
     visible_height: usize,
     inner_width: usize,
 ) {
-    let suggestions = app
-        .suggestions
-        .active_suggestions_with_limit(app.suggestions_display_cap);
+    let suggestions = app.suggestions.active_suggestions();
 
     // Top padding for breathing room
     lines.push(Line::from(""));
@@ -334,6 +332,37 @@ fn render_suggestions_content<'a>(
             Style::default().fg(Theme::GREY_500)
         };
 
+        let criticality_label = match suggestion.criticality {
+            cosmos_core::suggest::Criticality::Critical => "CRIT",
+            cosmos_core::suggest::Criticality::High => "HIGH",
+            cosmos_core::suggest::Criticality::Medium => "MED",
+            cosmos_core::suggest::Criticality::Low => "LOW",
+        };
+        let criticality_style = match suggestion.criticality {
+            cosmos_core::suggest::Criticality::Critical => {
+                Style::default().fg(Theme::GREY_900).bg(Theme::RED)
+            }
+            cosmos_core::suggest::Criticality::High => {
+                Style::default().fg(Theme::GREY_900).bg(Theme::YELLOW)
+            }
+            cosmos_core::suggest::Criticality::Medium => {
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300)
+            }
+            cosmos_core::suggest::Criticality::Low => {
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400)
+            }
+        };
+
+        let category_label = suggestion.category.label().to_ascii_uppercase();
+        let category_style = match suggestion.category {
+            cosmos_core::suggest::SuggestionCategory::Bug => {
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300)
+            }
+            cosmos_core::suggest::SuggestionCategory::Security => {
+                Style::default().fg(Theme::GREY_900).bg(Theme::ACCENT)
+            }
+        };
+
         // Multi-file indicator
         let multi_file_indicator = if suggestion.is_multi_file() {
             format!(" [{}]", suggestion.file_count())
@@ -351,8 +380,17 @@ fn render_suggestions_content<'a>(
             Style::default().fg(Theme::GREY_300)
         };
 
-        // First line has: padding (2) + kind + multi-file + ": "
-        let first_prefix_len = 2 + kind_label.len() + multi_file_indicator.len() + 2;
+        // First line has: padding + badges + kind + multi-file + ": "
+        let first_prefix_len = 2
+            + 2
+            + criticality_label.len()
+            + 2
+            + 2
+            + category_label.len()
+            + 2
+            + kind_label.len()
+            + multi_file_indicator.len()
+            + 2;
         let first_line_width = text_width.saturating_sub(first_prefix_len);
         // Continuation lines just have small indent (5 chars)
         let cont_indent = "     ";
@@ -366,6 +404,10 @@ fn render_suggestions_content<'a>(
         if let Some(first_line) = wrapped.first() {
             let mut spans = vec![
                 Span::styled("  ", Style::default()),
+                Span::styled(format!(" {} ", criticality_label), criticality_style),
+                Span::styled(" ", Style::default()),
+                Span::styled(format!(" {} ", category_label), category_style),
+                Span::styled(" ", Style::default()),
                 Span::styled(kind_label, kind_style),
             ];
             if suggestion.is_multi_file() {
@@ -1217,7 +1259,10 @@ mod tests {
     use super::*;
     use cosmos_core::context::WorkContext;
     use cosmos_core::index::CodebaseIndex;
-    use cosmos_core::suggest::SuggestionEngine;
+    use cosmos_core::suggest::{
+        Criticality, Priority, Suggestion, SuggestionCategory, SuggestionEngine, SuggestionKind,
+        SuggestionSource,
+    };
     use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1304,5 +1349,31 @@ mod tests {
         assert!(rendered.contains(" choose "));
         assert!(rendered.contains(" ask "));
         assert!(rendered.contains(" cancel "));
+    }
+
+    #[test]
+    fn suggestions_render_category_and_criticality_badges() {
+        let mut app = make_test_app();
+        let suggestion = Suggestion::new(
+            SuggestionKind::BugFix,
+            Priority::High,
+            std::path::PathBuf::from("src/auth.rs"),
+            "Authorization bypass when token validation is skipped.".to_string(),
+            SuggestionSource::LlmDeep,
+        )
+        .with_category(SuggestionCategory::Security)
+        .with_criticality(Criticality::Critical);
+        app.suggestions.add_llm_suggestion(suggestion);
+
+        let mut lines = Vec::new();
+        render_suggestions_content(&mut lines, &app, true, 18, 90);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("CRIT"));
+        assert!(rendered.contains("SECURITY"));
     }
 }

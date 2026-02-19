@@ -9,50 +9,23 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-const DEFAULT_SUGGESTIONS_DISPLAY_CAP: usize = 30;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SuggestionsProfile {
-    Strict,
-    #[default]
-    BalancedHighVolume,
-    MaxVolume,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Anonymous per-install identifier used for OpenRouter request stickiness.
     /// Cosmos may send selected code snippets + file paths to OpenRouter to generate/validate AI output.
     pub openrouter_user_id: Option<String>,
-    /// Persistent suggestion volume profile for quality gating.
-    #[serde(default)]
-    pub suggestions_profile: SuggestionsProfile,
-    /// Maximum number of active suggestions rendered in the UI.
-    #[serde(default = "default_suggestions_display_cap")]
-    pub suggestions_display_cap: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             openrouter_user_id: None,
-            suggestions_profile: SuggestionsProfile::BalancedHighVolume,
-            suggestions_display_cap: DEFAULT_SUGGESTIONS_DISPLAY_CAP,
         }
     }
 }
 
-fn default_suggestions_display_cap() -> usize {
-    DEFAULT_SUGGESTIONS_DISPLAY_CAP
-}
-
 impl Config {
-    fn sanitize(&mut self) {
-        self.suggestions_display_cap = self
-            .suggestions_display_cap
-            .clamp(1, DEFAULT_SUGGESTIONS_DISPLAY_CAP);
-    }
+    fn sanitize(&mut self) {}
 
     /// Get the config directory path
     fn config_dir() -> Option<PathBuf> {
@@ -312,60 +285,22 @@ mod tests {
     fn test_config_default() {
         let config = Config::default();
         assert!(config.openrouter_user_id.is_none());
-        assert_eq!(
-            config.suggestions_profile,
-            SuggestionsProfile::BalancedHighVolume
-        );
-        assert_eq!(
-            config.suggestions_display_cap,
-            DEFAULT_SUGGESTIONS_DISPLAY_CAP
-        );
     }
 
     #[test]
     fn test_config_deserializes_legacy_shape_with_defaults() {
-        let legacy = r#"{"openrouter_user_id":"anon-123"}"#;
+        let legacy = r#"{"openrouter_user_id":"anon-123","suggestions_profile":"strict","suggestions_display_cap":5}"#;
         let parsed: Config = serde_json::from_str(legacy).unwrap();
         assert_eq!(parsed.openrouter_user_id.as_deref(), Some("anon-123"));
-        assert_eq!(
-            parsed.suggestions_profile,
-            SuggestionsProfile::BalancedHighVolume
-        );
-        assert_eq!(
-            parsed.suggestions_display_cap,
-            DEFAULT_SUGGESTIONS_DISPLAY_CAP
-        );
     }
 
     #[test]
-    fn test_config_round_trip_with_suggestion_controls() {
+    fn test_config_round_trip() {
         let config = Config {
             openrouter_user_id: Some("anon-456".to_string()),
-            suggestions_profile: SuggestionsProfile::MaxVolume,
-            suggestions_display_cap: 30,
         };
         let encoded = serde_json::to_string(&config).unwrap();
         let decoded: Config = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.openrouter_user_id.as_deref(), Some("anon-456"));
-        assert_eq!(decoded.suggestions_profile, SuggestionsProfile::MaxVolume);
-        assert_eq!(decoded.suggestions_display_cap, 30);
-    }
-
-    #[test]
-    fn test_config_sanitize_clamps_invalid_display_cap() {
-        let mut config = Config {
-            openrouter_user_id: None,
-            suggestions_profile: SuggestionsProfile::Strict,
-            suggestions_display_cap: 0,
-        };
-        config.sanitize();
-        assert_eq!(config.suggestions_display_cap, 1);
-
-        config.suggestions_display_cap = 999;
-        config.sanitize();
-        assert_eq!(
-            config.suggestions_display_cap,
-            DEFAULT_SUGGESTIONS_DISPLAY_CAP
-        );
     }
 }

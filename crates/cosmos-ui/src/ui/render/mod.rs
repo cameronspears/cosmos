@@ -45,7 +45,11 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     // Overlays
     match &app.overlay {
-        Overlay::Alert { title, message } => render_alert(frame, title, message),
+        Overlay::Alert {
+            title,
+            message,
+            scroll,
+        } => render_alert(frame, title, message, *scroll),
         Overlay::Help { scroll } => render_help(frame, *scroll),
         Overlay::FileDetail { path, scroll } => {
             if let Some(file_index) = app.index.files.get(path) {

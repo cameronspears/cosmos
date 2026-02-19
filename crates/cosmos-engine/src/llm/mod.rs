@@ -12,8 +12,8 @@ pub mod review;
 pub mod tools;
 
 pub use analysis::{
-    analyze_codebase_fast_grounded, ask_question, run_fast_grounded_with_gate,
-    run_fast_grounded_with_gate_with_progress, suggestion_gate_config_for_profile,
+    analyze_codebase_dual_agent_reviewed, analyze_codebase_fast_grounded, ask_question,
+    run_fast_grounded_with_gate, run_fast_grounded_with_gate_with_progress,
     GatedSuggestionRunResult, SuggestionDiagnostics, SuggestionGateSnapshot,
     SuggestionQualityGateConfig,
 };

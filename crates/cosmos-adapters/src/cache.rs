@@ -37,6 +37,7 @@ const SUGGESTION_QUALITY_FILE: &str = "suggestion_quality.jsonl";
 const IMPLEMENTATION_HARNESS_FILE: &str = "implementation_harness.jsonl";
 const SUGGESTION_RUN_AUDIT_FILE: &str = "suggestion_runs.jsonl";
 const APPLY_PLAN_AUDIT_FILE: &str = "apply_plan_audit.jsonl";
+const SUGGESTION_COVERAGE_FILE: &str = "suggestion_coverage.json";
 const CACHE_LOCK_TIMEOUT_SECS: u64 = 5;
 const CACHE_LOCK_RETRY_MS: u64 = 50;
 
@@ -273,6 +274,83 @@ pub struct GroupingAiCache {
     pub cached_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuggestionCoverageCache {
+    pub updated_at: DateTime<Utc>,
+    pub recently_scanned: HashMap<PathBuf, DateTime<Utc>>,
+}
+
+impl SuggestionCoverageCache {
+    pub fn new() -> Self {
+        Self {
+            updated_at: Utc::now(),
+            recently_scanned: HashMap::new(),
+        }
+    }
+
+    pub fn normalize_paths(&mut self, root: &Path) -> bool {
+        if self.recently_scanned.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let mut normalized = HashMap::with_capacity(self.recently_scanned.len());
+        for (path, ts) in &self.recently_scanned {
+            let key = normalize_cache_path(path, root);
+            if &key != path {
+                changed = true;
+            }
+            let replace = normalized
+                .get(&key)
+                .map(|existing: &DateTime<Utc>| ts > existing)
+                .unwrap_or(true);
+            if replace {
+                normalized.insert(key, *ts);
+            }
+        }
+        if changed {
+            self.recently_scanned = normalized;
+            self.updated_at = Utc::now();
+        }
+        changed
+    }
+
+    pub fn record_scan<I>(&mut self, files: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let now = Utc::now();
+        for file in files {
+            self.recently_scanned.insert(file, now);
+        }
+        self.updated_at = now;
+    }
+
+    pub fn scanned_at(&self, path: &Path) -> Option<DateTime<Utc>> {
+        self.recently_scanned.get(path).copied()
+    }
+
+    pub fn prune(&mut self, keep_limit: usize) {
+        if self.recently_scanned.len() <= keep_limit {
+            return;
+        }
+        let mut by_time = self
+            .recently_scanned
+            .iter()
+            .map(|(path, ts)| (path.clone(), *ts))
+            .collect::<Vec<_>>();
+        by_time.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        by_time.truncate(keep_limit);
+        self.recently_scanned = by_time.into_iter().collect();
+        self.updated_at = Utc::now();
+    }
+}
+
+impl Default for SuggestionCoverageCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Lightweight pipeline metric row written as JSONL to `.cosmos/pipeline_metrics.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineMetricRecord {
@@ -324,6 +402,26 @@ pub struct SuggestionRunAuditRecord {
     pub suggestion_count: usize,
     pub validated_count: usize,
     pub rejected_count: usize,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub parse_strategy: Option<String>,
+    #[serde(default)]
+    pub attempt_index: Option<usize>,
+    #[serde(default)]
+    pub attempt_count: Option<usize>,
+    #[serde(default)]
+    pub gate_passed: Option<bool>,
+    #[serde(default)]
+    pub gate_fail_reasons: Vec<String>,
+    #[serde(default)]
+    pub llm_ms: Option<u64>,
+    #[serde(default)]
+    pub tool_calls: Option<usize>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+    #[serde(default)]
+    pub response_preview: Option<String>,
     pub suggestions: Vec<Suggestion>,
 }
 
@@ -869,6 +967,33 @@ impl Cache {
         Ok(())
     }
 
+    pub fn load_suggestion_coverage_cache(&self) -> Option<SuggestionCoverageCache> {
+        let path = self.cache_dir.join(SUGGESTION_COVERAGE_FILE);
+        if !path.exists() {
+            return None;
+        }
+        let _lock = self.lock(false).ok()?;
+        let content = fs::read_to_string(&path).ok()?;
+        let mut cache: SuggestionCoverageCache = serde_json::from_str(&content).ok()?;
+        let root = self
+            .cache_root
+            .parent()
+            .unwrap_or(self.cache_root.as_path());
+        let _ = cache.normalize_paths(root);
+        Some(cache)
+    }
+
+    pub fn save_suggestion_coverage_cache(
+        &self,
+        coverage: &SuggestionCoverageCache,
+    ) -> anyhow::Result<()> {
+        let _lock = self.lock(true)?;
+        let path = self.cache_dir.join(SUGGESTION_COVERAGE_FILE);
+        let content = serde_json::to_string(coverage)?;
+        write_atomic(&path, &content)?;
+        Ok(())
+    }
+
     /// Append a pipeline metric record (JSONL) for latency/cost tracking.
     pub fn append_pipeline_metric(&self, record: &PipelineMetricRecord) -> anyhow::Result<()> {
         let _lock = self.lock(true)?;
@@ -1086,6 +1211,7 @@ impl Cache {
                     SUGGESTIONS_CACHE_FILE,
                     SUGGESTION_RUN_AUDIT_FILE,
                     APPLY_PLAN_AUDIT_FILE,
+                    SUGGESTION_COVERAGE_FILE,
                 ],
                 ResetOption::Glossary => vec![GLOSSARY_FILE],
                 ResetOption::Memory => vec![MEMORY_FILE],
@@ -1689,6 +1815,16 @@ mod tests {
                 suggestion_count: 1,
                 validated_count: 1,
                 rejected_count: 0,
+                model: None,
+                parse_strategy: None,
+                attempt_index: None,
+                attempt_count: None,
+                gate_passed: None,
+                gate_fail_reasons: Vec::new(),
+                llm_ms: None,
+                tool_calls: None,
+                notes: Vec::new(),
+                response_preview: None,
                 suggestions: vec![suggestion.clone()],
             };
             cache.append_suggestion_run_audit(&run_row).unwrap();
@@ -1736,6 +1872,47 @@ mod tests {
         cache.clear_selective(&[ResetOption::Suggestions]).unwrap();
         assert!(!cache_dir.join(SUGGESTION_RUN_AUDIT_FILE).exists());
         assert!(!cache_dir.join(APPLY_PLAN_AUDIT_FILE).exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn suggestion_coverage_round_trip_and_suggestions_reset() {
+        let mut root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!("cosmos_suggestion_coverage_test_{}", nanos));
+        fs::create_dir_all(&root).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .expect("git init should run");
+
+        let cache = Cache::new(&root);
+        let mut coverage = SuggestionCoverageCache::new();
+        coverage.record_scan(vec![
+            PathBuf::from("src/a.rs"),
+            PathBuf::from("src/b.rs"),
+            PathBuf::from("src/c.rs"),
+        ]);
+        cache.save_suggestion_coverage_cache(&coverage).unwrap();
+
+        let loaded = cache
+            .load_suggestion_coverage_cache()
+            .expect("coverage should load");
+        assert_eq!(loaded.recently_scanned.len(), 3);
+        assert!(loaded
+            .recently_scanned
+            .contains_key(&PathBuf::from("src/a.rs")));
+
+        let cache_dir = root.join(CACHE_DIR).join(CACHE_LAYOUT_V2_DIR);
+        assert!(cache_dir.join(SUGGESTION_COVERAGE_FILE).exists());
+        cache.clear_selective(&[ResetOption::Suggestions]).unwrap();
+        assert!(!cache_dir.join(SUGGESTION_COVERAGE_FILE).exists());
 
         let _ = fs::remove_dir_all(&root);
     }

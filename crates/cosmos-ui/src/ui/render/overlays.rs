@@ -10,11 +10,30 @@ use ratatui::{
 };
 use std::path::{Path, PathBuf};
 
-pub(super) fn render_alert(frame: &mut Frame, title: &str, message: &str) {
-    let area = centered_rect(58, 36, frame.area());
+pub(super) fn render_alert(frame: &mut Frame, title: &str, message: &str, scroll: usize) {
+    let viewport = frame.area();
+    let max_width = viewport.width.saturating_sub(2).max(24);
+    let preferred_width = viewport.width.saturating_sub(6).min(132).max(56);
+    let width = preferred_width.min(max_width);
+    let text_width = width.saturating_sub(8).max(16) as usize;
+    let wrapped_message = wrap_text(message, text_width);
+
+    // base lines: blank + title + blank + message + blank
+    let desired_content_lines = 4usize.saturating_add(wrapped_message.len());
+    // +1 for footer line, +2 for border
+    let mut desired_height = (desired_content_lines.saturating_add(3)) as u16;
+    let min_height = 9u16;
+    let max_height = viewport.height.saturating_sub(2).max(min_height);
+    desired_height = desired_height.clamp(min_height, max_height);
+
+    let area = Rect::new(
+        viewport.x + viewport.width.saturating_sub(width) / 2,
+        viewport.y + viewport.height.saturating_sub(desired_height) / 2,
+        width,
+        desired_height,
+    );
     frame.render_widget(Clear, area);
 
-    let text_width = area.width.saturating_sub(8).max(16) as usize;
     let mut lines: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
@@ -26,41 +45,81 @@ pub(super) fn render_alert(frame: &mut Frame, title: &str, message: &str) {
         Line::from(""),
     ];
 
-    for line in wrap_text(message, text_width) {
+    for line in wrapped_message {
         lines.push(Line::from(vec![Span::styled(
             format!("  {}", line),
             Style::default().fg(Theme::GREY_200),
         )]));
     }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  ", Style::default()),
-        Span::styled(
-            " Enter ",
-            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300),
-        ),
-        Span::styled(" or ", Style::default().fg(Theme::GREY_500)),
-        Span::styled(
-            " Esc ",
-            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300),
-        ),
-        Span::styled(" to close", Style::default().fg(Theme::GREY_500)),
-    ]));
     lines.push(Line::from(""));
 
-    let block = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(" Message ")
-                .title_style(Style::default().fg(Theme::GREY_100))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Theme::GREY_400))
-                .style(Style::default().bg(Theme::GREY_800)),
-        )
-        .wrap(Wrap { trim: false });
-
+    let block = Block::default()
+        .title(" Message ")
+        .title_style(Style::default().fg(Theme::GREY_100))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::GREY_400))
+        .style(Style::default().bg(Theme::GREY_800));
+    let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let content_area = chunks[0];
+    let footer_area = chunks[1];
+
+    let max_scroll = lines
+        .len()
+        .saturating_sub(content_area.height.max(1) as usize);
+    let effective_scroll = scroll.min(max_scroll);
+
+    let content = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((effective_scroll as u16, 0))
+        .style(Style::default().bg(Theme::GREY_800));
+    frame.render_widget(content, content_area);
+
+    let footer_line = if max_scroll > 0 {
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "  ↑/↓ scroll ({}/{})  ",
+                    effective_scroll + 1,
+                    max_scroll + 1
+                ),
+                Style::default().fg(Theme::GREY_500),
+            ),
+            Span::styled(
+                "Enter",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300),
+            ),
+            Span::styled(" or ", Style::default().fg(Theme::GREY_500)),
+            Span::styled(
+                "Esc",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300),
+            ),
+            Span::styled(" to close", Style::default().fg(Theme::GREY_500)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                "Enter",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300),
+            ),
+            Span::styled(" or ", Style::default().fg(Theme::GREY_500)),
+            Span::styled(
+                "Esc",
+                Style::default().fg(Theme::GREY_900).bg(Theme::GREY_300),
+            ),
+            Span::styled(" to close", Style::default().fg(Theme::GREY_500)),
+        ])
+    };
+    frame.render_widget(
+        Paragraph::new(vec![footer_line]).style(Style::default().bg(Theme::GREY_800)),
+        footer_area,
+    );
 }
 
 pub(super) fn render_help(frame: &mut Frame, scroll: usize) {

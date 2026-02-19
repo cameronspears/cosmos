@@ -91,8 +91,21 @@ fn execute_startup_switch_to_main(app: &mut App, ctx: &RuntimeContext, main_bran
 
 /// Handle key events when an overlay is active
 fn handle_alert_overlay_input(app: &mut App, key: &KeyEvent) {
-    if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
-        app.close_overlay();
+    match key.code {
+        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
+        KeyCode::Down | KeyCode::Char('j') => app.overlay_scroll_down(),
+        KeyCode::Up | KeyCode::Char('k') => app.overlay_scroll_up(),
+        KeyCode::PageDown => {
+            for _ in 0..6 {
+                app.overlay_scroll_down();
+            }
+        }
+        KeyCode::PageUp => {
+            for _ in 0..6 {
+                app.overlay_scroll_up();
+            }
+        }
+        _ => {}
     }
 }
 

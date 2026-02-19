@@ -95,6 +95,7 @@ pub enum Overlay {
     Alert {
         title: String,
         message: String,
+        scroll: usize,
     },
     Help {
         scroll: usize,

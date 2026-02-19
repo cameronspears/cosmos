@@ -52,7 +52,15 @@ cargo run -p cosmos-tui -- --setup
 
 # Setup GitHub login
 cargo run -p cosmos-tui -- --github-login
+
+# Run suggestions in non-interactive audit mode with detailed trace diagnostics
+cargo run -p cosmos-tui -- --suggest-audit --suggest-runs 1 --suggest-trace
+
+# Stream reasoning/thinking deltas live during audit
+cargo run -p cosmos-tui -- --suggest-audit --suggest-runs 1 --suggest-trace --suggest-stream-reasoning
 ```
+
+See `docs/suggestions-observability.md` for the Suggestions pipeline diagram and trace workflow.
 
 ## Development
 

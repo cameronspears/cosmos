@@ -51,7 +51,6 @@ fn spawn_suggestions_generation(
     repo_root: PathBuf,
     index: cosmos_core::index::CodebaseIndex,
     context: cosmos_core::context::WorkContext,
-    suggestions_profile: cosmos_adapters::config::SuggestionsProfile,
     repo_memory_context: String,
 ) {
     let tx_suggestions = tx.clone();
@@ -62,28 +61,21 @@ fn spawn_suggestions_generation(
         } else {
             Some(repo_memory_context)
         };
-        let generation_target =
-            cosmos_engine::llm::suggestion_gate_config_for_profile(suggestions_profile)
-                .max_final_count
-                .max(1);
-        let run = cosmos_engine::llm::analyze_codebase_fast_grounded(
+        let run = cosmos_engine::llm::run_fast_grounded_with_gate(
             &repo_root,
             &index,
             &context,
             mem,
-            cosmos_engine::llm::models::Model::Smart,
-            generation_target,
-            None,
+            cosmos_engine::llm::SuggestionQualityGateConfig::default(),
         )
         .await;
 
         match run {
-            Ok((suggestions, usage, mut diagnostics)) => {
+            Ok(result) => {
+                let suggestions = result.suggestions;
+                let usage = result.usage;
+                let mut diagnostics = result.diagnostics;
                 diagnostics.refinement_complete = true;
-                diagnostics.provisional_count = suggestions.len();
-                diagnostics.validated_count = suggestions.len();
-                diagnostics.rejected_count = 0;
-                diagnostics.final_count = suggestions.len();
                 let model = diagnostics.model.clone();
 
                 let _ = tx_suggestions.send(BackgroundMessage::SuggestionsReady {
@@ -136,14 +128,7 @@ pub fn request_suggestions_refresh(
     let index = app.index.clone();
     let context = app.context.clone();
     let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
-    spawn_suggestions_generation(
-        tx,
-        repo_root,
-        index,
-        context,
-        app.suggestions_profile,
-        repo_memory_context,
-    );
+    spawn_suggestions_generation(tx, repo_root, index, context, repo_memory_context);
     true
 }
 
@@ -174,6 +159,20 @@ fn handle_suggestions_ready_message(
         suggestion_count: suggestions.len(),
         validated_count,
         rejected_count: diagnostics.rejected_count,
+        model: Some(model.clone()),
+        parse_strategy: Some(diagnostics.parse_strategy.clone()),
+        attempt_index: Some(diagnostics.attempt_index),
+        attempt_count: Some(diagnostics.attempt_count),
+        gate_passed: Some(diagnostics.gate_passed),
+        gate_fail_reasons: diagnostics.gate_fail_reasons.clone(),
+        llm_ms: Some(diagnostics.llm_ms),
+        tool_calls: Some(diagnostics.tool_calls),
+        notes: diagnostics.notes.clone(),
+        response_preview: if diagnostics.response_preview.trim().is_empty() {
+            None
+        } else {
+            Some(diagnostics.response_preview.clone())
+        },
         suggestions: suggestions.clone(),
     };
     let _ = cache.append_suggestion_run_audit(&run_audit);
@@ -458,7 +457,7 @@ fn handle_suggestions_error_message(app: &mut App, error: String) {
     if !maybe_prompt_api_key_overlay(app, &error) {
         app.open_alert(
             "Suggestions failed",
-            format!("Couldn't generate suggestions: {}", truncate(&error, 420)),
+            format!("Couldn't generate suggestions: {}", error),
         );
     }
     app.clear_apply_confirm();

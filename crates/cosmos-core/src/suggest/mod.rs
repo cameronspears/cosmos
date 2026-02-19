@@ -1,10 +1,7 @@
 //! Suggestion engine for Cosmos
 //!
-//! LLM-driven suggestions with a hard cap to avoid overwhelming users.
+//! LLM-driven suggestions.
 //! Suggestions are generated on-demand via `analyze_codebase()`.
-
-/// Maximum suggestions to display to avoid overwhelming users
-const MAX_SUGGESTIONS: usize = 30;
 
 use crate::index::CodebaseIndex;
 use chrono::{DateTime, Utc};
@@ -67,6 +64,53 @@ pub enum Priority {
     Low,
     Medium,
     High,
+}
+
+/// Suggestion category shown in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SuggestionCategory {
+    #[default]
+    Bug,
+    Security,
+}
+
+impl SuggestionCategory {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SuggestionCategory::Bug => "Bug",
+            SuggestionCategory::Security => "Security",
+        }
+    }
+}
+
+/// Criticality level used for primary ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Criticality {
+    Low,
+    #[default]
+    Medium,
+    High,
+    Critical,
+}
+
+impl Criticality {
+    pub fn from_priority(priority: Priority) -> Self {
+        match priority {
+            Priority::Low => Criticality::Low,
+            Priority::Medium => Criticality::Medium,
+            Priority::High => Criticality::High,
+        }
+    }
+
+    pub fn to_priority(self) -> Priority {
+        match self {
+            Criticality::Low => Priority::Low,
+            Criticality::Medium => Priority::Medium,
+            Criticality::High | Criticality::Critical => Priority::High,
+        }
+    }
 }
 
 /// Confidence level for suggestions
@@ -140,6 +184,10 @@ pub struct SuggestionEvidenceRef {
 pub struct Suggestion {
     pub id: Uuid,
     pub kind: SuggestionKind,
+    #[serde(default)]
+    pub category: SuggestionCategory,
+    #[serde(default)]
+    pub criticality: Criticality,
     pub priority: Priority,
     /// Confidence level (high = verified by reading code, medium = likely, low = uncertain)
     #[serde(default)]
@@ -193,6 +241,8 @@ impl Suggestion {
         Self {
             id: Uuid::new_v4(),
             kind,
+            category: SuggestionCategory::Bug,
+            criticality: Criticality::from_priority(priority),
             priority,
             confidence: Confidence::default(),
             file,
@@ -216,6 +266,17 @@ impl Suggestion {
 
     pub fn with_confidence(mut self, confidence: Confidence) -> Self {
         self.confidence = confidence;
+        self
+    }
+
+    pub fn with_category(mut self, category: SuggestionCategory) -> Self {
+        self.category = category;
+        self
+    }
+
+    pub fn with_criticality(mut self, criticality: Criticality) -> Self {
+        self.criticality = criticality;
+        self.priority = criticality.to_priority();
         self
     }
 
@@ -303,8 +364,12 @@ impl SuggestionEngine {
         }
     }
 
-    fn sort_by_priority_desc(&mut self) {
-        self.suggestions.sort_by(|a, b| b.priority.cmp(&a.priority));
+    fn sort_by_criticality_desc(&mut self) {
+        self.suggestions.sort_by(|a, b| {
+            b.criticality
+                .cmp(&a.criticality)
+                .then_with(|| b.priority.cmp(&a.priority))
+        });
     }
 
     fn kind_weight(kind: SuggestionKind) -> i64 {
@@ -340,21 +405,20 @@ impl SuggestionEngine {
         }
     }
 
-    /// Get all active suggestions (not yet applied), capped at MAX_SUGGESTIONS.
+    /// Get all active suggestions (not yet applied).
     pub fn active_suggestions(&self) -> Vec<&Suggestion> {
-        self.active_suggestions_with_limit(MAX_SUGGESTIONS)
+        self.suggestions.iter().filter(|s| !s.applied).collect()
     }
 
-    /// Get active suggestions (not yet applied), capped by caller limit and MAX_SUGGESTIONS.
+    /// Get active suggestions (not yet applied), capped by caller limit.
     pub fn active_suggestions_with_limit(&self, limit: usize) -> Vec<&Suggestion> {
         if limit == 0 {
             return Vec::new();
         }
-        let cap = limit.min(MAX_SUGGESTIONS);
         self.suggestions
             .iter()
             .filter(|s| !s.applied)
-            .take(cap)
+            .take(limit)
             .collect()
     }
 
@@ -371,7 +435,7 @@ impl SuggestionEngine {
     /// Add a suggestion from LLM
     pub fn add_llm_suggestion(&mut self, suggestion: Suggestion) {
         self.suggestions.push(suggestion);
-        self.sort_by_priority_desc();
+        self.sort_by_criticality_desc();
     }
 
     /// Replace provisional LLM suggestions with refined suggestions.
@@ -381,7 +445,7 @@ impl SuggestionEngine {
         self.suggestions
             .retain(|s| s.source != SuggestionSource::LlmDeep || s.applied);
         self.suggestions.append(&mut suggestions);
-        self.sort_by_priority_desc();
+        self.sort_by_criticality_desc();
     }
 
     /// Sort suggestions by priority first, then confidence and contradiction history,
@@ -411,7 +475,13 @@ impl SuggestionEngine {
         }
 
         self.suggestions.sort_by(|a, b| {
-            // Priority is the primary sort criterion
+            // Criticality is the primary sort criterion
+            let crit = b.criticality.cmp(&a.criticality);
+            if crit != std::cmp::Ordering::Equal {
+                return crit;
+            }
+
+            // Keep legacy priority as a fallback tie-breaker.
             let pri = b.priority.cmp(&a.priority);
             if pri != std::cmp::Ordering::Equal {
                 return pri;
@@ -468,6 +538,13 @@ mod tests {
     }
 
     #[test]
+    fn test_criticality_ordering() {
+        assert!(Criticality::Critical > Criticality::High);
+        assert!(Criticality::High > Criticality::Medium);
+        assert!(Criticality::Medium > Criticality::Low);
+    }
+
+    #[test]
     fn test_suggestion_creation() {
         let suggestion = Suggestion::new(
             SuggestionKind::Improvement,
@@ -494,6 +571,8 @@ mod tests {
 
         let mut value = serde_json::to_value(&suggestion).unwrap();
         if let Value::Object(map) = &mut value {
+            map.remove("category");
+            map.remove("criticality");
             map.remove("evidence");
             map.remove("evidence_refs");
             map.remove("verification_state");
@@ -504,13 +583,15 @@ mod tests {
         let round: Suggestion = serde_json::from_value(value).unwrap();
         assert!(round.evidence.is_none());
         assert!(round.evidence_refs.is_empty());
+        assert_eq!(round.category, SuggestionCategory::Bug);
+        assert_eq!(round.criticality, Criticality::Medium);
         assert_eq!(round.verification_state, VerificationState::Unverified);
         assert_eq!(round.validation_state, SuggestionValidationState::Pending);
         assert!(round.validation_metadata.why_interesting.is_none());
     }
 
     #[test]
-    fn test_active_suggestions_with_limit_caps_and_keeps_wrapper_compatibility() {
+    fn test_active_suggestions_with_limit_respects_only_callers_cap() {
         let index = CodebaseIndex {
             root: PathBuf::from("."),
             files: std::collections::HashMap::new(),
@@ -532,10 +613,10 @@ mod tests {
         assert_eq!(capped_30.len(), 30);
 
         let capped_overflow = engine.active_suggestions_with_limit(99);
-        assert_eq!(capped_overflow.len(), 30);
+        assert_eq!(capped_overflow.len(), 40);
 
         let wrapper = engine.active_suggestions();
-        assert_eq!(wrapper.len(), 30);
+        assert_eq!(wrapper.len(), 40);
     }
 
     #[test]
