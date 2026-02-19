@@ -11,9 +11,96 @@ use uuid::Uuid;
 
 /// OpenRouter direct API URL (BYOK mode)
 pub(crate) const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+/// Groq OpenAI-compatible API URL (direct mode)
+pub(crate) const GROQ_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 
-/// Maximum length for error content in error messages
-const MAX_ERROR_CONTENT_LEN: usize = 200;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LlmBackend {
+    OpenRouter,
+    Groq,
+}
+
+fn parse_llm_backend(value: Option<&str>) -> LlmBackend {
+    match value
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("openrouter")
+    {
+        "groq" => LlmBackend::Groq,
+        _ => LlmBackend::OpenRouter,
+    }
+}
+
+pub(crate) fn llm_backend() -> LlmBackend {
+    parse_llm_backend(std::env::var("COSMOS_LLM_BACKEND").ok().as_deref())
+}
+
+pub(crate) fn is_openrouter_backend() -> bool {
+    llm_backend() == LlmBackend::OpenRouter
+}
+
+fn backend_label() -> &'static str {
+    match llm_backend() {
+        LlmBackend::OpenRouter => "OpenRouter",
+        LlmBackend::Groq => "Groq",
+    }
+}
+
+pub(crate) fn chat_completions_url() -> &'static str {
+    match llm_backend() {
+        LlmBackend::OpenRouter => OPENROUTER_URL,
+        LlmBackend::Groq => GROQ_URL,
+    }
+}
+
+fn model_id_for_backend_impl(model: Model, backend: LlmBackend) -> String {
+    let id = model.id();
+    if backend == LlmBackend::Groq && id.starts_with("openai/gpt-oss-120b") {
+        "openai/gpt-oss-120b".to_string()
+    } else {
+        id.to_string()
+    }
+}
+
+pub(crate) fn model_id_for_backend(model: Model) -> String {
+    model_id_for_backend_impl(model, llm_backend())
+}
+
+fn normalize_groq_service_tier(value: Option<&str>) -> String {
+    value
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "on_demand".to_string())
+}
+
+pub(crate) fn groq_service_tier() -> Option<String> {
+    if llm_backend() != LlmBackend::Groq {
+        return None;
+    }
+    let tier =
+        normalize_groq_service_tier(std::env::var("COSMOS_GROQ_SERVICE_TIER").ok().as_deref());
+    Some(tier)
+}
+
+pub(crate) fn apply_backend_headers(
+    builder: reqwest::RequestBuilder,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    let builder = builder
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", api_key));
+    if is_openrouter_backend() {
+        builder
+            .header("HTTP-Referer", "https://cosmos.dev")
+            .header("X-Title", "Cosmos")
+    } else {
+        builder
+    }
+}
+
+/// Maximum length for error content in surfaced messages.
+/// Keep this high so provider diagnostics remain visible in the UI.
+const MAX_ERROR_CONTENT_LEN: usize = 12_000;
 
 /// Sanitize API response content for error messages to prevent credential leakage.
 fn sanitize_api_response(content: &str) -> String {
@@ -27,17 +114,24 @@ fn sanitize_api_response(content: &str) -> String {
         "sk-", // OpenAI/OpenRouter key prefix
     ];
 
-    let truncated = truncate_str(content, MAX_ERROR_CONTENT_LEN);
-
     // Check if the content might contain secrets
-    let lower = truncated.to_lowercase();
+    let lower = content.to_lowercase();
     for pattern in SECRET_PATTERNS {
         if lower.contains(pattern) {
             return "(response details redacted - may contain sensitive data)".to_string();
         }
     }
 
-    truncated.to_string()
+    let total_chars = content.chars().count();
+    if total_chars > MAX_ERROR_CONTENT_LEN {
+        return format!(
+            "{} … (truncated to {} chars)",
+            truncate_str(content, MAX_ERROR_CONTENT_LEN),
+            MAX_ERROR_CONTENT_LEN
+        );
+    }
+
+    content.to_string()
 }
 
 fn push_unique_candidate(candidates: &mut Vec<String>, candidate: impl Into<String>) {
@@ -183,10 +277,29 @@ where
     ))
 }
 
-/// Get the configured OpenRouter API key, if any.
+/// Get the configured API key for the active backend.
 pub(crate) fn api_key() -> Option<String> {
-    let mut config = Config::load();
-    config.get_api_key()
+    match llm_backend() {
+        LlmBackend::OpenRouter => {
+            let mut config = Config::load();
+            config.get_api_key()
+        }
+        LlmBackend::Groq => std::env::var("GROQ_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("GROQ_API_TOKEN").ok())
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok()),
+    }
+}
+
+pub(crate) fn missing_api_key_message() -> String {
+    match llm_backend() {
+        LlmBackend::OpenRouter => {
+            "No API key configured. Run 'cosmos --setup' to get started.".to_string()
+        }
+        LlmBackend::Groq => {
+            "No Groq API key configured. Set GROQ_API_KEY (or GROQ_API_TOKEN).".to_string()
+        }
+    }
 }
 
 /// Stable anonymous identifier for OpenRouter's `user` field.
@@ -194,7 +307,7 @@ pub(crate) fn api_key() -> Option<String> {
 /// OpenRouter uses this for user tracking to improve routing stickiness and caching.
 /// We store an anonymous UUID in config so the same user gets consistent routing.
 pub(crate) fn openrouter_user() -> Option<String> {
-    if cfg!(test) {
+    if cfg!(test) || !is_openrouter_backend() {
         return None;
     }
     let mut config = Config::load();
@@ -231,6 +344,8 @@ struct ChatRequest {
     /// OpenRouter provider configuration for automatic fallback
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<ProviderConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
 }
 
 /// OpenRouter provider configuration
@@ -366,6 +481,8 @@ struct CachedChatRequest {
     plugins: Option<Vec<PluginConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<ProviderConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
 }
 
 /// Build messages with caching enabled on the system prompt
@@ -796,6 +913,7 @@ where
                 }
                 Err(err) => {
                     let msg = err.to_string();
+                    let display_msg = sanitize_api_response(&msg);
                     let kind = classify_provider_error(&msg);
                     record_provider_failure(cfg.slug, kind);
                     failed_kinds.push(kind);
@@ -813,14 +931,9 @@ where
                         slice_timeout_ms: slice_ms,
                         elapsed_ms,
                         outcome_kind: outcome_kind.to_string(),
-                        error_tail: Some(truncate_str(&msg, 240).to_string()),
+                        error_tail: Some(display_msg.clone()),
                     });
-                    errs.push(format!(
-                        "{} ({}ms): {}",
-                        cfg.slug,
-                        elapsed_ms,
-                        truncate_str(&msg, 240)
-                    ));
+                    errs.push(format!("{} ({}ms): {}", cfg.slug, elapsed_ms, display_msg));
                 }
             }
         }
@@ -901,6 +1014,17 @@ fn provider_config_for_model(
     provider_config(response_format)
 }
 
+fn provider_for_backend(
+    model: Model,
+    response_format: &Option<ResponseFormat>,
+) -> Option<ProviderConfig> {
+    if is_openrouter_backend() {
+        Some(provider_config_for_model(model, response_format))
+    } else {
+        None
+    }
+}
+
 pub(crate) fn provider_cerebras_fp16() -> ProviderConfig {
     ProviderConfig {
         order: Some(vec!["cerebras/fp16".to_string()]),
@@ -916,6 +1040,9 @@ fn response_healing_plugins(
     response_format: &Option<ResponseFormat>,
     stream: bool,
 ) -> Option<Vec<PluginConfig>> {
+    if !is_openrouter_backend() {
+        return None;
+    }
     if response_format.is_some() && !stream {
         Some(vec![PluginConfig {
             id: RESPONSE_HEALING_PLUGIN_ID.to_string(),
@@ -926,10 +1053,29 @@ fn response_healing_plugins(
 }
 
 fn reasoning_config(model: Model) -> Option<ReasoningConfig> {
+    if llm_backend() == LlmBackend::Groq {
+        // Groq's OpenAI-compatible endpoint can reject non-standard reasoning config fields.
+        return None;
+    }
     model.reasoning_effort().map(|effort| ReasoningConfig {
         effort: effort.to_string(),
-        exclude: true,
+        exclude: !include_reasoning_output(),
     })
+}
+
+fn include_reasoning_output() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    std::env::var("COSMOS_INCLUDE_REASONING")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// OpenRouter error response (can come with 200 status for upstream errors)
@@ -945,7 +1091,7 @@ pub(crate) struct OpenRouterApiError {
     pub code: Option<i32>,
 }
 
-/// Send a request to OpenRouter with automatic retry on transient failures.
+/// Send a request to the active LLM backend with automatic retry on transient failures.
 ///
 /// Handles:
 /// - Network errors (timeout, connection failures)
@@ -963,17 +1109,8 @@ pub(crate) async fn send_with_retry<T: Serialize>(
     let mut retry_count = 0;
 
     while retry_count <= MAX_RETRIES {
-        // Build request with OpenRouter headers
-        let response = match client
-            .post(OPENROUTER_URL)
-            .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "https://cosmos.dev")
-            .header("X-Title", "Cosmos")
-            .header("Authorization", format!("Bearer {}", api_key))
-            .json(request_body)
-            .send()
-            .await
-        {
+        let request_builder = client.post(chat_completions_url()).json(request_body);
+        let response = match apply_backend_headers(request_builder, api_key).send().await {
             Ok(response) => response,
             Err(err) => {
                 last_error = err.to_string();
@@ -1003,7 +1140,8 @@ pub(crate) async fn send_with_retry<T: Serialize>(
         };
 
         if status.is_success() {
-            // OpenRouter sometimes returns errors with 200 status (upstream provider issues)
+            // OpenRouter sometimes returns errors with 200 status (upstream provider issues).
+            // Parsing is safe for Groq too (shape-compatible `error.message` objects).
             if let Ok(err_resp) = serde_json::from_str::<OpenRouterError>(&text) {
                 let is_retryable = err_resp
                     .error
@@ -1019,8 +1157,9 @@ pub(crate) async fn send_with_retry<T: Serialize>(
                 }
 
                 return Err(anyhow::anyhow!(
-                    "OpenRouter error: {}",
-                    truncate_str(&err_resp.error.message, 200)
+                    "{} error: {}",
+                    backend_label(),
+                    sanitize_api_response(&err_resp.error.message)
                 ));
             }
 
@@ -1047,14 +1186,23 @@ pub(crate) async fn send_with_retry<T: Serialize>(
 
         // Non-retryable error or max retries exceeded
         let error_msg = match status.as_u16() {
-            401 => "Invalid API key. Run 'cosmos --setup' to update it.".to_string(),
+            401 => match llm_backend() {
+                LlmBackend::OpenRouter => {
+                    "Invalid API key. Run 'cosmos --setup' to update it.".to_string()
+                }
+                LlmBackend::Groq => {
+                    "Invalid Groq API key. Set GROQ_API_KEY and try again.".to_string()
+                }
+            },
             429 => format!(
-                "Rate limited by OpenRouter after {} retries. Try again in a few minutes. (Press 'e' to view error log)",
-                retry_count
+                "Rate limited by {} after {} retries. Try again in a few minutes. (Press 'e' to view error log)",
+                backend_label(),
+                retry_count,
             ),
             500..=599 => format!(
-                "OpenRouter server error ({}). The service may be temporarily unavailable.",
-                status
+                "{} server error ({}). The service may be temporarily unavailable.",
+                backend_label(),
+                status,
             ),
             _ => format!("API error {}: {}", status, sanitize_api_response(&text)),
         };
@@ -1081,9 +1229,7 @@ pub(crate) async fn call_llm_with_usage(
     model: Model,
     json_mode: bool,
 ) -> anyhow::Result<LlmResponse> {
-    let api_key = api_key().ok_or_else(|| {
-        anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
-    })?;
+    let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
 
     if json_mode && !model.supports_json_mode() {
         return Err(anyhow::anyhow!(
@@ -1105,11 +1251,11 @@ pub(crate) async fn call_llm_with_usage(
 
     let stream = false;
     let plugins = response_healing_plugins(&response_format, stream);
-    let provider = provider_config_for_model(model, &response_format);
+    let provider = provider_for_backend(model, &response_format);
     let reasoning = reasoning_config(model);
 
     let request = ChatRequest {
-        model: model.id().to_string(),
+        model: model_id_for_backend(model),
         messages: vec![
             Message {
                 role: "system".to_string(),
@@ -1126,14 +1272,16 @@ pub(crate) async fn call_llm_with_usage(
         response_format,
         reasoning,
         plugins,
-        provider: Some(provider),
+        provider,
+        service_tier: groq_service_tier(),
     };
 
     let text = send_with_retry(&client, &api_key, &request).await?;
 
     let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
         anyhow::anyhow!(
-            "Failed to parse OpenRouter response: {}\n{}",
+            "Failed to parse {} response: {}\n{}",
+            backend_label(),
             e,
             sanitize_api_response(&text)
         )
@@ -1228,9 +1376,7 @@ pub(crate) async fn call_llm_structured_with_provider<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    let api_key = api_key().ok_or_else(|| {
-        anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
-    })?;
+    let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
 
     if !model.supports_structured_outputs() {
         return Err(anyhow::anyhow!(
@@ -1255,7 +1401,7 @@ where
     let reasoning = reasoning_config(model);
 
     let request = ChatRequest {
-        model: model.id().to_string(),
+        model: model_id_for_backend(model),
         messages: vec![
             Message {
                 role: "system".to_string(),
@@ -1272,7 +1418,12 @@ where
         response_format,
         reasoning,
         plugins,
-        provider: Some(provider),
+        provider: if is_openrouter_backend() {
+            Some(provider)
+        } else {
+            None
+        },
+        service_tier: groq_service_tier(),
     };
 
     let text = timeout(
@@ -1284,7 +1435,8 @@ where
 
     let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
         anyhow::anyhow!(
-            "Failed to parse OpenRouter response: {}\n{}",
+            "Failed to parse {} response: {}\n{}",
+            backend_label(),
             e,
             sanitize_api_response(&text)
         )
@@ -1331,9 +1483,7 @@ async fn call_llm_json_mode_with_provider<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    let api_key = api_key().ok_or_else(|| {
-        anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
-    })?;
+    let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
 
     if !model.supports_json_mode() {
         return Err(anyhow::anyhow!(
@@ -1358,7 +1508,7 @@ where
     };
 
     let request = ChatRequest {
-        model: model.id().to_string(),
+        model: model_id_for_backend(model),
         messages: vec![
             Message {
                 role: "system".to_string(),
@@ -1375,7 +1525,12 @@ where
         response_format,
         reasoning,
         plugins,
-        provider: Some(provider),
+        provider: if is_openrouter_backend() {
+            Some(provider)
+        } else {
+            None
+        },
+        service_tier: groq_service_tier(),
     };
 
     let text = timeout(
@@ -1387,7 +1542,8 @@ where
 
     let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
         anyhow::anyhow!(
-            "Failed to parse OpenRouter response: {}\n{}",
+            "Failed to parse {} response: {}\n{}",
+            backend_label(),
             e,
             sanitize_api_response(&text)
         )
@@ -1436,9 +1592,7 @@ pub(crate) async fn call_llm_structured<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    let api_key = api_key().ok_or_else(|| {
-        anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
-    })?;
+    let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
 
     if !model.supports_structured_outputs() {
         return Err(anyhow::anyhow!(
@@ -1460,11 +1614,11 @@ where
 
     let stream = false;
     let plugins = response_healing_plugins(&response_format, stream);
-    let provider = provider_config_for_model(model, &response_format);
+    let provider = provider_for_backend(model, &response_format);
     let reasoning = reasoning_config(model);
 
     let request = ChatRequest {
-        model: model.id().to_string(),
+        model: model_id_for_backend(model),
         messages: vec![
             Message {
                 role: "system".to_string(),
@@ -1481,14 +1635,16 @@ where
         response_format,
         reasoning,
         plugins,
-        provider: Some(provider),
+        provider,
+        service_tier: groq_service_tier(),
     };
 
     let text = send_with_retry(&client, &api_key, &request).await?;
 
     let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
         anyhow::anyhow!(
-            "Failed to parse OpenRouter response: {}\n{}",
+            "Failed to parse {} response: {}\n{}",
+            backend_label(),
             e,
             sanitize_api_response(&text)
         )
@@ -1569,9 +1725,7 @@ async fn call_llm_structured_limited_with_reasoning<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    let api_key = api_key().ok_or_else(|| {
-        anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
-    })?;
+    let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
 
     if !model.supports_structured_outputs() {
         return Err(anyhow::anyhow!(
@@ -1593,7 +1747,7 @@ where
 
     let stream = false;
     let plugins = response_healing_plugins(&response_format, stream);
-    let provider = provider_config_for_model(model, &response_format);
+    let provider = provider_for_backend(model, &response_format);
     let reasoning = if include_reasoning {
         reasoning_config(model)
     } else {
@@ -1601,7 +1755,7 @@ where
     };
 
     let request = ChatRequest {
-        model: model.id().to_string(),
+        model: model_id_for_backend(model),
         messages: vec![
             Message {
                 role: "system".to_string(),
@@ -1618,7 +1772,8 @@ where
         response_format,
         reasoning,
         plugins,
-        provider: Some(provider),
+        provider,
+        service_tier: groq_service_tier(),
     };
 
     let text = timeout(
@@ -1630,7 +1785,8 @@ where
 
     let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
         anyhow::anyhow!(
-            "Failed to parse OpenRouter response: {}\n{}",
+            "Failed to parse {} response: {}\n{}",
+            backend_label(),
             e,
             sanitize_api_response(&text)
         )
@@ -1692,9 +1848,7 @@ pub(crate) async fn call_llm_structured_cached<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    let api_key = api_key().ok_or_else(|| {
-        anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
-    })?;
+    let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
 
     if !model.supports_structured_outputs() {
         return Err(anyhow::anyhow!(
@@ -1716,12 +1870,12 @@ where
 
     let stream = false;
     let plugins = response_healing_plugins(&response_format, stream);
-    let provider = provider_config_for_model(model, &response_format);
+    let provider = provider_for_backend(model, &response_format);
     let reasoning = reasoning_config(model);
 
     // Use cached messages with cache_control on system prompt
     let request = CachedChatRequest {
-        model: model.id().to_string(),
+        model: model_id_for_backend(model),
         messages: build_cached_messages(system, user),
         user: openrouter_user(),
         max_tokens: model.max_tokens(),
@@ -1729,14 +1883,16 @@ where
         response_format,
         reasoning,
         plugins,
-        provider: Some(provider),
+        provider,
+        service_tier: groq_service_tier(),
     };
 
     let text = send_with_retry(&client, &api_key, &request).await?;
 
     let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
         anyhow::anyhow!(
-            "Failed to parse OpenRouter response: {}\n{}",
+            "Failed to parse {} response: {}\n{}",
+            backend_label(),
             e,
             sanitize_api_response(&text)
         )
@@ -1776,9 +1932,12 @@ where
 
 fn map_timeout_error(err: reqwest::Error) -> anyhow::Error {
     if err.is_timeout() {
-        anyhow::anyhow!("OpenRouter request timed out. Please try again.")
+        anyhow::anyhow!("{} request timed out. Please try again.", backend_label())
     } else if err.is_connect() {
-        anyhow::anyhow!("Could not connect to OpenRouter. Check your network and try again.")
+        anyhow::anyhow!(
+            "Could not connect to {}. Check your network and try again.",
+            backend_label()
+        )
     } else {
         err.into()
     }
@@ -1817,6 +1976,11 @@ struct CreditsData {
 /// Fetch the current account balance from OpenRouter.
 /// Returns the remaining credits (total_credits - total_usage).
 pub async fn fetch_account_balance() -> anyhow::Result<f64> {
+    if !is_openrouter_backend() {
+        return Err(anyhow::anyhow!(
+            "Account balance lookup is only supported for the OpenRouter backend."
+        ));
+    }
     let api_key = api_key().ok_or_else(|| anyhow::anyhow!("No API key configured"))?;
 
     let client = reqwest::Client::builder()
@@ -1876,6 +2040,37 @@ mod tests {
         assert_eq!(
             value.get("allow_fallbacks").and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn test_parse_llm_backend_defaults_openrouter() {
+        assert_eq!(parse_llm_backend(None), LlmBackend::OpenRouter);
+        assert_eq!(
+            parse_llm_backend(Some("openrouter")),
+            LlmBackend::OpenRouter
+        );
+        assert_eq!(parse_llm_backend(Some("groq")), LlmBackend::Groq);
+        assert_eq!(parse_llm_backend(Some("GROQ")), LlmBackend::Groq);
+    }
+
+    #[test]
+    fn test_model_id_normalization_for_groq_backend() {
+        let openrouter_id = model_id_for_backend_impl(Model::Speed, LlmBackend::OpenRouter);
+        assert_eq!(openrouter_id, "openai/gpt-oss-120b:exacto");
+
+        let groq_id = model_id_for_backend_impl(Model::Speed, LlmBackend::Groq);
+        assert_eq!(groq_id, "openai/gpt-oss-120b");
+    }
+
+    #[test]
+    fn test_normalize_groq_service_tier_defaults_to_on_demand() {
+        assert_eq!(normalize_groq_service_tier(None), "on_demand");
+        assert_eq!(normalize_groq_service_tier(Some("  ")), "on_demand");
+        assert_eq!(normalize_groq_service_tier(Some("FLEX")), "flex");
+        assert_eq!(
+            normalize_groq_service_tier(Some("performance")),
+            "performance"
         );
     }
 

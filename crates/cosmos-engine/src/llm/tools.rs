@@ -5,6 +5,7 @@
 
 use cosmos_adapters::util::{resolve_repo_path_allow_new, run_command_with_timeout};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -12,6 +13,8 @@ use std::time::Duration;
 
 /// Timeout for shell and search commands (prevents hangs)
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+const RELACE_PATH_GUIDANCE: &str =
+    "Use repo-relative paths like `crates/...` or `.`; do not use absolute filesystem paths.";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  TOOL DEFINITIONS
@@ -28,6 +31,8 @@ pub struct ToolDefinition {
 #[derive(Debug, Clone, Serialize)]
 pub struct FunctionDefinition {
     pub name: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
     pub description: &'static str,
     pub parameters: serde_json::Value,
 }
@@ -52,6 +57,117 @@ pub struct ToolResult {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportBackPayload {
+    pub explanation: ReportBackExplanation,
+    pub files: HashMap<String, Vec<(i64, i64)>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportBackExplanation {
+    pub role: String,
+    #[serde(default)]
+    pub findings: Vec<ReportBackFinding>,
+    #[serde(default)]
+    pub verified_findings: Vec<ReportBackFinding>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportBackFinding {
+    pub file: String,
+    pub line: usize,
+    pub category: String,
+    pub criticality: String,
+    pub summary: String,
+    pub detail: String,
+    pub evidence_quote: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ReportBackExplanationWire {
+    String(String),
+    Object(ReportBackExplanation),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportBackPayloadWire {
+    explanation: ReportBackExplanationWire,
+    files: ReportBackFilesWire,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ReportBackFilesWire {
+    Map(HashMap<String, Vec<(i64, i64)>>),
+    List(Vec<ReportBackFileEntryWire>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportBackFileEntryWire {
+    path: String,
+    ranges: Vec<(i64, i64)>,
+}
+
+pub fn parse_report_back_payload(args_json: &str) -> Result<ReportBackPayload, String> {
+    let parsed: ReportBackPayloadWire = serde_json::from_str(args_json)
+        .map_err(|err| format!("Invalid report_back JSON: {err}"))?;
+
+    let explanation = match parsed.explanation {
+        ReportBackExplanationWire::String(text) => {
+            serde_json::from_str::<ReportBackExplanation>(text.trim()).map_err(|err| {
+                format!("report_back.explanation must be valid JSON object: {err}")
+            })?
+        }
+        ReportBackExplanationWire::Object(value) => value,
+    };
+
+    let files = match parsed.files {
+        ReportBackFilesWire::Map(files) => files,
+        ReportBackFilesWire::List(entries) => {
+            let mut files: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+            for entry in entries {
+                files
+                    .entry(entry.path)
+                    .or_default()
+                    .extend(entry.ranges.into_iter());
+            }
+            files
+        }
+    };
+
+    let parsed = ReportBackPayload { explanation, files };
+
+    if parsed.explanation.role.trim().is_empty() {
+        return Err("report_back.explanation.role must be non-empty".to_string());
+    }
+
+    for (file, ranges) in &parsed.files {
+        if file.trim().is_empty() {
+            return Err("report_back contains an empty file path".to_string());
+        }
+        for (start, end) in ranges {
+            if *start < 1 {
+                return Err(format!(
+                    "Invalid report_back range for {file}: start must be >= 1 (got {start})"
+                ));
+            }
+            if *end < *start {
+                return Err(format!(
+                    "Invalid report_back range for {file}: end ({end}) < start ({start})"
+                ));
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
 /// Get all available tool definitions for top-down exploration
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -60,6 +176,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function",
             function: FunctionDefinition {
                 name: "tree",
+                strict: None,
                 description: "List directory structure. Start here to understand the codebase layout.",
                 parameters: serde_json::json!({
                     "type": "object",
@@ -81,6 +198,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function",
             function: FunctionDefinition {
                 name: "head",
+                strict: None,
                 description: "Read first N lines of a file. Use to see imports, exports, and structure before diving deeper.",
                 parameters: serde_json::json!({
                     "type": "object",
@@ -103,6 +221,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function",
             function: FunctionDefinition {
                 name: "search",
+                strict: None,
                 description: "Search for pattern in files. Returns matches with line numbers. Use to find where to look before reading.",
                 parameters: serde_json::json!({
                     "type": "object",
@@ -129,6 +248,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function",
             function: FunctionDefinition {
                 name: "read_range",
+                strict: None,
                 description: "Read specific line range from a file. Use after search to examine specific sections.",
                 parameters: serde_json::json!({
                     "type": "object",
@@ -155,6 +275,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function",
             function: FunctionDefinition {
                 name: "shell",
+                strict: None,
                 description: "Execute shell command. Use only when specialized tools don't fit. Output truncated at 4KB.",
                 parameters: serde_json::json!({
                     "type": "object",
@@ -165,6 +286,226 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         }
                     },
                     "required": ["command"]
+                }),
+            },
+        },
+    ]
+}
+
+/// Relace-style fast-agentic-search tools used by suggestion generation.
+pub fn get_relace_search_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "view_file",
+                strict: Some(true),
+                description: "Tool for viewing/exploring the contents of existing files\n\nLine numbers are included in the output, indexing at 1. If the output does not include the end of the file, it will be noted after the final output line.\n\nExample (viewing the first 2 lines of a file):\n1   def my_function():\n2       print(\"Hello, World!\")\n... rest of file truncated ...",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["path", "view_range"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Repository-relative path to a file (preferred), e.g. `crates/cosmos-engine/src/llm/agentic.rs`. `/repo/...` paths are also accepted for compatibility."
+                        },
+                        "view_range": {
+                            "type": "array",
+                            "items": { "type": "integer" },
+                            "default": [1, 100],
+                            "description": "Range of file lines to view. If not specified, the first 100 lines of the file are shown. If provided, the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file."
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "view_directory",
+                strict: Some(true),
+                description: "Tool for viewing the contents of a directory.\n\n* Lists contents recursively, relative to the input directory\n* Directories are suffixed with a trailing slash '/'\n* Depth might be limited by the tool implementation\n* Output is limited to the first 250 items\n\nExample output:\nfile1.txt\nfile2.txt\nsubdir1/\nsubdir1/file3.txt",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["path", "include_hidden"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Repository-relative path to a directory (preferred), e.g. `.` or `crates/`. `/repo/...` paths are also accepted for compatibility."
+                        },
+                        "include_hidden": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "If true, include hidden files in the output (false by default)."
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "grep_search",
+                strict: Some(true),
+                description: "Fast text-based regex search that finds exact pattern matches within files or directories, utilizing the ripgrep command for efficient searching. Results will be formatted in the style of ripgrep and can be configured to include line numbers and content. To avoid overwhelming output, the results are capped at 50 matches. Use the include or exclude patterns to filter the search scope by file type or specific paths. This is best for finding exact text matches or regex patterns.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["query", "case_sensitive", "exclude_pattern", "include_pattern"],
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The regex pattern to search for"
+                        },
+                        "case_sensitive": {
+                            "type": "boolean",
+                            "default": true,
+                            "description": "Whether the search should be case sensitive"
+                        },
+                        "exclude_pattern": {
+                            "type": ["string", "null"],
+                            "description": "Glob pattern for files to exclude"
+                        },
+                        "include_pattern": {
+                            "type": ["string", "null"],
+                            "description": "Glob pattern for files to include (e.g. '*.ts' for TypeScript files)"
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "bash",
+                strict: Some(true),
+                description: "Tool for executing bash commands.\n\n* Avoid long running commands\n* Avoid dangerous/destructive commands\n* Prefer using other more specialized tools where possible",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Bash command to execute"
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "report_back",
+                strict: Some(true),
+                description: "This is a tool to use when you feel like you have finished exploring the codebase and understanding the problem, and now would like to report back to the user.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["explanation", "files"],
+                    "properties": {
+                        "explanation": {
+                            "type": "object",
+                            "required": ["role", "findings", "verified_findings"],
+                            "properties": {
+                                "role": {
+                                    "type": "string",
+                                    "enum": ["bug_hunter", "security_reviewer", "final_reviewer"]
+                                },
+                                "findings": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "required": [
+                                            "file",
+                                            "line",
+                                            "category",
+                                            "criticality",
+                                            "summary",
+                                            "detail",
+                                            "evidence_quote"
+                                        ],
+                                        "properties": {
+                                            "file": { "type": "string" },
+                                            "line": { "type": "integer", "minimum": 1 },
+                                            "category": {
+                                                "type": "string",
+                                                "enum": ["bug", "security"]
+                                            },
+                                            "criticality": {
+                                                "type": "string",
+                                                "enum": ["critical", "high", "medium", "low"]
+                                            },
+                                            "summary": { "type": "string" },
+                                            "detail": { "type": "string" },
+                                            "evidence_quote": { "type": "string" }
+                                        },
+                                        "additionalProperties": false
+                                    }
+                                },
+                                "verified_findings": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "required": [
+                                            "file",
+                                            "line",
+                                            "category",
+                                            "criticality",
+                                            "summary",
+                                            "detail",
+                                            "evidence_quote"
+                                        ],
+                                        "properties": {
+                                            "file": { "type": "string" },
+                                            "line": { "type": "integer", "minimum": 1 },
+                                            "category": {
+                                                "type": "string",
+                                                "enum": ["bug", "security"]
+                                            },
+                                            "criticality": {
+                                                "type": "string",
+                                                "enum": ["critical", "high", "medium", "low"]
+                                            },
+                                            "summary": { "type": "string" },
+                                            "detail": { "type": "string" },
+                                            "evidence_quote": { "type": "string" }
+                                        },
+                                        "additionalProperties": false
+                                    }
+                                }
+                            },
+                            "additionalProperties": false,
+                            "description": "Structured findings payload. bug/security agents fill findings and leave verified_findings empty; final reviewer fills verified_findings and leaves findings empty."
+                        },
+                        "files": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["path", "ranges"],
+                                "properties": {
+                                    "path": {
+                                        "type": "string",
+                                        "description": "File path relative to repo root (without /repo prefix)."
+                                    },
+                                    "ranges": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "array",
+                                            "minItems": 2,
+                                            "maxItems": 2,
+                                            "prefixItems": [{ "type": "integer" }, { "type": "integer" }]
+                                        },
+                                        "description": "Line ranges relevant to the report as [start, end] tuples."
+                                    }
+                                },
+                                "additionalProperties": false
+                            },
+                            "description": "A list of file entries containing path and relevant line ranges."
+                        }
+                    },
+                    "additionalProperties": false
                 }),
             },
         },
@@ -274,6 +615,11 @@ pub fn execute_tool(root: &Path, tool_call: &ToolCall) -> ToolResult {
         "search" => execute_search(root, &tool_call.function.arguments),
         "read_range" => execute_read_range(root, &tool_call.function.arguments),
         "shell" => execute_shell(root, &tool_call.function.arguments),
+        "view_file" => execute_view_file(root, &tool_call.function.arguments),
+        "view_directory" => execute_view_directory(root, &tool_call.function.arguments),
+        "grep_search" => execute_grep_search(root, &tool_call.function.arguments),
+        "bash" => execute_bash(root, &tool_call.function.arguments),
+        "report_back" => execute_report_back(&tool_call.function.arguments),
         _ => format!("Unknown tool: {}", tool_call.function.name),
     };
 
@@ -536,6 +882,234 @@ fn execute_search(root: &Path, args_json: &str) -> String {
     }
 }
 
+fn resolve_relace_path(root: &Path, raw: &str) -> Result<std::path::PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "Invalid path '{}': path must not be empty. {}",
+            raw, RELACE_PATH_GUIDANCE
+        ));
+    }
+
+    let repo_relative = if trimmed == "/repo" || trimmed == "/repo/" {
+        "."
+    } else if let Some(stripped) = trimmed.strip_prefix("/repo/") {
+        stripped
+    } else {
+        trimmed
+    };
+
+    if repo_relative == "." {
+        return root
+            .canonicalize()
+            .map_err(|err| normalize_relace_path_error(raw, &err.to_string()));
+    }
+
+    resolve_repo_path_allow_new(root, std::path::Path::new(repo_relative))
+        .map(|resolved| resolved.absolute)
+        .map_err(|err| normalize_relace_path_error(raw, &err))
+}
+
+fn normalize_relace_path_error(raw: &str, err: &str) -> String {
+    let trimmed_err = err.trim().trim_end_matches('.');
+    format!(
+        "Invalid path '{}': {}. {}",
+        raw, trimmed_err, RELACE_PATH_GUIDANCE
+    )
+}
+
+fn execute_view_file(root: &Path, args_json: &str) -> String {
+    #[derive(Deserialize)]
+    struct ViewFileArgs {
+        path: String,
+        view_range: Vec<i64>,
+    }
+
+    let args: ViewFileArgs = match serde_json::from_str(args_json) {
+        Ok(value) => value,
+        Err(err) => return format!("Invalid arguments: {err}"),
+    };
+
+    if args.view_range.len() != 2 {
+        return "Invalid view_range: expected [start_line, end_line]".to_string();
+    }
+
+    let target = match resolve_relace_path(root, &args.path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    if !target.exists() || !target.is_file() {
+        return format!("File not found: {}", args.path);
+    }
+
+    let start_line = args.view_range[0].max(1) as usize;
+    let raw_end = args.view_range[1];
+
+    let content = match fs::read_to_string(&target) {
+        Ok(value) => value,
+        Err(err) => return format!("Failed to read file: {err}"),
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    if total_lines == 0 {
+        return String::new();
+    }
+
+    let start = start_line
+        .saturating_sub(1)
+        .min(total_lines.saturating_sub(1));
+    let end = if raw_end == -1 {
+        total_lines
+    } else {
+        raw_end.max(start_line as i64) as usize
+    }
+    .min(total_lines);
+
+    let mut output = String::new();
+    for (idx, line) in lines[start..end].iter().enumerate() {
+        output.push_str(&format!("{}   {}\n", start + idx + 1, line));
+    }
+    if end < total_lines {
+        output.push_str("... rest of file truncated ...");
+    }
+    output
+}
+
+fn execute_view_directory(root: &Path, args_json: &str) -> String {
+    #[derive(Deserialize)]
+    struct ViewDirectoryArgs {
+        path: String,
+        include_hidden: bool,
+    }
+
+    let args: ViewDirectoryArgs = match serde_json::from_str(args_json) {
+        Ok(value) => value,
+        Err(err) => return format!("Invalid arguments: {err}"),
+    };
+
+    let target = match resolve_relace_path(root, &args.path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if !target.exists() || !target.is_dir() {
+        return format!("Directory not found: {}", args.path);
+    }
+
+    let mut entries = Vec::new();
+    let mut stack = vec![target.clone()];
+
+    while let Some(dir) = stack.pop() {
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        for entry in read_dir.filter_map(|item| item.ok()) {
+            let path = entry.path();
+            let rel = match path.strip_prefix(&target) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let rel_display = rel.to_string_lossy().replace('\\', "/");
+            if rel_display.is_empty() {
+                continue;
+            }
+            if !args.include_hidden
+                && rel
+                    .components()
+                    .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
+            {
+                continue;
+            }
+
+            if path.is_dir() {
+                entries.push(format!("{}/", rel_display.trim_end_matches('/')));
+                stack.push(path);
+            } else {
+                entries.push(rel_display);
+            }
+        }
+    }
+
+    entries.sort();
+    entries.truncate(250);
+    entries.join("\n")
+}
+
+fn execute_grep_search(root: &Path, args_json: &str) -> String {
+    #[derive(Deserialize)]
+    struct GrepSearchArgs {
+        query: String,
+        case_sensitive: bool,
+        exclude_pattern: Option<String>,
+        include_pattern: Option<String>,
+    }
+
+    let args: GrepSearchArgs = match serde_json::from_str(args_json) {
+        Ok(value) => value,
+        Err(err) => return format!("Invalid arguments: {err}"),
+    };
+
+    if let Err(err) = is_safe_regex_pattern(&args.query) {
+        return err;
+    }
+
+    let mut cmd = Command::new("rg");
+    cmd.arg("--line-number")
+        .arg("--no-heading")
+        .arg("--color=never")
+        .arg("--max-count=50");
+
+    if !args.case_sensitive {
+        cmd.arg("-i");
+    }
+    if let Some(pattern) = args.exclude_pattern.as_deref() {
+        if !pattern.trim().is_empty() {
+            cmd.arg("--glob").arg(format!("!{}", pattern.trim()));
+        }
+    }
+    if let Some(pattern) = args.include_pattern.as_deref() {
+        if !pattern.trim().is_empty() {
+            cmd.arg("--glob").arg(pattern.trim());
+        }
+    }
+
+    cmd.arg(&args.query).arg(root).current_dir(root);
+
+    match run_command_with_timeout(&mut cmd, TOOL_TIMEOUT) {
+        Ok(result) => {
+            if result.timed_out {
+                return "Search timed out after 10 seconds. Try a more specific pattern."
+                    .to_string();
+            }
+            if result.stdout.trim().is_empty() {
+                "No matches found".to_string()
+            } else {
+                truncate_output(result.stdout)
+            }
+        }
+        Err(err) => format!("Search failed: {err}"),
+    }
+}
+
+fn execute_bash(root: &Path, args_json: &str) -> String {
+    execute_shell(root, args_json)
+}
+
+fn execute_report_back(args_json: &str) -> String {
+    match parse_report_back_payload(args_json) {
+        Ok(payload) => format!(
+            "report_back accepted (role={}, findings={}, verified_findings={}, files={})",
+            payload.explanation.role,
+            payload.explanation.findings.len(),
+            payload.explanation.verified_findings.len(),
+            payload.files.len(),
+        ),
+        Err(err) => format!("Invalid report_back payload: {err}"),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  READ_RANGE - Specific line range
 // ═══════════════════════════════════════════════════════════════════════════
@@ -732,6 +1306,153 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_relace_tool_definitions_match_expected_names() {
+        let tools = get_relace_search_tool_definitions();
+        let names = tools
+            .iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "view_file",
+                "view_directory",
+                "grep_search",
+                "bash",
+                "report_back"
+            ]
+        );
+        assert!(tools.iter().all(|tool| tool.function.strict == Some(true)));
+    }
+
+    #[test]
+    fn test_relace_tool_required_params_match_expected_schema() {
+        let tools = get_relace_search_tool_definitions();
+        let mut required_by_tool = std::collections::HashMap::new();
+        for tool in tools {
+            let required = tool
+                .function
+                .parameters
+                .get("required")
+                .and_then(|v| v.as_array())
+                .expect("required array")
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>();
+            required_by_tool.insert(tool.function.name, required);
+        }
+
+        assert_eq!(
+            required_by_tool.get("view_file"),
+            Some(&vec!["path".to_string(), "view_range".to_string()])
+        );
+        assert_eq!(
+            required_by_tool.get("view_directory"),
+            Some(&vec!["path".to_string(), "include_hidden".to_string()])
+        );
+        assert_eq!(
+            required_by_tool.get("grep_search"),
+            Some(&vec![
+                "query".to_string(),
+                "case_sensitive".to_string(),
+                "exclude_pattern".to_string(),
+                "include_pattern".to_string(),
+            ])
+        );
+        assert_eq!(
+            required_by_tool.get("bash"),
+            Some(&vec!["command".to_string()])
+        );
+        assert_eq!(
+            required_by_tool.get("report_back"),
+            Some(&vec!["explanation".to_string(), "files".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_report_back_explanation_schema_is_object() {
+        let tools = get_relace_search_tool_definitions();
+        let report_back = tools
+            .into_iter()
+            .find(|tool| tool.function.name == "report_back")
+            .expect("report_back tool should exist");
+        let explanation_type = report_back
+            .function
+            .parameters
+            .get("properties")
+            .and_then(|p| p.get("explanation"))
+            .and_then(|e| e.get("type"))
+            .and_then(|t| t.as_str())
+            .expect("explanation type should be present");
+        assert_eq!(explanation_type, "object");
+    }
+
+    #[test]
+    fn test_parse_report_back_payload_strict_validation() {
+        let ok = parse_report_back_payload(
+            r#"{"explanation":"{\"role\":\"x\"}","files":{"src/lib.rs":[[10,20]]}}"#,
+        )
+        .expect("valid payload");
+        assert_eq!(ok.files.len(), 1);
+        assert_eq!(ok.explanation.role, "x");
+
+        let ok_object_explanation = parse_report_back_payload(
+            r#"{"explanation":{"role":"bug_hunter","findings":[],"verified_findings":[]},"files":{"src/lib.rs":[[10,20]]}}"#,
+        )
+        .expect("valid object explanation payload");
+        assert_eq!(ok_object_explanation.explanation.role, "bug_hunter");
+
+        let ok_list = parse_report_back_payload(
+            r#"{"explanation":"{\"role\":\"x\"}","files":[{"path":"src/main.rs","ranges":[[4,7]]}]}"#,
+        )
+        .expect("valid list payload");
+        assert_eq!(ok_list.files.len(), 1);
+        assert!(ok_list.files.contains_key("src/main.rs"));
+
+        let err =
+            parse_report_back_payload(r#"{"explanation":" ","files":{"src/lib.rs":[[0,20]]}}"#)
+                .expect_err("invalid explanation should fail");
+        assert!(err.contains("valid JSON object"));
+
+        let err_role = parse_report_back_payload(
+            r#"{"explanation":{"role":" ","findings":[],"verified_findings":[]},"files":{"src/lib.rs":[[10,20]]}}"#,
+        )
+        .expect_err("empty role should fail");
+        assert!(err_role.contains("role must be non-empty"));
+    }
+
+    #[test]
+    fn test_resolve_relace_path_accepts_repo_relative_and_repo_alias_paths() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("crates")).expect("create crates dir");
+
+        let root = dir.path();
+        let canonical_root = root.canonicalize().expect("canonicalize root");
+        let resolved_dot = resolve_relace_path(root, ".").expect("dot path should resolve");
+        assert_eq!(resolved_dot, canonical_root);
+
+        let resolved_relative =
+            resolve_relace_path(root, "crates/").expect("repo-relative path should resolve");
+        assert_eq!(resolved_relative, canonical_root.join("crates"));
+
+        let resolved_repo = resolve_relace_path(root, "/repo").expect("/repo should resolve");
+        assert_eq!(resolved_repo, canonical_root);
+
+        let resolved_repo_nested =
+            resolve_relace_path(root, "/repo/crates/").expect("/repo/... should resolve");
+        assert_eq!(resolved_repo_nested, canonical_root.join("crates"));
+    }
+
+    #[test]
+    fn test_resolve_relace_path_error_includes_canonical_guidance() {
+        let dir = tempdir().expect("tempdir");
+        let err = resolve_relace_path(dir.path(), "/etc/passwd")
+            .expect_err("absolute path outside /repo alias should fail");
+        assert!(err.contains("Invalid path '/etc/passwd'"));
+        assert!(err.contains("Use repo-relative paths like `crates/...` or `.`"));
+    }
 
     #[test]
     fn test_shell_echo() {

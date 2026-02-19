@@ -15,23 +15,6 @@ use cosmos_engine::llm;
 use cosmos_ui::app;
 use std::path::{Path, PathBuf};
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum SuggestProfileArg {
-    Strict,
-    Balanced,
-    Max,
-}
-
-impl SuggestProfileArg {
-    fn as_profile(self) -> config::SuggestionsProfile {
-        match self {
-            SuggestProfileArg::Strict => config::SuggestionsProfile::Strict,
-            SuggestProfileArg::Balanced => config::SuggestionsProfile::BalancedHighVolume,
-            SuggestProfileArg::Max => config::SuggestionsProfile::MaxVolume,
-        }
-    }
-}
-
 #[derive(Parser, Debug)]
 #[command(
     name = "cosmos",
@@ -62,18 +45,70 @@ struct Args {
     #[arg(long, default_value_t = 1, requires = "suggest_audit")]
     suggest_runs: usize,
 
-    /// Suggestions profile to use in audit mode
-    #[arg(long, value_enum, default_value_t = SuggestProfileArg::Balanced, requires = "suggest_audit")]
-    suggest_profile: SuggestProfileArg,
-
     /// Print accepted suggestions in audit mode
     #[arg(long, requires = "suggest_audit")]
     suggest_print: bool,
+
+    /// Print detailed diagnostics/trace details in audit mode
+    #[arg(long, requires = "suggest_audit")]
+    suggest_trace: bool,
+
+    /// Stream reasoning/thinking deltas during suggestion audit (debug-only; output may be truncated)
+    #[arg(long, requires = "suggest_audit")]
+    suggest_stream_reasoning: bool,
+
+    /// LLM backend to use (`openrouter` or direct `groq`)
+    #[arg(long, value_enum)]
+    llm_backend: Option<LlmBackendArg>,
+
+    /// Groq service tier when using `--llm-backend groq`
+    #[arg(long, value_enum)]
+    groq_service_tier: Option<GroqServiceTierArg>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum LlmBackendArg {
+    Openrouter,
+    Groq,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum GroqServiceTierArg {
+    #[value(name = "on_demand")]
+    OnDemand,
+    #[value(name = "flex")]
+    Flex,
+    #[value(name = "performance")]
+    Performance,
+    #[value(name = "auto")]
+    Auto,
+}
+
+impl GroqServiceTierArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            GroqServiceTierArg::OnDemand => "on_demand",
+            GroqServiceTierArg::Flex => "flex",
+            GroqServiceTierArg::Performance => "performance",
+            GroqServiceTierArg::Auto => "auto",
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(backend) = args.llm_backend {
+        let value = match backend {
+            LlmBackendArg::Openrouter => "openrouter",
+            LlmBackendArg::Groq => "groq",
+        };
+        std::env::set_var("COSMOS_LLM_BACKEND", value);
+    }
+    if let Some(tier) = args.groq_service_tier {
+        std::env::set_var("COSMOS_GROQ_SERVICE_TIER", tier.as_str());
+    }
 
     // Handle --setup flag (BYOK mode)
     if args.setup {
@@ -95,13 +130,17 @@ async fn main() -> Result<()> {
     let context = init_context(&path)?;
 
     if args.suggest_audit {
+        if args.suggest_stream_reasoning {
+            std::env::set_var("COSMOS_STREAM_REASONING", "1");
+            std::env::set_var("COSMOS_INCLUDE_REASONING", "1");
+        }
         return run_suggestion_audit(
             &path,
             &index,
             &context,
             args.suggest_runs.max(1),
-            args.suggest_profile,
             args.suggest_print,
+            args.suggest_trace,
         )
         .await;
     }
@@ -118,17 +157,16 @@ async fn run_suggestion_audit(
     index: &CodebaseIndex,
     context: &WorkContext,
     runs: usize,
-    profile_arg: SuggestProfileArg,
     print_suggestions: bool,
+    print_trace: bool,
 ) -> Result<()> {
     if !llm::is_available() {
         return Err(anyhow::anyhow!(
-            "AI is unavailable. Configure an API key with `cosmos --setup` first."
+            "AI is unavailable. Configure an API key first (`cosmos --setup` for OpenRouter, or set GROQ_API_KEY for `--llm-backend groq`)."
         ));
     }
 
-    let profile = profile_arg.as_profile();
-    let mut gate_config = llm::suggestion_gate_config_for_profile(profile);
+    let mut gate_config = llm::SuggestionQualityGateConfig::default();
     gate_config.max_attempts = gate_config.max_attempts.max(4);
 
     let mut best_result: Option<llm::GatedSuggestionRunResult> = None;
@@ -136,8 +174,8 @@ async fn run_suggestion_audit(
     let mut last_error: Option<String> = None;
 
     println!(
-        "Running suggestion audit: runs={}, profile={:?}, target={}..{}",
-        runs, profile, gate_config.min_final_count, gate_config.max_final_count
+        "Running suggestion audit: runs={}, target={}..{}",
+        runs, gate_config.min_final_count, gate_config.max_final_count
     );
 
     for run_index in 1..=runs {
@@ -179,6 +217,12 @@ async fn run_suggestion_audit(
                         diagnostics.file_balance_dropped_count,
                         diagnostics.parse_strategy
                     );
+                    if print_trace && !diagnostics.gate_fail_reasons.is_empty() {
+                        println!(
+                            "      gate_fail_reasons={}",
+                            diagnostics.gate_fail_reasons.join("; ")
+                        );
+                    }
                 },
             ),
         )
@@ -253,6 +297,58 @@ async fn run_suggestion_audit(
         }
     );
 
+    if print_trace {
+        println!("\nDetailed diagnostics:");
+        println!(
+            "  run_id={} model={} strategy={} attempts={}/{} llm_ms={} tool_calls={} response_chars={}",
+            best.diagnostics.run_id,
+            best.diagnostics.model,
+            best.diagnostics.parse_strategy,
+            best.diagnostics.attempt_index,
+            best.diagnostics.attempt_count,
+            best.diagnostics.llm_ms,
+            best.diagnostics.tool_calls,
+            best.diagnostics.response_chars
+        );
+        println!(
+            "  gate_passed={} gate_fail_reasons={}",
+            best.gate.passed,
+            if best.gate.fail_reasons.is_empty() {
+                "none".to_string()
+            } else {
+                best.gate.fail_reasons.join("; ")
+            }
+        );
+        println!(
+            "  reasoning_output_requested={} (set COSMOS_INCLUDE_REASONING=1 to request provider rationale in traces)",
+            include_reasoning_output_from_env()
+        );
+        if !best.diagnostics.response_preview.trim().is_empty() {
+            println!("  response_preview={}", best.diagnostics.response_preview);
+        }
+        for note in best
+            .diagnostics
+            .notes
+            .iter()
+            .filter(|note| note.starts_with("worker_summary:"))
+        {
+            println!("  {}", note.trim_start_matches("worker_summary:"));
+        }
+        for note in best
+            .diagnostics
+            .notes
+            .iter()
+            .filter(|note| !note.starts_with("worker_summary:"))
+            .take(40)
+        {
+            println!("  note: {}", note);
+        }
+        println!(
+            "  run_audit_log={}",
+            path.join(".cosmos/suggestion_runs.jsonl").display()
+        );
+    }
+
     if print_suggestions {
         println!("\nAccepted suggestions:");
         for (idx, suggestion) in best.suggestions.iter().enumerate() {
@@ -270,6 +366,18 @@ async fn run_suggestion_audit(
     }
 
     Ok(())
+}
+
+fn include_reasoning_output_from_env() -> bool {
+    std::env::var("COSMOS_INCLUDE_REASONING")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// Initialize the codebase index

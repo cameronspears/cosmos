@@ -4,11 +4,18 @@
 //! in a loop until they have enough context to complete their task.
 
 use super::client::{
-    api_key, create_http_client, openrouter_user, send_with_retry, REQUEST_TIMEOUT_SECS,
+    api_key, apply_backend_headers, chat_completions_url, create_http_client, groq_service_tier,
+    is_openrouter_backend, missing_api_key_message, model_id_for_backend, openrouter_user,
+    send_with_retry, REQUEST_TIMEOUT_SECS,
 };
 use super::models::{merge_usage, Model, Usage};
-use super::tools::{execute_tool, get_tool_definitions, ToolCall, ToolDefinition};
+use super::tools::{
+    execute_tool, get_relace_search_tool_definitions, get_tool_definitions,
+    parse_report_back_payload, ReportBackPayload, ToolCall, ToolDefinition,
+};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,16 +24,128 @@ use tokio::sync::Semaphore;
 /// Overall timeout for the agentic loop to prevent indefinite hangs
 const LOOP_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_PARALLEL_TOOL_EXECUTIONS: usize = 4;
+/// Extra turns reserved to nudge the model to finalize with `report_back`.
+const REPORT_BACK_GRACE_ROUNDS: usize = 2;
 
 /// Some providers occasionally return a response with no content and no tool calls.
 /// Treat this as transient and retry a few times with backoff.
 const EMPTY_RESPONSE_MAX_RETRIES: u32 = 3;
+const TEXT_INSTEAD_OF_REPORT_BACK_MAX_RETRIES: u32 = 2;
+const INVALID_REPORT_BACK_PAYLOAD_MAX_RETRIES: u32 = 2;
+const REPEATED_TOOL_ERROR_THRESHOLD: u32 = 3;
+const TOOL_ERROR_LOOP_EXTRA_RETRIES: u32 = 2;
+const FINALIZATION_NON_REPORT_BACK_MAX_RETRIES: u32 = 1;
+const STREAM_REASONING_PRINT_MAX_CHARS: usize = 8_000;
 
 /// Response from an agentic LLM call
 #[derive(Debug)]
 pub struct AgenticResponse {
     pub content: String,
     pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgenticReportBackResponse {
+    pub report_back: ReportBackPayload,
+    pub usage: Option<Usage>,
+    pub trace: AgenticTrace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgenticTrace {
+    #[serde(default)]
+    pub steps: Vec<AgenticTraceStep>,
+    #[serde(default)]
+    pub finalized_with_report_back: bool,
+    #[serde(default)]
+    pub termination_reason: Option<String>,
+    #[serde(default)]
+    pub repeated_tool_error_count: u32,
+    #[serde(default)]
+    pub invalid_report_back_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgenticTraceStep {
+    pub iteration: usize,
+    pub finalization_round: bool,
+    #[serde(default)]
+    pub assistant_content_preview: Option<String>,
+    #[serde(default)]
+    pub reasoning_preview: Option<String>,
+    #[serde(default)]
+    pub tool_call_names: Vec<String>,
+    pub report_back_called: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolErrorLoopAction {
+    None,
+    InjectCorrective,
+    Fail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizationNonReportBackAction {
+    Retry,
+    Fail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidReportBackAction {
+    Retry,
+    Fail,
+}
+
+#[derive(Debug, Default)]
+struct ToolErrorLoopTracker {
+    last_signature: Option<String>,
+    consecutive: u32,
+    max_consecutive: u32,
+    threshold_triggered: bool,
+    corrective_retries: u32,
+}
+
+impl ToolErrorLoopTracker {
+    fn observe(&mut self, signature: Option<String>) -> ToolErrorLoopAction {
+        let Some(signature) = signature else {
+            self.last_signature = None;
+            self.consecutive = 0;
+            self.threshold_triggered = false;
+            self.corrective_retries = 0;
+            return ToolErrorLoopAction::None;
+        };
+
+        if self.last_signature.as_deref() == Some(signature.as_str()) {
+            self.consecutive = self.consecutive.saturating_add(1);
+        } else {
+            self.last_signature = Some(signature);
+            self.consecutive = 1;
+            self.threshold_triggered = false;
+            self.corrective_retries = 0;
+        }
+
+        self.max_consecutive = self.max_consecutive.max(self.consecutive);
+        if self.consecutive < REPEATED_TOOL_ERROR_THRESHOLD {
+            return ToolErrorLoopAction::None;
+        }
+
+        if !self.threshold_triggered {
+            self.threshold_triggered = true;
+            return ToolErrorLoopAction::InjectCorrective;
+        }
+
+        if self.corrective_retries < TOOL_ERROR_LOOP_EXTRA_RETRIES {
+            self.corrective_retries = self.corrective_retries.saturating_add(1);
+            return ToolErrorLoopAction::InjectCorrective;
+        }
+
+        ToolErrorLoopAction::Fail
+    }
+
+    fn max_consecutive(&self) -> u32 {
+        self.max_consecutive
+    }
 }
 
 async fn run_parallel_ordered_blocking<I, O, F>(
@@ -94,7 +213,7 @@ pub struct FunctionCallMessage {
     pub arguments: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
@@ -116,6 +235,8 @@ struct ChatRequest {
     parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<ProviderConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -134,9 +255,28 @@ pub struct JsonSchemaConfig {
 }
 
 #[derive(Serialize, Clone)]
-#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
 enum ToolChoice {
+    Mode(ToolChoiceMode),
+    Function(ToolChoiceFunctionSelection),
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "snake_case")]
+enum ToolChoiceMode {
     Auto,
+}
+
+#[derive(Serialize, Clone)]
+struct ToolChoiceFunctionSelection {
+    #[serde(rename = "type")]
+    choice_type: &'static str,
+    function: ToolChoiceFunctionName,
+}
+
+#[derive(Serialize, Clone)]
+struct ToolChoiceFunctionName {
+    name: &'static str,
 }
 
 #[derive(Serialize, Clone)]
@@ -144,7 +284,7 @@ struct PluginConfig {
     id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ProviderThresholds {
     #[serde(skip_serializing_if = "Option::is_none")]
     p50: Option<f64>,
@@ -156,7 +296,7 @@ struct ProviderThresholds {
     p99: Option<f64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ProviderConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     order: Option<Vec<String>>,
@@ -172,7 +312,7 @@ struct ProviderConfig {
 }
 
 /// OpenRouter reasoning configuration for extended thinking
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ReasoningConfig {
     effort: String,
     /// Exclude reasoning from the response (we only want the final answer)
@@ -192,11 +332,175 @@ pub fn schema_to_response_format(name: &str, schema: serde_json::Value) -> Respo
     }
 }
 
-fn reasoning_config(model: Model) -> Option<ReasoningConfig> {
+fn reasoning_config_for_model(model: Model, include_output: bool) -> Option<ReasoningConfig> {
+    if !is_openrouter_backend() {
+        // Groq rejects OpenRouter-specific reasoning objects on some routes.
+        return None;
+    }
     model.reasoning_effort().map(|effort| ReasoningConfig {
         effort: effort.to_string(),
-        exclude: true,
+        exclude: !include_output,
     })
+}
+
+fn reasoning_config(model: Model) -> Option<ReasoningConfig> {
+    reasoning_config_for_model(model, include_reasoning_output())
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn stream_reasoning_output_enabled() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    env_flag("COSMOS_STREAM_REASONING")
+}
+
+fn include_reasoning_output() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    env_flag("COSMOS_INCLUDE_REASONING") || stream_reasoning_output_enabled()
+}
+
+fn preview_text(value: Option<&str>, limit_chars: usize) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let mut out = value.chars().take(limit_chars).collect::<String>();
+            if value.chars().count() > limit_chars {
+                out.push('…');
+            }
+            out
+        })
+}
+
+fn preview_reasoning(value: Option<&serde_json::Value>, limit_chars: usize) -> Option<String> {
+    let value = value?;
+    match value {
+        serde_json::Value::String(text) => preview_text(Some(text), limit_chars),
+        other => {
+            let serialized = other.to_string();
+            preview_text(Some(&serialized), limit_chars)
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct StreamPrintState {
+    printed_reasoning_chars: usize,
+    reasoning_truncated: bool,
+    last_tool_line: Option<String>,
+}
+
+fn format_streamed_reasoning_chunk(text: &str, state: &mut StreamPrintState) -> Option<String> {
+    if text.is_empty() || state.reasoning_truncated {
+        return None;
+    }
+    let remaining = STREAM_REASONING_PRINT_MAX_CHARS.saturating_sub(state.printed_reasoning_chars);
+    if remaining == 0 {
+        state.reasoning_truncated = true;
+        return Some(format!(
+            "\n[reasoning-stream] output truncated at {} chars\n",
+            STREAM_REASONING_PRINT_MAX_CHARS
+        ));
+    }
+
+    let char_count = text.chars().count();
+    if char_count <= remaining {
+        state.printed_reasoning_chars = state.printed_reasoning_chars.saturating_add(char_count);
+        return Some(text.to_string());
+    }
+
+    let mut output = text.chars().take(remaining).collect::<String>();
+    state.printed_reasoning_chars = STREAM_REASONING_PRINT_MAX_CHARS;
+    state.reasoning_truncated = true;
+    output.push_str(&format!(
+        "\n[reasoning-stream] output truncated at {} chars\n",
+        STREAM_REASONING_PRINT_MAX_CHARS
+    ));
+    Some(output)
+}
+
+fn normalize_tool_error_signature(tool_name: &str, content: &str) -> Option<String> {
+    let first_line = content.lines().next().unwrap_or_default().trim();
+    if first_line.is_empty() {
+        return Some(format!("{}:empty_output", tool_name));
+    }
+
+    let lower = first_line.to_ascii_lowercase();
+    let normalized = if lower.starts_with("invalid path")
+        || lower.contains("path escapes repository")
+        || lower.contains("absolute paths are not allowed")
+        || lower.contains("parent traversal is not allowed")
+    {
+        "path_contract_violation"
+    } else if lower.starts_with("invalid arguments") {
+        "invalid_arguments"
+    } else if lower.starts_with("file not found") {
+        "file_not_found"
+    } else if lower.starts_with("directory not found") {
+        "directory_not_found"
+    } else if lower.starts_with("search timed out") || lower.starts_with("command timed out") {
+        "tool_timeout"
+    } else if lower.starts_with("failed to execute command")
+        || lower.starts_with("search failed")
+        || lower.starts_with("failed to read file")
+    {
+        "tool_execution_failed"
+    } else {
+        return None;
+    };
+
+    Some(format!("{}:{}", tool_name, normalized))
+}
+
+fn build_tool_error_loop_corrective_prompt(signature: &str) -> String {
+    format!(
+        "You are repeating the same failing tool pattern ({signature}). \
+Use repo-relative paths only (examples: `.` or `crates/cosmos-engine/src/llm/agentic.rs`). \
+Do not use absolute filesystem paths. In finalization, call report_back exactly once with a valid JSON object payload."
+    )
+}
+
+fn build_invalid_report_back_retry_prompt(first_error: &str, latest_error: &str) -> String {
+    format!(
+        "Your report_back payload is invalid.\n\
+First validation error: {first_error}\n\
+Latest validation error: {latest_error}\n\
+Call report_back again with strict schema:\n\
+1) explanation must be an object with role/findings/verified_findings\n\
+2) files must be a map or list of {{path,ranges}}\n\
+3) ranges must be [start,end] with start>=1 and end>=start\n\
+Return only a valid report_back call."
+    )
+}
+
+fn finalization_non_report_back_action(retries: u32) -> FinalizationNonReportBackAction {
+    if retries < FINALIZATION_NON_REPORT_BACK_MAX_RETRIES {
+        FinalizationNonReportBackAction::Retry
+    } else {
+        FinalizationNonReportBackAction::Fail
+    }
+}
+
+fn invalid_report_back_action(retries: u32, within_time_budget: bool) -> InvalidReportBackAction {
+    if retries < INVALID_REPORT_BACK_PAYLOAD_MAX_RETRIES && within_time_budget {
+        InvalidReportBackAction::Retry
+    } else {
+        InvalidReportBackAction::Fail
+    }
 }
 
 fn response_healing_plugins() -> Vec<PluginConfig> {
@@ -205,12 +509,26 @@ fn response_healing_plugins() -> Vec<PluginConfig> {
     }]
 }
 
-const GPT_OSS_PROVIDER_ORDER: [&str; 3] = ["cerebras/fp16", "deepinfra/turbo", "groq"];
+const SPEED_PRIMARY_PROVIDER: &str = "groq";
+const SPEED_FALLBACK_PROVIDER: &str = "cerebras/fp16";
+const GPT_OSS_PROVIDER_ORDER: [&str; 2] = [SPEED_PRIMARY_PROVIDER, SPEED_FALLBACK_PROVIDER];
+
+fn provider_single(provider: &str, require_parameters: bool) -> ProviderConfig {
+    let require_parameters = if require_parameters { Some(true) } else { None };
+    ProviderConfig {
+        order: Some(vec![provider.to_string()]),
+        allow_fallbacks: false,
+        require_parameters,
+        preferred_max_latency: None,
+        preferred_min_throughput: None,
+        quantizations: None,
+    }
+}
 
 fn provider_config(model: Model, require_parameters: bool) -> ProviderConfig {
     let require_parameters = if require_parameters { Some(true) } else { None };
 
-    // For gpt-oss-120b (Speed tier), strongly prefer Cerebras fp16, with explicit fallbacks.
+    // For gpt-oss-120b (Speed tier), prefer Groq first with explicit Cerebras fallback.
     if model == Model::Speed {
         return ProviderConfig {
             order: Some(
@@ -219,8 +537,7 @@ fn provider_config(model: Model, require_parameters: bool) -> ProviderConfig {
                     .map(|p| p.to_string())
                     .collect(),
             ),
-            // Restrict routing to the explicit order only (Cerebras fp16 first, then
-            // explicitly-approved fallbacks).
+            // Restrict routing to the explicit order only (Groq first, then Cerebras/fp16).
             allow_fallbacks: false,
             require_parameters,
             preferred_max_latency: None,
@@ -249,6 +566,43 @@ fn provider_config(model: Model, require_parameters: bool) -> ProviderConfig {
     }
 }
 
+fn provider_config_for_backend(model: Model, require_parameters: bool) -> Option<ProviderConfig> {
+    if is_openrouter_backend() {
+        Some(provider_config(model, require_parameters))
+    } else {
+        None
+    }
+}
+
+fn is_no_endpoints_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("no endpoints found")
+        || (message.contains("404")
+            && message.contains("not found")
+            && message.contains("endpoint"))
+}
+
+fn is_rate_limited_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("429")
+        || message.contains("too many requests")
+        || message.contains("rate limited")
+        || message.contains("rate-limited")
+}
+
+fn is_provider_unavailable_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("no provider available")
+        || message.contains("provider is unavailable")
+        || (message.contains("503") && message.contains("provider"))
+}
+
+fn is_route_or_capacity_error(error: &anyhow::Error) -> bool {
+    is_no_endpoints_error(error)
+        || is_rate_limited_error(error)
+        || is_provider_unavailable_error(error)
+}
+
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
@@ -265,7 +619,373 @@ struct ResponseMessage {
     content: Option<String>,
     tool_calls: Option<Vec<ToolCallMessage>>,
     #[serde(default)]
+    reasoning: Option<serde_json::Value>,
+    #[serde(default)]
     refusal: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
+    #[serde(default)]
+    refusal: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamToolCallDelta {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "type")]
+    #[serde(default)]
+    call_type: Option<String>,
+    #[serde(default)]
+    function: Option<StreamFunctionCallDelta>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamFunctionCallDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+fn empty_tool_call_message() -> ToolCallMessage {
+    ToolCallMessage {
+        id: String::new(),
+        call_type: "function".to_string(),
+        function: FunctionCallMessage {
+            name: String::new(),
+            arguments: String::new(),
+        },
+    }
+}
+
+fn reasoning_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items.iter().map(reasoning_text).collect::<String>(),
+        serde_json::Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(|value| value.as_str()) {
+                text.to_string()
+            } else {
+                value.to_string()
+            }
+        }
+        _ => value.to_string(),
+    }
+}
+
+fn apply_tool_call_deltas(
+    output: &mut Vec<ToolCallMessage>,
+    deltas: Vec<StreamToolCallDelta>,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for delta in deltas {
+        let index = delta.index.unwrap_or(output.len());
+        while output.len() <= index {
+            output.push(empty_tool_call_message());
+        }
+        let call = &mut output[index];
+        if let Some(id) = delta.id {
+            if !id.is_empty() {
+                call.id = id;
+            }
+        }
+        if let Some(call_type) = delta.call_type {
+            if !call_type.is_empty() {
+                call.call_type = call_type;
+            }
+        }
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                if !name.is_empty() {
+                    if call.function.name.is_empty() {
+                        call.function.name = name.clone();
+                    } else if call.function.name != name && !call.function.name.ends_with(&name) {
+                        call.function.name.push_str(&name);
+                    }
+                    names.push(name);
+                }
+            }
+            if let Some(arguments) = function.arguments {
+                if !arguments.is_empty() {
+                    call.function.arguments.push_str(&arguments);
+                }
+            }
+        }
+    }
+    names
+}
+
+fn process_sse_payload(
+    payload: &str,
+    content: &mut String,
+    reasoning: &mut String,
+    tool_calls: &mut Vec<ToolCallMessage>,
+    refusal: &mut Option<String>,
+    usage: &mut Option<Usage>,
+    stream_reasoning: bool,
+    print_state: &mut StreamPrintState,
+) -> anyhow::Result<bool> {
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return Ok(false);
+    }
+    if payload == "[DONE]" {
+        return Ok(true);
+    }
+
+    let chunk: StreamChunk = serde_json::from_str(payload)
+        .map_err(|err| anyhow::anyhow!("Failed to parse stream chunk: {}", err))?;
+    if let Some(chunk_usage) = chunk.usage {
+        *usage = Some(chunk_usage);
+    }
+    for choice in chunk.choices {
+        if let Some(refusal_text) = choice.delta.refusal {
+            if !refusal_text.trim().is_empty() {
+                *refusal = Some(refusal_text);
+            }
+        }
+        if let Some(text) = choice.delta.content {
+            content.push_str(&text);
+        }
+        if let Some(reasoning_value) = choice.delta.reasoning {
+            let text = reasoning_text(&reasoning_value);
+            if !text.is_empty() {
+                reasoning.push_str(&text);
+                if stream_reasoning {
+                    if let Some(output) = format_streamed_reasoning_chunk(&text, print_state) {
+                        eprint!("{}", output);
+                        let _ = std::io::stderr().flush();
+                    }
+                }
+            }
+        }
+        if let Some(delta_calls) = choice.delta.tool_calls {
+            let names = apply_tool_call_deltas(tool_calls, delta_calls);
+            if stream_reasoning && !names.is_empty() {
+                let tool_line = names.join(", ");
+                if print_state.last_tool_line.as_deref() != Some(tool_line.as_str()) {
+                    eprintln!("\n[tool] {}", tool_line);
+                    print_state.last_tool_line = Some(tool_line);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn send_streaming_chat_request(
+    client: &reqwest::Client,
+    api_key: &str,
+    request: &ChatRequest,
+) -> anyhow::Result<ChatResponse> {
+    let request_builder = client.post(chat_completions_url()).json(request);
+    let response = apply_backend_headers(request_builder, api_key)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("Streaming API error {}: {}", status, text));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut event_data = String::new();
+
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    let mut refusal = None;
+    let mut usage = None;
+    let stream_reasoning = stream_reasoning_output_enabled();
+    let mut printed_header = false;
+    let mut print_state = StreamPrintState::default();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|err| anyhow::anyhow!("Stream read failed: {}", err))?;
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(pos) = buffer.find('\n') {
+            let mut line = buffer[..pos].to_string();
+            buffer.drain(..=pos);
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            let line = line.trim_end();
+
+            if line.is_empty() {
+                if !event_data.is_empty() {
+                    if stream_reasoning && !printed_header {
+                        eprintln!("\n[reasoning-stream]");
+                        printed_header = true;
+                    }
+                    if process_sse_payload(
+                        &event_data,
+                        &mut content,
+                        &mut reasoning,
+                        &mut tool_calls,
+                        &mut refusal,
+                        &mut usage,
+                        stream_reasoning,
+                        &mut print_state,
+                    )? {
+                        if stream_reasoning && printed_header {
+                            eprintln!();
+                        }
+                        return Ok(ChatResponse {
+                            choices: vec![Choice {
+                                message: ResponseMessage {
+                                    content: if content.is_empty() {
+                                        None
+                                    } else {
+                                        Some(content)
+                                    },
+                                    tool_calls: if tool_calls.is_empty() {
+                                        None
+                                    } else {
+                                        Some(tool_calls)
+                                    },
+                                    reasoning: if reasoning.is_empty() {
+                                        None
+                                    } else {
+                                        Some(serde_json::Value::String(reasoning))
+                                    },
+                                    refusal,
+                                },
+                            }],
+                            usage,
+                        });
+                    }
+                    event_data.clear();
+                }
+                continue;
+            }
+
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim_start();
+                if !event_data.is_empty() {
+                    event_data.push('\n');
+                }
+                event_data.push_str(data);
+            }
+        }
+    }
+
+    if !event_data.trim().is_empty() {
+        let _ = process_sse_payload(
+            &event_data,
+            &mut content,
+            &mut reasoning,
+            &mut tool_calls,
+            &mut refusal,
+            &mut usage,
+            stream_reasoning,
+            &mut print_state,
+        )?;
+    }
+    if stream_reasoning && printed_header {
+        eprintln!();
+    }
+
+    Ok(ChatResponse {
+        choices: vec![Choice {
+            message: ResponseMessage {
+                content: if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
+                },
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
+                reasoning: if reasoning.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::String(reasoning))
+                },
+                refusal,
+            },
+        }],
+        usage,
+    })
+}
+
+async fn send_report_back_text_with_speed_fallback(
+    client: &reqwest::Client,
+    api_key: &str,
+    model: Model,
+    include_reasoning_output: bool,
+    request: &mut ChatRequest,
+) -> anyhow::Result<String> {
+    if !is_openrouter_backend() {
+        return send_with_retry(client, api_key, request).await;
+    }
+    match send_with_retry(client, api_key, request).await {
+        Ok(text) => Ok(text),
+        Err(primary_err) => {
+            if model != Model::Speed || !is_route_or_capacity_error(&primary_err) {
+                return Err(primary_err);
+            }
+
+            // Fallback 1: keep model, remove provider pin to allow OpenRouter routing.
+            request.provider = None;
+            match send_with_retry(client, api_key, request).await {
+                Ok(text) => Ok(text),
+                Err(unpinned_err) => {
+                    if !is_route_or_capacity_error(&unpinned_err) {
+                        return Err(anyhow::anyhow!(
+                            "Pinned provider was unavailable ({}), and unpinned routing failed: {}",
+                            primary_err,
+                            unpinned_err
+                        ));
+                    }
+
+                    // Fallback 2: stay on gpt-oss-120b and force the explicit Cerebras route.
+                    request.model = model_id_for_backend(model);
+                    request.max_tokens = model.max_tokens();
+                    request.reasoning = reasoning_config_for_model(model, include_reasoning_output);
+                    request.provider = Some(provider_single(SPEED_FALLBACK_PROVIDER, false));
+                    send_with_retry(client, api_key, request)
+                        .await
+                        .map_err(|cerebras_err| {
+                            anyhow::anyhow!(
+                                "No routes available for {} (ordered and unpinned). Explicit fallback provider {} also failed: {}",
+                                model.id(),
+                                SPEED_FALLBACK_PROVIDER,
+                                cerebras_err
+                            )
+                        })
+                }
+            }
+        }
+    }
 }
 
 /// Call LLM with tool-calling capability.
@@ -290,9 +1010,7 @@ pub async fn call_llm_agentic(
     max_iterations: usize,
     final_response_format: Option<ResponseFormat>,
 ) -> anyhow::Result<AgenticResponse> {
-    let api_key = api_key().ok_or_else(|| {
-        anyhow::anyhow!("No API key configured. Run 'cosmos --setup' to get started.")
-    })?;
+    let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
 
     let client = create_http_client(REQUEST_TIMEOUT_SECS)?;
 
@@ -328,7 +1046,7 @@ pub async fn call_llm_agentic(
         // During exploration, don't use structured output (incompatible with tools for many models)
         // Structured output is only applied on the final forced response
         let request = ChatRequest {
-            model: model.id().to_string(),
+            model: model_id_for_backend(model),
             messages: messages.clone(),
             user: openrouter_user(),
             max_tokens: model.max_tokens(),
@@ -337,9 +1055,10 @@ pub async fn call_llm_agentic(
             reasoning: reasoning_config(model),
             plugins: None,
             tools: Some(tools.clone()),
-            tool_choice: Some(ToolChoice::Auto),
+            tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
             parallel_tool_calls: Some(true),
-            provider: Some(provider_config(model, false)),
+            provider: provider_config_for_backend(model, false),
+            service_tier: groq_service_tier(),
         };
 
         // Use shared retry helper - handles timeouts, rate limits, server errors
@@ -474,18 +1193,23 @@ pub async fn call_llm_agentic(
             });
 
             let format_request = ChatRequest {
-                model: model.id().to_string(),
+                model: model_id_for_backend(model),
                 messages: messages.clone(),
                 user: openrouter_user(),
                 max_tokens: model.max_tokens(),
                 stream: false,
                 response_format: final_response_format.clone(),
                 reasoning: reasoning_config(model),
-                plugins: Some(response_healing_plugins()),
+                plugins: if is_openrouter_backend() {
+                    Some(response_healing_plugins())
+                } else {
+                    None
+                },
                 tools: None,
                 tool_choice: None,
                 parallel_tool_calls: None,
-                provider: Some(provider_config(model, true)),
+                provider: provider_config_for_backend(model, true),
+                service_tier: groq_service_tier(),
             };
 
             let text = send_with_retry(&client, &api_key, &format_request).await?;
@@ -542,7 +1266,7 @@ pub async fn call_llm_agentic(
     // Don't include tools or structured output to maximize compatibility
     let use_structured_output = final_response_format.is_some();
     let final_request = ChatRequest {
-        model: model.id().to_string(),
+        model: model_id_for_backend(model),
         messages: messages.clone(),
         user: openrouter_user(),
         max_tokens: model.max_tokens(),
@@ -557,7 +1281,8 @@ pub async fn call_llm_agentic(
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
-        provider: Some(provider_config(model, use_structured_output)),
+        provider: provider_config_for_backend(model, use_structured_output),
+        service_tier: groq_service_tier(),
     };
     // Use shared retry helper for final request too, plus a few retries for empty content.
     let mut last_error: Option<anyhow::Error> = None;
@@ -630,6 +1355,463 @@ pub async fn call_llm_agentic(
         content,
         usage: total_usage,
     })
+}
+
+/// Agentic call variant that only succeeds when the model completes via `report_back`.
+///
+/// This is used by suggestion generation workflows that require strict tool-based completion.
+pub async fn call_llm_agentic_report_back_only(
+    system: &str,
+    user: &str,
+    model: Model,
+    repo_root: &Path,
+    max_iterations: usize,
+) -> anyhow::Result<AgenticReportBackResponse> {
+    let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
+    let client = create_http_client(REQUEST_TIMEOUT_SECS)?;
+    let tools = get_relace_search_tool_definitions();
+
+    let mut messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Some(system.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Some(user.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+
+    let mut iteration = 0usize;
+    let start = Instant::now();
+    let mut total_usage: Option<Usage> = None;
+    let mut empty_response_retries: u32 = 0;
+    let mut text_response_retries: u32 = 0;
+    let mut invalid_report_back_retries: u32 = 0;
+    let mut first_invalid_report_back_error: Option<String> = None;
+    let mut finalization_non_report_back_retries: u32 = 0;
+    let mut tool_error_loop_tracker = ToolErrorLoopTracker::default();
+    let max_total_iterations = max_iterations.saturating_add(REPORT_BACK_GRACE_ROUNDS);
+    let mut forced_report_back_mode = false;
+    let mut trace = AgenticTrace::default();
+    let mut stream_reasoning = stream_reasoning_output_enabled();
+    let mut include_reasoning = include_reasoning_output();
+    let mut stream_fallback_logged = false;
+
+    loop {
+        iteration += 1;
+        if iteration > max_total_iterations || start.elapsed() > LOOP_TIMEOUT {
+            return Err(anyhow::anyhow!(
+                "termination_reason=timeout Agent did not call report_back within iteration/time budget."
+            ));
+        }
+
+        let elapsed_ms = start.elapsed().as_millis();
+        let timeout_ms = LOOP_TIMEOUT.as_millis();
+        let near_timeout = elapsed_ms.saturating_mul(100) >= timeout_ms.saturating_mul(75);
+        let finalization_round =
+            near_timeout || iteration >= max_total_iterations.saturating_sub(2);
+        if finalization_round && !forced_report_back_mode {
+            forced_report_back_mode = true;
+            messages.push(Message {
+                role: "user".to_string(),
+                content: Some(
+                    "Time budget is nearly exhausted. Stop exploring and call report_back now."
+                        .to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        let request_tools = if finalization_round {
+            tools
+                .iter()
+                .filter(|tool| tool.function.name == "report_back")
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            tools.clone()
+        };
+        let request = ChatRequest {
+            model: model_id_for_backend(model),
+            messages: messages.clone(),
+            user: openrouter_user(),
+            max_tokens: model.max_tokens(),
+            stream: stream_reasoning,
+            response_format: None,
+            reasoning: reasoning_config_for_model(model, include_reasoning),
+            plugins: None,
+            tools: Some(request_tools),
+            tool_choice: Some(if finalization_round {
+                ToolChoice::Function(ToolChoiceFunctionSelection {
+                    choice_type: "function",
+                    function: ToolChoiceFunctionName {
+                        name: "report_back",
+                    },
+                })
+            } else {
+                ToolChoice::Mode(ToolChoiceMode::Auto)
+            }),
+            parallel_tool_calls: Some(!finalization_round),
+            provider: provider_config_for_backend(model, stream_reasoning),
+            service_tier: groq_service_tier(),
+        };
+        let mut request = request;
+        let parsed: ChatResponse = if stream_reasoning {
+            match send_streaming_chat_request(&client, &api_key, &request).await {
+                Ok(parsed) => parsed,
+                Err(stream_err) => {
+                    let mut final_stream_error = stream_err;
+                    if is_route_or_capacity_error(&final_stream_error) && request.provider.is_some()
+                    {
+                        // Retry once with relaxed capability matching before buffered fallback.
+                        request.provider = provider_config_for_backend(model, false);
+                        match send_streaming_chat_request(&client, &api_key, &request).await {
+                            Ok(parsed) => {
+                                // Keep streaming enabled for future iterations now that relaxed streaming works.
+                                parsed
+                            }
+                            Err(relaxed_stream_err) => {
+                                final_stream_error = relaxed_stream_err;
+                                if !stream_fallback_logged {
+                                    eprintln!(
+                                        "\n[reasoning-stream] fallback to buffered mode: strict+relaxed stream failed: {}",
+                                        final_stream_error
+                                    );
+                                    stream_fallback_logged = true;
+                                }
+                                stream_reasoning = false;
+                                if is_route_or_capacity_error(&final_stream_error) {
+                                    include_reasoning = false;
+                                }
+                                request.stream = false;
+                                request.provider = provider_config_for_backend(model, false);
+                                request.reasoning =
+                                    reasoning_config_for_model(model, include_reasoning);
+                                let text = send_report_back_text_with_speed_fallback(
+                                    &client,
+                                    &api_key,
+                                    model,
+                                    include_reasoning,
+                                    &mut request,
+                                )
+                                .await?;
+                                serde_json::from_str(&text).map_err(|e| {
+                                    anyhow::anyhow!("Failed to parse response: {}\n{}", e, text)
+                                })?
+                            }
+                        }
+                    } else {
+                        if !stream_fallback_logged {
+                            eprintln!(
+                                "\n[reasoning-stream] fallback to buffered mode: {}",
+                                final_stream_error
+                            );
+                            stream_fallback_logged = true;
+                        }
+                        stream_reasoning = false;
+                        if is_route_or_capacity_error(&final_stream_error) {
+                            include_reasoning = false;
+                        }
+                        request.stream = false;
+                        request.provider = provider_config_for_backend(model, false);
+                        request.reasoning = reasoning_config_for_model(model, include_reasoning);
+                        let text = send_report_back_text_with_speed_fallback(
+                            &client,
+                            &api_key,
+                            model,
+                            include_reasoning,
+                            &mut request,
+                        )
+                        .await?;
+                        serde_json::from_str(&text).map_err(|e| {
+                            anyhow::anyhow!("Failed to parse response: {}\n{}", e, text)
+                        })?
+                    }
+                }
+            }
+        } else {
+            let text = send_report_back_text_with_speed_fallback(
+                &client,
+                &api_key,
+                model,
+                include_reasoning,
+                &mut request,
+            )
+            .await?;
+            serde_json::from_str(&text)
+                .map_err(|e| anyhow::anyhow!("Failed to parse response: {}\n{}", e, text))?
+        };
+        total_usage = merge_usage(total_usage, parsed.usage.clone());
+
+        let choice = parsed
+            .choices
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No response from model"))?;
+
+        if let Some(refusal) = &choice.message.refusal {
+            return Err(anyhow::anyhow!(
+                "termination_reason=refusal Request was refused: {}",
+                refusal.chars().take(200).collect::<String>()
+            ));
+        }
+
+        let assistant_content_preview = preview_text(choice.message.content.as_deref(), 180);
+        let reasoning_preview = preview_reasoning(choice.message.reasoning.as_ref(), 180);
+
+        if let Some(tool_calls) = &choice.message.tool_calls {
+            if !tool_calls.is_empty() {
+                let tool_call_names = tool_calls
+                    .iter()
+                    .map(|tool_call| tool_call.function.name.clone())
+                    .collect::<Vec<_>>();
+                let report_back_called = tool_calls
+                    .iter()
+                    .any(|tool_call| tool_call.function.name == "report_back");
+                trace.steps.push(AgenticTraceStep {
+                    iteration,
+                    finalization_round,
+                    assistant_content_preview: assistant_content_preview.clone(),
+                    reasoning_preview: reasoning_preview.clone(),
+                    tool_call_names,
+                    report_back_called,
+                });
+
+                messages.push(Message {
+                    role: "assistant".to_string(),
+                    content: choice.message.content.clone(),
+                    tool_calls: Some(tool_calls.clone()),
+                    tool_call_id: None,
+                });
+
+                if let Some(report_call) = tool_calls
+                    .iter()
+                    .find(|tool_call| tool_call.function.name == "report_back")
+                {
+                    match parse_report_back_payload(&report_call.function.arguments) {
+                        Ok(payload) => {
+                            trace.finalized_with_report_back = true;
+                            trace.termination_reason = Some("report_back_ok".to_string());
+                            trace.repeated_tool_error_count = trace
+                                .repeated_tool_error_count
+                                .max(tool_error_loop_tracker.max_consecutive());
+                            trace.invalid_report_back_count = invalid_report_back_retries;
+                            return Ok(AgenticReportBackResponse {
+                                report_back: payload,
+                                usage: total_usage,
+                                trace,
+                            });
+                        }
+                        Err(err) => {
+                            let action = invalid_report_back_action(
+                                invalid_report_back_retries,
+                                start.elapsed() < LOOP_TIMEOUT,
+                            );
+                            invalid_report_back_retries =
+                                invalid_report_back_retries.saturating_add(1);
+                            trace.invalid_report_back_count = invalid_report_back_retries;
+                            if first_invalid_report_back_error.is_none() {
+                                first_invalid_report_back_error = Some(err.clone());
+                            }
+                            match action {
+                                InvalidReportBackAction::Retry => {
+                                    iteration = iteration.saturating_sub(1);
+                                    let first_error = first_invalid_report_back_error
+                                        .as_deref()
+                                        .unwrap_or(err.as_str());
+                                    messages.push(Message {
+                                        role: "user".to_string(),
+                                        content: Some(build_invalid_report_back_retry_prompt(
+                                            first_error,
+                                            &err,
+                                        )),
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                    });
+                                    continue;
+                                }
+                                InvalidReportBackAction::Fail => {}
+                            }
+                            return Err(anyhow::anyhow!(
+                                "termination_reason=invalid_report_back_exhausted invalid_report_back_count={} Invalid report_back payload: {}",
+                                invalid_report_back_retries,
+                                err
+                            ));
+                        }
+                    }
+                }
+
+                if finalization_round {
+                    match finalization_non_report_back_action(finalization_non_report_back_retries)
+                    {
+                        FinalizationNonReportBackAction::Retry => {
+                            finalization_non_report_back_retries =
+                                finalization_non_report_back_retries.saturating_add(1);
+                            iteration = iteration.saturating_sub(1);
+                            messages.push(Message {
+                                role: "user".to_string(),
+                                content: Some(
+                                    "Finalization mode is active. You must call report_back now. Do not call other tools."
+                                        .to_string(),
+                                ),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            });
+                            continue;
+                        }
+                        FinalizationNonReportBackAction::Fail => {}
+                    }
+
+                    return Err(anyhow::anyhow!(
+                        "termination_reason=finalization_non_report_back finalization_retries_exhausted={} Model called non-report_back tools in finalization mode.",
+                        finalization_non_report_back_retries
+                    ));
+                }
+
+                let repo_root_buf = repo_root.to_path_buf();
+                let inputs: Vec<(PathBuf, ToolCall)> = tool_calls
+                    .iter()
+                    .map(|tc| {
+                        let tool_call_id = tc.id.clone();
+                        let tool_call = ToolCall {
+                            id: tool_call_id,
+                            function: super::tools::FunctionCall {
+                                name: tc.function.name.clone(),
+                                arguments: tc.function.arguments.clone(),
+                            },
+                        };
+                        (repo_root_buf.clone(), tool_call)
+                    })
+                    .collect();
+
+                let results = run_parallel_ordered_blocking(
+                    inputs,
+                    MAX_PARALLEL_TOOL_EXECUTIONS,
+                    Arc::new(|(repo_root, tool_call): (PathBuf, ToolCall)| {
+                        execute_tool(&repo_root, &tool_call)
+                    }),
+                )
+                .await;
+
+                let mut round_error_signatures = Vec::new();
+                for (idx, tc) in tool_calls.iter().enumerate() {
+                    let tc_id = tc.id.clone();
+                    let result = results
+                        .get(idx)
+                        .and_then(|r| r.as_ref())
+                        .cloned()
+                        .unwrap_or_else(|| super::tools::ToolResult {
+                            tool_call_id: tc_id.clone(),
+                            content:
+                                "Tool execution failed. Please try again. (no tool result returned)"
+                                    .to_string(),
+                        });
+                    if let Some(signature) =
+                        normalize_tool_error_signature(&tc.function.name, &result.content)
+                    {
+                        round_error_signatures.push(signature);
+                    }
+                    messages.push(Message {
+                        role: "tool".to_string(),
+                        content: Some(result.content),
+                        tool_calls: None,
+                        tool_call_id: Some(tc_id),
+                    });
+                }
+
+                let round_signature = if round_error_signatures.is_empty() {
+                    None
+                } else {
+                    Some(round_error_signatures.join("|"))
+                };
+                let loop_action = tool_error_loop_tracker.observe(round_signature.clone());
+                trace.repeated_tool_error_count = trace
+                    .repeated_tool_error_count
+                    .max(tool_error_loop_tracker.max_consecutive());
+
+                match loop_action {
+                    ToolErrorLoopAction::None => {}
+                    ToolErrorLoopAction::InjectCorrective => {
+                        if let Some(signature) = round_signature {
+                            iteration = iteration.saturating_sub(1);
+                            messages.push(Message {
+                                role: "user".to_string(),
+                                content: Some(build_tool_error_loop_corrective_prompt(&signature)),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            });
+                        }
+                    }
+                    ToolErrorLoopAction::Fail => {
+                        return Err(anyhow::anyhow!(
+                            "termination_reason=tool_error_loop repeated_tool_errors={} invalid_report_back_count={} Agent repeated the same failing tool pattern.",
+                            tool_error_loop_tracker.max_consecutive(),
+                            invalid_report_back_retries
+                        ));
+                    }
+                }
+                continue;
+            }
+        }
+
+        let _ = tool_error_loop_tracker.observe(None);
+        let content = choice.message.content.clone().unwrap_or_default();
+        trace.steps.push(AgenticTraceStep {
+            iteration,
+            finalization_round,
+            assistant_content_preview: assistant_content_preview.clone(),
+            reasoning_preview: reasoning_preview.clone(),
+            tool_call_names: Vec::new(),
+            report_back_called: false,
+        });
+        if content.trim().is_empty() {
+            if empty_response_retries < EMPTY_RESPONSE_MAX_RETRIES && start.elapsed() < LOOP_TIMEOUT
+            {
+                empty_response_retries += 1;
+                iteration = iteration.saturating_sub(1);
+                let delay_ms = 250u64 * (1 << empty_response_retries);
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                continue;
+            }
+            return Err(anyhow::anyhow!(
+                "termination_reason=empty_response Model returned empty response and did not call report_back."
+            ));
+        }
+        if text_response_retries < TEXT_INSTEAD_OF_REPORT_BACK_MAX_RETRIES
+            && start.elapsed() < LOOP_TIMEOUT
+        {
+            text_response_retries += 1;
+            iteration = iteration.saturating_sub(1);
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: Some(content),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            messages.push(Message {
+                role: "user".to_string(),
+                content: Some(if finalization_round {
+                    "Finalization mode is active. Call report_back exactly once now. Do not return plain text."
+                        .to_string()
+                } else {
+                    "Continue exploring with tools if needed, then finish by calling report_back exactly once. Do not return plain text."
+                        .to_string()
+                }),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            continue;
+        }
+
+        return Err(anyhow::anyhow!(
+            "termination_reason=text_instead_of_report_back Model returned text instead of calling report_back. Last content: {}",
+            content.chars().take(200).collect::<String>()
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -719,9 +1901,10 @@ mod tests {
             reasoning: None,
             plugins: None,
             tools: Some(tools),
-            tool_choice: Some(ToolChoice::Auto),
+            tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
             parallel_tool_calls: Some(true),
             provider: None,
+            service_tier: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -731,16 +1914,148 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_request_forced_function_tool_choice_shape() {
+        let request = ChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some("hi".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            user: None,
+            max_tokens: 128,
+            stream: false,
+            response_format: None,
+            reasoning: None,
+            plugins: None,
+            tools: Some(get_relace_search_tool_definitions()),
+            tool_choice: Some(ToolChoice::Function(ToolChoiceFunctionSelection {
+                choice_type: "function",
+                function: ToolChoiceFunctionName {
+                    name: "report_back",
+                },
+            })),
+            parallel_tool_calls: Some(false),
+            provider: None,
+            service_tier: None,
+        };
+
+        let value: serde_json::Value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["tool_choice"]["type"], "function");
+        assert_eq!(value["tool_choice"]["function"]["name"], "report_back");
+    }
+
+    #[test]
     fn test_reasoning_config_for_all_models() {
         use super::Model;
 
-        // Speed gets low, Smart xhigh
+        // Speed gets high, Smart xhigh
         let speed = reasoning_config(Model::Speed).expect("Speed should have reasoning");
-        assert_eq!(speed.effort, "low");
+        assert_eq!(speed.effort, "high");
         assert!(speed.exclude);
 
         let smart = reasoning_config(Model::Smart).expect("Smart should have reasoning");
         assert_eq!(smart.effort, "xhigh");
+    }
+
+    #[test]
+    fn test_speed_provider_prefers_groq_then_cerebras() {
+        let provider = provider_config(Model::Speed, false);
+        let value = serde_json::to_value(&provider).expect("serialize provider");
+        let order = value
+            .get("order")
+            .and_then(|v| v.as_array())
+            .expect("order array");
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0].as_str(), Some("groq"));
+        assert_eq!(order[1].as_str(), Some("cerebras/fp16"));
+        assert_eq!(
+            value.get("allow_fallbacks").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_tool_error_loop_tracker_triggers_fail_after_retry_budget() {
+        let mut tracker = ToolErrorLoopTracker::default();
+        let signature = Some("view_directory:path_contract_violation".to_string());
+
+        assert_eq!(
+            tracker.observe(signature.clone()),
+            ToolErrorLoopAction::None
+        );
+        assert_eq!(
+            tracker.observe(signature.clone()),
+            ToolErrorLoopAction::None
+        );
+        assert_eq!(
+            tracker.observe(signature.clone()),
+            ToolErrorLoopAction::InjectCorrective
+        );
+        assert_eq!(
+            tracker.observe(signature.clone()),
+            ToolErrorLoopAction::InjectCorrective
+        );
+        assert_eq!(
+            tracker.observe(signature.clone()),
+            ToolErrorLoopAction::InjectCorrective
+        );
+        assert_eq!(tracker.observe(signature), ToolErrorLoopAction::Fail);
+    }
+
+    #[test]
+    fn test_finalization_non_report_back_action_is_bounded() {
+        assert_eq!(
+            finalization_non_report_back_action(0),
+            FinalizationNonReportBackAction::Retry
+        );
+        assert_eq!(
+            finalization_non_report_back_action(FINALIZATION_NON_REPORT_BACK_MAX_RETRIES),
+            FinalizationNonReportBackAction::Fail
+        );
+    }
+
+    #[test]
+    fn test_invalid_report_back_action_is_bounded() {
+        assert_eq!(
+            invalid_report_back_action(0, true),
+            InvalidReportBackAction::Retry
+        );
+        assert_eq!(
+            invalid_report_back_action(INVALID_REPORT_BACK_PAYLOAD_MAX_RETRIES, true),
+            InvalidReportBackAction::Fail
+        );
+        assert_eq!(
+            invalid_report_back_action(0, false),
+            InvalidReportBackAction::Fail
+        );
+    }
+
+    #[test]
+    fn test_streamed_reasoning_output_truncates_after_cap() {
+        let mut state = StreamPrintState::default();
+        let large = "a".repeat(STREAM_REASONING_PRINT_MAX_CHARS + 25);
+        let first = format_streamed_reasoning_chunk(&large, &mut state).expect("expected output");
+        assert!(first.contains("output truncated"));
+        assert!(state.reasoning_truncated);
+        assert_eq!(
+            state.printed_reasoning_chars,
+            STREAM_REASONING_PRINT_MAX_CHARS
+        );
+
+        let second = format_streamed_reasoning_chunk("still more", &mut state);
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn test_normalize_tool_error_signature_for_path_contract() {
+        let signature = normalize_tool_error_signature(
+            "view_directory",
+            "Invalid path '/repo': Path escapes repository: .",
+        )
+        .expect("expected normalized signature");
+        assert_eq!(signature, "view_directory:path_contract_violation");
     }
 
     #[tokio::test]
