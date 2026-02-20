@@ -687,14 +687,13 @@ fn process_sse_payload(
                 if stream_reasoning {
                     if let Some(output) = format_streamed_reasoning_chunk(&text, print_state) {
                         if let Some(sink) = stream_sink {
-                            for line in output.lines() {
-                                let trimmed = line.trim();
-                                if trimmed.is_empty() {
+                            for segment in output.split('\n') {
+                                if segment.is_empty() {
                                     continue;
                                 }
                                 sink(AgenticStreamEvent {
                                     kind: AgenticStreamKind::Reasoning,
-                                    line: trimmed.to_string(),
+                                    line: segment.to_string(),
                                 });
                             }
                         } else {

@@ -481,12 +481,7 @@ fn handle_suggestions_stream_message(
     if app.loading != LoadingState::GeneratingSuggestions {
         return;
     }
-    let kind_label = match kind {
-        cosmos_engine::llm::AgenticStreamKind::Reasoning => "reasoning",
-        cosmos_engine::llm::AgenticStreamKind::Tool => "tool",
-        cosmos_engine::llm::AgenticStreamKind::Notice => "notice",
-    };
-    app.push_suggestion_stream_line(format!("[{}|{}] {}", worker, kind_label, line));
+    app.push_suggestion_stream_event(&worker, kind, &line);
 }
 
 fn handle_grouping_enhanced_message(

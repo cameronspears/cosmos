@@ -51,6 +51,8 @@ pub(crate) const ASK_STARTER_QUESTIONS: [&str; 3] = [
     "What are the top 3 improvements with the biggest user impact?",
 ];
 const SUGGESTION_STREAM_LINE_CAP: usize = 120;
+const STREAM_REASONING_SEGMENT_MAX_CHARS: usize = 120;
+const STREAM_REASONING_VISIBLE_SEGMENTS_PER_WORKER: usize = 5;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  APP STATE
@@ -361,6 +363,90 @@ impl App {
             return;
         }
         self.suggestion_stream_lines.push(line);
+        self.enforce_suggestion_stream_line_cap();
+        self.needs_redraw = true;
+    }
+
+    pub fn push_suggestion_stream_event(
+        &mut self,
+        worker: &str,
+        kind: cosmos_engine::llm::AgenticStreamKind,
+        chunk: &str,
+    ) {
+        let kind_label = match kind {
+            cosmos_engine::llm::AgenticStreamKind::Reasoning => "reasoning",
+            cosmos_engine::llm::AgenticStreamKind::Tool => "tool",
+            cosmos_engine::llm::AgenticStreamKind::Notice => "notice",
+        };
+        let prefix = format!("[{}|{}] ", worker, kind_label);
+
+        match kind {
+            cosmos_engine::llm::AgenticStreamKind::Reasoning => {
+                if let Some(existing) = self
+                    .suggestion_stream_lines
+                    .iter_mut()
+                    .rev()
+                    .find(|line| line.starts_with(&prefix))
+                {
+                    if !chunk.is_empty() {
+                        existing.push_str(chunk);
+                        self.needs_redraw = true;
+                    }
+                    return;
+                }
+
+                if chunk.trim().is_empty() {
+                    return;
+                }
+
+                let mut line = prefix;
+                line.push_str(chunk);
+                self.suggestion_stream_lines.push(line);
+                self.enforce_suggestion_stream_line_cap();
+                self.needs_redraw = true;
+            }
+            cosmos_engine::llm::AgenticStreamKind::Tool => {
+                let trimmed = chunk.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                self.upsert_suggestion_stream_line(&prefix, trimmed);
+            }
+            cosmos_engine::llm::AgenticStreamKind::Notice => {
+                let trimmed = chunk.trim();
+                // "reasoning-stream" banners are purely structural and spammy in the live feed.
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("reasoning-stream") {
+                    return;
+                }
+                self.upsert_suggestion_stream_line(&prefix, trimmed);
+            }
+        }
+    }
+
+    fn upsert_suggestion_stream_line(&mut self, prefix: &str, value: &str) {
+        if let Some(existing) = self
+            .suggestion_stream_lines
+            .iter_mut()
+            .rev()
+            .find(|line| line.starts_with(prefix))
+        {
+            let mut updated = prefix.to_string();
+            updated.push_str(value);
+            if *existing != updated {
+                *existing = updated;
+                self.needs_redraw = true;
+            }
+            return;
+        }
+
+        let mut line = prefix.to_string();
+        line.push_str(value);
+        self.suggestion_stream_lines.push(line);
+        self.enforce_suggestion_stream_line_cap();
+        self.needs_redraw = true;
+    }
+
+    fn enforce_suggestion_stream_line_cap(&mut self) {
         if self.suggestion_stream_lines.len() > SUGGESTION_STREAM_LINE_CAP {
             let overflow = self
                 .suggestion_stream_lines
@@ -368,7 +454,46 @@ impl App {
                 .saturating_sub(SUGGESTION_STREAM_LINE_CAP);
             self.suggestion_stream_lines.drain(..overflow);
         }
-        self.needs_redraw = true;
+    }
+
+    pub fn suggestion_stream_lines_for_display(&self) -> Vec<String> {
+        let reasoning_entries = self
+            .suggestion_stream_lines
+            .iter()
+            .filter_map(|line| {
+                parse_reasoning_stream_line(line)
+                    .map(|(worker, text)| (worker.to_string(), text.to_string()))
+            })
+            .collect::<Vec<_>>();
+
+        if reasoning_entries.is_empty() {
+            return self.suggestion_stream_lines.clone();
+        }
+
+        let mut formatted = Vec::new();
+        for (idx, (worker, text)) in reasoning_entries.iter().enumerate() {
+            formatted.extend(format_reasoning_stream_block(worker, text));
+            if idx + 1 < reasoning_entries.len() {
+                formatted.push(String::new());
+            }
+        }
+
+        let hidden_updates = self
+            .suggestion_stream_lines
+            .len()
+            .saturating_sub(reasoning_entries.len());
+        if hidden_updates > 0 {
+            let noun = if hidden_updates == 1 {
+                "update"
+            } else {
+                "updates"
+            };
+            formatted.push(format!(
+                "[stream|notice] {} non-reasoning {} hidden",
+                hidden_updates, noun
+            ));
+        }
+        formatted
     }
 
     /// Enter search mode
@@ -1729,6 +1854,120 @@ impl App {
     }
 }
 
+fn parse_reasoning_stream_line(line: &str) -> Option<(&str, &str)> {
+    if !line.starts_with('[') {
+        return None;
+    }
+    let end = line.find(']')?;
+    let tag = &line[1..end];
+    let (worker, kind) = tag.split_once('|')?;
+    if kind != "reasoning" {
+        return None;
+    }
+    let text = line[end + 1..].trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some((worker, text))
+}
+
+fn normalize_reasoning_stream_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    let mut prev_char: Option<char> = None;
+
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+
+        if pending_space && !out.is_empty() {
+            out.push(' ');
+        } else if let Some(prev) = prev_char {
+            if !out.is_empty()
+                && !out.ends_with(' ')
+                && matches!(prev, '.' | '!' | '?' | ';' | ':')
+                && ch.is_ascii_alphabetic()
+            {
+                out.push(' ');
+            }
+        }
+
+        out.push(ch);
+        prev_char = Some(ch);
+        pending_space = false;
+    }
+
+    out.trim().to_string()
+}
+
+fn split_reasoning_segments(text: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let min_sentence_len = STREAM_REASONING_SEGMENT_MAX_CHARS / 3;
+
+    for token in text.split_whitespace() {
+        let projected = if current.is_empty() {
+            token.len()
+        } else {
+            current.len() + 1 + token.len()
+        };
+        if projected > STREAM_REASONING_SEGMENT_MAX_CHARS && !current.is_empty() {
+            segments.push(current.trim().to_string());
+            current.clear();
+        }
+
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(token);
+
+        let end = token.chars().last().unwrap_or(' ');
+        if matches!(end, '.' | '!' | '?' | ';') && current.len() >= min_sentence_len {
+            segments.push(current.trim().to_string());
+            current.clear();
+        }
+    }
+
+    if !current.trim().is_empty() {
+        segments.push(current.trim().to_string());
+    }
+
+    segments
+}
+
+fn format_reasoning_stream_block(worker: &str, text: &str) -> Vec<String> {
+    let normalized = normalize_reasoning_stream_text(text);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let segments = split_reasoning_segments(&normalized);
+    if segments.is_empty() {
+        return Vec::new();
+    }
+
+    let hidden = segments
+        .len()
+        .saturating_sub(STREAM_REASONING_VISIBLE_SEGMENTS_PER_WORKER);
+    let visible_segments = if hidden > 0 {
+        segments[hidden..].to_vec()
+    } else {
+        segments
+    };
+
+    let mut lines = Vec::with_capacity(visible_segments.len() + 2);
+    lines.push(format!("[{}|reasoning]", worker));
+    if hidden > 0 {
+        lines.push(format!("  … {} earlier thoughts hidden", hidden));
+    }
+    for segment in visible_segments {
+        lines.push(format!("  • {}", segment));
+    }
+    lines
+}
+
 fn build_flat_search_entries(tree: &[FlatTreeEntry]) -> Vec<FlatSearchEntry> {
     tree.iter()
         .map(|entry| FlatSearchEntry {
@@ -1806,6 +2045,164 @@ mod tests {
         };
 
         App::new(index, suggestions, context)
+    }
+
+    #[test]
+    fn suggestion_stream_reasoning_chunks_coalesce_for_same_worker() {
+        let mut app = make_test_app();
+
+        app.push_suggestion_stream_event(
+            "bug_hunter#2",
+            cosmos_engine::llm::AgenticStreamKind::Reasoning,
+            "_TIMEOUT",
+        );
+        app.push_suggestion_stream_event(
+            "bug_hunter#2",
+            cosmos_engine::llm::AgenticStreamKind::Reasoning,
+            "_SE",
+        );
+        app.push_suggestion_stream_event(
+            "bug_hunter#2",
+            cosmos_engine::llm::AgenticStreamKind::Reasoning,
+            "CS",
+        );
+
+        assert_eq!(app.suggestion_stream_lines.len(), 1);
+        assert_eq!(
+            app.suggestion_stream_lines[0],
+            "[bug_hunter#2|reasoning] _TIMEOUT_SECS"
+        );
+    }
+
+    #[test]
+    fn suggestion_stream_reasoning_chunks_append_to_existing_worker_line() {
+        let mut app = make_test_app();
+
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Reasoning,
+            "first",
+        );
+        app.push_suggestion_stream_event(
+            "security_reviewer#1",
+            cosmos_engine::llm::AgenticStreamKind::Reasoning,
+            "other",
+        );
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Reasoning,
+            " second",
+        );
+
+        assert_eq!(app.suggestion_stream_lines.len(), 2);
+        assert_eq!(
+            app.suggestion_stream_lines[0],
+            "[bug_hunter#1|reasoning] first second"
+        );
+        assert_eq!(
+            app.suggestion_stream_lines[1],
+            "[security_reviewer#1|reasoning] other"
+        );
+    }
+
+    #[test]
+    fn suggestion_stream_tool_events_replace_per_worker() {
+        let mut app = make_test_app();
+
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Tool,
+            "search",
+        );
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Tool,
+            "read_range",
+        );
+        app.push_suggestion_stream_event(
+            "security_reviewer#1",
+            cosmos_engine::llm::AgenticStreamKind::Tool,
+            "view_file",
+        );
+
+        assert_eq!(app.suggestion_stream_lines.len(), 2);
+        assert_eq!(
+            app.suggestion_stream_lines[0],
+            "[bug_hunter#1|tool] read_range"
+        );
+        assert_eq!(
+            app.suggestion_stream_lines[1],
+            "[security_reviewer#1|tool] view_file"
+        );
+    }
+
+    #[test]
+    fn suggestion_stream_reasoning_notice_banner_is_ignored() {
+        let mut app = make_test_app();
+
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Notice,
+            "reasoning-stream",
+        );
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Notice,
+            "streaming fallback enabled",
+        );
+
+        assert_eq!(app.suggestion_stream_lines.len(), 1);
+        assert_eq!(
+            app.suggestion_stream_lines[0],
+            "[bug_hunter#1|notice] streaming fallback enabled"
+        );
+    }
+
+    #[test]
+    fn suggestion_stream_display_prioritizes_reasoning() {
+        let mut app = make_test_app();
+
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Reasoning,
+            "thinking",
+        );
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Tool,
+            "search",
+        );
+
+        let visible = app.suggestion_stream_lines_for_display();
+        assert_eq!(visible.len(), 3);
+        assert_eq!(visible[0], "[bug_hunter#1|reasoning]");
+        assert_eq!(visible[1], "  • thinking");
+        assert_eq!(visible[2], "[stream|notice] 1 non-reasoning update hidden");
+    }
+
+    #[test]
+    fn suggestion_stream_display_formats_reasoning_into_readable_segments() {
+        let mut app = make_test_app();
+
+        app.push_suggestion_stream_event(
+            "security_reviewer#1",
+            cosmos_engine::llm::AgenticStreamKind::Reasoning,
+            "First we should inspect update.rs for timeout and error propagation issues.Then inspect keyring.rs for unsafe deserialization or unchecked unwraps.",
+        );
+
+        let visible = app.suggestion_stream_lines_for_display();
+        assert_eq!(visible[0], "[security_reviewer#1|reasoning]");
+        let bullet_count = visible
+            .iter()
+            .filter(|line| line.starts_with("  • "))
+            .count();
+        assert!(bullet_count >= 2);
+    }
+
+    #[test]
+    fn normalize_reasoning_stream_text_inserts_space_after_punctuation() {
+        let normalized = normalize_reasoning_stream_text("alpha.Beta gamma");
+        assert_eq!(normalized, "alpha. Beta gamma");
     }
 
     #[test]

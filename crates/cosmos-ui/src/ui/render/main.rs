@@ -202,8 +202,8 @@ fn render_suggestions_content<'a>(
         if app.loading == LoadingState::GeneratingSuggestions {
             let stream_width = inner_width.saturating_sub(8).max(20);
             let mut stream_lines = Vec::new();
-            for raw in &app.suggestion_stream_lines {
-                let wrapped = wrap_text(raw, stream_width);
+            for raw in app.suggestion_stream_lines_for_display() {
+                let wrapped = wrap_text(&raw, stream_width);
                 if wrapped.is_empty() {
                     continue;
                 }
