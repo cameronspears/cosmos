@@ -201,28 +201,36 @@ fn render_suggestions_content<'a>(
         ]));
         if app.loading == LoadingState::GeneratingSuggestions {
             let stream_width = inner_width.saturating_sub(8).max(20);
-            let mut stream_lines = Vec::new();
-            for raw in app.suggestion_stream_lines_for_display() {
+            let mut stream_lines: Vec<(String, Style)> = Vec::new();
+            for raw in app.suggestion_task_lines_for_display() {
+                let style = if raw.starts_with("• Updated Plan") {
+                    Style::default().fg(Theme::GREY_200)
+                } else if raw.contains("☑") {
+                    Style::default().fg(Theme::GREY_300)
+                } else if raw.contains("☐") {
+                    Style::default().fg(Theme::GREY_500)
+                } else if raw.starts_with("[stream|notice]") {
+                    Style::default().fg(Theme::GREY_500)
+                } else {
+                    Style::default().fg(Theme::GREY_400)
+                };
                 let wrapped = wrap_text(&raw, stream_width);
                 if wrapped.is_empty() {
                     continue;
                 }
                 for (idx, segment) in wrapped.into_iter().enumerate() {
                     if idx == 0 {
-                        stream_lines.push(format!("    {}", segment));
+                        stream_lines.push((format!("    {}", segment), style));
                     } else {
-                        stream_lines.push(format!("      {}", segment));
+                        stream_lines.push((format!("      {}", segment), style));
                     }
                 }
             }
 
             let available = visible_height.saturating_sub(lines.len() + 1);
             let start = stream_lines.len().saturating_sub(available);
-            for line in stream_lines.into_iter().skip(start) {
-                lines.push(Line::from(vec![Span::styled(
-                    line,
-                    Style::default().fg(Theme::GREY_500),
-                )]));
+            for (line, style) in stream_lines.into_iter().skip(start) {
+                lines.push(Line::from(vec![Span::styled(line, style)]));
             }
         }
         return;

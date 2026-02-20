@@ -77,6 +77,15 @@ struct GroupingSearchFile {
     path_lower: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SuggestionWorkerTaskState {
+    worker: String,
+    reasoning: Option<String>,
+    tools: Vec<String>,
+    report_back_called: bool,
+    notice: Option<String>,
+}
+
 /// Main application state for Cosmos
 pub struct App {
     // Core data
@@ -494,6 +503,111 @@ impl App {
             ));
         }
         formatted
+    }
+
+    pub fn suggestion_task_lines_for_display(&self) -> Vec<String> {
+        let mut workers: Vec<SuggestionWorkerTaskState> = Vec::new();
+        let mut worker_index: HashMap<String, usize> = HashMap::new();
+
+        for line in &self.suggestion_stream_lines {
+            let Some((worker, kind, text)) = parse_stream_tagged_line(line) else {
+                continue;
+            };
+            let idx = *worker_index.entry(worker.to_string()).or_insert_with(|| {
+                workers.push(SuggestionWorkerTaskState {
+                    worker: worker.to_string(),
+                    ..SuggestionWorkerTaskState::default()
+                });
+                workers.len().saturating_sub(1)
+            });
+            let state = &mut workers[idx];
+
+            match kind {
+                "reasoning" => {
+                    if !text.is_empty() {
+                        state.reasoning = Some(text.to_string());
+                    }
+                }
+                "tool" => {
+                    for tool in parse_tool_names(text) {
+                        if tool.eq_ignore_ascii_case("report_back") {
+                            state.report_back_called = true;
+                            continue;
+                        }
+                        if !state.tools.iter().any(|existing| existing == &tool) {
+                            state.tools.push(tool);
+                        }
+                    }
+                }
+                "notice" => {
+                    if !text.is_empty() {
+                        state.notice = Some(text.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if workers.is_empty() {
+            return self.suggestion_stream_lines_for_display();
+        }
+
+        let mut lines = vec!["• Updated Plan".to_string()];
+        for (idx, worker) in workers.iter().enumerate() {
+            let branch = if idx + 1 == workers.len() {
+                "└"
+            } else {
+                "├"
+            };
+            lines.push(format!(
+                "{} {}",
+                branch,
+                format_stream_worker_label(&worker.worker)
+            ));
+
+            let planning_complete = worker.report_back_called || !worker.tools.is_empty();
+            let inspect_complete = worker.report_back_called;
+
+            if let Some(reasoning) = worker.reasoning.as_deref() {
+                let normalized = normalize_reasoning_stream_text(reasoning);
+                let segment = split_reasoning_segments(&normalized)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| "Outline investigation scope".to_string());
+                let marker = if planning_complete { "☑" } else { "☐" };
+                lines.push(format!(
+                    "  {} {}",
+                    marker,
+                    truncate_display_text(&segment, 92)
+                ));
+            } else {
+                let marker = if planning_complete { "☑" } else { "☐" };
+                lines.push(format!("  {} Outline investigation scope", marker));
+            }
+
+            let inspect_summary = if worker.tools.is_empty() {
+                "Inspect code with search/read tools".to_string()
+            } else {
+                summarize_tool_activity(&worker.tools)
+            };
+            let inspect_marker = if inspect_complete { "☑" } else { "☐" };
+            lines.push(format!("  {} {}", inspect_marker, inspect_summary));
+
+            let report_back_status = if worker.report_back_called {
+                "☑"
+            } else {
+                "☐"
+            };
+            lines.push(format!(
+                "  {} Submit findings via report_back",
+                report_back_status
+            ));
+
+            if let Some(notice) = worker.notice.as_deref() {
+                lines.push(format!("  · {}", truncate_display_text(notice, 92)));
+            }
+        }
+        lines
     }
 
     /// Enter search mode
@@ -1855,20 +1969,99 @@ impl App {
 }
 
 fn parse_reasoning_stream_line(line: &str) -> Option<(&str, &str)> {
+    let (worker, kind, text) = parse_stream_tagged_line(line)?;
+    if kind != "reasoning" {
+        return None;
+    }
+    if text.is_empty() {
+        return None;
+    }
+    Some((worker, text))
+}
+
+fn parse_stream_tagged_line(line: &str) -> Option<(&str, &str, &str)> {
     if !line.starts_with('[') {
         return None;
     }
     let end = line.find(']')?;
     let tag = &line[1..end];
     let (worker, kind) = tag.split_once('|')?;
-    if kind != "reasoning" {
-        return None;
-    }
     let text = line[end + 1..].trim();
-    if text.is_empty() {
-        return None;
+    Some((worker, kind, text))
+}
+
+fn parse_tool_names(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|chunk| chunk.trim())
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| chunk.to_string())
+        .collect()
+}
+
+fn format_stream_worker_label(raw: &str) -> String {
+    let (role, batch) = raw.split_once('#').unwrap_or((raw, ""));
+    let role_label = match role {
+        "bug_hunter" => "Bug Hunter".to_string(),
+        "security_reviewer" => "Security Reviewer".to_string(),
+        _ => role
+            .split('_')
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+
+    if batch.is_empty() {
+        role_label
+    } else {
+        format!("{} #{}", role_label, batch)
     }
-    Some((worker, text))
+}
+
+fn summarize_tool_activity(tools: &[String]) -> String {
+    let mut labels: Vec<&str> = Vec::new();
+    for tool in tools {
+        let label = match tool.as_str() {
+            "view_file" | "head" | "read_range" => "read files",
+            "view_directory" | "tree" => "map directories",
+            "search" | "grep_search" => "search patterns",
+            "shell" | "bash" => "run shell checks",
+            _ => "inspect context",
+        };
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+
+    if labels.is_empty() {
+        return "Inspect code with search/read tools".to_string();
+    }
+
+    let summary = if labels.len() > 2 {
+        format!("{}, {}...", labels[0], labels[1])
+    } else {
+        labels.join(", ")
+    };
+    format!("Inspect code with {}", summary)
+}
+
+fn truncate_display_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+
+    let mut truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
 }
 
 fn normalize_reasoning_stream_text(text: &str) -> String {
@@ -2203,6 +2396,77 @@ mod tests {
     fn normalize_reasoning_stream_text_inserts_space_after_punctuation() {
         let normalized = normalize_reasoning_stream_text("alpha.Beta gamma");
         assert_eq!(normalized, "alpha. Beta gamma");
+    }
+
+    #[test]
+    fn suggestion_task_lines_show_worker_progress_and_report_back() {
+        let mut app = make_test_app();
+
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Reasoning,
+            "Scan the assigned files and confirm concrete bug evidence before finalizing.",
+        );
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Tool,
+            "view_file, grep_search",
+        );
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Tool,
+            "report_back",
+        );
+
+        let visible = app.suggestion_task_lines_for_display();
+        assert!(visible.iter().any(|line| line == "• Updated Plan"));
+        assert!(visible.iter().any(|line| line.contains("Bug Hunter #1")));
+        assert!(visible
+            .iter()
+            .any(|line| line.contains("☑ Submit findings via report_back")));
+    }
+
+    #[test]
+    fn suggestion_task_lines_keep_report_back_pending_until_called() {
+        let mut app = make_test_app();
+
+        app.push_suggestion_stream_event(
+            "security_reviewer#1",
+            cosmos_engine::llm::AgenticStreamKind::Tool,
+            "view_file",
+        );
+
+        let visible = app.suggestion_task_lines_for_display();
+        assert!(visible
+            .iter()
+            .any(|line| line.contains("Security Reviewer #1")));
+        assert!(visible
+            .iter()
+            .any(|line| line.contains("☐ Submit findings via report_back")));
+    }
+
+    #[test]
+    fn suggestion_task_lines_keep_inspection_unchecked_until_report_back() {
+        let mut app = make_test_app();
+
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Reasoning,
+            "Inspect files for bug patterns and collect concrete evidence.",
+        );
+        app.push_suggestion_stream_event(
+            "bug_hunter#1",
+            cosmos_engine::llm::AgenticStreamKind::Tool,
+            "view_file, grep_search",
+        );
+
+        let visible = app.suggestion_task_lines_for_display();
+        assert!(visible
+            .iter()
+            .any(|line| line.contains("☐ Inspect code with")));
+        assert!(visible
+            .iter()
+            .any(|line| line.contains("☐ Submit findings via report_back")));
     }
 
     #[test]
