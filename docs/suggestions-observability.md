@@ -40,7 +40,7 @@ flowchart TD
 
 By default, reasoning output is excluded from provider responses.
 
-- Default: reasoning hidden (`exclude=true`)
+- Default: reasoning hidden (`include_reasoning=false`)
 - Opt-in: set `COSMOS_INCLUDE_REASONING=1`
 - Live stream opt-in: set `COSMOS_STREAM_REASONING=1` (or use `--suggest-stream-reasoning`)
 

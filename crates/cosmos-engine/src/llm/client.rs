@@ -16,16 +16,19 @@ pub(crate) fn chat_completions_url() -> &'static str {
 }
 
 fn model_id_for_backend_impl(model: Model) -> String {
-    let id = model.id();
-    if id.starts_with("openai/gpt-oss-120b") || model == Model::Smart {
-        "openai/gpt-oss-120b".to_string()
-    } else {
-        id.to_string()
-    }
+    model.id().to_string()
 }
 
 pub(crate) fn model_id_for_backend(model: Model) -> String {
     model_id_for_backend_impl(model)
+}
+
+fn is_openai_gpt_oss_model(model_id: &str) -> bool {
+    model_id.starts_with("openai/gpt-oss-")
+}
+
+pub(crate) fn supports_parallel_tool_calls_for_backend(model: Model) -> bool {
+    !is_openai_gpt_oss_model(model_id_for_backend_impl(model).as_str())
 }
 
 fn normalize_groq_service_tier(value: Option<&str>) -> String {
@@ -255,21 +258,25 @@ struct ChatRequest {
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<String>,
-    max_tokens: u32,
+    max_completion_tokens: u32,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ReasoningConfig>,
+    include_reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     service_tier: Option<String>,
 }
 
-/// Reasoning configuration for models that support it.
-#[derive(Serialize)]
-struct ReasoningConfig {
-    effort: String,
-    exclude: bool,
+#[derive(Debug, Clone, Default)]
+struct ReasoningRequestFields {
+    include_reasoning: Option<bool>,
+    reasoning_effort: Option<String>,
+    reasoning_format: Option<String>,
 }
 
 /// Response format configuration for structured output parsing.
@@ -298,81 +305,6 @@ struct JsonSchemaWrapper {
 struct Message {
     role: String,
     content: String,
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  ANTHROPIC PROMPT CACHING SUPPORT
-// ═══════════════════════════════════════════════════════════════════════════
-// Anthropic models support prompt caching via multipart message format with
-// cache_control breakpoints. Cached reads are 0.1x input pricing.
-
-/// Cache control for Anthropic prompt caching
-#[derive(Serialize, Clone)]
-struct CacheControl {
-    #[serde(rename = "type")]
-    cache_type: String, // "ephemeral"
-}
-
-/// A content part in a multipart message (for caching)
-#[derive(Serialize, Clone)]
-struct ContentPart {
-    #[serde(rename = "type")]
-    part_type: String, // "text"
-    text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cache_control: Option<CacheControl>,
-}
-
-/// Content can be either a simple string or multipart array
-#[derive(Serialize, Clone)]
-#[serde(untagged)]
-enum MessageContent2 {
-    Text(String),
-    Parts(Vec<ContentPart>),
-}
-
-/// Message with multipart content support (for caching)
-#[derive(Serialize, Clone)]
-struct CachedMessage {
-    role: String,
-    content: MessageContent2,
-}
-
-/// Chat request with cached message support
-#[derive(Serialize)]
-struct CachedChatRequest {
-    model: String,
-    messages: Vec<CachedMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user: Option<String>,
-    max_tokens: u32,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<ResponseFormat>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ReasoningConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    service_tier: Option<String>,
-}
-
-/// Build messages with caching enabled on the system prompt
-fn build_cached_messages(system: &str, user: &str) -> Vec<CachedMessage> {
-    vec![
-        CachedMessage {
-            role: "system".to_string(),
-            content: MessageContent2::Parts(vec![ContentPart {
-                part_type: "text".to_string(),
-                text: system.to_string(),
-                cache_control: Some(CacheControl {
-                    cache_type: "ephemeral".to_string(),
-                }),
-            }]),
-        },
-        CachedMessage {
-            role: "user".to_string(),
-            content: MessageContent2::Text(user.to_string()),
-        },
-    ]
 }
 
 #[derive(Deserialize)]
@@ -544,10 +476,17 @@ where
     }
 }
 
-fn reasoning_config(model: Model) -> Option<ReasoningConfig> {
-    let _ = model;
-    // Groq's OpenAI-compatible endpoint can reject non-standard reasoning config fields.
-    None
+fn reasoning_fields_for_model(model: Model, include_output: bool) -> ReasoningRequestFields {
+    let backend_model = model_id_for_backend_impl(model);
+    if is_openai_gpt_oss_model(backend_model.as_str()) {
+        return ReasoningRequestFields {
+            include_reasoning: Some(include_output),
+            reasoning_effort: model.reasoning_effort().map(str::to_string),
+            reasoning_format: None,
+        };
+    }
+
+    ReasoningRequestFields::default()
 }
 
 /// Generic provider error envelope (can arrive with HTTP 200 from proxy layers).
@@ -715,7 +654,7 @@ pub(crate) async fn call_llm_with_usage(
     };
 
     let stream = false;
-    let reasoning = reasoning_config(model);
+    let reasoning = reasoning_fields_for_model(model, false);
 
     let request = ChatRequest {
         model: model_id_for_backend(model),
@@ -730,10 +669,12 @@ pub(crate) async fn call_llm_with_usage(
             },
         ],
         user: None,
-        max_tokens: model.max_tokens(),
+        max_completion_tokens: model.max_tokens(),
         stream,
         response_format,
-        reasoning,
+        include_reasoning: reasoning.include_reasoning,
+        reasoning_effort: reasoning.reasoning_effort,
+        reasoning_format: reasoning.reasoning_format,
         service_tier: groq_service_tier(),
     };
 
@@ -858,7 +799,7 @@ where
     });
 
     let stream = false;
-    let reasoning = reasoning_config(model);
+    let reasoning = reasoning_fields_for_model(model, false);
 
     let request = ChatRequest {
         model: model_id_for_backend(model),
@@ -873,10 +814,12 @@ where
             },
         ],
         user: None,
-        max_tokens: model.max_tokens(),
+        max_completion_tokens: model.max_tokens(),
         stream,
         response_format,
-        reasoning,
+        include_reasoning: reasoning.include_reasoning,
+        reasoning_effort: reasoning.reasoning_effort,
+        reasoning_format: reasoning.reasoning_format,
         service_tier: groq_service_tier(),
     };
 
@@ -987,11 +930,7 @@ where
     });
 
     let stream = false;
-    let reasoning = if include_reasoning {
-        reasoning_config(model)
-    } else {
-        None
-    };
+    let reasoning = reasoning_fields_for_model(model, include_reasoning);
 
     let request = ChatRequest {
         model: model_id_for_backend(model),
@@ -1006,10 +945,12 @@ where
             },
         ],
         user: None,
-        max_tokens,
+        max_completion_tokens: max_tokens,
         stream,
         response_format,
-        reasoning,
+        include_reasoning: reasoning.include_reasoning,
+        reasoning_effort: reasoning.reasoning_effort,
+        reasoning_format: reasoning.reasoning_format,
         service_tier: groq_service_tier(),
     };
 
@@ -1057,17 +998,10 @@ where
     })
 }
 
-/// Call LLM API with structured output and cache hints for repeated prompts.
+/// Call LLM API with structured output on the standard chat completion shape.
 ///
-/// # Arguments
-/// * `system` - System prompt (will be cached)
-/// * `user` - User message (not cached - changes each call)
-/// * `model` - Model to use
-/// * `schema_name` - Name for the schema (e.g., "fix_content")
-/// * `schema` - JSON Schema definition
-///
-/// # Returns
-/// Parsed response matching type T and usage stats
+/// Groq prompt caching is automatic on supported models, so this path intentionally
+/// uses the same request format as `call_llm_structured` without cache-control hints.
 pub(crate) async fn call_llm_structured_cached<T>(
     system: &str,
     user: &str,
@@ -1078,82 +1012,7 @@ pub(crate) async fn call_llm_structured_cached<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
-
-    if !model.supports_structured_outputs() {
-        return Err(anyhow::anyhow!(
-            "Structured outputs aren't supported for {}. Try a different model.",
-            model.id()
-        ));
-    }
-
-    let client = create_http_client(REQUEST_TIMEOUT_SECS)?;
-
-    let response_format = Some(ResponseFormat {
-        format_type: "json_schema".to_string(),
-        json_schema: Some(JsonSchemaWrapper {
-            name: schema_name.to_string(),
-            strict: true,
-            schema,
-        }),
-    });
-
-    let stream = false;
-    let reasoning = reasoning_config(model);
-
-    // Use cached messages with cache_control on system prompt
-    let request = CachedChatRequest {
-        model: model_id_for_backend(model),
-        messages: build_cached_messages(system, user),
-        user: None,
-        max_tokens: model.max_tokens(),
-        stream,
-        response_format,
-        reasoning,
-        service_tier: groq_service_tier(),
-    };
-
-    let text = send_with_retry(&client, &api_key, &request).await?;
-
-    let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse {} response: {}\n{}",
-            backend_label(),
-            e,
-            sanitize_api_response(&text)
-        )
-    })?;
-
-    let choice = parsed.choices.first();
-
-    // Check for refusal (content moderation)
-    if let Some(c) = choice {
-        if let Some(refusal) = &c.message.refusal {
-            return Err(anyhow::anyhow!(
-                "Request was refused: {}",
-                truncate_str(refusal, 200)
-            ));
-        }
-    }
-
-    // Extract content, handling null/empty cases
-    let content = choice
-        .and_then(|c| c.message.content.clone())
-        .unwrap_or_default();
-
-    if content.is_empty() {
-        return Err(anyhow::anyhow!(
-            "API returned empty response. The model may have been rate limited or failed to generate content. Please try again."
-        ));
-    }
-
-    let data: T = parse_structured_content(&content)?;
-
-    Ok(StructuredResponse {
-        data,
-        usage: parsed.usage,
-        speed_failover: None,
-    })
+    call_llm_structured(system, user, model, schema_name, schema).await
 }
 
 fn map_timeout_error(err: reqwest::Error) -> anyhow::Error {
@@ -1213,9 +1072,16 @@ mod tests {
     }
 
     #[test]
-    fn test_reasoning_config_disabled_for_direct_groq() {
-        assert!(reasoning_config(Model::Speed).is_none());
-        assert!(reasoning_config(Model::Smart).is_none());
+    fn test_reasoning_fields_for_gpt_oss_models() {
+        let speed = reasoning_fields_for_model(Model::Speed, false);
+        assert_eq!(speed.include_reasoning, Some(false));
+        assert_eq!(speed.reasoning_effort.as_deref(), Some("medium"));
+        assert!(speed.reasoning_format.is_none());
+
+        let smart = reasoning_fields_for_model(Model::Smart, true);
+        assert_eq!(smart.include_reasoning, Some(true));
+        assert_eq!(smart.reasoning_effort.as_deref(), Some("high"));
+        assert!(smart.reasoning_format.is_none());
     }
 
     #[test]

@@ -5,7 +5,8 @@
 
 use super::client::{
     api_key, apply_backend_headers, chat_completions_url, create_http_client, groq_service_tier,
-    missing_api_key_message, model_id_for_backend, send_with_retry, REQUEST_TIMEOUT_SECS,
+    missing_api_key_message, model_id_for_backend, send_with_retry,
+    supports_parallel_tool_calls_for_backend, REQUEST_TIMEOUT_SECS,
 };
 use super::models::{merge_usage, Model, Usage};
 use super::tools::{
@@ -33,7 +34,7 @@ const TEXT_INSTEAD_OF_REPORT_BACK_MAX_RETRIES: u32 = 2;
 const INVALID_REPORT_BACK_PAYLOAD_MAX_RETRIES: u32 = 2;
 const REPEATED_TOOL_ERROR_THRESHOLD: u32 = 3;
 const TOOL_ERROR_LOOP_EXTRA_RETRIES: u32 = 2;
-const FINALIZATION_NON_REPORT_BACK_MAX_RETRIES: u32 = 1;
+const FINALIZATION_NON_REPORT_BACK_MAX_RETRIES: u32 = 3;
 const STREAM_REASONING_PRINT_MAX_CHARS: usize = 8_000;
 
 /// Response from an agentic LLM call
@@ -100,6 +101,7 @@ enum ToolErrorLoopAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum FinalizationNonReportBackAction {
     Retry,
     Fail,
@@ -233,12 +235,16 @@ struct ChatRequest {
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<String>,
-    max_tokens: u32,
+    max_completion_tokens: u32,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ReasoningConfig>,
+    include_reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plugins: Option<Vec<PluginConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -272,6 +278,7 @@ pub struct JsonSchemaConfig {
 #[serde(untagged)]
 enum ToolChoice {
     Mode(ToolChoiceMode),
+    #[allow(dead_code)]
     Function(ToolChoiceFunctionSelection),
 }
 
@@ -325,11 +332,11 @@ struct ProviderConfig {
     quantizations: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Clone)]
-struct ReasoningConfig {
-    effort: String,
-    /// Exclude reasoning from the response (we only want the final answer)
-    exclude: bool,
+#[derive(Clone, Default)]
+struct ReasoningRequestFields {
+    include_reasoning: Option<bool>,
+    reasoning_effort: Option<String>,
+    reasoning_format: Option<String>,
 }
 
 /// Create a ResponseFormat from a JSON schema value
@@ -345,14 +352,29 @@ pub fn schema_to_response_format(name: &str, schema: serde_json::Value) -> Respo
     }
 }
 
-fn reasoning_config_for_model(model: Model, include_output: bool) -> Option<ReasoningConfig> {
-    let _ = (model, include_output);
-    // Groq's OpenAI-compatible endpoint can reject non-standard reasoning fields.
-    None
+fn reasoning_config_for_model(model: Model, include_output: bool) -> ReasoningRequestFields {
+    let backend_model = model_id_for_backend(model);
+    if backend_model.starts_with("openai/gpt-oss-") {
+        return ReasoningRequestFields {
+            include_reasoning: Some(include_output),
+            reasoning_effort: model.reasoning_effort().map(str::to_string),
+            reasoning_format: None,
+        };
+    }
+
+    ReasoningRequestFields::default()
 }
 
-fn reasoning_config(model: Model) -> Option<ReasoningConfig> {
+fn reasoning_config(model: Model) -> ReasoningRequestFields {
     reasoning_config_for_model(model, include_reasoning_output())
+}
+
+fn parallel_tool_calls_setting(model: Model, enabled: bool) -> Option<bool> {
+    if supports_parallel_tool_calls_for_backend(model) {
+        Some(enabled)
+    } else {
+        None
+    }
 }
 
 fn env_flag(name: &str) -> bool {
@@ -495,6 +517,7 @@ Return only a valid report_back call."
     )
 }
 
+#[allow(dead_code)]
 fn finalization_non_report_back_action(retries: u32) -> FinalizationNonReportBackAction {
     if retries < FINALIZATION_NON_REPORT_BACK_MAX_RETRIES {
         FinalizationNonReportBackAction::Retry
@@ -942,18 +965,21 @@ pub async fn call_llm_agentic(
         }
         // During exploration, don't use structured output (incompatible with tools for many models)
         // Structured output is only applied on the final forced response
+        let reasoning = reasoning_config(model);
         let request = ChatRequest {
             model: model_id_for_backend(model),
             messages: messages.clone(),
             user: None,
-            max_tokens: model.max_tokens(),
+            max_completion_tokens: model.max_tokens(),
             stream: false,
             response_format: None,
-            reasoning: reasoning_config(model),
+            include_reasoning: reasoning.include_reasoning,
+            reasoning_effort: reasoning.reasoning_effort,
+            reasoning_format: reasoning.reasoning_format,
             plugins: None,
             tools: Some(tools.clone()),
             tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
-            parallel_tool_calls: Some(true),
+            parallel_tool_calls: parallel_tool_calls_setting(model, true),
             provider: None,
             service_tier: groq_service_tier(),
         };
@@ -1089,14 +1115,17 @@ pub async fn call_llm_agentic(
                 tool_call_id: None,
             });
 
+            let reasoning = reasoning_config(model);
             let format_request = ChatRequest {
                 model: model_id_for_backend(model),
                 messages: messages.clone(),
                 user: None,
-                max_tokens: model.max_tokens(),
+                max_completion_tokens: model.max_tokens(),
                 stream: false,
                 response_format: final_response_format.clone(),
-                reasoning: reasoning_config(model),
+                include_reasoning: reasoning.include_reasoning,
+                reasoning_effort: reasoning.reasoning_effort,
+                reasoning_format: reasoning.reasoning_format,
                 plugins: None,
                 tools: None,
                 tool_choice: None,
@@ -1157,14 +1186,17 @@ pub async fn call_llm_agentic(
 
     // Final call: no tools at all, just ask for the response
     // Don't include tools or structured output to maximize compatibility
+    let reasoning = reasoning_config(model);
     let final_request = ChatRequest {
         model: model_id_for_backend(model),
         messages: messages.clone(),
         user: None,
-        max_tokens: model.max_tokens(),
+        max_completion_tokens: model.max_tokens(),
         stream: false,
         response_format: final_response_format,
-        reasoning: reasoning_config(model),
+        include_reasoning: reasoning.include_reasoning,
+        reasoning_effort: reasoning.reasoning_effort,
+        reasoning_format: reasoning.reasoning_format,
         plugins: None,
         tools: None,
         tool_choice: None,
@@ -1287,8 +1319,10 @@ pub async fn call_llm_agentic_report_back_only(
     let max_total_iterations = max_iterations.saturating_add(REPORT_BACK_GRACE_ROUNDS);
     let mut forced_report_back_mode = false;
     let mut trace = AgenticTrace::default();
-    let mut stream_reasoning = stream_reasoning_output_enabled() || stream_sink.is_some();
-    let include_reasoning = include_reasoning_output() || stream_sink.is_some();
+    // Keep reasoning output opt-in; enabling it by default increases latency and can destabilize
+    // tool-call formatting under tight rate-limit conditions.
+    let mut stream_reasoning = stream_reasoning_output_enabled() && stream_sink.is_some();
+    let include_reasoning = include_reasoning_output();
     let mut stream_fallback_logged = false;
 
     loop {
@@ -1316,36 +1350,21 @@ pub async fn call_llm_agentic_report_back_only(
                 tool_call_id: None,
             });
         }
-        let request_tools = if finalization_round {
-            tools
-                .iter()
-                .filter(|tool| tool.function.name == "report_back")
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            tools.clone()
-        };
+        let reasoning = reasoning_config_for_model(model, include_reasoning);
         let request = ChatRequest {
             model: model_id_for_backend(model),
             messages: messages.clone(),
             user: None,
-            max_tokens: model.max_tokens(),
+            max_completion_tokens: model.max_tokens(),
             stream: stream_reasoning,
             response_format: None,
-            reasoning: reasoning_config_for_model(model, include_reasoning),
+            include_reasoning: reasoning.include_reasoning,
+            reasoning_effort: reasoning.reasoning_effort,
+            reasoning_format: reasoning.reasoning_format,
             plugins: None,
-            tools: Some(request_tools),
-            tool_choice: Some(if finalization_round {
-                ToolChoice::Function(ToolChoiceFunctionSelection {
-                    choice_type: "function",
-                    function: ToolChoiceFunctionName {
-                        name: "report_back",
-                    },
-                })
-            } else {
-                ToolChoice::Mode(ToolChoiceMode::Auto)
-            }),
-            parallel_tool_calls: Some(!finalization_round),
+            tools: Some(tools.clone()),
+            tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
+            parallel_tool_calls: parallel_tool_calls_setting(model, !finalization_round),
             provider: None,
             service_tier: groq_service_tier(),
         };
@@ -1370,7 +1389,10 @@ pub async fn call_llm_agentic_report_back_only(
                     }
                     stream_reasoning = false;
                     request.stream = false;
-                    request.reasoning = reasoning_config_for_model(model, include_reasoning);
+                    let reasoning = reasoning_config_for_model(model, include_reasoning);
+                    request.include_reasoning = reasoning.include_reasoning;
+                    request.reasoning_effort = reasoning.reasoning_effort;
+                    request.reasoning_format = reasoning.reasoning_format;
                     let text = send_report_back_text_with_speed_fallback(
                         &client,
                         &api_key,
@@ -1495,30 +1517,23 @@ pub async fn call_llm_agentic_report_back_only(
                 }
 
                 if finalization_round {
-                    match finalization_non_report_back_action(finalization_non_report_back_retries)
+                    finalization_non_report_back_retries =
+                        finalization_non_report_back_retries.saturating_add(1);
+                    iteration = iteration.saturating_sub(1);
+                    let reminder = if finalization_non_report_back_retries
+                        <= FINALIZATION_NON_REPORT_BACK_MAX_RETRIES
                     {
-                        FinalizationNonReportBackAction::Retry => {
-                            finalization_non_report_back_retries =
-                                finalization_non_report_back_retries.saturating_add(1);
-                            iteration = iteration.saturating_sub(1);
-                            messages.push(Message {
-                                role: "user".to_string(),
-                                content: Some(
-                                    "Finalization mode is active. You must call report_back now. Do not call other tools."
-                                        .to_string(),
-                                ),
-                                tool_calls: None,
-                                tool_call_id: None,
-                            });
-                            continue;
-                        }
-                        FinalizationNonReportBackAction::Fail => {}
-                    }
-
-                    return Err(anyhow::anyhow!(
-                        "termination_reason=finalization_non_report_back finalization_retries_exhausted={} Model called non-report_back tools in finalization mode.",
-                        finalization_non_report_back_retries
-                    ));
+                        "Finalization mode is active. You must call report_back now. Do not call other tools."
+                    } else {
+                        "Finalization retries are exhausted. Stop exploration and call report_back immediately with your best grounded findings."
+                    };
+                    messages.push(Message {
+                        role: "user".to_string(),
+                        content: Some(reminder.to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                    continue;
                 }
 
                 let repo_root_buf = repo_root.to_path_buf();
@@ -1744,10 +1759,12 @@ mod tests {
                 tool_call_id: None,
             }],
             user: None,
-            max_tokens: 128,
+            max_completion_tokens: 128,
             stream: false,
             response_format: None,
-            reasoning: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            reasoning_format: None,
             plugins: None,
             tools: Some(tools),
             tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
@@ -1773,10 +1790,12 @@ mod tests {
                 tool_call_id: None,
             }],
             user: None,
-            max_tokens: 128,
+            max_completion_tokens: 128,
             stream: false,
             response_format: None,
-            reasoning: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            reasoning_format: None,
             plugins: None,
             tools: Some(get_relace_search_tool_definitions()),
             tool_choice: Some(ToolChoice::Function(ToolChoiceFunctionSelection {
@@ -1796,10 +1815,17 @@ mod tests {
     }
 
     #[test]
-    fn test_reasoning_config_disabled_for_direct_groq() {
+    fn test_reasoning_config_for_gpt_oss_models() {
         use super::Model;
-        assert!(reasoning_config(Model::Speed).is_none());
-        assert!(reasoning_config(Model::Smart).is_none());
+        let speed = reasoning_config(Model::Speed);
+        assert_eq!(speed.include_reasoning, Some(false));
+        assert_eq!(speed.reasoning_effort.as_deref(), Some("medium"));
+        assert!(speed.reasoning_format.is_none());
+
+        let smart = reasoning_config(Model::Smart);
+        assert_eq!(smart.include_reasoning, Some(false));
+        assert_eq!(smart.reasoning_effort.as_deref(), Some("high"));
+        assert!(smart.reasoning_format.is_none());
     }
 
     #[test]
@@ -1813,10 +1839,12 @@ mod tests {
                 tool_call_id: None,
             }],
             user: None,
-            max_tokens: 64,
+            max_completion_tokens: 64,
             stream: false,
             response_format: None,
-            reasoning: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            reasoning_format: None,
             plugins: None,
             tools: None,
             tool_choice: None,

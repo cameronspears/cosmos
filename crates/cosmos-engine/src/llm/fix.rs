@@ -483,8 +483,8 @@ pub(crate) fn fix_response_schema() -> serde_json::Value {
 
 /// Call LLM with structured output, caching, and fallback for context limits
 ///
-/// Uses Anthropic prompt caching to reduce costs (~90% savings on cached prompts)
-/// and potentially improve reliability.
+/// Uses Groq's automatic prompt caching on supported models and can improve
+/// cost/latency when prompt prefixes repeat.
 // This helper threads all retry/caching controls from callers without hidden defaults.
 #[allow(clippy::too_many_arguments)]
 async fn call_llm_structured_with_fallback<T>(
@@ -521,7 +521,8 @@ where
         )
         .await
     } else {
-        // Cached version - caches the system prompt for Anthropic models.
+        // Cached version delegates to the standard structured call shape. Groq handles
+        // prompt caching automatically server-side for supported models.
         call_llm_structured_cached::<T>(system, primary, model, schema_name, schema.clone()).await
     };
 

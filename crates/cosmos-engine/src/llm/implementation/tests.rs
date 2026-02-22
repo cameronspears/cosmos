@@ -31,7 +31,7 @@ diff --git a/a.rs b/a.rs
 
 #[test]
 fn model_policy_uses_smart_tier() {
-    assert_eq!(IMPLEMENTATION_MODEL.id(), "z-ai/glm-5");
+    assert_eq!(IMPLEMENTATION_MODEL.id(), "openai/gpt-oss-120b");
 }
 
 #[test]
