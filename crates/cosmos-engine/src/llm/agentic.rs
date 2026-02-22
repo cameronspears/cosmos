@@ -36,6 +36,10 @@ const REPEATED_TOOL_ERROR_THRESHOLD: u32 = 3;
 const TOOL_ERROR_LOOP_EXTRA_RETRIES: u32 = 2;
 const FINALIZATION_NON_REPORT_BACK_MAX_RETRIES: u32 = 3;
 const STREAM_REASONING_PRINT_MAX_CHARS: usize = 8_000;
+/// Groq recommends low temperatures for reliable tool calling.
+const TOOL_CALL_TEMPERATURE: f32 = 0.2;
+/// Retry once colder when tool-call generation fails validation.
+const TOOL_CALL_RETRY_TEMPERATURE: f32 = 0.0;
 
 /// Response from an agentic LLM call
 #[derive(Debug)]
@@ -238,6 +242,8 @@ struct ChatRequest {
     max_completion_tokens: u32,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     include_reasoning: Option<bool>,
@@ -253,6 +259,8 @@ struct ChatRequest {
     tool_choice: Option<ToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disable_tool_validation: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<ProviderConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -901,11 +909,112 @@ async fn send_streaming_chat_request(
 async fn send_report_back_text_with_speed_fallback(
     client: &reqwest::Client,
     api_key: &str,
-    _model: Model,
-    _include_reasoning_output: bool,
     request: &mut ChatRequest,
 ) -> anyhow::Result<String> {
-    send_with_retry(client, api_key, request).await
+    match send_with_retry(client, api_key, request).await {
+        Ok(text) => Ok(text),
+        Err(err) => {
+            if is_tool_call_validation_error(&err)
+                && request.temperature.unwrap_or(TOOL_CALL_TEMPERATURE)
+                    > (TOOL_CALL_RETRY_TEMPERATURE + f32::EPSILON)
+            {
+                request.temperature = Some(TOOL_CALL_RETRY_TEMPERATURE);
+                send_with_retry(client, api_key, request).await
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn is_tool_call_validation_error(err: &anyhow::Error) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("tool call validation failed")
+        || (text.contains("attempted to call tool") && text.contains("not in request"))
+        || text.contains("failed_generation")
+}
+
+async fn maybe_format_agentic_content(
+    client: &reqwest::Client,
+    api_key: &str,
+    model: Model,
+    user_prompt: &str,
+    draft_content: String,
+    final_response_format: Option<ResponseFormat>,
+    usage: Option<Usage>,
+) -> anyhow::Result<AgenticResponse> {
+    let Some(response_format) = final_response_format else {
+        return Ok(AgenticResponse {
+            content: draft_content,
+            usage,
+        });
+    };
+
+    let reasoning = reasoning_config(model);
+    let format_request = ChatRequest {
+        model: model_id_for_backend(model),
+        messages: vec![
+            Message {
+                role: "system".to_string(),
+                content: Some(
+                    "Convert the draft answer into the required JSON schema. Return only valid JSON matching the schema exactly. Do not call tools and do not include markdown fences.".to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(format!(
+                    "Original task:\n{}\n\nDraft answer:\n{}\n\nReturn only valid JSON.",
+                    user_prompt, draft_content
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ],
+        user: None,
+        max_completion_tokens: model.max_tokens(),
+        stream: false,
+        temperature: Some(TOOL_CALL_RETRY_TEMPERATURE),
+        response_format: Some(response_format),
+        include_reasoning: reasoning.include_reasoning,
+        reasoning_effort: reasoning.reasoning_effort,
+        reasoning_format: reasoning.reasoning_format,
+        plugins: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        disable_tool_validation: None,
+        provider: None,
+        service_tier: groq_service_tier(),
+    };
+
+    let text = send_with_retry(client, api_key, &format_request).await?;
+    let parsed: ChatResponse = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("Failed to parse format response: {}\n{}", e, text))?;
+    let choice = parsed
+        .choices
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No response from model"))?;
+
+    if let Some(refusal) = &choice.message.refusal {
+        return Err(anyhow::anyhow!(
+            "Request was refused: {}",
+            refusal.chars().take(200).collect::<String>()
+        ));
+    }
+
+    let formatted = choice.message.content.clone().unwrap_or_default();
+    if formatted.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "Model returned empty response during structured formatting. This may be due to rate limiting or an API issue. Try again."
+        ));
+    }
+
+    Ok(AgenticResponse {
+        content: formatted,
+        usage: merge_usage(usage, parsed.usage),
+    })
 }
 
 /// Call LLM with tool-calling capability.
@@ -972,6 +1081,7 @@ pub async fn call_llm_agentic(
             user: None,
             max_completion_tokens: model.max_tokens(),
             stream: false,
+            temperature: Some(TOOL_CALL_TEMPERATURE),
             response_format: None,
             include_reasoning: reasoning.include_reasoning,
             reasoning_effort: reasoning.reasoning_effort,
@@ -980,12 +1090,15 @@ pub async fn call_llm_agentic(
             tools: Some(tools.clone()),
             tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
             parallel_tool_calls: parallel_tool_calls_setting(model, true),
+            disable_tool_validation: Some(true),
             provider: None,
             service_tier: groq_service_tier(),
         };
+        let mut request = request;
 
         // Use shared retry helper - handles timeouts, rate limits, server errors
-        let text = send_with_retry(&client, &api_key, &request).await?;
+        let text =
+            send_report_back_text_with_speed_fallback(&client, &api_key, &mut request).await?;
 
         let parsed: ChatResponse = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("Failed to parse response: {}\n{}", e, text))?;
@@ -1067,8 +1180,6 @@ pub async fn call_llm_agentic(
         }
 
         // Model returned final response (no tool calls)
-        // If we have structured output schema, the content should already be formatted
-        // (structured output was requested but may not have been enforced during tool loop)
         let content = choice.message.content.clone().unwrap_or_default();
 
         // Validate we got actual content
@@ -1087,96 +1198,22 @@ pub async fn call_llm_agentic(
             ));
         }
 
-        // If structured output is requested but content doesn't look like valid JSON,
-        // make one more call with structured output to format the response
-        let needs_formatting = if final_response_format.is_some() {
-            let trimmed = content.trim();
-            // Check if content looks like valid JSON (starts with [ or {)
-            !(trimmed.starts_with('[') || trimmed.starts_with('{'))
-                || serde_json::from_str::<serde_json::Value>(trimmed).is_err()
-        } else {
-            false
-        };
-
-        if needs_formatting {
-            // Content isn't valid JSON - ask for formatting with structured output
-            messages.push(Message {
-                role: "assistant".to_string(),
-                content: Some(content.clone()),
-                tool_calls: None,
-                tool_call_id: None,
-            });
-            messages.push(Message {
-                role: "user".to_string(),
-                content: Some(
-                    "Format your response as valid JSON matching the required schema.".to_string(),
-                ),
-                tool_calls: None,
-                tool_call_id: None,
-            });
-
-            let reasoning = reasoning_config(model);
-            let format_request = ChatRequest {
-                model: model_id_for_backend(model),
-                messages: messages.clone(),
-                user: None,
-                max_completion_tokens: model.max_tokens(),
-                stream: false,
-                response_format: final_response_format.clone(),
-                include_reasoning: reasoning.include_reasoning,
-                reasoning_effort: reasoning.reasoning_effort,
-                reasoning_format: reasoning.reasoning_format,
-                plugins: None,
-                tools: None,
-                tool_choice: None,
-                parallel_tool_calls: None,
-                provider: None,
-                service_tier: groq_service_tier(),
-            };
-
-            let text = send_with_retry(&client, &api_key, &format_request).await?;
-            let parsed: ChatResponse = serde_json::from_str(&text)
-                .map_err(|e| anyhow::anyhow!("Failed to parse format response: {}\n{}", e, text))?;
-            total_usage = merge_usage(total_usage, parsed.usage.clone());
-
-            let choice = parsed
-                .choices
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("No response from model"))?;
-
-            if let Some(refusal) = &choice.message.refusal {
-                return Err(anyhow::anyhow!(
-                    "Request was refused: {}",
-                    refusal.chars().take(200).collect::<String>()
-                ));
-            }
-
-            let formatted = choice.message.content.clone().unwrap_or(content);
-            if formatted.trim().is_empty() {
-                return Err(anyhow::anyhow!(
-                    "Model returned empty response during formatting. This may be due to rate limiting or an API issue. Try again."
-                ));
-            }
-
-            return Ok(AgenticResponse {
-                content: formatted,
-                usage: total_usage,
-            });
-        }
-
-        return Ok(AgenticResponse {
+        return maybe_format_agentic_content(
+            &client,
+            &api_key,
+            model,
+            user,
             content,
-            usage: total_usage,
-        });
+            final_response_format.clone(),
+            total_usage,
+        )
+        .await;
     }
 
     // If we broke out of loop (hit max iterations), make one final call WITHOUT tools
     // to force the model to respond with whatever it has
-    let final_instruction = if final_response_format.is_some() {
-        "You've gathered enough context. Now respond with valid JSON matching the required schema. No more tool calls."
-    } else {
-        "You've gathered enough context. Now respond based on what you've learned. No more tool calls."
-    };
+    let final_instruction =
+        "You've gathered enough context. Now respond based on what you've learned. No more tool calls.";
     messages.push(Message {
         role: "user".to_string(),
         content: Some(final_instruction.to_string()),
@@ -1185,7 +1222,6 @@ pub async fn call_llm_agentic(
     });
 
     // Final call: no tools at all, just ask for the response
-    // Don't include tools or structured output to maximize compatibility
     let reasoning = reasoning_config(model);
     let final_request = ChatRequest {
         model: model_id_for_backend(model),
@@ -1193,7 +1229,8 @@ pub async fn call_llm_agentic(
         user: None,
         max_completion_tokens: model.max_tokens(),
         stream: false,
-        response_format: final_response_format,
+        temperature: None,
+        response_format: None,
         include_reasoning: reasoning.include_reasoning,
         reasoning_effort: reasoning.reasoning_effort,
         reasoning_format: reasoning.reasoning_format,
@@ -1201,6 +1238,7 @@ pub async fn call_llm_agentic(
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
+        disable_tool_validation: None,
         provider: None,
         service_tier: groq_service_tier(),
     };
@@ -1271,10 +1309,16 @@ pub async fn call_llm_agentic(
         ));
     }
 
-    Ok(AgenticResponse {
+    maybe_format_agentic_content(
+        &client,
+        &api_key,
+        model,
+        user,
         content,
-        usage: total_usage,
-    })
+        final_response_format,
+        total_usage,
+    )
+    .await
 }
 
 /// Agentic call variant that only succeeds when the model completes via `report_back`.
@@ -1357,6 +1401,7 @@ pub async fn call_llm_agentic_report_back_only(
             user: None,
             max_completion_tokens: model.max_tokens(),
             stream: stream_reasoning,
+            temperature: Some(TOOL_CALL_TEMPERATURE),
             response_format: None,
             include_reasoning: reasoning.include_reasoning,
             reasoning_effort: reasoning.reasoning_effort,
@@ -1365,6 +1410,7 @@ pub async fn call_llm_agentic_report_back_only(
             tools: Some(tools.clone()),
             tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
             parallel_tool_calls: parallel_tool_calls_setting(model, !finalization_round),
+            disable_tool_validation: Some(true),
             provider: None,
             service_tier: groq_service_tier(),
         };
@@ -1393,27 +1439,16 @@ pub async fn call_llm_agentic_report_back_only(
                     request.include_reasoning = reasoning.include_reasoning;
                     request.reasoning_effort = reasoning.reasoning_effort;
                     request.reasoning_format = reasoning.reasoning_format;
-                    let text = send_report_back_text_with_speed_fallback(
-                        &client,
-                        &api_key,
-                        model,
-                        include_reasoning,
-                        &mut request,
-                    )
-                    .await?;
+                    let text =
+                        send_report_back_text_with_speed_fallback(&client, &api_key, &mut request)
+                            .await?;
                     serde_json::from_str(&text)
                         .map_err(|e| anyhow::anyhow!("Failed to parse response: {}\n{}", e, text))?
                 }
             }
         } else {
-            let text = send_report_back_text_with_speed_fallback(
-                &client,
-                &api_key,
-                model,
-                include_reasoning,
-                &mut request,
-            )
-            .await?;
+            let text =
+                send_report_back_text_with_speed_fallback(&client, &api_key, &mut request).await?;
             serde_json::from_str(&text)
                 .map_err(|e| anyhow::anyhow!("Failed to parse response: {}\n{}", e, text))?
         };
@@ -1761,6 +1796,7 @@ mod tests {
             user: None,
             max_completion_tokens: 128,
             stream: false,
+            temperature: Some(TOOL_CALL_TEMPERATURE),
             response_format: None,
             include_reasoning: None,
             reasoning_effort: None,
@@ -1769,6 +1805,7 @@ mod tests {
             tools: Some(tools),
             tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
             parallel_tool_calls: Some(true),
+            disable_tool_validation: Some(true),
             provider: None,
             service_tier: None,
         };
@@ -1776,6 +1813,7 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"tool_choice\":\"auto\""));
         assert!(json.contains("\"parallel_tool_calls\":true"));
+        assert!(json.contains("\"disable_tool_validation\":true"));
         assert!(json.contains("\"tools\""));
     }
 
@@ -1792,6 +1830,7 @@ mod tests {
             user: None,
             max_completion_tokens: 128,
             stream: false,
+            temperature: Some(TOOL_CALL_TEMPERATURE),
             response_format: None,
             include_reasoning: None,
             reasoning_effort: None,
@@ -1805,6 +1844,7 @@ mod tests {
                 },
             })),
             parallel_tool_calls: Some(false),
+            disable_tool_validation: Some(true),
             provider: None,
             service_tier: None,
         };
@@ -1841,6 +1881,7 @@ mod tests {
             user: None,
             max_completion_tokens: 64,
             stream: false,
+            temperature: None,
             response_format: None,
             include_reasoning: None,
             reasoning_effort: None,
@@ -1849,11 +1890,21 @@ mod tests {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
+            disable_tool_validation: None,
             provider: None,
             service_tier: None,
         };
         let value = serde_json::to_value(&request).expect("serialize request");
         assert!(value.get("provider").is_none());
+        assert!(value.get("disable_tool_validation").is_none());
+    }
+
+    #[test]
+    fn test_detects_tool_call_validation_errors() {
+        let err = anyhow::anyhow!(
+            "API error 400 Bad Request: {{\"error\":{{\"message\":\"Tool call validation failed: attempted to call tool 'json' which was not in request\"}}}}"
+        );
+        assert!(is_tool_call_validation_error(&err));
     }
 
     #[test]
