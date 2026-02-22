@@ -81,7 +81,8 @@ pub async fn run_tui(
     let ai_enabled = cosmos_engine::llm::is_available();
     if !ai_enabled {
         app.open_api_key_overlay(Some(
-            "No Groq API key configured yet. Paste your key to start AI suggestions.".to_string(),
+            "No Cerebras API key configured yet. Paste your key to start AI suggestions."
+                .to_string(),
         ));
     }
 

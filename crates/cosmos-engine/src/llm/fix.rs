@@ -483,7 +483,7 @@ pub(crate) fn fix_response_schema() -> serde_json::Value {
 
 /// Call LLM with structured output, caching, and fallback for context limits
 ///
-/// Uses Groq's automatic prompt caching on supported models and can improve
+/// Uses Cerebras's automatic prompt caching on supported models and can improve
 /// cost/latency when prompt prefixes repeat.
 // This helper threads all retry/caching controls from callers without hidden defaults.
 #[allow(clippy::too_many_arguments)]
@@ -521,7 +521,7 @@ where
         )
         .await
     } else {
-        // Cached version delegates to the standard structured call shape. Groq handles
+        // Cached version delegates to the standard structured call shape. Cerebras handles
         // prompt caching automatically server-side for supported models.
         call_llm_structured_cached::<T>(system, primary, model, schema_name, schema.clone()).await
     };

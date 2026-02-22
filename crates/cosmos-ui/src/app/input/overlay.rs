@@ -6,7 +6,7 @@ use crate::ui::{App, LoadingState, Overlay, StartupAction, StartupMode};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-const GROQ_KEYS_URL: &str = "https://console.groq.com/keys";
+const CEREBRAS_KEYS_URL: &str = "https://cloud.cerebras.ai";
 
 fn normalize_api_key_input(raw: &str) -> String {
     let trimmed = raw.trim();
@@ -19,7 +19,7 @@ fn open_provider_link(app: &mut App, url: &str, label: &str) {
         Ok(()) => {}
         Err(_) => {
             let message = format!(
-                "Couldn't open browser. Visit {} to open Groq {} page.",
+                "Couldn't open browser. Visit {} to open Cerebras {} page.",
                 url, label
             );
             if let Overlay::ApiKeySetup { error, .. } = &mut app.overlay {
@@ -114,7 +114,7 @@ fn handle_api_key_overlay_input(app: &mut App, key: &KeyEvent, ctx: &RuntimeCont
             app.close_overlay();
         }
         KeyCode::Char('k') if has_control_or_command(key.modifiers) => {
-            open_provider_link(app, GROQ_KEYS_URL, "keys");
+            open_provider_link(app, CEREBRAS_KEYS_URL, "keys");
         }
         KeyCode::Backspace => {
             if let Overlay::ApiKeySetup {
@@ -150,7 +150,7 @@ fn handle_api_key_overlay_input(app: &mut App, key: &KeyEvent, ctx: &RuntimeCont
 
             if candidate.is_empty() {
                 if let Overlay::ApiKeySetup { error, .. } = &mut app.overlay {
-                    *error = Some("Paste a Groq API key to continue.".to_string());
+                    *error = Some("Paste a Cerebras API key to continue.".to_string());
                 }
                 return;
             }
@@ -163,7 +163,7 @@ fn handle_api_key_overlay_input(app: &mut App, key: &KeyEvent, ctx: &RuntimeCont
                 {
                     *save_armed = true;
                     *error = Some(
-                        "This key does not start with gsk_ or sk-. Press Enter again to save anyway, or keep editing."
+                        "This key format looks unusual. Press Enter again to save anyway, or keep editing."
                             .to_string(),
                     );
                 }

@@ -4,15 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
-/// Groq OpenAI-compatible API URL (direct mode).
-pub(crate) const GROQ_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
+/// Cerebras OpenAI-compatible API URL.
+pub(crate) const CEREBRAS_URL: &str = "https://api.cerebras.ai/v1/chat/completions";
 
 fn backend_label() -> &'static str {
-    "Groq"
+    "Cerebras"
 }
 
 pub(crate) fn chat_completions_url() -> &'static str {
-    GROQ_URL
+    CEREBRAS_URL
 }
 
 fn model_id_for_backend_impl(model: Model) -> String {
@@ -23,24 +23,12 @@ pub(crate) fn model_id_for_backend(model: Model) -> String {
     model_id_for_backend_impl(model)
 }
 
-fn is_openai_gpt_oss_model(model_id: &str) -> bool {
-    model_id.starts_with("openai/gpt-oss-")
+fn is_gpt_oss_model(model_id: &str) -> bool {
+    model_id.starts_with("gpt-oss-")
 }
 
 pub(crate) fn supports_parallel_tool_calls_for_backend(model: Model) -> bool {
-    !is_openai_gpt_oss_model(model_id_for_backend_impl(model).as_str())
-}
-
-fn normalize_groq_service_tier(value: Option<&str>) -> String {
-    value
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "on_demand".to_string())
-}
-
-pub(crate) fn groq_service_tier() -> Option<String> {
-    let raw = std::env::var("COSMOS_GROQ_SERVICE_TIER").ok()?;
-    Some(normalize_groq_service_tier(Some(raw.as_str())))
+    !is_gpt_oss_model(model_id_for_backend_impl(model).as_str())
 }
 
 pub(crate) fn apply_backend_headers(
@@ -236,13 +224,12 @@ pub(crate) fn api_key() -> Option<String> {
     let mut config = Config::load();
     config
         .get_api_key()
-        .or_else(|| std::env::var("GROQ_API_KEY").ok())
-        .or_else(|| std::env::var("GROQ_API_TOKEN").ok())
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .or_else(|| std::env::var("CEREBRAS_API_KEY").ok())
+        .or_else(|| std::env::var("CEREBRAS_API_TOKEN").ok())
 }
 
 pub(crate) fn missing_api_key_message() -> String {
-    "No Groq API key configured. Run 'cosmos --setup' or set GROQ_API_KEY.".to_string()
+    "No Cerebras API key configured. Run 'cosmos --setup' or set CEREBRAS_API_KEY.".to_string()
 }
 
 /// Response from LLM including content and usage stats
@@ -268,8 +255,6 @@ struct ChatRequest {
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_format: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    service_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -441,9 +426,9 @@ where
     .await
     {
         Ok(mut response) => {
-            diagnostics.selected_provider = Some("groq".to_string());
+            diagnostics.selected_provider = Some("cerebras".to_string());
             diagnostics.attempts.push(ProviderAttemptDiagnostics {
-                provider_slug: "groq".to_string(),
+                provider_slug: "cerebras".to_string(),
                 mode: "json_schema".to_string(),
                 slice_timeout_ms: timeout_ms,
                 elapsed_ms: call_start.elapsed().as_millis() as u64,
@@ -457,7 +442,7 @@ where
             let err_text = err.to_string();
             let kind = classify_provider_error(&err_text);
             diagnostics.attempts.push(ProviderAttemptDiagnostics {
-                provider_slug: "groq".to_string(),
+                provider_slug: "cerebras".to_string(),
                 mode: "json_schema".to_string(),
                 slice_timeout_ms: timeout_ms,
                 elapsed_ms: call_start.elapsed().as_millis() as u64,
@@ -468,7 +453,7 @@ where
             Err(anyhow::Error::new(SpeedFailoverError {
                 diagnostics,
                 message: format!(
-                    "Groq call failed for openai/gpt-oss-120b: {}",
+                    "Cerebras call failed for gpt-oss-120b: {}",
                     sanitize_api_response(&err_text)
                 ),
             }))
@@ -477,15 +462,10 @@ where
 }
 
 fn reasoning_fields_for_model(model: Model, include_output: bool) -> ReasoningRequestFields {
-    let backend_model = model_id_for_backend_impl(model);
-    if is_openai_gpt_oss_model(backend_model.as_str()) {
-        return ReasoningRequestFields {
-            include_reasoning: Some(include_output),
-            reasoning_effort: model.reasoning_effort().map(str::to_string),
-            reasoning_format: None,
-        };
-    }
-
+    let _ = model;
+    let _ = include_output;
+    // Cerebras chat completions currently rejects provider-specific reasoning fields such as
+    // `include_reasoning` and `reasoning_effort` (422 wrong_api_format). Keep them omitted.
     ReasoningRequestFields::default()
 }
 
@@ -596,7 +576,7 @@ pub(crate) async fn send_with_retry<T: Serialize>(
 
         // Non-retryable error or max retries exceeded
         let error_msg = match status.as_u16() {
-            401 => "Invalid Groq API key. Run 'cosmos --setup' or set GROQ_API_KEY and try again."
+            401 => "Invalid Cerebras API key. Run 'cosmos --setup' or set CEREBRAS_API_KEY and try again."
                 .to_string(),
             429 => format!(
                 "Rate limited by {} after {} retries. Try again in a few minutes. (Press 'e' to view error log)",
@@ -675,7 +655,6 @@ pub(crate) async fn call_llm_with_usage(
         include_reasoning: reasoning.include_reasoning,
         reasoning_effort: reasoning.reasoning_effort,
         reasoning_format: reasoning.reasoning_format,
-        service_tier: groq_service_tier(),
     };
 
     let text = send_with_retry(&client, &api_key, &request).await?;
@@ -820,7 +799,6 @@ where
         include_reasoning: reasoning.include_reasoning,
         reasoning_effort: reasoning.reasoning_effort,
         reasoning_format: reasoning.reasoning_format,
-        service_tier: groq_service_tier(),
     };
 
     let text = send_with_retry(&client, &api_key, &request).await?;
@@ -951,7 +929,6 @@ where
         include_reasoning: reasoning.include_reasoning,
         reasoning_effort: reasoning.reasoning_effort,
         reasoning_format: reasoning.reasoning_format,
-        service_tier: groq_service_tier(),
     };
 
     let text = timeout(
@@ -1000,7 +977,7 @@ where
 
 /// Call LLM API with structured output on the standard chat completion shape.
 ///
-/// Groq prompt caching is automatic on supported models, so this path intentionally
+/// Cerebras prompt caching is handled provider-side on supported models, so this path intentionally
 /// uses the same request format as `call_llm_structured` without cache-control hints.
 pub(crate) async fn call_llm_structured_cached<T>(
     system: &str,
@@ -1053,34 +1030,23 @@ mod tests {
     }
 
     #[test]
-    fn test_model_id_normalization_for_groq_backend_and_smart_model() {
-        let groq_id = model_id_for_backend_impl(Model::Speed);
-        assert_eq!(groq_id, "openai/gpt-oss-120b");
+    fn test_model_id_normalization_for_cerebras_backend_and_smart_model() {
+        let cerebras_id = model_id_for_backend_impl(Model::Speed);
+        assert_eq!(cerebras_id, "gpt-oss-120b");
         let smart_id = model_id_for_backend_impl(Model::Smart);
-        assert_eq!(smart_id, "openai/gpt-oss-120b");
+        assert_eq!(smart_id, "gpt-oss-120b");
     }
 
     #[test]
-    fn test_normalize_groq_service_tier_defaults_to_on_demand() {
-        assert_eq!(normalize_groq_service_tier(None), "on_demand");
-        assert_eq!(normalize_groq_service_tier(Some("  ")), "on_demand");
-        assert_eq!(normalize_groq_service_tier(Some("FLEX")), "flex");
-        assert_eq!(
-            normalize_groq_service_tier(Some("performance")),
-            "performance"
-        );
-    }
-
-    #[test]
-    fn test_reasoning_fields_for_gpt_oss_models() {
+    fn test_reasoning_fields_are_omitted_for_cerebras() {
         let speed = reasoning_fields_for_model(Model::Speed, false);
-        assert_eq!(speed.include_reasoning, Some(false));
-        assert_eq!(speed.reasoning_effort.as_deref(), Some("medium"));
+        assert!(speed.include_reasoning.is_none());
+        assert!(speed.reasoning_effort.is_none());
         assert!(speed.reasoning_format.is_none());
 
         let smart = reasoning_fields_for_model(Model::Smart, true);
-        assert_eq!(smart.include_reasoning, Some(true));
-        assert_eq!(smart.reasoning_effort.as_deref(), Some("high"));
+        assert!(smart.include_reasoning.is_none());
+        assert!(smart.reasoning_effort.is_none());
         assert!(smart.reasoning_format.is_none());
     }
 

@@ -649,7 +649,7 @@ pub fn get_relace_search_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function",
             function: FunctionDefinition {
                 name: "bash",
-                strict: Some(true),
+                strict: None,
                 description: "Tool for executing bash commands.\n\n* Avoid long running commands\n* Avoid dangerous/destructive commands\n* Prefer using other more specialized tools where possible",
                 parameters: serde_json::json!({
                     "type": "object",
@@ -692,7 +692,7 @@ pub fn get_relace_search_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function",
             function: FunctionDefinition {
                 name: "report_back",
-                strict: Some(true),
+                strict: None,
                 description: "This is a tool to use when you feel like you have finished exploring the codebase and understanding the problem, and now would like to report back to the user.",
                 parameters: serde_json::json!({
                     "type": "object",
@@ -806,7 +806,7 @@ pub fn get_relace_search_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function",
             function: FunctionDefinition {
                 name: "repo_browser.report_back",
-                strict: Some(true),
+                strict: None,
                 description: "Compatibility alias for report_back used by some providers.",
                 parameters: serde_json::json!({
                     "type": "object",
@@ -932,6 +932,93 @@ pub fn get_relace_search_tool_definitions() -> Vec<ToolDefinition> {
             },
         },
     ]
+}
+
+fn report_back_finding_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": [
+            "file",
+            "line",
+            "category",
+            "criticality",
+            "summary",
+            "detail",
+            "evidence_quote"
+        ],
+        "properties": {
+            "file": { "type": "string" },
+            "line": { "type": "integer" },
+            "category": { "type": "string" },
+            "criticality": { "type": "string" },
+            "summary": { "type": "string" },
+            "detail": { "type": "string" },
+            "evidence_quote": { "type": "string" }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn report_back_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        tool_type: "function",
+        function: FunctionDefinition {
+            name: "report_back",
+            strict: None,
+            description: "Report final findings after inspection. Call exactly once when done.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "required": ["explanation", "files"],
+                "properties": {
+                    "explanation": {
+                        "type": "object",
+                        "required": ["role", "findings", "verified_findings"],
+                        "properties": {
+                            "role": { "type": "string" },
+                            "findings": {
+                                "type": "array",
+                                "items": report_back_finding_schema()
+                            },
+                            "verified_findings": {
+                                "type": "array",
+                                "items": report_back_finding_schema()
+                            }
+                        },
+                        "additionalProperties": false
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["path", "ranges"],
+                            "properties": {
+                                "path": { "type": "string" },
+                                "ranges": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "array",
+                                        "items": { "type": "integer" }
+                                    }
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "additionalProperties": false
+            }),
+        },
+    }
+}
+
+/// Cerebras-compatible reduced toolset for report_back-only agentic workflows.
+///
+/// This avoids large compatibility-alias schemas that can fail provider-side grammar
+/// compilation and reduces token load under strict TPM limits.
+pub fn get_relace_search_tool_definitions_cerebras() -> Vec<ToolDefinition> {
+    let mut tools = get_tool_definitions();
+    tools.push(report_back_tool_definition());
+    tools
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1074,18 +1161,37 @@ fn execute_tree(root: &Path, args_json: &str) -> String {
     }
 
     let args: TreeArgs = serde_json::from_str(args_json).unwrap_or_default();
-    let target = match &args.path {
-        Some(p) => {
-            // Validate path to prevent traversal attacks
-            let path = std::path::Path::new(p);
-            match resolve_repo_path_allow_new(root, path) {
-                Ok(resolved) => resolved.absolute,
-                Err(e) => return format!("Invalid path '{}': {}", p, e),
+    let max_depth = args.depth.unwrap_or(3);
+
+    // Be permissive for common model assumptions about repo roots so `tree` does not
+    // get stuck in path-contract loops.
+    let raw_path = args.path.as_deref().map(str::trim).unwrap_or(".");
+    let normalized = if raw_path.is_empty()
+        || raw_path == "."
+        || raw_path == "./"
+        || raw_path == "repo"
+        || raw_path == "/repo"
+    {
+        "."
+    } else {
+        raw_path.strip_prefix("/repo/").unwrap_or(raw_path)
+    };
+
+    let target = if normalized == "." {
+        root.to_path_buf()
+    } else {
+        match resolve_repo_path_allow_new(root, std::path::Path::new(normalized)) {
+            Ok(resolved) => resolved.absolute,
+            Err(e) => {
+                let mut output = format!(
+                    "Invalid path '{}': {}. Falling back to repository root.\n",
+                    raw_path, e
+                );
+                build_tree(root, root, "", max_depth, 0, &mut output);
+                return truncate_output(output);
             }
         }
-        None => root.to_path_buf(),
     };
-    let max_depth = args.depth.unwrap_or(3);
 
     if !target.exists() {
         return format!("Path not found: {}", target.display());
@@ -1199,10 +1305,9 @@ fn execute_head(root: &Path, args_json: &str) -> String {
         Err(e) => return format!("Invalid arguments: {}", e),
     };
 
-    // Validate path to prevent traversal attacks
-    let target = match resolve_repo_path_allow_new(root, std::path::Path::new(&args.path)) {
-        Ok(resolved) => resolved.absolute,
-        Err(e) => return format!("Invalid path '{}': {}", args.path, e),
+    let target = match resolve_relace_path(root, &args.path) {
+        Ok(path) => path,
+        Err(err) => return err,
     };
     let num_lines = args.lines.unwrap_or(50);
 
@@ -1253,11 +1358,15 @@ fn execute_search(root: &Path, args_json: &str) -> String {
     }
 
     let target = match &args.path {
-        Some(p) => {
-            // Validate path to prevent traversal attacks
-            match resolve_repo_path_allow_new(root, std::path::Path::new(p)) {
-                Ok(resolved) => resolved.absolute,
-                Err(e) => return format!("Invalid path '{}': {}", p, e),
+        Some(raw_path) => {
+            let trimmed = raw_path.trim();
+            if trimmed.is_empty() {
+                root.to_path_buf()
+            } else {
+                match resolve_relace_path(root, trimmed) {
+                    Ok(path) => path,
+                    Err(err) => return err,
+                }
             }
         }
         None => root.to_path_buf(),
@@ -1723,10 +1832,9 @@ fn execute_read_range(root: &Path, args_json: &str) -> String {
         Err(e) => return format!("Invalid arguments: {}", e),
     };
 
-    // Validate path to prevent traversal attacks
-    let target = match resolve_repo_path_allow_new(root, std::path::Path::new(&args.path)) {
-        Ok(resolved) => resolved.absolute,
-        Err(e) => return format!("Invalid path '{}': {}", args.path, e),
+    let target = match resolve_relace_path(root, &args.path) {
+        Ok(path) => path,
+        Err(err) => return err,
     };
 
     if !target.exists() {
@@ -1945,14 +2053,61 @@ mod tests {
             .iter()
             .map(|tool| (tool.function.name, tool.function.strict))
             .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(strict_by_name.get("report_back"), Some(&Some(true)));
-        assert_eq!(
-            strict_by_name.get("repo_browser.report_back"),
-            Some(&Some(true))
-        );
+        assert_eq!(strict_by_name.get("report_back"), Some(&None));
+        assert_eq!(strict_by_name.get("repo_browser.report_back"), Some(&None));
         assert_eq!(strict_by_name.get("view_file"), Some(&None));
         assert_eq!(strict_by_name.get("view_directory"), Some(&None));
         assert_eq!(strict_by_name.get("repo_browser.exec"), Some(&None));
+    }
+
+    #[test]
+    fn test_cerebras_relace_toolset_is_minimal_and_includes_report_back() {
+        let tools = get_relace_search_tool_definitions_cerebras();
+        let names = tools
+            .iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "tree",
+                "head",
+                "search",
+                "read_range",
+                "shell",
+                "report_back"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cerebras_report_back_schema_avoids_unsupported_keywords() {
+        let tools = get_relace_search_tool_definitions_cerebras();
+        let report_back = tools
+            .iter()
+            .find(|tool| tool.function.name == "report_back")
+            .expect("report_back should exist");
+        let serialized = report_back.function.parameters.to_string();
+
+        // Keep this aligned with Cerebras structured-output/tool schema limitations.
+        for keyword in [
+            "\"minItems\"",
+            "\"maxItems\"",
+            "\"minimum\"",
+            "\"maximum\"",
+            "\"pattern\"",
+            "\"format\"",
+            "\"oneOf\"",
+            "\"allOf\"",
+            "\"if\"",
+            "\"then\"",
+            "\"else\"",
+        ] {
+            assert!(
+                !serialized.contains(keyword),
+                "unexpected unsupported keyword in Cerebras report_back schema: {keyword}"
+            );
+        }
     }
 
     #[test]

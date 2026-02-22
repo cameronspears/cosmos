@@ -6,7 +6,7 @@
 //! to suggest improvements, bug fixes, and optimizations.
 
 use anyhow::Result;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use cosmos_adapters::{cache, config, git_ops, github, keyring};
 use cosmos_core::context::WorkContext;
 use cosmos_core::index::CodebaseIndex;
@@ -30,7 +30,7 @@ struct Args {
     #[arg(default_value = ".")]
     path: PathBuf,
 
-    /// Set up Groq API key for AI features (BYOK mode)
+    /// Set up Cerebras API key for AI features (BYOK mode)
     #[arg(long)]
     setup: bool,
 
@@ -57,42 +57,11 @@ struct Args {
     /// Stream reasoning/thinking deltas during suggestion audit (debug-only; output may be truncated)
     #[arg(long, requires = "suggest_audit")]
     suggest_stream_reasoning: bool,
-
-    /// Groq service tier override (optional). If omitted, Groq default routing is used.
-    #[arg(long, value_enum)]
-    groq_service_tier: Option<GroqServiceTierArg>,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum GroqServiceTierArg {
-    #[value(name = "on_demand")]
-    OnDemand,
-    #[value(name = "flex")]
-    Flex,
-    #[value(name = "performance")]
-    Performance,
-    #[value(name = "auto")]
-    Auto,
-}
-
-impl GroqServiceTierArg {
-    fn as_str(self) -> &'static str {
-        match self {
-            GroqServiceTierArg::OnDemand => "on_demand",
-            GroqServiceTierArg::Flex => "flex",
-            GroqServiceTierArg::Performance => "performance",
-            GroqServiceTierArg::Auto => "auto",
-        }
-    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
-    if let Some(tier) = args.groq_service_tier {
-        std::env::set_var("COSMOS_GROQ_SERVICE_TIER", tier.as_str());
-    }
 
     // Handle --setup flag (BYOK mode)
     if args.setup {
@@ -148,7 +117,7 @@ async fn run_suggestion_audit(
 ) -> Result<()> {
     if !llm::is_available() {
         return Err(anyhow::anyhow!(
-            "AI is unavailable. Configure an API key first (`cosmos --setup` or set GROQ_API_KEY)."
+            "AI is unavailable. Configure an API key first (`cosmos --setup` or set CEREBRAS_API_KEY)."
         ));
     }
 
@@ -467,8 +436,8 @@ fn setup_api_key() -> Result<()> {
                 keyring::credentials_store_label()
             );
             eprintln!();
-            eprintln!("  Workaround: Set the GROQ_API_KEY environment variable:");
-            eprintln!("    export GROQ_API_KEY=\"your-key-here\"");
+            eprintln!("  Workaround: Set the CEREBRAS_API_KEY environment variable:");
+            eprintln!("    export CEREBRAS_API_KEY=\"your-key-here\"");
             eprintln!();
             return Err(anyhow::anyhow!("API key verification failed"));
         }

@@ -183,7 +183,7 @@ fn k_opens_api_key_overlay() {
 
 #[test]
 fn enter_opens_apply_plan_without_mutation() {
-    std::env::set_var("GROQ_API_KEY", "test-key");
+    std::env::set_var("CEREBRAS_API_KEY", "test-key");
     let mut root = std::env::temp_dir();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -240,13 +240,13 @@ fn enter_opens_apply_plan_without_mutation() {
     assert_eq!(app.loading, LoadingState::None);
     assert!(app.pending_changes.is_empty());
 
-    std::env::remove_var("GROQ_API_KEY");
+    std::env::remove_var("CEREBRAS_API_KEY");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn enter_rejects_weakly_grounded_suggestion() {
-    std::env::set_var("GROQ_API_KEY", "test-key");
+    std::env::set_var("CEREBRAS_API_KEY", "test-key");
     let mut root = std::env::temp_dir();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -305,13 +305,13 @@ fn enter_rejects_weakly_grounded_suggestion() {
     assert!(app.armed_file_hashes.is_empty());
     assert!(app.pending_changes.is_empty());
 
-    std::env::remove_var("GROQ_API_KEY");
+    std::env::remove_var("CEREBRAS_API_KEY");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn apply_arm_resets_on_selection_change() {
-    std::env::set_var("GROQ_API_KEY", "test-key");
+    std::env::set_var("CEREBRAS_API_KEY", "test-key");
     let mut root = std::env::temp_dir();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -383,13 +383,13 @@ fn apply_arm_resets_on_selection_change() {
     assert!(app.armed_suggestion_id.is_none());
     assert!(app.armed_file_hashes.is_empty());
 
-    std::env::remove_var("GROQ_API_KEY");
+    std::env::remove_var("CEREBRAS_API_KEY");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn apply_plan_cancel_clears_apply_confirmation() {
-    std::env::set_var("GROQ_API_KEY", "test-key");
+    std::env::set_var("CEREBRAS_API_KEY", "test-key");
     let mut root = std::env::temp_dir();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -455,13 +455,13 @@ fn apply_plan_cancel_clears_apply_confirmation() {
     assert!(app.armed_suggestion_id.is_none());
     assert!(app.armed_file_hashes.is_empty());
 
-    std::env::remove_var("GROQ_API_KEY");
+    std::env::remove_var("CEREBRAS_API_KEY");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn apply_plan_confirm_reports_files_changed_since_preview() {
-    std::env::set_var("GROQ_API_KEY", "test-key");
+    std::env::set_var("CEREBRAS_API_KEY", "test-key");
     let mut root = std::env::temp_dir();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -529,13 +529,13 @@ fn apply_plan_confirm_reports_files_changed_since_preview() {
     }
     assert!(app.armed_suggestion_id.is_none());
 
-    std::env::remove_var("GROQ_API_KEY");
+    std::env::remove_var("CEREBRAS_API_KEY");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn apply_plan_confirm_starts_apply_flow() {
-    std::env::set_var("GROQ_API_KEY", "test-key");
+    std::env::set_var("CEREBRAS_API_KEY", "test-key");
     let (_dir, repo_path) = init_temp_git_repo_with_file();
 
     let index = CodebaseIndex {
@@ -595,7 +595,7 @@ async fn apply_plan_confirm_starts_apply_flow() {
     assert!(app.armed_suggestion_id.is_none());
     assert!(app.armed_file_hashes.is_empty());
 
-    std::env::remove_var("GROQ_API_KEY");
+    std::env::remove_var("CEREBRAS_API_KEY");
 }
 
 fn init_temp_git_repo_with_file() -> (tempfile::TempDir, PathBuf) {

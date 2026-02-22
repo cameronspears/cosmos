@@ -188,7 +188,7 @@ pub(super) fn render_help(frame: &mut Frame, scroll: usize) {
     help_text.push(section_spacer());
     help_text.push(key_row("↵", "Open apply plan / confirm"));
     help_text.push(key_row("r", "Refresh suggestions"));
-    help_text.push(key_row("k", "Open Groq setup guide"));
+    help_text.push(key_row("k", "Open Cerebras setup guide"));
     help_text.push(key_row("?", "Show help"));
     help_text.push(key_row("q", "Quit"));
     help_text.push(section_spacer());
@@ -333,7 +333,7 @@ pub(super) fn render_api_key_overlay(
     let mut lines: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Connect Groq to enable AI suggestions in Cosmos.",
+            "  Connect Cerebras to enable AI suggestions in Cosmos.",
             Style::default()
                 .fg(Theme::WHITE)
                 .add_modifier(Modifier::BOLD),
@@ -355,17 +355,15 @@ pub(super) fn render_api_key_overlay(
                 crate::ui::provider_keys_shortcut_display(),
                 Style::default().fg(Theme::GREY_400),
             ),
-            Span::styled(" for Groq keys", Style::default().fg(Theme::GREY_500)),
+            Span::styled(" for Cerebras keys", Style::default().fg(Theme::GREY_500)),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::styled("  2) ", Style::default().fg(Theme::GREEN)),
             Span::styled(
-                "Paste your API key below (it usually starts with ",
+                "Paste your API key below.",
                 Style::default().fg(Theme::GREY_400),
             ),
-            Span::styled("gsk_", Style::default().fg(Theme::GREY_200)),
-            Span::styled(")", Style::default().fg(Theme::GREY_400)),
         ]),
         Line::from(""),
     ];
@@ -377,8 +375,10 @@ pub(super) fn render_api_key_overlay(
         .filter(|c| !c.is_whitespace())
         .collect();
     let key_len = normalized_key.chars().count();
-    let visible_prefix = if normalized_key.starts_with("gsk_") {
-        Some("gsk_")
+    let visible_prefix = if normalized_key.starts_with("csk-") {
+        Some("csk-")
+    } else if normalized_key.starts_with("csk_") {
+        Some("csk_")
     } else if normalized_key.starts_with("sk-") {
         Some("sk-")
     } else {
@@ -434,9 +434,9 @@ pub(super) fn render_api_key_overlay(
 
     if key_len > 0 {
         let prefix_status = if visible_prefix.is_some() {
-            "prefix detected"
+            "recognized prefix detected"
         } else {
-            "prefix gsk_/sk- not detected"
+            "no recognizable prefix"
         };
         lines.push(Line::from(vec![
             Span::styled("  Key check: ", Style::default().fg(Theme::GREY_500)),
@@ -449,7 +449,7 @@ pub(super) fn render_api_key_overlay(
             lines.push(Line::from(vec![
                 Span::styled("  ! ", Style::default().fg(Theme::YELLOW)),
                 Span::styled(
-                    "Groq keys usually start with gsk_ (or sk-)",
+                    "Could not recognize key prefix; verify the key in cloud.cerebras.ai.",
                     Style::default().fg(Theme::GREY_300),
                 ),
             ]));
@@ -472,7 +472,7 @@ pub(super) fn render_api_key_overlay(
         Style::default().fg(Theme::GREY_500),
     )]));
     lines.push(Line::from(vec![Span::styled(
-        "  Data use: selected snippets + file paths may be sent to Groq.",
+        "  Data use: selected snippets + file paths may be sent to Cerebras.",
         Style::default().fg(Theme::GREY_500),
     )]));
     lines.push(Line::from(""));
@@ -672,7 +672,7 @@ pub(super) fn render_apply_plan(
             ),
         ]));
         for line in wrap_text(
-            "Cosmos may send selected code snippets and file paths to Groq to generate and validate suggestions. Local cache stays in .cosmos and can be cleared with Reset.",
+            "Cosmos may send selected code snippets and file paths to Cerebras to generate and validate suggestions. Local cache stays in .cosmos and can be cleared with Reset.",
             text_width,
         ) {
             lines.push(Line::from(vec![
@@ -1265,7 +1265,7 @@ pub(super) fn render_welcome(frame: &mut Frame) {
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Data use: Cosmos sends selected code snippets + file paths to Groq for AI generation and validation.",
+            "  Data use: Cosmos sends selected code snippets + file paths to Cerebras for AI generation and validation.",
             Style::default().fg(Theme::GREY_400),
         )]),
         Line::from(vec![Span::styled(

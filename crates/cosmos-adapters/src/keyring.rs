@@ -21,8 +21,9 @@ const KEYRING_USERNAME: &str = "default";
 /// All credentials stored in a single keychain entry
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StoredCredentials {
+    #[serde(alias = "groq_api_key")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    groq_api_key: Option<String>,
+    cerebras_api_key: Option<String>,
     /// Legacy field preserved for backward compatibility with older credential blobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     openrouter_api_key: Option<String>,
@@ -64,7 +65,7 @@ fn keyring_disabled() -> bool {
     // If the local credentials file exists and already contains usable credentials, prefer it
     // to avoid interactive system keychain prompts (common in CI/lab runs and some macOS setups).
     if let Ok(creds) = read_fallback_credentials() {
-        if creds.groq_api_key.is_some()
+        if creds.cerebras_api_key.is_some()
             || creds.openrouter_api_key.is_some()
             || creds.github_token.is_some()
         {
@@ -198,7 +199,9 @@ pub fn warn_keychain_error_once(context: &str, err: &str) {
     );
     eprintln!("  Tip: When macOS prompts, choose \"Always Allow\" for cosmos.");
     eprintln!("  Tip: To bypass keychain prompts: export COSMOS_DISABLE_KEYRING=1");
-    eprintln!("  Tip: You can also set GROQ_API_KEY and GITHUB_TOKEN env vars to bypass keychain.");
+    eprintln!(
+        "  Tip: You can also set CEREBRAS_API_KEY and GITHUB_TOKEN env vars to bypass keychain."
+    );
 }
 
 /// Read credentials from the unified keychain entry
@@ -271,19 +274,19 @@ fn reset_for_tests() {
 // Public API
 // ============================================================================
 
-/// Get the Groq API key from the credential store.
+/// Get the Cerebras API key from the credential store.
 ///
 /// Legacy OpenRouter fields are parsed for compatibility but intentionally
 /// ignored as active credentials.
 pub fn get_api_key() -> KeyringResult<Option<String>> {
     let creds = read_credentials_cached()?;
-    Ok(creds.groq_api_key)
+    Ok(creds.cerebras_api_key)
 }
 
-/// Set the Groq API key in the keychain.
+/// Set the Cerebras API key in the keychain.
 pub fn set_api_key(key: &str) -> Result<(), String> {
     let mut creds = read_credentials_cached().unwrap_or_default();
-    creds.groq_api_key = Some(key.to_string());
+    creds.cerebras_api_key = Some(key.to_string());
     write_credentials(&creds).map_err(|e| e.to_string())?;
     update_cache(creds);
     Ok(())
@@ -316,7 +319,7 @@ mod tests {
     #[test]
     fn test_stored_credentials_default() {
         let creds = StoredCredentials::default();
-        assert!(creds.groq_api_key.is_none());
+        assert!(creds.cerebras_api_key.is_none());
         assert!(creds.openrouter_api_key.is_none());
         assert!(creds.github_token.is_none());
     }
@@ -324,17 +327,17 @@ mod tests {
     #[test]
     fn test_stored_credentials_serialization() {
         let creds = StoredCredentials {
-            groq_api_key: Some("gsk-test".to_string()),
+            cerebras_api_key: Some("csk-test".to_string()),
             openrouter_api_key: Some("sk-test".to_string()),
             github_token: Some("ghp_test".to_string()),
         };
         let json = serde_json::to_string(&creds).unwrap();
-        assert!(json.contains("gsk-test"));
+        assert!(json.contains("csk-test"));
         assert!(json.contains("sk-test"));
         assert!(json.contains("ghp_test"));
 
         let parsed: StoredCredentials = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.groq_api_key, Some("gsk-test".to_string()));
+        assert_eq!(parsed.cerebras_api_key, Some("csk-test".to_string()));
         assert_eq!(parsed.openrouter_api_key, Some("sk-test".to_string()));
         assert_eq!(parsed.github_token, Some("ghp_test".to_string()));
     }
@@ -343,12 +346,12 @@ mod tests {
     fn test_stored_credentials_partial_serialization() {
         // Only API key set
         let creds = StoredCredentials {
-            groq_api_key: Some("gsk-test".to_string()),
+            cerebras_api_key: Some("csk-test".to_string()),
             openrouter_api_key: None,
             github_token: None,
         };
         let json = serde_json::to_string(&creds).unwrap();
-        assert!(json.contains("gsk-test"));
+        assert!(json.contains("csk-test"));
         assert!(!json.contains("openrouter_api_key"));
         assert!(!json.contains("github_token")); // None fields should be omitted
     }
@@ -358,16 +361,23 @@ mod tests {
         // JSON with only one field should parse correctly
         let json = r#"{"openrouter_api_key": "sk-test"}"#;
         let parsed: StoredCredentials = serde_json::from_str(json).unwrap();
-        assert!(parsed.groq_api_key.is_none());
+        assert!(parsed.cerebras_api_key.is_none());
         assert_eq!(parsed.openrouter_api_key, Some("sk-test".to_string()));
         assert!(parsed.github_token.is_none());
+    }
+
+    #[test]
+    fn test_stored_credentials_deserialize_legacy_groq_field_alias() {
+        let json = r#"{"groq_api_key":"gsk-legacy"}"#;
+        let parsed: StoredCredentials = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.cerebras_api_key, Some("gsk-legacy".to_string()));
     }
 
     #[test]
     fn test_stored_credentials_deserialize_empty() {
         let json = "{}";
         let parsed: StoredCredentials = serde_json::from_str(json).unwrap();
-        assert!(parsed.groq_api_key.is_none());
+        assert!(parsed.cerebras_api_key.is_none());
         assert!(parsed.openrouter_api_key.is_none());
         assert!(parsed.github_token.is_none());
     }
@@ -388,9 +398,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         reset_for_tests();
 
-        set_api_key("gsk-test-key").unwrap();
+        set_api_key("csk-test-key").unwrap();
         set_github_token("ghp-test-token").unwrap();
-        assert_eq!(get_api_key().unwrap(), Some("gsk-test-key".to_string()));
+        assert_eq!(get_api_key().unwrap(), Some("csk-test-key".to_string()));
         assert_eq!(
             get_github_token().unwrap(),
             Some("ghp-test-token".to_string())

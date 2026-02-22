@@ -921,7 +921,7 @@ fn handle_enter_in_ask_panel(app: &mut App) -> bool {
     if !cosmos_engine::llm::is_available() {
         prompt_api_key_setup(
             app,
-            "No API key configured yet. Add your Groq key to ask questions.",
+            "No API key configured yet. Add your Cerebras key to ask questions.",
         );
     } else {
         app.start_question();
@@ -935,7 +935,7 @@ fn handle_enter_suggestions(app: &mut App) {
         if !llm_available_for_apply() {
             prompt_api_key_setup(
                 app,
-                "No API key configured yet. Add your Groq key to continue.",
+                "No API key configured yet. Add your Cerebras key to continue.",
             );
         } else if let Err(e) = open_apply_plan_for_suggestion(app, &suggestion) {
             app.open_alert("Couldn't open preview", e.user_message());

@@ -96,7 +96,7 @@ impl Config {
         Ok(())
     }
 
-    /// Get the Groq API key (keyring first, environment fallback).
+    /// Get the Cerebras API key (keyring first, environment fallback).
     pub fn get_api_key(&mut self) -> Option<String> {
         // Keyring/store has precedence for the default "just works" path.
         match keyring::get_api_key() {
@@ -106,10 +106,9 @@ impl Config {
                 keyring::warn_keychain_error_once("API key", &err);
             }
         }
-        std::env::var("GROQ_API_KEY")
+        std::env::var("CEREBRAS_API_KEY")
             .ok()
-            .or_else(|| std::env::var("GROQ_API_TOKEN").ok())
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+            .or_else(|| std::env::var("CEREBRAS_API_TOKEN").ok())
     }
 
     /// Set and save the API key
@@ -118,7 +117,7 @@ impl Config {
         keyring::set_api_key(key).map_err(|e| {
             format!(
                 "Failed to store API key in {}: {}. \
-                 You can set the GROQ_API_KEY environment variable instead.",
+                 You can set the CEREBRAS_API_KEY environment variable instead.",
                 keyring::credentials_store_label(),
                 e
             )
@@ -129,17 +128,17 @@ impl Config {
             Ok(Some(stored_key)) if stored_key == key => self.save(),
             Ok(Some(_)) => Err(format!(
                 "API key verification failed: stored key doesn't match in {}. \
-                     You can set the GROQ_API_KEY environment variable instead.",
+                     You can set the CEREBRAS_API_KEY environment variable instead.",
                 keyring::credentials_store_label()
             )),
             Ok(None) => Err(format!(
                 "API key verification failed: key was not persisted to {}. \
-                     You can set the GROQ_API_KEY environment variable instead.",
+                     You can set the CEREBRAS_API_KEY environment variable instead.",
                 keyring::credentials_store_label()
             )),
             Err(read_err) => Err(format!(
                 "API key verification failed: couldn't read back from {} ({}). \
-                     You can set the GROQ_API_KEY environment variable instead.",
+                     You can set the CEREBRAS_API_KEY environment variable instead.",
                 keyring::credentials_store_label(),
                 read_err
             )),
@@ -155,15 +154,13 @@ impl Config {
                 keyring::warn_keychain_error_once("API key", &err);
             }
         }
-        std::env::var("GROQ_API_KEY").is_ok()
-            || std::env::var("GROQ_API_TOKEN").is_ok()
-            || std::env::var("OPENAI_API_KEY").is_ok()
+        std::env::var("CEREBRAS_API_KEY").is_ok() || std::env::var("CEREBRAS_API_TOKEN").is_ok()
     }
 
     /// Validate API key format.
     pub fn validate_api_key_format(key: &str) -> bool {
         let key = key.trim();
-        !key.is_empty() && (key.starts_with("gsk_") || key.starts_with("sk-"))
+        !key.is_empty() && key.chars().count() >= 16
     }
 
     /// Get the config file location for display
@@ -183,15 +180,15 @@ pub fn setup_api_key_interactive() -> Result<String, String> {
     println!("  │  COSMOS SETUP                                           │");
     println!("  └─────────────────────────────────────────────────────────┘");
     println!();
-    println!("  Cosmos uses Groq for AI-powered suggestions.");
+    println!("  Cosmos uses Cerebras for AI-powered suggestions.");
     println!("  Quick setup takes about a minute.");
     println!();
     println!("  Steps:");
-    println!("    1) Create a key at https://console.groq.com/keys");
-    println!("    2) Ensure your Groq account is active");
+    println!("    1) Create a key at https://cloud.cerebras.ai");
+    println!("    2) Ensure your Cerebras account is active");
     println!("    3) Paste the key below and press Enter");
     println!();
-    println!("  Data use notice: Cosmos sends selected code snippets and file paths to Groq");
+    println!("  Data use notice: Cosmos sends selected code snippets and file paths to Cerebras");
     println!("  to generate and validate suggestions. Local cache stays in .cosmos.");
     println!();
     println!(
@@ -199,7 +196,7 @@ pub fn setup_api_key_interactive() -> Result<String, String> {
         keyring::credentials_store_label()
     );
     println!("  You can update it later with `cosmos --setup`.");
-    println!("  Prefer env vars? Set GROQ_API_KEY and rerun.");
+    println!("  Prefer env vars? Set CEREBRAS_API_KEY and rerun.");
     println!();
     print!("  API Key: ");
     io::stdout().flush().map_err(|e| e.to_string())?;
@@ -215,8 +212,8 @@ pub fn setup_api_key_interactive() -> Result<String, String> {
     // Validate key format
     if !Config::validate_api_key_format(&key) {
         println!();
-        println!("  Warning: Key doesn't look like a Groq key (usually starts with gsk_)");
-        println!("     Saving anyway...");
+        println!("  Warning: Key looks unusual for an API key. Saving anyway...");
+        println!("     If requests fail, verify it in https://cloud.cerebras.ai.");
     }
 
     // Save the key

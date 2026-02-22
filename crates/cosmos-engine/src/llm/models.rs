@@ -13,7 +13,7 @@ pub enum Model {
 const MODEL_MAX_TOKENS: u32 = 16384;
 
 /// Models we allow to use JSON formatting / structured outputs.
-const JSON_FORMAT_MODELS: [&str; 1] = ["openai/gpt-oss-120b"];
+const JSON_FORMAT_MODELS: [&str; 1] = ["gpt-oss-120b"];
 
 fn supports_json_format(model_id: &str) -> bool {
     JSON_FORMAT_MODELS.contains(&model_id)
@@ -22,8 +22,8 @@ fn supports_json_format(model_id: &str) -> bool {
 impl Model {
     pub fn id(&self) -> &'static str {
         match self {
-            Model::Speed => "openai/gpt-oss-120b",
-            Model::Smart => "openai/gpt-oss-120b",
+            Model::Speed => "gpt-oss-120b",
+            Model::Smart => "gpt-oss-120b",
         }
     }
 
@@ -118,8 +118,8 @@ mod tests {
 
     #[test]
     fn test_supports_json_format_allowlist() {
-        assert!(supports_json_format("openai/gpt-oss-120b"));
-        assert!(!supports_json_format("openai/gpt-4o"));
+        assert!(supports_json_format("gpt-oss-120b"));
+        assert!(!supports_json_format("gpt-4o"));
     }
 
     #[test]

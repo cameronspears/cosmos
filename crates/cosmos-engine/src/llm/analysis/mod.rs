@@ -2674,6 +2674,7 @@ fn build_dual_agent_user_prompt(
     role: &str,
     candidate_files: &[PathBuf],
     project_ethos: Option<&str>,
+    repo_memory: Option<&str>,
     retry_feedback: Option<&str>,
 ) -> String {
     let mut prompt = String::from(
@@ -2703,6 +2704,11 @@ Focus on these candidate files first (you may inspect related files as needed):\
     if let Some(ethos) = project_ethos.map(str::trim).filter(|v| !v.is_empty()) {
         prompt.push_str("\nPROJECT ETHOS:\n");
         prompt.push_str(truncate_str(ethos, 2_000));
+        prompt.push('\n');
+    }
+    if let Some(memory) = repo_memory.map(str::trim).filter(|v| !v.is_empty()) {
+        prompt.push_str("\nREPO MEMORY:\n");
+        prompt.push_str(truncate_str(memory, 1_500));
         prompt.push('\n');
     }
     if let Some(feedback) = retry_feedback.map(str::trim).filter(|v| !v.is_empty()) {
@@ -2837,20 +2843,21 @@ pub async fn analyze_codebase_dual_agent_reviewed(
     repo_root: &Path,
     index: &CodebaseIndex,
     context: &WorkContext,
-    _repo_memory: Option<String>,
+    repo_memory: Option<String>,
+    attempt_index: usize,
     retry_feedback: Option<&str>,
     stream_sink: Option<SuggestionStreamSink>,
 ) -> anyhow::Result<(Vec<Suggestion>, Option<Usage>, SuggestionDiagnostics)> {
     let run_id = Uuid::new_v4().to_string();
     let project_ethos = load_project_ethos(repo_root);
     let candidate_files = build_hybrid_candidate_pool(repo_root, index, context);
-    // Keep fanout intentionally low to reduce rate-limit pressure on Speed-tier runs.
-    // Run one role per attempt (security first, bug on retry) to avoid concurrent contention.
-    let dual_iteration_budget = 2usize;
+    // Keep fanout bounded, but wide enough that each attempt can inspect materially
+    // different areas of the candidate pool.
+    let dual_iteration_budget = 6usize;
     const DUAL_ROLE_WORKER_COUNT: usize = 1;
     const DUAL_ROLE_MAX_INFLIGHT: usize = 1;
-    const DUAL_ROLE_WORKER_FILE_SPAN_MIN: usize = 2;
-    const DUAL_ROLE_WORKER_FILE_SPAN_MAX: usize = 3;
+    const DUAL_ROLE_WORKER_FILE_SPAN_MIN: usize = 8;
+    const DUAL_ROLE_WORKER_FILE_SPAN_MAX: usize = 16;
     let dual_role_worker_timeout_ms = dual_role_worker_timeout_ms();
     let worker_file_span = if candidate_files.is_empty() {
         0
@@ -2860,41 +2867,63 @@ pub async fn analyze_codebase_dual_agent_reviewed(
             DUAL_ROLE_WORKER_FILE_SPAN_MAX,
         )
     };
+    let rotation_stride = worker_file_span
+        .saturating_mul(DUAL_ROLE_WORKER_COUNT)
+        .max(1);
+    let candidate_rotation_offset = if candidate_files.is_empty() {
+        0
+    } else {
+        (attempt_index
+            .saturating_sub(1)
+            .saturating_mul(rotation_stride))
+            % candidate_files.len()
+    };
+    let rotated_candidates = if candidate_files.is_empty() {
+        Vec::new()
+    } else {
+        candidate_files
+            .iter()
+            .cycle()
+            .skip(candidate_rotation_offset)
+            .take(candidate_files.len())
+            .cloned()
+            .collect::<Vec<_>>()
+    };
 
     let mut focus_batches = vec![Vec::new(); DUAL_ROLE_WORKER_COUNT];
-    for (idx, path) in candidate_files.iter().enumerate() {
-        focus_batches[idx % DUAL_ROLE_WORKER_COUNT].push(path.clone());
-    }
     for worker_idx in 0..DUAL_ROLE_WORKER_COUNT {
-        if focus_batches[worker_idx].is_empty() && !candidate_files.is_empty() {
-            focus_batches[worker_idx]
-                .push(candidate_files[worker_idx % candidate_files.len()].clone());
-        }
-        if candidate_files.is_empty() {
+        if rotated_candidates.is_empty() {
             continue;
         }
-        let mut refill_idx = worker_idx;
-        while focus_batches[worker_idx].len() < worker_file_span {
-            focus_batches[worker_idx]
-                .push(candidate_files[refill_idx % candidate_files.len()].clone());
-            refill_idx = refill_idx.saturating_add(DUAL_ROLE_WORKER_COUNT);
+        let worker_start = worker_idx.saturating_mul(worker_file_span);
+        for step in 0..worker_file_span {
+            let idx = (worker_start + step) % rotated_candidates.len();
+            let path = rotated_candidates[idx].clone();
+            if !focus_batches[worker_idx].contains(&path) {
+                focus_batches[worker_idx].push(path);
+            }
         }
-        if focus_batches[worker_idx].len() > worker_file_span {
-            focus_batches[worker_idx].truncate(worker_file_span);
+        if focus_batches[worker_idx].is_empty() {
+            focus_batches[worker_idx]
+                .push(rotated_candidates[worker_idx % rotated_candidates.len()].clone());
         }
     }
 
-    let role_configs: Vec<(&str, &str)> = if retry_feedback.is_some() {
-        vec![("bug_hunter", RELACE_BUG_HUNTER_SYSTEM)]
-    } else {
-        vec![("security_reviewer", RELACE_SECURITY_REVIEWER_SYSTEM)]
-    };
+    let role_configs: Vec<(&str, &str)> = vec![
+        ("security_reviewer", RELACE_SECURITY_REVIEWER_SYSTEM),
+        ("bug_hunter", RELACE_BUG_HUNTER_SYSTEM),
+    ];
     let mut jobs: Vec<(String, usize, Vec<PathBuf>, String, String)> =
         Vec::with_capacity(DUAL_ROLE_WORKER_COUNT * role_configs.len());
     for (batch_idx, files) in focus_batches.iter().enumerate() {
         for (role, system_prompt) in &role_configs {
-            let prompt =
-                build_dual_agent_user_prompt(role, files, project_ethos.as_deref(), retry_feedback);
+            let prompt = build_dual_agent_user_prompt(
+                role,
+                files,
+                project_ethos.as_deref(),
+                repo_memory.as_deref(),
+                retry_feedback,
+            );
             jobs.push((
                 (*role).to_string(),
                 batch_idx,
@@ -3075,6 +3104,7 @@ pub async fn analyze_codebase_dual_agent_reviewed(
         .sum();
 
     let mut notes = vec![
+        format!("dual_attempt_index:{}", attempt_index),
         format!("candidate_pool_size:{}", candidate_files.len()),
         format!(
             "candidate_pool_preview:{}",
@@ -3085,7 +3115,9 @@ pub async fn analyze_codebase_dual_agent_reviewed(
                 .collect::<Vec<_>>()
                 .join(",")
         ),
+        format!("candidate_rotation_offset:{}", candidate_rotation_offset),
         format!("dual_agent_ms:{}", dual_elapsed_ms),
+        format!("dual_role_count:{}", role_configs.len()),
         format!("dual_worker_total:{}", planned_worker_jobs),
         format!("dual_worker_max_inflight:{}", DUAL_ROLE_MAX_INFLIGHT),
         format!("dual_worker_file_span:{}", worker_file_span),
@@ -3286,6 +3318,7 @@ where
                 index,
                 context,
                 repo_memory.clone(),
+                attempt_index,
                 retry_feedback.as_deref(),
                 stream_sink.clone(),
             ),
@@ -3342,18 +3375,38 @@ where
         diagnostics.final_count = suggestions.len();
 
         if suggestions.is_empty() {
-            let note_preview = diagnostics
+            let primary_note_preview = diagnostics
                 .notes
                 .iter()
                 .take(10)
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("; ");
+            let worker_note_preview = diagnostics
+                .notes
+                .iter()
+                .filter(|note| note.starts_with("worker_summary:"))
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            let note_preview = match (
+                primary_note_preview.is_empty(),
+                worker_note_preview.is_empty(),
+            ) {
+                (true, true) => String::new(),
+                (false, true) => primary_note_preview,
+                (true, false) => worker_note_preview,
+                (false, false) => {
+                    format!("{}; {}", primary_note_preview, worker_note_preview)
+                }
+            };
             last_error = Some(anyhow::anyhow!(
-                "No findings were returned by bug/security agents (raw_reported={}, strategy={}, notes={})",
+                "No findings were returned by bug/security agents (raw_reported={}, strategy={}, notes={}, response_preview={})",
                 diagnostics.raw_count,
                 diagnostics.parse_strategy,
-                note_preview
+                note_preview,
+                diagnostics.response_preview
             ));
             let elapsed_ms = total_start.elapsed().as_millis() as u64;
             let budget_exhausted = elapsed_ms >= gate_config.max_suggest_ms;

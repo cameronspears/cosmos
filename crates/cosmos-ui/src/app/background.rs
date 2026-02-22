@@ -30,7 +30,7 @@ fn is_api_key_error(message: &str) -> bool {
     let lowered = message.to_ascii_lowercase();
     lowered.contains("no api key configured")
         || lowered.contains("invalid api key")
-        || (lowered.contains("groq") && lowered.contains("api key"))
+        || (lowered.contains("cerebras") && lowered.contains("api key"))
         || lowered.contains("run 'cosmos --setup'")
 }
 
@@ -39,9 +39,9 @@ fn maybe_prompt_api_key_overlay(app: &mut App, message: &str) -> bool {
         return false;
     }
     let detail = if message.to_ascii_lowercase().contains("invalid api key") {
-        "Groq rejected this API key. Paste a valid key to continue."
+        "Cerebras rejected this API key. Paste a valid key to continue."
     } else {
-        "Cosmos needs a Groq API key to run AI actions."
+        "Cosmos needs a Cerebras API key to run AI actions."
     };
     app.open_api_key_overlay(Some(detail.to_string()));
     true

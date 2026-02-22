@@ -4,13 +4,15 @@
 //! in a loop until they have enough context to complete their task.
 
 use super::client::{
-    api_key, apply_backend_headers, chat_completions_url, create_http_client, groq_service_tier,
+    api_key, apply_backend_headers, chat_completions_url, create_http_client,
     missing_api_key_message, model_id_for_backend, send_with_retry,
     supports_parallel_tool_calls_for_backend, REQUEST_TIMEOUT_SECS,
 };
 use super::models::{merge_usage, Model, Usage};
+#[cfg(test)]
+use super::tools::get_relace_search_tool_definitions;
 use super::tools::{
-    execute_tool, get_relace_search_tool_definitions, get_tool_definitions,
+    execute_tool, get_relace_search_tool_definitions_cerebras, get_tool_definitions,
     parse_report_back_payload, ReportBackExplanation, ReportBackPayload, ToolCall, ToolDefinition,
 };
 use futures::StreamExt;
@@ -36,7 +38,7 @@ const REPEATED_TOOL_ERROR_THRESHOLD: u32 = 3;
 const TOOL_ERROR_LOOP_EXTRA_RETRIES: u32 = 2;
 const FINALIZATION_NON_REPORT_BACK_MAX_RETRIES: u32 = 3;
 const STREAM_REASONING_PRINT_MAX_CHARS: usize = 8_000;
-/// Groq recommends low temperatures for reliable tool calling.
+/// Use low temperatures for reliable tool calling with Cerebras tool-use.
 const TOOL_CALL_TEMPERATURE: f32 = 0.2;
 /// Retry once colder when tool-call generation fails validation.
 const TOOL_CALL_RETRY_TEMPERATURE: f32 = 0.0;
@@ -263,8 +265,6 @@ struct ChatRequest {
     disable_tool_validation: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<ProviderConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    service_tier: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -360,16 +360,9 @@ pub fn schema_to_response_format(name: &str, schema: serde_json::Value) -> Respo
     }
 }
 
-fn reasoning_config_for_model(model: Model, include_output: bool) -> ReasoningRequestFields {
-    let backend_model = model_id_for_backend(model);
-    if backend_model.starts_with("openai/gpt-oss-") {
-        return ReasoningRequestFields {
-            include_reasoning: Some(include_output),
-            reasoning_effort: model.reasoning_effort().map(str::to_string),
-            reasoning_format: None,
-        };
-    }
-
+fn reasoning_config_for_model(_model: Model, _include_output: bool) -> ReasoningRequestFields {
+    // Cerebras chat completions currently rejects provider-specific reasoning request fields.
+    // Omit them to keep agent/tool calls compatible.
     ReasoningRequestFields::default()
 }
 
@@ -1011,7 +1004,6 @@ async fn maybe_format_agentic_content(
         parallel_tool_calls: None,
         disable_tool_validation: None,
         provider: None,
-        service_tier: groq_service_tier(),
     };
 
     let text = send_with_retry(client, api_key, &format_request).await?;
@@ -1117,7 +1109,6 @@ pub async fn call_llm_agentic(
             parallel_tool_calls: parallel_tool_calls_setting(model, true),
             disable_tool_validation: None,
             provider: None,
-            service_tier: groq_service_tier(),
         };
         let mut request = request;
 
@@ -1265,7 +1256,6 @@ pub async fn call_llm_agentic(
         parallel_tool_calls: None,
         disable_tool_validation: None,
         provider: None,
-        service_tier: groq_service_tier(),
     };
     // Use shared retry helper for final request too, plus a few retries for empty content.
     let mut last_error: Option<anyhow::Error> = None;
@@ -1359,7 +1349,7 @@ pub async fn call_llm_agentic_report_back_only(
 ) -> anyhow::Result<AgenticReportBackResponse> {
     let api_key = api_key().ok_or_else(|| anyhow::anyhow!(missing_api_key_message()))?;
     let client = create_http_client(REQUEST_TIMEOUT_SECS)?;
-    let tools = get_relace_search_tool_definitions();
+    let tools = get_relace_search_tool_definitions_cerebras();
 
     let mut messages = vec![
         Message {
@@ -1418,8 +1408,10 @@ pub async fn call_llm_agentic_report_back_only(
         let elapsed_ms = start.elapsed().as_millis();
         let timeout_ms = LOOP_TIMEOUT.as_millis();
         let near_timeout = elapsed_ms.saturating_mul(100) >= timeout_ms.saturating_mul(75);
-        let finalization_round =
-            near_timeout || iteration >= max_total_iterations.saturating_sub(2);
+        // Reserve the configured grace rounds for finalization *after* the normal
+        // exploration budget has been used. The previous threshold entered
+        // finalization too early for small iteration budgets (for example, budget=2).
+        let finalization_round = near_timeout || iteration > max_iterations;
         if finalization_round && !forced_report_back_mode {
             forced_report_back_mode = true;
             messages.push(Message {
@@ -1432,7 +1424,16 @@ pub async fn call_llm_agentic_report_back_only(
                 tool_call_id: None,
             });
         }
-        let tool_choice = Some(ToolChoice::Mode(ToolChoiceMode::Auto));
+        let tool_choice = if finalization_round {
+            Some(ToolChoice::Function(ToolChoiceFunctionSelection {
+                choice_type: "function",
+                function: ToolChoiceFunctionName {
+                    name: "report_back",
+                },
+            }))
+        } else {
+            Some(ToolChoice::Mode(ToolChoiceMode::Auto))
+        };
         let reasoning = reasoning_config_for_model(model, include_reasoning);
         let request = ChatRequest {
             model: model_id_for_backend(model),
@@ -1451,7 +1452,6 @@ pub async fn call_llm_agentic_report_back_only(
             parallel_tool_calls: parallel_tool_calls_setting(model, !finalization_round),
             disable_tool_validation: None,
             provider: None,
-            service_tier: groq_service_tier(),
         };
         let mut request = request;
         let parsed: ChatResponse = if stream_reasoning {
@@ -1732,12 +1732,21 @@ pub async fn call_llm_agentic_report_back_only(
             report_back_called: false,
         });
         if content.trim().is_empty() {
-            if !finalization_round
-                && empty_response_retries < EMPTY_RESPONSE_MAX_RETRIES
-                && start.elapsed() < LOOP_TIMEOUT
+            if empty_response_retries < EMPTY_RESPONSE_MAX_RETRIES && start.elapsed() < LOOP_TIMEOUT
             {
                 empty_response_retries += 1;
                 let delay_ms = 250u64 * (1 << empty_response_retries);
+                if finalization_round {
+                    messages.push(Message {
+                        role: "user".to_string(),
+                        content: Some(
+                            "Finalization mode is active. The previous response was empty. Call report_back now. If no verified findings exist, send findings: [] and files: []."
+                                .to_string(),
+                        ),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
                 tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 continue;
             }
@@ -1910,7 +1919,6 @@ mod tests {
             parallel_tool_calls: Some(true),
             disable_tool_validation: None,
             provider: None,
-            service_tier: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1949,7 +1957,6 @@ mod tests {
             parallel_tool_calls: Some(false),
             disable_tool_validation: None,
             provider: None,
-            service_tier: None,
         };
 
         let value: serde_json::Value = serde_json::to_value(request).unwrap();
@@ -1959,16 +1966,16 @@ mod tests {
     }
 
     #[test]
-    fn test_reasoning_config_for_gpt_oss_models() {
+    fn test_reasoning_config_omits_reasoning_fields_for_cerebras() {
         use super::Model;
         let speed = reasoning_config(Model::Speed);
-        assert_eq!(speed.include_reasoning, Some(false));
-        assert_eq!(speed.reasoning_effort.as_deref(), Some("medium"));
+        assert!(speed.include_reasoning.is_none());
+        assert!(speed.reasoning_effort.is_none());
         assert!(speed.reasoning_format.is_none());
 
         let smart = reasoning_config(Model::Smart);
-        assert_eq!(smart.include_reasoning, Some(false));
-        assert_eq!(smart.reasoning_effort.as_deref(), Some("high"));
+        assert!(smart.include_reasoning.is_none());
+        assert!(smart.reasoning_effort.is_none());
         assert!(smart.reasoning_format.is_none());
     }
 
@@ -1996,7 +2003,6 @@ mod tests {
             parallel_tool_calls: None,
             disable_tool_validation: None,
             provider: None,
-            service_tier: None,
         };
         let value = serde_json::to_value(&request).expect("serialize request");
         assert!(value.get("provider").is_none());
