@@ -299,22 +299,37 @@ pub fn get_relace_search_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function",
             function: FunctionDefinition {
                 name: "view_file",
-                strict: Some(true),
+                strict: None,
                 description: "Tool for viewing/exploring the contents of existing files\n\nLine numbers are included in the output, indexing at 1. If the output does not include the end of the file, it will be noted after the final output line.\n\nExample (viewing the first 2 lines of a file):\n1   def my_function():\n2       print(\"Hello, World!\")\n... rest of file truncated ...",
                 parameters: serde_json::json!({
                     "type": "object",
-                    "required": ["path", "view_range"],
+                    "required": [],
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "Repository-relative path to a file (preferred), e.g. `crates/cosmos-engine/src/llm/agentic.rs`. `/repo/...` paths are also accepted for compatibility."
+                        },
+                        "file_path": {
+                            "type": "string",
+                            "description": "Legacy alias for path."
                         },
                         "view_range": {
                             "type": "array",
                             "items": { "type": "integer" },
                             "default": [1, 100],
                             "description": "Range of file lines to view. If not specified, the first 100 lines of the file are shown. If provided, the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file."
-                        }
+                        },
+                        "range": {
+                            "type": "array",
+                            "items": { "type": "integer" }
+                        },
+                        "line": { "type": "integer" },
+                        "start_line": { "type": "integer" },
+                        "end_line": { "type": "integer" },
+                        "line_start": { "type": "integer" },
+                        "line_end": { "type": "integer" },
+                        "start": { "type": "integer" },
+                        "end": { "type": "integer" }
                     },
                     "additionalProperties": false
                 }),
@@ -324,15 +339,27 @@ pub fn get_relace_search_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function",
             function: FunctionDefinition {
                 name: "view_directory",
-                strict: Some(true),
+                strict: None,
                 description: "Tool for viewing the contents of a directory.\n\n* Lists contents recursively, relative to the input directory\n* Directories are suffixed with a trailing slash '/'\n* Depth might be limited by the tool implementation\n* Output is limited to the first 250 items\n\nExample output:\nfile1.txt\nfile2.txt\nsubdir1/\nsubdir1/file3.txt",
                 parameters: serde_json::json!({
                     "type": "object",
-                    "required": ["path", "include_hidden"],
+                    "required": [],
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "Repository-relative path to a directory (preferred), e.g. `.` or `crates/`. `/repo/...` paths are also accepted for compatibility."
+                        },
+                        "root_path": {
+                            "type": "string",
+                            "description": "Legacy alias for path."
+                        },
+                        "dir": {
+                            "type": "string",
+                            "description": "Legacy alias for path."
+                        },
+                        "directory": {
+                            "type": "string",
+                            "description": "Legacy alias for path."
                         },
                         "include_hidden": {
                             "type": "boolean",
@@ -348,11 +375,11 @@ pub fn get_relace_search_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function",
             function: FunctionDefinition {
                 name: "grep_search",
-                strict: Some(true),
+                strict: None,
                 description: "Fast text-based regex search that finds exact pattern matches within files or directories, utilizing the ripgrep command for efficient searching. Results will be formatted in the style of ripgrep and can be configured to include line numbers and content. To avoid overwhelming output, the results are capped at 50 matches. Use the include or exclude patterns to filter the search scope by file type or specific paths. This is best for finding exact text matches or regex patterns.",
                 parameters: serde_json::json!({
                     "type": "object",
-                    "required": ["query", "case_sensitive", "exclude_pattern", "include_pattern"],
+                    "required": ["query"],
                     "properties": {
                         "query": {
                             "type": "string",
@@ -370,6 +397,248 @@ pub fn get_relace_search_tool_definitions() -> Vec<ToolDefinition> {
                         "include_pattern": {
                             "type": ["string", "null"],
                             "description": "Glob pattern for files to include (e.g. '*.ts' for TypeScript files)"
+                        },
+                        "path": {
+                            "type": ["string", "null"],
+                            "description": "Optional repository-relative path to narrow the search scope."
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "search",
+                strict: None,
+                description: "Compatibility alias for grep_search. Supports either `query` or `pattern` and performs fast regex search within the repository.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Regex pattern to search for."
+                        },
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regex pattern to search for (legacy alias for query)."
+                        },
+                        "case_sensitive": {
+                            "type": "boolean",
+                            "default": true
+                        },
+                        "exclude_pattern": {
+                            "type": ["string", "null"]
+                        },
+                        "include_pattern": {
+                            "type": ["string", "null"]
+                        },
+                        "path": {
+                            "type": ["string", "null"]
+                        },
+                        "context": {
+                            "type": "integer",
+                            "minimum": 0
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "repo_browser.search",
+                strict: None,
+                description:
+                    "Compatibility alias for search/grep_search used by some providers.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Regex pattern to search for."
+                        },
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regex pattern to search for (legacy alias for query)."
+                        },
+                        "case_sensitive": {
+                            "type": "boolean",
+                            "default": true
+                        },
+                        "exclude_pattern": {
+                            "type": ["string", "null"]
+                        },
+                        "include_pattern": {
+                            "type": ["string", "null"]
+                        },
+                        "path": {
+                            "type": ["string", "null"]
+                        },
+                        "context": {
+                            "type": "integer",
+                            "minimum": 0
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "open_file",
+                strict: None,
+                description: "Compatibility alias for view_file. Opens a file at an optional line range.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "file_path": { "type": "string" },
+                        "view_range": {
+                            "type": "array",
+                            "items": { "type": "integer" }
+                        },
+                        "range": {
+                            "type": "array",
+                            "items": { "type": "integer" }
+                        },
+                        "line": { "type": "integer" },
+                        "start_line": { "type": "integer" },
+                        "end_line": { "type": "integer" },
+                        "line_start": { "type": "integer" },
+                        "line_end": { "type": "integer" },
+                        "start": { "type": "integer" },
+                        "end": { "type": "integer" }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "repo_browser.open_file",
+                strict: None,
+                description: "Compatibility alias for view_file used by some providers.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "file_path": { "type": "string" },
+                        "view_range": {
+                            "type": "array",
+                            "items": { "type": "integer" }
+                        },
+                        "range": {
+                            "type": "array",
+                            "items": { "type": "integer" }
+                        },
+                        "line": { "type": "integer" },
+                        "start_line": { "type": "integer" },
+                        "end_line": { "type": "integer" },
+                        "line_start": { "type": "integer" },
+                        "line_end": { "type": "integer" },
+                        "start": { "type": "integer" },
+                        "end": { "type": "integer" }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "repo_browser.view_file",
+                strict: None,
+                description: "Compatibility alias for view_file used by some providers.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "file_path": { "type": "string" },
+                        "view_range": {
+                            "type": "array",
+                            "items": { "type": "integer" }
+                        },
+                        "range": {
+                            "type": "array",
+                            "items": { "type": "integer" }
+                        },
+                        "line": { "type": "integer" },
+                        "start_line": { "type": "integer" },
+                        "end_line": { "type": "integer" },
+                        "line_start": { "type": "integer" },
+                        "line_end": { "type": "integer" },
+                        "start": { "type": "integer" },
+                        "end": { "type": "integer" }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "print_tree",
+                strict: None,
+                description: "Compatibility alias for view_directory.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "root_path": { "type": "string" },
+                        "dir": { "type": "string" },
+                        "directory": { "type": "string" },
+                        "include_hidden": {
+                            "type": "boolean",
+                            "default": false
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "repo_browser.view_directory",
+                strict: None,
+                description: "Compatibility alias for view_directory used by some providers.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "root_path": { "type": "string" },
+                        "dir": { "type": "string" },
+                        "directory": { "type": "string" },
+                        "include_hidden": {
+                            "type": "boolean",
+                            "default": false
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "repo_browser.print_tree",
+                strict: None,
+                description: "Compatibility alias for view_directory/print_tree used by some providers.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "root_path": { "type": "string" },
+                        "dir": { "type": "string" },
+                        "directory": { "type": "string" },
+                        "include_hidden": {
+                            "type": "boolean",
+                            "default": false
                         }
                     },
                     "additionalProperties": false
@@ -389,6 +658,30 @@ pub fn get_relace_search_tool_definitions() -> Vec<ToolDefinition> {
                         "command": {
                             "type": "string",
                             "description": "Bash command to execute"
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "repo_browser.exec",
+                strict: None,
+                description:
+                    "Compatibility alias for bash/shell execution used by some providers.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": [],
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Bash command to execute"
+                        },
+                        "cmd": {
+                            "type": "string",
+                            "description": "Legacy alias for command."
                         }
                     },
                     "additionalProperties": false
@@ -478,6 +771,135 @@ pub fn get_relace_search_tool_definitions() -> Vec<ToolDefinition> {
                             },
                             "additionalProperties": false,
                             "description": "Structured findings payload. bug/security agents fill findings and leave verified_findings empty; final reviewer fills verified_findings and leaves findings empty."
+                        },
+                        "files": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["path", "ranges"],
+                                "properties": {
+                                    "path": {
+                                        "type": "string",
+                                        "description": "File path relative to repo root (without /repo prefix)."
+                                    },
+                                    "ranges": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "array",
+                                            "minItems": 2,
+                                            "maxItems": 2,
+                                            "prefixItems": [{ "type": "integer" }, { "type": "integer" }]
+                                        },
+                                        "description": "Line ranges relevant to the report as [start, end] tuples."
+                                    }
+                                },
+                                "additionalProperties": false
+                            },
+                            "description": "A list of file entries containing path and relevant line ranges."
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function",
+            function: FunctionDefinition {
+                name: "repo_browser.report_back",
+                strict: Some(true),
+                description: "Compatibility alias for report_back used by some providers.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "required": ["explanation", "files"],
+                    "properties": {
+                        "explanation": {
+                            "type": "object",
+                            "required": ["role", "findings", "verified_findings"],
+                            "properties": {
+                                "role": {
+                                    "type": "string",
+                                    "enum": ["bug_hunter", "security_reviewer", "final_reviewer"]
+                                },
+                                "findings": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "required": [
+                                            "file",
+                                            "line",
+                                            "category",
+                                            "criticality",
+                                            "summary",
+                                            "detail",
+                                            "evidence_quote"
+                                        ],
+                                        "properties": {
+                                            "file": { "type": "string" },
+                                            "line": { "type": "integer", "minimum": 1 },
+                                            "category": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "bug",
+                                                    "security"
+                                                ]
+                                            },
+                                            "criticality": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "low",
+                                                    "medium",
+                                                    "high",
+                                                    "critical"
+                                                ]
+                                            },
+                                            "summary": { "type": "string" },
+                                            "detail": { "type": "string" },
+                                            "evidence_quote": { "type": "string" }
+                                        },
+                                        "additionalProperties": false
+                                    }
+                                },
+                                "verified_findings": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "required": [
+                                            "file",
+                                            "line",
+                                            "category",
+                                            "criticality",
+                                            "summary",
+                                            "detail",
+                                            "evidence_quote"
+                                        ],
+                                        "properties": {
+                                            "file": { "type": "string" },
+                                            "line": { "type": "integer", "minimum": 1 },
+                                            "category": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "bug",
+                                                    "security"
+                                                ]
+                                            },
+                                            "criticality": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "low",
+                                                    "medium",
+                                                    "high",
+                                                    "critical"
+                                                ]
+                                            },
+                                            "summary": { "type": "string" },
+                                            "detail": { "type": "string" },
+                                            "evidence_quote": { "type": "string" }
+                                        },
+                                        "additionalProperties": false
+                                    }
+                                }
+                            },
+                            "additionalProperties": false
                         },
                         "files": {
                             "type": "array",
@@ -612,14 +1034,25 @@ pub fn execute_tool(root: &Path, tool_call: &ToolCall) -> ToolResult {
     let content = match tool_call.function.name.as_str() {
         "tree" => execute_tree(root, &tool_call.function.arguments),
         "head" => execute_head(root, &tool_call.function.arguments),
-        "search" => execute_search(root, &tool_call.function.arguments),
+        "search" | "repo_browser.search" => {
+            execute_search_alias(root, &tool_call.function.arguments)
+        }
         "read_range" => execute_read_range(root, &tool_call.function.arguments),
         "shell" => execute_shell(root, &tool_call.function.arguments),
-        "view_file" => execute_view_file(root, &tool_call.function.arguments),
-        "view_directory" => execute_view_directory(root, &tool_call.function.arguments),
+        "view_file" | "open_file" | "repo_browser.open_file" | "repo_browser.view_file" => {
+            execute_open_file_alias(root, &tool_call.function.arguments)
+        }
+        "view_directory"
+        | "print_tree"
+        | "repo_browser.view_directory"
+        | "repo_browser.print_tree" => {
+            execute_print_tree_alias(root, &tool_call.function.arguments)
+        }
         "grep_search" => execute_grep_search(root, &tool_call.function.arguments),
-        "bash" => execute_bash(root, &tool_call.function.arguments),
-        "report_back" => execute_report_back(&tool_call.function.arguments),
+        "bash" | "repo_browser.exec" => execute_bash(root, &tool_call.function.arguments),
+        "report_back" | "repo_browser.report_back" => {
+            execute_report_back(&tool_call.function.arguments)
+        }
         _ => format!("Unknown tool: {}", tool_call.function.name),
     };
 
@@ -1037,13 +1470,160 @@ fn execute_view_directory(root: &Path, args_json: &str) -> String {
     entries.join("\n")
 }
 
+fn execute_search_alias(root: &Path, args_json: &str) -> String {
+    #[derive(Deserialize, Default)]
+    struct SearchAliasArgs {
+        query: Option<String>,
+        pattern: Option<String>,
+        path: Option<String>,
+        case_sensitive: Option<bool>,
+        exclude_pattern: Option<String>,
+        include_pattern: Option<String>,
+    }
+
+    let args: SearchAliasArgs = match serde_json::from_str(args_json) {
+        Ok(value) => value,
+        Err(err) => return format!("Invalid arguments: {err}"),
+    };
+
+    let has_grep_specific_args = args.query.is_some()
+        || args.case_sensitive.is_some()
+        || args.exclude_pattern.is_some()
+        || args.include_pattern.is_some();
+
+    if has_grep_specific_args {
+        let query = args
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                args.pattern
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string)
+            });
+        let Some(query) = query else {
+            return "Invalid arguments: expected non-empty query or pattern".to_string();
+        };
+        let normalized = serde_json::json!({
+            "query": query,
+            "case_sensitive": args.case_sensitive.unwrap_or(true),
+            "exclude_pattern": args.exclude_pattern,
+            "include_pattern": args.include_pattern,
+            "path": args.path,
+        });
+        return execute_grep_search(root, &normalized.to_string());
+    }
+
+    execute_search(root, args_json)
+}
+
+fn execute_open_file_alias(root: &Path, args_json: &str) -> String {
+    #[derive(Deserialize, Default)]
+    struct OpenFileAliasArgs {
+        path: Option<String>,
+        file_path: Option<String>,
+        view_range: Option<Vec<i64>>,
+        range: Option<Vec<i64>>,
+        line: Option<i64>,
+        start_line: Option<i64>,
+        end_line: Option<i64>,
+        line_start: Option<i64>,
+        line_end: Option<i64>,
+        start: Option<i64>,
+        end: Option<i64>,
+    }
+
+    let args: OpenFileAliasArgs = match serde_json::from_str(args_json) {
+        Ok(value) => value,
+        Err(err) => return format!("Invalid arguments: {err}"),
+    };
+
+    let path = [args.path.as_deref(), args.file_path.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_string);
+    let Some(path) = path else {
+        return "Invalid arguments: expected a non-empty path".to_string();
+    };
+
+    let view_range = if let Some(range) = args.view_range.or(args.range) {
+        if range.len() != 2 {
+            return "Invalid arguments: view_range/range must contain exactly two integers"
+                .to_string();
+        }
+        range
+    } else if let Some(line) = args.line {
+        vec![line, line]
+    } else {
+        let start = args
+            .start_line
+            .or(args.line_start)
+            .or(args.start)
+            .unwrap_or(1);
+        let end = args
+            .end_line
+            .or(args.line_end)
+            .or(args.end)
+            .unwrap_or_else(|| start.saturating_add(99));
+        vec![start, end]
+    };
+
+    let normalized = serde_json::json!({
+        "path": path,
+        "view_range": view_range,
+    });
+    execute_view_file(root, &normalized.to_string())
+}
+
+fn execute_print_tree_alias(root: &Path, args_json: &str) -> String {
+    #[derive(Deserialize, Default)]
+    struct PrintTreeAliasArgs {
+        path: Option<String>,
+        root_path: Option<String>,
+        dir: Option<String>,
+        directory: Option<String>,
+        include_hidden: Option<bool>,
+    }
+
+    let args: PrintTreeAliasArgs = match serde_json::from_str(args_json) {
+        Ok(value) => value,
+        Err(err) => return format!("Invalid arguments: {err}"),
+    };
+
+    let path = [
+        args.path.as_deref(),
+        args.root_path.as_deref(),
+        args.dir.as_deref(),
+        args.directory.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .map(str::to_string)
+    .unwrap_or_else(|| ".".to_string());
+
+    let normalized = serde_json::json!({
+        "path": path,
+        "include_hidden": args.include_hidden.unwrap_or(false),
+    });
+    execute_view_directory(root, &normalized.to_string())
+}
+
 fn execute_grep_search(root: &Path, args_json: &str) -> String {
     #[derive(Deserialize)]
     struct GrepSearchArgs {
         query: String,
-        case_sensitive: bool,
+        case_sensitive: Option<bool>,
         exclude_pattern: Option<String>,
         include_pattern: Option<String>,
+        path: Option<String>,
     }
 
     let args: GrepSearchArgs = match serde_json::from_str(args_json) {
@@ -1051,9 +1631,25 @@ fn execute_grep_search(root: &Path, args_json: &str) -> String {
         Err(err) => return format!("Invalid arguments: {err}"),
     };
 
-    if let Err(err) = is_safe_regex_pattern(&args.query) {
+    let query = args.query.trim();
+    if query.is_empty() {
+        return "Invalid arguments: query must not be empty".to_string();
+    }
+    if let Err(err) = is_safe_regex_pattern(query) {
         return err;
     }
+    let search_root = match args
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        Some(path) => match resolve_relace_path(root, path) {
+            Ok(value) => value,
+            Err(err) => return err,
+        },
+        None => root.to_path_buf(),
+    };
 
     let mut cmd = Command::new("rg");
     cmd.arg("--line-number")
@@ -1061,7 +1657,7 @@ fn execute_grep_search(root: &Path, args_json: &str) -> String {
         .arg("--color=never")
         .arg("--max-count=50");
 
-    if !args.case_sensitive {
+    if !args.case_sensitive.unwrap_or(true) {
         cmd.arg("-i");
     }
     if let Some(pattern) = args.exclude_pattern.as_deref() {
@@ -1075,7 +1671,7 @@ fn execute_grep_search(root: &Path, args_json: &str) -> String {
         }
     }
 
-    cmd.arg(&args.query).arg(root).current_dir(root);
+    cmd.arg(query).arg(&search_root).current_dir(root);
 
     match run_command_with_timeout(&mut cmd, TOOL_TIMEOUT) {
         Ok(result) => {
@@ -1220,9 +1816,12 @@ fn contains_dangerous_chars(command: &str) -> bool {
 
 /// Execute shell command with allowlist-based safety checks
 fn execute_shell(root: &Path, args_json: &str) -> String {
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Default)]
     struct ShellArgs {
-        command: String,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        cmd: Option<String>,
     }
 
     let args: ShellArgs = match serde_json::from_str(args_json) {
@@ -1230,7 +1829,15 @@ fn execute_shell(root: &Path, args_json: &str) -> String {
         Err(e) => return format!("Invalid arguments: {}", e),
     };
 
-    let command = args.command.trim();
+    let command = args
+        .command
+        .as_deref()
+        .or(args.cmd.as_deref())
+        .map(str::trim)
+        .unwrap_or("");
+    if command.is_empty() {
+        return "Invalid arguments: missing command".to_string();
+    }
 
     // Check for dangerous shell metacharacters that could bypass the allowlist
     if contains_dangerous_chars(command) {
@@ -1320,11 +1927,32 @@ mod tests {
                 "view_file",
                 "view_directory",
                 "grep_search",
+                "search",
+                "repo_browser.search",
+                "open_file",
+                "repo_browser.open_file",
+                "repo_browser.view_file",
+                "print_tree",
+                "repo_browser.view_directory",
+                "repo_browser.print_tree",
                 "bash",
-                "report_back"
+                "repo_browser.exec",
+                "report_back",
+                "repo_browser.report_back"
             ]
         );
-        assert!(tools.iter().all(|tool| tool.function.strict == Some(true)));
+        let strict_by_name = tools
+            .iter()
+            .map(|tool| (tool.function.name, tool.function.strict))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(strict_by_name.get("report_back"), Some(&Some(true)));
+        assert_eq!(
+            strict_by_name.get("repo_browser.report_back"),
+            Some(&Some(true))
+        );
+        assert_eq!(strict_by_name.get("view_file"), Some(&None));
+        assert_eq!(strict_by_name.get("view_directory"), Some(&None));
+        assert_eq!(strict_by_name.get("repo_browser.exec"), Some(&None));
     }
 
     #[test]
@@ -1337,36 +1965,71 @@ mod tests {
                 .parameters
                 .get("required")
                 .and_then(|v| v.as_array())
-                .expect("required array")
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect::<Vec<_>>();
+                .map(|required| {
+                    required
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             required_by_tool.insert(tool.function.name, required);
         }
 
         assert_eq!(
             required_by_tool.get("view_file"),
-            Some(&vec!["path".to_string(), "view_range".to_string()])
+            Some(&Vec::<String>::new())
         );
         assert_eq!(
             required_by_tool.get("view_directory"),
-            Some(&vec!["path".to_string(), "include_hidden".to_string()])
+            Some(&Vec::<String>::new())
         );
         assert_eq!(
             required_by_tool.get("grep_search"),
-            Some(&vec![
-                "query".to_string(),
-                "case_sensitive".to_string(),
-                "exclude_pattern".to_string(),
-                "include_pattern".to_string(),
-            ])
+            Some(&vec!["query".to_string()])
+        );
+        assert_eq!(required_by_tool.get("search"), Some(&Vec::<String>::new()));
+        assert_eq!(
+            required_by_tool.get("open_file"),
+            Some(&Vec::<String>::new())
+        );
+        assert_eq!(
+            required_by_tool.get("repo_browser.search"),
+            Some(&Vec::<String>::new())
+        );
+        assert_eq!(
+            required_by_tool.get("repo_browser.open_file"),
+            Some(&Vec::<String>::new())
+        );
+        assert_eq!(
+            required_by_tool.get("repo_browser.view_file"),
+            Some(&Vec::<String>::new())
+        );
+        assert_eq!(
+            required_by_tool.get("print_tree"),
+            Some(&Vec::<String>::new())
+        );
+        assert_eq!(
+            required_by_tool.get("repo_browser.view_directory"),
+            Some(&Vec::<String>::new())
+        );
+        assert_eq!(
+            required_by_tool.get("repo_browser.print_tree"),
+            Some(&Vec::<String>::new())
         );
         assert_eq!(
             required_by_tool.get("bash"),
             Some(&vec!["command".to_string()])
         );
         assert_eq!(
+            required_by_tool.get("repo_browser.exec"),
+            Some(&Vec::<String>::new())
+        );
+        assert_eq!(
             required_by_tool.get("report_back"),
+            Some(&vec!["explanation".to_string(), "files".to_string()])
+        );
+        assert_eq!(
+            required_by_tool.get("repo_browser.report_back"),
             Some(&vec!["explanation".to_string(), "files".to_string()])
         );
     }
@@ -1452,6 +2115,118 @@ mod tests {
             .expect_err("absolute path outside /repo alias should fail");
         assert!(err.contains("Invalid path '/etc/passwd'"));
         assert!(err.contains("Use repo-relative paths like `crates/...` or `.`"));
+    }
+
+    #[test]
+    fn test_search_alias_maps_query_to_grep_search() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("test.rs"), "fn hello_world() {}\n").unwrap();
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: r#"{"query":"hello_world"}"#.to_string(),
+            },
+        };
+        let result = execute_tool(dir.path(), &call);
+        assert!(result.content.contains("hello_world"));
+    }
+
+    #[test]
+    fn test_open_file_alias_maps_to_view_file() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("test.rs"),
+            "line1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "open_file".to_string(),
+                arguments: r#"{"path":"test.rs","start_line":2,"end_line":3}"#.to_string(),
+            },
+        };
+        let result = execute_tool(dir.path(), &call);
+        assert!(result.content.contains("2   line2"));
+        assert!(result.content.contains("3   line3"));
+    }
+
+    #[test]
+    fn test_repo_browser_open_file_alias_maps_to_view_file() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("test.rs"), "alpha\nbeta\ngamma\n").unwrap();
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "repo_browser.open_file".to_string(),
+                arguments: r#"{"file_path":"test.rs","line":2}"#.to_string(),
+            },
+        };
+        let result = execute_tool(dir.path(), &call);
+        assert!(result.content.contains("2   beta"));
+    }
+
+    #[test]
+    fn test_repo_browser_view_file_alias_maps_to_view_file() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("test.rs"), "alpha\nbeta\ngamma\n").unwrap();
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "repo_browser.view_file".to_string(),
+                arguments: r#"{"path":"test.rs","line":3}"#.to_string(),
+            },
+        };
+        let result = execute_tool(dir.path(), &call);
+        assert!(result.content.contains("3   gamma"));
+    }
+
+    #[test]
+    fn test_repo_browser_search_alias_maps_to_search() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("test.rs"), "fn hello_world() {}\n").unwrap();
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "repo_browser.search".to_string(),
+                arguments: r#"{"query":"hello_world"}"#.to_string(),
+            },
+        };
+        let result = execute_tool(dir.path(), &call);
+        assert!(result.content.contains("hello_world"));
+    }
+
+    #[test]
+    fn test_print_tree_alias_maps_to_view_directory() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "pub fn x() {}\n").unwrap();
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "print_tree".to_string(),
+                arguments: r#"{"path":"src"}"#.to_string(),
+            },
+        };
+        let result = execute_tool(dir.path(), &call);
+        assert!(result.content.contains("lib.rs"));
+        assert!(result.content.contains("nested/"));
+    }
+
+    #[test]
+    fn test_repo_browser_report_back_alias_maps_to_report_back() {
+        let dir = tempdir().unwrap();
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "repo_browser.report_back".to_string(),
+                arguments: r#"{"explanation":{"role":"bug_hunter","findings":[],"verified_findings":[]},"files":[]}"#
+                    .to_string(),
+            },
+        };
+        let result = execute_tool(dir.path(), &call);
+        assert!(result.content.contains("report_back accepted"));
     }
 
     #[test]

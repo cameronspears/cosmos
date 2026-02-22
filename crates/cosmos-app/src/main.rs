@@ -14,6 +14,7 @@ use cosmos_core::suggest::SuggestionEngine;
 use cosmos_engine::llm;
 use cosmos_ui::app;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -124,6 +125,7 @@ async fn main() -> Result<()> {
             args.suggest_runs.max(1),
             args.suggest_print,
             args.suggest_trace,
+            args.suggest_stream_reasoning,
         )
         .await;
     }
@@ -142,6 +144,7 @@ async fn run_suggestion_audit(
     runs: usize,
     print_suggestions: bool,
     print_trace: bool,
+    stream_reasoning: bool,
 ) -> Result<()> {
     if !llm::is_available() {
         return Err(anyhow::anyhow!(
@@ -151,6 +154,7 @@ async fn run_suggestion_audit(
 
     let mut gate_config = llm::SuggestionQualityGateConfig::default();
     gate_config.max_attempts = gate_config.max_attempts.max(4);
+    gate_config.min_final_count = gate_config.min_final_count.max(3);
 
     let mut best_result: Option<llm::GatedSuggestionRunResult> = None;
     let mut best_key: Option<(usize, usize, usize)> = None; // (ethos_actionable_count, final_count, validated_count)
@@ -164,14 +168,22 @@ async fn run_suggestion_audit(
     for run_index in 1..=runs {
         println!("Run {}/{}...", run_index, runs);
         let run_timeout_ms = gate_config.max_suggest_ms.saturating_add(30_000);
+        let stream_sink: Option<llm::SuggestionStreamSink> = if stream_reasoning {
+            Some(Arc::new(move |worker, kind, line| {
+                println!("[{}][{:?}] {}", worker, kind, line);
+            }))
+        } else {
+            None
+        };
         let run_result = tokio::time::timeout(
             std::time::Duration::from_millis(run_timeout_ms),
-            llm::run_fast_grounded_with_gate_with_progress(
+            llm::run_fast_grounded_with_gate_with_progress_and_stream(
                 path,
                 index,
                 context,
                 None,
                 gate_config.clone(),
+                stream_sink,
                 |attempt_index, attempt_count, gate, diagnostics| {
                     let prevalidation = diagnostics
                         .validation_rejection_histogram
@@ -213,6 +225,16 @@ async fn run_suggestion_audit(
 
         match run_result {
             Ok(Ok(result)) => {
+                if !result.gate.passed {
+                    let reasons = if result.gate.fail_reasons.is_empty() {
+                        "quality gate did not pass".to_string()
+                    } else {
+                        result.gate.fail_reasons.join("; ")
+                    };
+                    println!("  FAIL gate_failed {}", reasons);
+                    last_error = Some(format!("gate_failed: {}", reasons));
+                    continue;
+                }
                 let validated_count = result
                     .suggestions
                     .iter()

@@ -47,6 +47,17 @@ fn maybe_prompt_api_key_overlay(app: &mut App, message: &str) -> bool {
     true
 }
 
+fn suggestions_budget_ms() -> u64 {
+    const DEFAULT_MS: u64 = 180_000;
+    const MIN_MS: u64 = 120_000;
+    const MAX_MS: u64 = 600_000;
+    std::env::var("COSMOS_SUGGEST_MAX_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(MIN_MS, MAX_MS))
+        .unwrap_or(DEFAULT_MS)
+}
+
 fn spawn_suggestions_generation(
     tx: mpsc::Sender<BackgroundMessage>,
     repo_root: PathBuf,
@@ -67,12 +78,16 @@ fn spawn_suggestions_generation(
                 let _ = tx.send(BackgroundMessage::SuggestionsStream { worker, kind, line });
             },
         );
+        let mut gate_config = cosmos_engine::llm::SuggestionQualityGateConfig::default();
+        gate_config.min_final_count = gate_config.min_final_count.max(1);
+        gate_config.max_attempts = gate_config.max_attempts.max(2);
+        gate_config.max_suggest_ms = gate_config.max_suggest_ms.max(suggestions_budget_ms());
         let run = cosmos_engine::llm::run_fast_grounded_with_gate_with_progress_and_stream(
             &repo_root,
             &index,
             &context,
             mem,
-            cosmos_engine::llm::SuggestionQualityGateConfig::default(),
+            gate_config,
             Some(stream_sink),
             |_, _, _, _| {},
         )
@@ -185,6 +200,23 @@ fn handle_suggestions_ready_message(
         suggestions: suggestions.clone(),
     };
     let _ = cache.append_suggestion_run_audit(&run_audit);
+    if !diagnostics.gate_passed {
+        restore_loading_after_suggestion_stage(app);
+        app.clear_apply_confirm();
+        let reasons = if diagnostics.gate_fail_reasons.is_empty() {
+            "quality gate did not pass".to_string()
+        } else {
+            diagnostics.gate_fail_reasons.join("; ")
+        };
+        app.open_alert(
+            "Suggestions withheld",
+            format!(
+                "Suggestions were withheld because the quality gate failed: {}",
+                truncate(&reasons, 180)
+            ),
+        );
+        return;
+    }
     let contradiction_counts = cache
         .recent_contradicted_evidence_counts(300)
         .unwrap_or_default();

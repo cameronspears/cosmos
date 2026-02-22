@@ -11,7 +11,7 @@ use super::client::{
 use super::models::{merge_usage, Model, Usage};
 use super::tools::{
     execute_tool, get_relace_search_tool_definitions, get_tool_definitions,
-    parse_report_back_payload, ReportBackPayload, ToolCall, ToolDefinition,
+    parse_report_back_payload, ReportBackExplanation, ReportBackPayload, ToolCall, ToolDefinition,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -525,7 +525,32 @@ Return only a valid report_back call."
     )
 }
 
-#[allow(dead_code)]
+fn is_report_back_tool_name(name: &str) -> bool {
+    matches!(name, "report_back" | "repo_browser.report_back")
+}
+
+fn infer_report_back_role(system: &str, user: &str) -> &'static str {
+    let combined = format!("{}\n{}", system, user).to_ascii_lowercase();
+    if combined.contains("security_reviewer") || combined.contains("security reviewer") {
+        "security_reviewer"
+    } else if combined.contains("bug_hunter") || combined.contains("bug hunter") {
+        "bug_hunter"
+    } else {
+        "final_reviewer"
+    }
+}
+
+fn empty_report_back_payload(role: &str) -> ReportBackPayload {
+    ReportBackPayload {
+        explanation: ReportBackExplanation {
+            role: role.to_string(),
+            findings: Vec::new(),
+            verified_findings: Vec::new(),
+        },
+        files: std::collections::HashMap::new(),
+    }
+}
+
 fn finalization_non_report_back_action(retries: u32) -> FinalizationNonReportBackAction {
     if retries < FINALIZATION_NON_REPORT_BACK_MAX_RETRIES {
         FinalizationNonReportBackAction::Retry
@@ -1090,7 +1115,7 @@ pub async fn call_llm_agentic(
             tools: Some(tools.clone()),
             tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
             parallel_tool_calls: parallel_tool_calls_setting(model, true),
-            disable_tool_validation: Some(true),
+            disable_tool_validation: None,
             provider: None,
             service_tier: groq_service_tier(),
         };
@@ -1353,6 +1378,7 @@ pub async fn call_llm_agentic_report_back_only(
 
     let mut iteration = 0usize;
     let start = Instant::now();
+    let fallback_role = infer_report_back_role(system, user);
     let mut total_usage: Option<Usage> = None;
     let mut empty_response_retries: u32 = 0;
     let mut text_response_retries: u32 = 0;
@@ -1372,6 +1398,18 @@ pub async fn call_llm_agentic_report_back_only(
     loop {
         iteration += 1;
         if iteration > max_total_iterations || start.elapsed() > LOOP_TIMEOUT {
+            if forced_report_back_mode {
+                trace.termination_reason = Some("timeout_fallback_empty_report_back".to_string());
+                trace.repeated_tool_error_count = trace
+                    .repeated_tool_error_count
+                    .max(tool_error_loop_tracker.max_consecutive());
+                trace.invalid_report_back_count = invalid_report_back_retries;
+                return Ok(AgenticReportBackResponse {
+                    report_back: empty_report_back_payload(fallback_role),
+                    usage: total_usage,
+                    trace,
+                });
+            }
             return Err(anyhow::anyhow!(
                 "termination_reason=timeout Agent did not call report_back within iteration/time budget."
             ));
@@ -1387,13 +1425,14 @@ pub async fn call_llm_agentic_report_back_only(
             messages.push(Message {
                 role: "user".to_string(),
                 content: Some(
-                    "Time budget is nearly exhausted. Stop exploring and call report_back now."
+                    "Time budget is nearly exhausted. Stop exploring and call report_back now. If you have no verified findings, send findings: [] and files: []."
                         .to_string(),
                 ),
                 tool_calls: None,
                 tool_call_id: None,
             });
         }
+        let tool_choice = Some(ToolChoice::Mode(ToolChoiceMode::Auto));
         let reasoning = reasoning_config_for_model(model, include_reasoning);
         let request = ChatRequest {
             model: model_id_for_backend(model),
@@ -1408,9 +1447,9 @@ pub async fn call_llm_agentic_report_back_only(
             reasoning_format: reasoning.reasoning_format,
             plugins: None,
             tools: Some(tools.clone()),
-            tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
+            tool_choice,
             parallel_tool_calls: parallel_tool_calls_setting(model, !finalization_round),
-            disable_tool_validation: Some(true),
+            disable_tool_validation: None,
             provider: None,
             service_tier: groq_service_tier(),
         };
@@ -1477,7 +1516,7 @@ pub async fn call_llm_agentic_report_back_only(
                     .collect::<Vec<_>>();
                 let report_back_called = tool_calls
                     .iter()
-                    .any(|tool_call| tool_call.function.name == "report_back");
+                    .any(|tool_call| is_report_back_tool_name(&tool_call.function.name));
                 trace.steps.push(AgenticTraceStep {
                     iteration,
                     finalization_round,
@@ -1496,7 +1535,7 @@ pub async fn call_llm_agentic_report_back_only(
 
                 if let Some(report_call) = tool_calls
                     .iter()
-                    .find(|tool_call| tool_call.function.name == "report_back")
+                    .find(|tool_call| is_report_back_tool_name(&tool_call.function.name))
                 {
                     match parse_report_back_payload(&report_call.function.arguments) {
                         Ok(payload) => {
@@ -1525,7 +1564,6 @@ pub async fn call_llm_agentic_report_back_only(
                             }
                             match action {
                                 InvalidReportBackAction::Retry => {
-                                    iteration = iteration.saturating_sub(1);
                                     let first_error = first_invalid_report_back_error
                                         .as_deref()
                                         .unwrap_or(err.as_str());
@@ -1542,6 +1580,18 @@ pub async fn call_llm_agentic_report_back_only(
                                 }
                                 InvalidReportBackAction::Fail => {}
                             }
+                            if finalization_round {
+                                trace.termination_reason =
+                                    Some("invalid_report_back_fallback_empty".to_string());
+                                trace.repeated_tool_error_count = trace
+                                    .repeated_tool_error_count
+                                    .max(tool_error_loop_tracker.max_consecutive());
+                                return Ok(AgenticReportBackResponse {
+                                    report_back: empty_report_back_payload(fallback_role),
+                                    usage: total_usage,
+                                    trace,
+                                });
+                            }
                             return Err(anyhow::anyhow!(
                                 "termination_reason=invalid_report_back_exhausted invalid_report_back_count={} Invalid report_back payload: {}",
                                 invalid_report_back_retries,
@@ -1552,23 +1602,37 @@ pub async fn call_llm_agentic_report_back_only(
                 }
 
                 if finalization_round {
+                    let action =
+                        finalization_non_report_back_action(finalization_non_report_back_retries);
                     finalization_non_report_back_retries =
                         finalization_non_report_back_retries.saturating_add(1);
-                    iteration = iteration.saturating_sub(1);
-                    let reminder = if finalization_non_report_back_retries
-                        <= FINALIZATION_NON_REPORT_BACK_MAX_RETRIES
-                    {
-                        "Finalization mode is active. You must call report_back now. Do not call other tools."
-                    } else {
-                        "Finalization retries are exhausted. Stop exploration and call report_back immediately with your best grounded findings."
-                    };
-                    messages.push(Message {
-                        role: "user".to_string(),
-                        content: Some(reminder.to_string()),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                    continue;
+                    match action {
+                        FinalizationNonReportBackAction::Retry => {
+                            messages.push(Message {
+                                role: "user".to_string(),
+                                content: Some(
+                                    "Finalization mode is active. You must call report_back now. Do not call other tools. If no verified findings exist, send findings: [] and files: []."
+                                        .to_string(),
+                                ),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            });
+                            continue;
+                        }
+                        FinalizationNonReportBackAction::Fail => {
+                            trace.termination_reason =
+                                Some("finalization_non_report_back_fallback_empty".to_string());
+                            trace.repeated_tool_error_count = trace
+                                .repeated_tool_error_count
+                                .max(tool_error_loop_tracker.max_consecutive());
+                            trace.invalid_report_back_count = invalid_report_back_retries;
+                            return Ok(AgenticReportBackResponse {
+                                report_back: empty_report_back_payload(fallback_role),
+                                usage: total_usage,
+                                trace,
+                            });
+                        }
+                    }
                 }
 
                 let repo_root_buf = repo_root.to_path_buf();
@@ -1668,23 +1732,36 @@ pub async fn call_llm_agentic_report_back_only(
             report_back_called: false,
         });
         if content.trim().is_empty() {
-            if empty_response_retries < EMPTY_RESPONSE_MAX_RETRIES && start.elapsed() < LOOP_TIMEOUT
+            if !finalization_round
+                && empty_response_retries < EMPTY_RESPONSE_MAX_RETRIES
+                && start.elapsed() < LOOP_TIMEOUT
             {
                 empty_response_retries += 1;
-                iteration = iteration.saturating_sub(1);
                 let delay_ms = 250u64 * (1 << empty_response_retries);
                 tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 continue;
+            }
+            if finalization_round {
+                trace.termination_reason = Some("empty_response_fallback_empty".to_string());
+                trace.repeated_tool_error_count = trace
+                    .repeated_tool_error_count
+                    .max(tool_error_loop_tracker.max_consecutive());
+                trace.invalid_report_back_count = invalid_report_back_retries;
+                return Ok(AgenticReportBackResponse {
+                    report_back: empty_report_back_payload(fallback_role),
+                    usage: total_usage,
+                    trace,
+                });
             }
             return Err(anyhow::anyhow!(
                 "termination_reason=empty_response Model returned empty response and did not call report_back."
             ));
         }
-        if text_response_retries < TEXT_INSTEAD_OF_REPORT_BACK_MAX_RETRIES
+        if !finalization_round
+            && text_response_retries < TEXT_INSTEAD_OF_REPORT_BACK_MAX_RETRIES
             && start.elapsed() < LOOP_TIMEOUT
         {
             text_response_retries += 1;
-            iteration = iteration.saturating_sub(1);
             messages.push(Message {
                 role: "assistant".to_string(),
                 content: Some(content),
@@ -1704,6 +1781,32 @@ pub async fn call_llm_agentic_report_back_only(
                 tool_call_id: None,
             });
             continue;
+        }
+
+        if finalization_round {
+            if let Ok(payload) = parse_report_back_payload(content.trim()) {
+                trace.finalized_with_report_back = true;
+                trace.termination_reason = Some("text_report_back_ok".to_string());
+                trace.repeated_tool_error_count = trace
+                    .repeated_tool_error_count
+                    .max(tool_error_loop_tracker.max_consecutive());
+                trace.invalid_report_back_count = invalid_report_back_retries;
+                return Ok(AgenticReportBackResponse {
+                    report_back: payload,
+                    usage: total_usage,
+                    trace,
+                });
+            }
+            trace.termination_reason = Some("text_fallback_empty".to_string());
+            trace.repeated_tool_error_count = trace
+                .repeated_tool_error_count
+                .max(tool_error_loop_tracker.max_consecutive());
+            trace.invalid_report_back_count = invalid_report_back_retries;
+            return Ok(AgenticReportBackResponse {
+                report_back: empty_report_back_payload(fallback_role),
+                usage: total_usage,
+                trace,
+            });
         }
 
         return Err(anyhow::anyhow!(
@@ -1805,7 +1908,7 @@ mod tests {
             tools: Some(tools),
             tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
             parallel_tool_calls: Some(true),
-            disable_tool_validation: Some(true),
+            disable_tool_validation: None,
             provider: None,
             service_tier: None,
         };
@@ -1813,7 +1916,7 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"tool_choice\":\"auto\""));
         assert!(json.contains("\"parallel_tool_calls\":true"));
-        assert!(json.contains("\"disable_tool_validation\":true"));
+        assert!(!json.contains("\"disable_tool_validation\""));
         assert!(json.contains("\"tools\""));
     }
 
@@ -1844,7 +1947,7 @@ mod tests {
                 },
             })),
             parallel_tool_calls: Some(false),
-            disable_tool_validation: Some(true),
+            disable_tool_validation: None,
             provider: None,
             service_tier: None,
         };
@@ -1852,6 +1955,7 @@ mod tests {
         let value: serde_json::Value = serde_json::to_value(request).unwrap();
         assert_eq!(value["tool_choice"]["type"], "function");
         assert_eq!(value["tool_choice"]["function"]["name"], "report_back");
+        assert!(value.get("disable_tool_validation").is_none());
     }
 
     #[test]

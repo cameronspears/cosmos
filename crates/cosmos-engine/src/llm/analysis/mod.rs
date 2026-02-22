@@ -49,7 +49,7 @@ const SUMMARY_MIN_CHARS: usize = 24;
 const DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE: f32 = 0.30;
 const DEFAULT_MAX_SMART_REWRITES_PER_RUN: usize = 8;
 const ASK_ETHOS_MAX_CHARS: usize = 8_000;
-const HYBRID_CANDIDATE_POOL_SIZE: usize = 30;
+const HYBRID_CANDIDATE_POOL_SIZE: usize = 60;
 const HYBRID_CHURN_PERCENT: usize = 40;
 const HYBRID_SECURITY_PERCENT: usize = 30;
 const HYBRID_COMPLEXITY_PERCENT: usize = 20;
@@ -65,6 +65,7 @@ Goals:
 - Never fabricate claims.
 
 When done, call report_back exactly once.
+- If you find no verified issues, still call report_back with "findings": [] and "files": [].
 - explanation MUST be a JSON object (not a quoted string) with this exact shape:
   {
     "role": "bug_hunter",
@@ -89,6 +90,7 @@ Goals:
 - Never fabricate claims.
 
 When done, call report_back exactly once.
+- If you find no verified issues, still call report_back with "findings": [] and "files": [].
 - explanation MUST be a JSON object (not a quoted string) with this exact shape:
   {
     "role": "security_reviewer",
@@ -1701,6 +1703,7 @@ fn is_retryable_generation_error(error: &anyhow::Error) -> bool {
         || message.contains("invalid report_back payload")
         || message.contains("invalid agent explanation json")
         || message.contains("invalid reviewer explanation json")
+        || message.contains("tool call validation failed")
         || message.contains("did not call report_back within iteration/time budget")
         || message.contains("did not call report_back")
         || message.contains("text instead of calling report_back")
@@ -2000,13 +2003,16 @@ fn map_report_findings_to_suggestions(
     let mut seen_evidence = HashSet::new();
 
     for finding in findings {
-        let category = parse_report_category(&finding.category).unwrap_or_else(|| {
-            if finding.category.to_ascii_lowercase().contains("sec") {
-                SuggestionCategory::Security
-            } else {
-                SuggestionCategory::Bug
-            }
-        });
+        let category_lower = finding.category.trim().to_ascii_lowercase();
+        let category = if let Some(parsed) = parse_report_category(&finding.category) {
+            parsed
+        } else if category_lower.contains("sec") {
+            SuggestionCategory::Security
+        } else if category_lower.contains("bug") {
+            SuggestionCategory::Bug
+        } else {
+            continue;
+        };
         let criticality =
             parse_report_criticality(&finding.criticality).unwrap_or(Criticality::Medium);
 
@@ -2048,18 +2054,30 @@ fn map_report_findings_to_suggestions(
         }
 
         let evidence_text = if finding.evidence_quote.trim().is_empty() {
-            format!(
-                "No evidence quote provided by agent for {}:{}.",
-                file.display(),
-                line
-            )
+            continue;
         } else {
-            finding.evidence_quote.clone()
+            finding.evidence_quote.trim().to_string()
         };
         let quality = evidence_snippet_quality(&evidence_text);
+        if snippet_is_low_quality_for_grounding(quality) {
+            continue;
+        }
         let mut evidence_id = stable_evidence_id(&file, line, &evidence_text);
         while !seen_evidence.insert(evidence_id) {
             evidence_id = evidence_id.wrapping_add(1);
+        }
+
+        let claim_observed_behavior = normalize_grounded_summary(
+            if finding.summary.trim().is_empty() {
+                detail.as_str()
+            } else {
+                finding.summary.as_str()
+            },
+            &detail,
+            line,
+        );
+        if claim_observed_behavior.is_empty() {
+            continue;
         }
 
         let impact_class = match category {
@@ -2089,14 +2107,24 @@ fn map_report_findings_to_suggestions(
             evidence_quality_score: Some(quality.executable_ratio),
             snippet_comment_ratio: Some(quality.comment_ratio),
             snippet_top_comment_ratio: Some(quality.top_window_comment_ratio),
-            claim_observed_behavior: Some(finding.summary.trim().to_string()),
+            claim_observed_behavior: Some(claim_observed_behavior),
             claim_impact_class: Some(impact_class),
             ..Default::default()
-        })
-        .with_validation_state(SuggestionValidationState::Validated)
-        .with_verification_state(VerificationState::Verified);
+        });
 
         suggestion = annotate_implementation_readiness(suggestion);
+        if !suggestion_has_usable_evidence_quality(&suggestion) {
+            continue;
+        }
+        if !suggestion_claim_is_grounded_for_acceptance(&suggestion) {
+            continue;
+        }
+        if deterministic_prevalidation_ethos_reason(&suggestion).is_some() {
+            continue;
+        }
+        suggestion = suggestion
+            .with_validation_state(SuggestionValidationState::Validated)
+            .with_verification_state(VerificationState::Verified);
         out.push(suggestion);
     }
 
@@ -2577,7 +2605,7 @@ fn suggestion_meets_ethos_contract(suggestion: &Suggestion) -> bool {
 }
 
 fn build_gate_snapshot(
-    _config: &SuggestionQualityGateConfig,
+    config: &SuggestionQualityGateConfig,
     suggestions: &[Suggestion],
     suggest_total_ms: u64,
     suggest_total_cost_usd: f64,
@@ -2594,6 +2622,37 @@ fn build_gate_snapshot(
     let pending_count = final_count.saturating_sub(validated_count);
     let displayed_valid_ratio = ratio(validated_count, final_count);
     let diversity_metrics = compute_suggestion_diversity_metrics(suggestions);
+    let mut fail_reasons = Vec::new();
+    if final_count < config.min_final_count {
+        fail_reasons.push(format!(
+            "final_count_below_min:{}<{}",
+            final_count, config.min_final_count
+        ));
+    }
+    if final_count > config.max_final_count {
+        fail_reasons.push(format!(
+            "final_count_above_max:{}>{}",
+            final_count, config.max_final_count
+        ));
+    }
+    if displayed_valid_ratio < config.min_displayed_valid_ratio {
+        fail_reasons.push(format!(
+            "displayed_valid_ratio_below_min:{:.3}<{:.3}",
+            displayed_valid_ratio, config.min_displayed_valid_ratio
+        ));
+    }
+    if suggest_total_cost_usd > config.max_suggest_cost_usd {
+        fail_reasons.push(format!(
+            "suggest_cost_above_max:{:.4}>{:.4}",
+            suggest_total_cost_usd, config.max_suggest_cost_usd
+        ));
+    }
+    if suggest_total_ms > config.max_suggest_ms {
+        fail_reasons.push(format!(
+            "suggest_time_above_max:{}>{}",
+            suggest_total_ms, config.max_suggest_ms
+        ));
+    }
 
     SuggestionGateSnapshot {
         final_count,
@@ -2606,8 +2665,8 @@ fn build_gate_snapshot(
         unique_topic_count: diversity_metrics.unique_topic_count,
         dominant_file_ratio: diversity_metrics.dominant_file_ratio,
         unique_file_count: diversity_metrics.unique_file_count,
-        passed: true,
-        fail_reasons: Vec::new(),
+        passed: fail_reasons.is_empty(),
+        fail_reasons,
     }
 }
 
@@ -2628,7 +2687,7 @@ Focus on these candidate files first (you may inspect related files as needed):\
     }
 
     prompt.push_str(
-        "\nTargets:\n- Find high-value, concrete issues only.\n- Prefer quality over quantity.\n- Dynamic volume: return as many strictly supported findings as you can validate.\n- Never fabricate evidence.\n- Finish only via report_back.\n- Do not stop early: inspect assigned files first before concluding.\n- Return at least one finding when you have direct code evidence.\n",
+        "\nTargets:\n- Find high-value, concrete issues only.\n- Prefer quality over quantity.\n- Dynamic volume: return as many strictly supported findings as you can validate.\n- Never fabricate evidence.\n- Finish only via report_back.\n- Do not stop early: inspect assigned files first before concluding.\n- If no verified findings remain after inspection, call report_back with findings: [] and files: [].\n",
     );
 
     if role == "bug_hunter" {
@@ -2637,7 +2696,7 @@ Focus on these candidate files first (you may inspect related files as needed):\
         );
     } else if role == "security_reviewer" {
         prompt.push_str(
-            "\nSecurity checklist:\n- authn/authz bypasses\n- injection risks (sql/shell/template)\n- unsafe deserialization/parsing of untrusted input\n- secret/token leakage paths\n- path traversal/file permission misuse\n",
+            "\nSecurity checklist:\n- authn/authz bypasses across trust boundaries\n- injection risks (sql/shell/template)\n- unsafe deserialization/parsing of untrusted input\n- secret/token leakage paths\n- path traversal/file permission misuse\n- prefer externally reachable vulnerabilities over local-only hardening concerns\n- environment-variable/config-only concerns are hardening unless cross-boundary exploitability is concrete\n",
         );
     }
 
@@ -2762,6 +2821,18 @@ fn trace_response_preview(trace: &AgenticTrace) -> Option<String> {
     Some(truncate_str(preview, 72).to_string())
 }
 
+fn dual_role_worker_timeout_ms() -> u64 {
+    const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+    const MIN_TIMEOUT_MS: u64 = 60_000;
+    const MAX_TIMEOUT_MS: u64 = 300_000;
+
+    std::env::var("COSMOS_DUAL_WORKER_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS))
+        .unwrap_or(DEFAULT_TIMEOUT_MS)
+}
+
 pub async fn analyze_codebase_dual_agent_reviewed(
     repo_root: &Path,
     index: &CodebaseIndex,
@@ -2773,62 +2844,67 @@ pub async fn analyze_codebase_dual_agent_reviewed(
     let run_id = Uuid::new_v4().to_string();
     let project_ethos = load_project_ethos(repo_root);
     let candidate_files = build_hybrid_candidate_pool(repo_root, index, context);
-    let dual_iteration_budget = 4usize;
-    const DUAL_ROLE_WORKER_COUNT: usize = 3;
-    const DUAL_ROLE_MAX_INFLIGHT: usize = 3;
-    const DUAL_ROLE_WORKER_TIMEOUT_MS: u64 = 45_000;
-    let worker_file_span =
-        ((candidate_files.len() + DUAL_ROLE_WORKER_COUNT - 1) / DUAL_ROLE_WORKER_COUNT).max(6);
+    // Keep fanout intentionally low to reduce rate-limit pressure on Speed-tier runs.
+    // Run one role per attempt (security first, bug on retry) to avoid concurrent contention.
+    let dual_iteration_budget = 2usize;
+    const DUAL_ROLE_WORKER_COUNT: usize = 1;
+    const DUAL_ROLE_MAX_INFLIGHT: usize = 1;
+    const DUAL_ROLE_WORKER_FILE_SPAN_MIN: usize = 2;
+    const DUAL_ROLE_WORKER_FILE_SPAN_MAX: usize = 3;
+    let dual_role_worker_timeout_ms = dual_role_worker_timeout_ms();
+    let worker_file_span = if candidate_files.is_empty() {
+        0
+    } else {
+        ((candidate_files.len() + DUAL_ROLE_WORKER_COUNT - 1) / DUAL_ROLE_WORKER_COUNT).clamp(
+            DUAL_ROLE_WORKER_FILE_SPAN_MIN,
+            DUAL_ROLE_WORKER_FILE_SPAN_MAX,
+        )
+    };
 
-    let mut focus_batches = Vec::with_capacity(DUAL_ROLE_WORKER_COUNT);
+    let mut focus_batches = vec![Vec::new(); DUAL_ROLE_WORKER_COUNT];
+    for (idx, path) in candidate_files.iter().enumerate() {
+        focus_batches[idx % DUAL_ROLE_WORKER_COUNT].push(path.clone());
+    }
     for worker_idx in 0..DUAL_ROLE_WORKER_COUNT {
-        let start = worker_idx * worker_file_span;
-        let mut batch = candidate_files
-            .iter()
-            .skip(start)
-            .take(worker_file_span)
-            .cloned()
-            .collect::<Vec<_>>();
-        if batch.is_empty() && !candidate_files.is_empty() {
-            batch = candidate_files
-                .iter()
-                .take(worker_file_span)
-                .cloned()
-                .collect::<Vec<_>>();
+        if focus_batches[worker_idx].is_empty() && !candidate_files.is_empty() {
+            focus_batches[worker_idx]
+                .push(candidate_files[worker_idx % candidate_files.len()].clone());
         }
-        focus_batches.push(batch);
+        if candidate_files.is_empty() {
+            continue;
+        }
+        let mut refill_idx = worker_idx;
+        while focus_batches[worker_idx].len() < worker_file_span {
+            focus_batches[worker_idx]
+                .push(candidate_files[refill_idx % candidate_files.len()].clone());
+            refill_idx = refill_idx.saturating_add(DUAL_ROLE_WORKER_COUNT);
+        }
+        if focus_batches[worker_idx].len() > worker_file_span {
+            focus_batches[worker_idx].truncate(worker_file_span);
+        }
     }
 
+    let role_configs: Vec<(&str, &str)> = if retry_feedback.is_some() {
+        vec![("bug_hunter", RELACE_BUG_HUNTER_SYSTEM)]
+    } else {
+        vec![("security_reviewer", RELACE_SECURITY_REVIEWER_SYSTEM)]
+    };
     let mut jobs: Vec<(String, usize, Vec<PathBuf>, String, String)> =
-        Vec::with_capacity(DUAL_ROLE_WORKER_COUNT * 2);
+        Vec::with_capacity(DUAL_ROLE_WORKER_COUNT * role_configs.len());
     for (batch_idx, files) in focus_batches.iter().enumerate() {
-        let bug_prompt = build_dual_agent_user_prompt(
-            "bug_hunter",
-            files,
-            project_ethos.as_deref(),
-            retry_feedback,
-        );
-        let sec_prompt = build_dual_agent_user_prompt(
-            "security_reviewer",
-            files,
-            project_ethos.as_deref(),
-            retry_feedback,
-        );
-        jobs.push((
-            "bug_hunter".to_string(),
-            batch_idx,
-            files.clone(),
-            RELACE_BUG_HUNTER_SYSTEM.to_string(),
-            bug_prompt,
-        ));
-        jobs.push((
-            "security_reviewer".to_string(),
-            batch_idx,
-            files.clone(),
-            RELACE_SECURITY_REVIEWER_SYSTEM.to_string(),
-            sec_prompt,
-        ));
+        for (role, system_prompt) in &role_configs {
+            let prompt =
+                build_dual_agent_user_prompt(role, files, project_ethos.as_deref(), retry_feedback);
+            jobs.push((
+                (*role).to_string(),
+                batch_idx,
+                files.clone(),
+                (*system_prompt).to_string(),
+                prompt,
+            ));
+        }
     }
+    let planned_worker_jobs = jobs.len();
 
     let dual_start = std::time::Instant::now();
     let mut dual_results = Vec::with_capacity(jobs.len());
@@ -2845,7 +2921,7 @@ pub async fn analyze_codebase_dual_agent_reviewed(
                         }) as AgenticStreamSink
                     });
                     let result = tokio::time::timeout(
-                        std::time::Duration::from_millis(DUAL_ROLE_WORKER_TIMEOUT_MS),
+                        std::time::Duration::from_millis(dual_role_worker_timeout_ms),
                         call_llm_agentic_report_back_only(
                             &system,
                             &prompt,
@@ -2857,7 +2933,7 @@ pub async fn analyze_codebase_dual_agent_reviewed(
                     )
                     .await
                     .map_err(|_| {
-                        anyhow::anyhow!("worker timed out after {}ms", DUAL_ROLE_WORKER_TIMEOUT_MS)
+                        anyhow::anyhow!("worker timed out after {}ms", dual_role_worker_timeout_ms)
                     })
                     .and_then(|inner| inner);
                     (role, batch_idx, files, result)
@@ -2986,7 +3062,7 @@ pub async fn analyze_codebase_dual_agent_reviewed(
 
     if worker_success_count == 0 {
         return Err(anyhow::anyhow!(
-            "All dual-agent workers failed. {}",
+            "All suggestion workers failed. {}",
             worker_failures.join(" | ")
         ));
     }
@@ -3010,7 +3086,7 @@ pub async fn analyze_codebase_dual_agent_reviewed(
                 .join(",")
         ),
         format!("dual_agent_ms:{}", dual_elapsed_ms),
-        format!("dual_worker_total:{}", DUAL_ROLE_WORKER_COUNT * 2),
+        format!("dual_worker_total:{}", planned_worker_jobs),
         format!("dual_worker_max_inflight:{}", DUAL_ROLE_MAX_INFLIGHT),
         format!("dual_worker_file_span:{}", worker_file_span),
         format!("dual_worker_success:{}", worker_success_count),
@@ -3028,7 +3104,7 @@ pub async fn analyze_codebase_dual_agent_reviewed(
             worker_failure_invalid_report_back_count
         ),
         format!("dual_worker_failures_other:{}", worker_failure_other_count),
-        format!("dual_worker_timeout_ms:{}", DUAL_ROLE_WORKER_TIMEOUT_MS),
+        format!("dual_worker_timeout_ms:{}", dual_role_worker_timeout_ms),
         format!("dual_iteration_budget:{}", dual_iteration_budget),
         format!("bug_findings_reported:{}", bug_findings_count),
         format!("security_findings_reported:{}", security_findings_count),
@@ -3039,9 +3115,12 @@ pub async fn analyze_codebase_dual_agent_reviewed(
     let diagnostics = SuggestionDiagnostics {
         run_id,
         model: Model::Speed.id().to_string(),
-        iterations: DUAL_ROLE_WORKER_COUNT * 2,
+        iterations: planned_worker_jobs,
         tool_calls: 0,
-        tool_names: vec!["bug_hunter".to_string(), "security_reviewer".to_string()],
+        tool_names: role_configs
+            .iter()
+            .map(|(role, _)| (*role).to_string())
+            .collect(),
         tool_exec_ms: dual_elapsed_ms,
         llm_ms: dual_elapsed_ms,
         batch_verify_ms: 0,
@@ -3074,7 +3153,7 @@ pub async fn analyze_codebase_dual_agent_reviewed(
         pack_core_count: 0,
         pack_line1_ratio: 0.0,
         provisional_count: suggestions.len(),
-        generation_waves: DUAL_ROLE_WORKER_COUNT * 2,
+        generation_waves: planned_worker_jobs,
         generation_topup_calls: 0,
         generation_mapped_count: suggestions.len(),
         validated_count: suggestions.len(),
@@ -3188,6 +3267,7 @@ where
 
     let mut merged_usage: Option<Usage> = None;
     let mut retry_feedback: Option<String> = None;
+    let mut best_failed_result: Option<GatedSuggestionRunResult> = None;
     let mut last_error: Option<anyhow::Error> = None;
     let mut attempts_executed = 0usize;
 
@@ -3288,13 +3368,51 @@ where
         }
 
         on_progress(attempt_index, attempt_count, &gate, &diagnostics);
-
-        return Ok(GatedSuggestionRunResult {
+        let attempt_result = GatedSuggestionRunResult {
             suggestions,
-            usage: merged_usage,
+            usage: merged_usage.clone(),
             diagnostics,
             gate,
-        });
+        };
+        if attempt_result.gate.passed {
+            return Ok(attempt_result);
+        }
+
+        let gate_reasons = if attempt_result.gate.fail_reasons.is_empty() {
+            "unknown gate failure".to_string()
+        } else {
+            attempt_result.gate.fail_reasons.join("; ")
+        };
+        let distinct_files = attempt_result
+            .suggestions
+            .iter()
+            .map(|suggestion| suggestion.file.display().to_string())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .take(6)
+            .collect::<Vec<_>>()
+            .join(", ");
+        best_failed_result = Some(attempt_result);
+
+        let elapsed_ms = total_start.elapsed().as_millis() as u64;
+        let budget_exhausted = elapsed_ms >= gate_config.max_suggest_ms;
+        if budget_exhausted || attempt_index >= attempt_count {
+            break;
+        }
+        retry_feedback = Some(format!(
+            "Previous attempt failed quality gate: {}. Return more distinct bug/security findings with direct evidence from different files when possible. Do not repeat prior findings unless you have materially stronger evidence. Prior files: {}",
+            gate_reasons,
+            if distinct_files.is_empty() {
+                "(none)".to_string()
+            } else {
+                distinct_files
+            }
+        ));
+        continue;
+    }
+
+    if let Some(result) = best_failed_result {
+        return Ok(result);
     }
 
     if let Some(err) = last_error {
