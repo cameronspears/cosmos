@@ -125,6 +125,7 @@ Goal: find VERIFIED bugs and VERIFIED security flaws only.
 - If you cannot verify a claim from code, do not include it.
 - Follow project ETHOS when provided.
 - Use plain language. Avoid file paths, symbols, or implementation jargon in summaries.
+- Translate technical terms for non-engineers (for example: "panic" -> "crash", "unwrap" -> "missing error handling", "None" -> "not available").
 - Keep every suggestion actionable: the detail should explain root cause and what to change.
 - Output ONLY bug/security findings. No refactors, style advice, optimizations, documentation, or quality nits.
 
@@ -2279,12 +2280,8 @@ fn map_report_findings_to_suggestions(
             normalize_ethos_summary(raw_summary, &finding.detail, Some(impact_class.as_str()));
         if summary.is_empty() {
             let fallback_seed = match category {
-                SuggestionCategory::Security => {
-                    "When someone uses this flow, unsafe access may be possible"
-                }
-                SuggestionCategory::Bug => {
-                    "When someone uses this flow, the action can fail unexpectedly"
-                }
+                SuggestionCategory::Security => "Unsafe access may be possible in this flow",
+                SuggestionCategory::Bug => "This flow can fail unexpectedly at runtime",
             };
             summary = normalize_ethos_summary(
                 fallback_seed,

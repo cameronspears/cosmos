@@ -26,14 +26,14 @@ fn ensure_sentence_punctuation(mut text: String) -> String {
     text
 }
 
-fn lowercase_first_ascii(text: &str) -> String {
+fn uppercase_first_ascii(text: &str) -> String {
     let mut chars = text.chars();
     let Some(first) = chars.next() else {
         return String::new();
     };
     format!(
         "{}{}",
-        first.to_ascii_lowercase(),
+        first.to_ascii_uppercase(),
         chars.collect::<String>()
     )
 }
@@ -67,102 +67,128 @@ fn strip_summary_lead_in(summary: &str) -> String {
     collapse_whitespace(&text)
 }
 
-fn normalize_outcome_clause(outcome: &str) -> String {
-    let core = collapse_whitespace(
-        outcome
-            .trim()
-            .trim_end_matches(['.', '!', '?'])
-            .trim_matches(',')
-            .trim(),
-    );
-    if core.is_empty() {
+fn replace_case_insensitive(text: &str, pattern: &str, replacement: &str) -> String {
+    Regex::new(pattern)
+        .expect("replacement regex should compile")
+        .replace_all(text, replacement)
+        .to_string()
+}
+
+fn rewrite_crash_condition_sentence(text: &str) -> Option<String> {
+    let trimmed = text.trim().trim_end_matches(['.', '!', '?']);
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let crash_if_re = Regex::new(
+        r"(?i)^(?:[a-z][a-z0-9_ ]*?\s+)?(?:may\s+)?(?:crash(?:es)?|panic(?:s|ed|ing)?)\s+if\s+(.+)$",
+    )
+    .expect("crash-if regex should compile");
+    if let Some(caps) = crash_if_re.captures(trimmed) {
+        let condition = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if !condition.is_empty() {
+            return Some(format!(
+                "If {}, this action can crash instead of showing a clear error",
+                condition
+            ));
+        }
+    }
+
+    let crash_when_re = Regex::new(
+        r"(?i)^(?:[a-z][a-z0-9_ ]*?\s+)?(?:may\s+)?(?:crash(?:es)?|panic(?:s|ed|ing)?)\s+when\s+(.+)$",
+    )
+    .expect("crash-when regex should compile");
+    if let Some(caps) = crash_when_re.captures(trimmed) {
+        let condition = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if !condition.is_empty() {
+            return Some(format!(
+                "If {}, this action can crash instead of showing a clear error",
+                condition
+            ));
+        }
+    }
+
+    None
+}
+
+fn rewrite_assumes_non_empty_sentence(text: &str) -> Option<String> {
+    let trimmed = text.trim().trim_end_matches(['.', '!', '?']);
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let assumes_re = Regex::new(r"(?i)^assumes (.+?) is non[- ]empty when (.+)$")
+        .expect("assumes regex should compile");
+    let caps = assumes_re.captures(trimmed)?;
+    let subject = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+    let action = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+    if subject.is_empty() || action.is_empty() {
+        return None;
+    }
+    Some(format!("If {} is missing, {} can fail", subject, action))
+}
+
+fn soften_technical_summary_language(summary: &str) -> String {
+    let mut text = collapse_whitespace(summary.trim());
+    if text.is_empty() {
         return String::new();
     }
 
-    let lower = core.to_ascii_lowercase();
-    if lower.starts_with("the action ")
-        || lower.starts_with("the app ")
-        || lower.starts_with("it ")
-        || lower.starts_with("this ")
-        || lower.starts_with("someone ")
-        || lower.starts_with("users ")
-        || lower.starts_with("user ")
-    {
-        return core;
+    text = replace_case_insensitive(&text, r"(?i)\bnon[- ]zero exit status\b", "an error");
+    text = replace_case_insensitive(&text, r"(?i)\bunix[_-]?epoch\b", "1970");
+    text = replace_case_insensitive(&text, r"(?i)\bsystemtime\b", "system clock");
+    text = replace_case_insensitive(&text, r"(?i)\bfilesystem\b", "file system");
+    text = replace_case_insensitive(&text, r"(?i)\bunwrap\b", "unchecked value handling");
+    text = replace_case_insensitive(&text, r"\bHEAD\b", "current branch");
+    text = replace_case_insensitive(&text, r"(?i)\bshorthand\b", "branch name");
+    text = replace_case_insensitive(&text, r"\bNone\b", "not available");
+    text = replace_case_insensitive(&text, r"(?i)\bsymbol name\b", "component name");
+    text = replace_case_insensitive(&text, r"(?i)\bpanic(?:s|ed|ing)?\b", "crash");
+
+    if let Some(rewritten) = rewrite_crash_condition_sentence(&text) {
+        text = rewritten;
+    } else if let Some(rewritten) = rewrite_assumes_non_empty_sentence(&text) {
+        text = rewritten;
     }
 
-    if lower.starts_with("can ")
-        || lower.starts_with("may ")
-        || lower.starts_with("might ")
-        || lower.starts_with("will ")
-    {
-        return format!("the action {}", lower);
-    }
-
-    let noun_like_outcomes = [
-        "panic",
-        "crash",
-        "hang",
-        "timeout",
-        "time out",
-        "failure",
-        "fail",
-        "fails",
-        "error",
-        "errors",
-        "delete",
-        "deletion",
-        "overwrite",
-        "overwrites",
-        "leak",
-        "expose",
-        "bypass",
-        "stuck",
-        "drop",
-        "skip",
-        "duplicate",
-        "corrupt",
-        "lose",
-    ];
-    if noun_like_outcomes
-        .iter()
-        .any(|marker| lower.starts_with(marker))
-    {
-        return format!("the action can {}", lowercase_first_ascii(&core));
-    }
-
-    lowercase_first_ascii(&core)
-}
-
-fn rewrite_if_clause_to_when(summary: &str) -> Option<String> {
-    let lower = summary.to_ascii_lowercase();
-    let idx = lower.find(" if ")?;
-    let outcome = summary[..idx].trim().trim_matches(',');
-    let condition = summary[idx + 4..].trim().trim_end_matches(['.', '!', '?']);
-    if outcome.is_empty() || condition.is_empty() {
-        return None;
-    }
-
-    let outcome_clause = normalize_outcome_clause(outcome);
-    if outcome_clause.is_empty() {
-        return None;
-    }
-
-    Some(ensure_sentence_punctuation(format!(
-        "When {}, {}",
-        collapse_whitespace(condition),
-        outcome_clause
-    )))
+    collapse_whitespace(text.trim().trim_matches(','))
 }
 
 fn impact_clause_for_class(impact_class: Option<&str>) -> Option<&'static str> {
     match impact_class {
-        Some("correctness") => Some("which can give people incorrect results"),
-        Some("reliability") => Some("which can block normal use"),
-        Some("security") => Some("which can expose data or allow unsafe access"),
-        Some("data_integrity") => Some("which can leave saved data in an inconsistent state"),
+        Some("correctness") => Some("This can lead to incorrect results."),
+        Some("reliability") => Some("This can interrupt normal use."),
+        Some("security") => Some("This can expose data or allow unsafe access."),
+        Some("data_integrity") => Some("This can leave saved data in an inconsistent state."),
         _ => None,
     }
+}
+
+fn summary_already_mentions_impact(lower: &str) -> bool {
+    [
+        " can ",
+        " may ",
+        " might ",
+        " will ",
+        " fails",
+        " fail ",
+        " failed",
+        " crash",
+        " panic",
+        " timeout",
+        " times out",
+        " error",
+        " incorrect",
+        " wrong",
+        " blocked",
+        " expose",
+        " unsafe",
+        " inconsistent",
+        " stuck",
+        " hang",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn add_impact_clause(summary: &str, impact_class: Option<&str>) -> String {
@@ -178,11 +204,14 @@ fn add_impact_clause(summary: &str, impact_class: Option<&str>) -> String {
         return ensure_sentence_punctuation(core);
     };
     let lower = core.to_ascii_lowercase();
-    if lower.contains("which can") || lower.contains(clause) || core.len() > 180 {
+    if summary_already_mentions_impact(&format!(" {} ", lower))
+        || lower.contains(&clause.to_ascii_lowercase())
+        || core.len() > 180
+    {
         return ensure_sentence_punctuation(core);
     }
 
-    ensure_sentence_punctuation(format!("{core}, {clause}"))
+    format!("{} {}", ensure_sentence_punctuation(core), clause)
 }
 
 fn is_fragment_sentence(summary: &str) -> bool {
@@ -271,18 +300,12 @@ pub(super) fn normalize_ethos_summary(
         return String::new();
     }
 
-    let lower = stripped.to_ascii_lowercase();
-    let shaped = if lower.starts_with("when ") {
-        ensure_sentence_punctuation(stripped)
-    } else if let Some(rewritten) = rewrite_if_clause_to_when(&stripped) {
-        rewritten
-    } else {
-        let outcome = normalize_outcome_clause(&stripped);
-        if outcome.is_empty() {
-            return String::new();
-        }
-        ensure_sentence_punctuation(format!("When someone uses this flow, {}", outcome))
-    };
+    let softened = soften_technical_summary_language(&stripped);
+    if softened.is_empty() {
+        return String::new();
+    }
+
+    let shaped = ensure_sentence_punctuation(uppercase_first_ascii(&softened));
 
     let final_summary = add_impact_clause(&shaped, impact_class);
     if is_valid_grounded_summary(&final_summary) {

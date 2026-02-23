@@ -682,16 +682,28 @@ fn normalize_grounded_summary_rewrites_low_information_summary_from_detail() {
 }
 
 #[test]
-fn normalize_ethos_summary_rewrites_if_clause_with_impact() {
+fn normalize_ethos_summary_keeps_natural_sentence_without_forcing_when_template() {
     let summary = normalize_ethos_summary(
         "Potential panic if cargo command is unavailable or fails to execute.",
         "Running cargo can panic when the command is missing.",
         Some("reliability"),
     );
     let lower = summary.to_ascii_lowercase();
-    assert!(summary.starts_with("When "));
+    assert!(!lower.starts_with("when someone uses this flow"));
     assert!(lower.contains("cargo command is unavailable"));
-    assert!(lower.contains("which can block normal use"));
+    assert!(summary.ends_with('.'));
+}
+
+#[test]
+fn normalize_ethos_summary_adds_impact_sentence_when_missing() {
+    let summary = normalize_ethos_summary(
+        "Permission checks are skipped for this request path.",
+        "Request handling bypasses the auth gate and proceeds without validating caller scope.",
+        Some("security"),
+    );
+    let lower = summary.to_ascii_lowercase();
+    assert!(lower.contains("permission checks are skipped"));
+    assert!(lower.contains("this can expose data or allow unsafe access."));
 }
 
 #[test]
@@ -704,7 +716,36 @@ fn normalize_ethos_summary_scrubs_internal_path_references() {
     let lower = summary.to_ascii_lowercase();
     assert!(!lower.contains("crates/"));
     assert!(!lower.contains(".rs"));
-    assert!(summary.starts_with("When "));
+    assert!(lower.contains("config is missing"));
+    assert!(!lower.starts_with("when someone uses this flow"));
+}
+
+#[test]
+fn normalize_ethos_summary_translates_crash_jargon_to_plain_language() {
+    let summary = normalize_ethos_summary(
+        "Panic if git command fails or returns non-zero exit status.",
+        "The command branch currently unwraps process status without a handled error path.",
+        Some("reliability"),
+    );
+    let lower = summary.to_ascii_lowercase();
+    assert!(!lower.contains("panic"));
+    assert!(!lower.contains("non-zero exit status"));
+    assert!(lower.contains("crash"));
+    assert!(lower.contains("showing a clear error"));
+}
+
+#[test]
+fn normalize_ethos_summary_rewrites_technical_optional_state_terms() {
+    let summary = normalize_ethos_summary(
+        "Panic when HEAD is detached and shorthand is None.",
+        "Branch parsing uses unwrap when shorthand is missing.",
+        Some("correctness"),
+    );
+    let lower = summary.to_ascii_lowercase();
+    assert!(!lower.contains("panic"));
+    assert!(!lower.contains("none"));
+    assert!(lower.contains("current branch"));
+    assert!(lower.contains("not available"));
 }
 
 #[test]

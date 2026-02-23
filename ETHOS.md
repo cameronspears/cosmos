@@ -96,9 +96,11 @@ In practice:
 For user-facing suggestion summaries:
 
 - Use concrete product moments (sign-in, save, upload, checkout).
-- Use this shape whenever possible:
-  - "When someone <action>, <visible outcome>."
-  - "This matters because <real-world impact>."
+- Prefer 1-2 short sentences with a clear product moment and visible outcome.
+- Useful patterns (examples, not a required template):
+  - "<User moment>, <visible outcome>."
+  - "<Visible outcome>. <Why it matters in real life>."
+- Do not force "When ..., then ..." phrasing when another sentence reads clearer.
 - Avoid internal jargon, file references, and implementation details in summaries.
 
 ## Non-Goals
