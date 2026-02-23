@@ -202,15 +202,31 @@ fn render_suggestions_content<'a>(
         if app.loading == LoadingState::GeneratingSuggestions {
             let stream_width = inner_width.saturating_sub(8).max(20);
             let mut stream_lines: Vec<(String, Style)> = Vec::new();
-            for raw in app.suggestion_task_lines_for_display() {
-                let style = if raw.starts_with("• Updated Plan") {
+            let display_lines = app.suggestion_task_lines_for_display();
+
+            for raw in display_lines {
+                let style = if raw.starts_with("• Live Agent Activity")
+                    || raw.starts_with("• Updated Plan")
+                {
+                    Style::default().fg(Theme::GREY_200)
+                } else if raw.ends_with("thinking:") {
                     Style::default().fg(Theme::GREY_200)
                 } else if raw.contains("☑") {
                     Style::default().fg(Theme::GREY_300)
                 } else if raw.contains("☐") {
                     Style::default().fg(Theme::GREY_500)
+                } else if raw.starts_with("  now:") {
+                    Style::default().fg(Theme::GREY_300)
+                } else if raw.starts_with("  recent:") {
+                    Style::default().fg(Theme::GREY_400)
+                } else if raw.starts_with("  status:") {
+                    Style::default().fg(Theme::GREY_500)
+                } else if raw.starts_with("  summary:") {
+                    Style::default().fg(Theme::GREY_400)
                 } else if raw.starts_with("[stream|notice]") {
                     Style::default().fg(Theme::GREY_500)
+                } else if raw.starts_with("[") {
+                    Style::default().fg(Theme::GREY_300)
                 } else {
                     Style::default().fg(Theme::GREY_400)
                 };

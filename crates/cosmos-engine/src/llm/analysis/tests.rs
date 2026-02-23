@@ -29,6 +29,52 @@ fn test_suggestion(summary: &str) -> Suggestion {
     .with_verification_state(VerificationState::Verified)
 }
 
+fn validated_finding_suggestion(
+    file: &str,
+    line: usize,
+    category: SuggestionCategory,
+    criticality: Criticality,
+    summary: &str,
+    detail: &str,
+    snippet_id: usize,
+) -> Suggestion {
+    let impact_class = match category {
+        SuggestionCategory::Security => "security",
+        SuggestionCategory::Bug => "correctness",
+    };
+    Suggestion::new(
+        SuggestionKind::BugFix,
+        criticality.to_priority(),
+        PathBuf::from(file),
+        summary.to_string(),
+        SuggestionSource::LlmDeep,
+    )
+    .with_category(category)
+    .with_criticality(criticality)
+    .with_confidence(cosmos_core::suggest::Confidence::High)
+    .with_line(line)
+    .with_detail(detail.to_string())
+    .with_evidence(
+        " 41| if cache_write(path).is_err() {\n 42|     panic!(\"save failed\");\n 43| }"
+            .to_string(),
+    )
+    .with_evidence_refs(vec![SuggestionEvidenceRef {
+        snippet_id,
+        file: PathBuf::from(file),
+        line,
+    }])
+    .with_validation_metadata(SuggestionValidationMetadata {
+        evidence_quality_score: Some(0.9),
+        snippet_comment_ratio: Some(0.0),
+        snippet_top_comment_ratio: Some(0.0),
+        claim_observed_behavior: Some("cache_write(path).is_err() then panic".to_string()),
+        claim_impact_class: Some(impact_class.to_string()),
+        ..Default::default()
+    })
+    .with_validation_state(SuggestionValidationState::Validated)
+    .with_verification_state(VerificationState::Verified)
+}
+
 #[test]
 fn non_summary_model_guard_rejects_speed() {
     assert!(ensure_non_summary_model(Model::Speed, "Suggestions").is_err());
@@ -511,6 +557,12 @@ fn gate_default_mapping_matches_expected_ranges() {
 }
 
 #[test]
+fn deterministic_soft_target_defaults_to_six() {
+    let gate = SuggestionQualityGateConfig::default();
+    assert_eq!(deterministic_soft_target_count(&gate), 6);
+}
+
+#[test]
 fn gate_snapshot_is_best_effort_when_ethos_actionable_is_below_final_count() {
     let config = SuggestionQualityGateConfig {
         min_final_count: 1,
@@ -630,6 +682,32 @@ fn normalize_grounded_summary_rewrites_low_information_summary_from_detail() {
 }
 
 #[test]
+fn normalize_ethos_summary_rewrites_if_clause_with_impact() {
+    let summary = normalize_ethos_summary(
+        "Potential panic if cargo command is unavailable or fails to execute.",
+        "Running cargo can panic when the command is missing.",
+        Some("reliability"),
+    );
+    let lower = summary.to_ascii_lowercase();
+    assert!(summary.starts_with("When "));
+    assert!(lower.contains("cargo command is unavailable"));
+    assert!(lower.contains("which can block normal use"));
+}
+
+#[test]
+fn normalize_ethos_summary_scrubs_internal_path_references() {
+    let summary = normalize_ethos_summary(
+        "Fix: crates/cosmos-engine/src/main.rs panics if config is missing.",
+        "The startup path panics when config is absent.",
+        Some("correctness"),
+    );
+    let lower = summary.to_ascii_lowercase();
+    assert!(!lower.contains("crates/"));
+    assert!(!lower.contains(".rs"));
+    assert!(summary.starts_with("When "));
+}
+
+#[test]
 fn normalize_grounded_detail_does_not_inject_generic_user_impact_fallback() {
     let detail = normalize_grounded_detail(
         "Too short",
@@ -638,6 +716,67 @@ fn normalize_grounded_detail_does_not_inject_generic_user_impact_fallback() {
     let lower = detail.to_ascii_lowercase();
     assert!(!lower.contains("this matters because"));
     assert!(!lower.contains("users can observe incorrect behavior"));
+}
+
+#[test]
+fn deterministic_selection_prefers_distinct_files_and_dedups_duplicates() {
+    let suggestions = vec![
+        validated_finding_suggestion(
+            "src/a.rs",
+            41,
+            SuggestionCategory::Security,
+            Criticality::High,
+            "Potential panic if auth token parsing fails.",
+            "auth token parse failures currently panic in this path.",
+            100,
+        ),
+        validated_finding_suggestion(
+            "src/a.rs",
+            41,
+            SuggestionCategory::Security,
+            Criticality::Medium,
+            "Potential panic if auth token parsing fails.",
+            "same underlying issue with weaker wording.",
+            100,
+        ),
+        validated_finding_suggestion(
+            "src/b.rs",
+            52,
+            SuggestionCategory::Bug,
+            Criticality::High,
+            "Potential crash if cache write fails.",
+            "cache write errors panic instead of returning handled failures.",
+            101,
+        ),
+        validated_finding_suggestion(
+            "src/c.rs",
+            33,
+            SuggestionCategory::Bug,
+            Criticality::Medium,
+            "Potential stale state if retry loop never exits.",
+            "retry loop can spin forever when backoff never increases.",
+            102,
+        ),
+        validated_finding_suggestion(
+            "src/d.rs",
+            19,
+            SuggestionCategory::Security,
+            Criticality::Medium,
+            "Potential unauthorized access if token check is skipped.",
+            "token check can be skipped in one branch, allowing unsafe access.",
+            103,
+        ),
+    ];
+
+    let selection = deterministic_select_suggestions(&suggestions, 4, 8);
+    assert!(selection.suggestions.len() >= 3);
+    assert!(selection.suggestions.len() < suggestions.len());
+    let unique_files = selection
+        .suggestions
+        .iter()
+        .map(|s| s.file.clone())
+        .collect::<HashSet<_>>();
+    assert!(unique_files.len() >= 3);
 }
 
 #[test]

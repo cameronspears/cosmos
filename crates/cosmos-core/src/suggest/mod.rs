@@ -520,7 +520,24 @@ impl SuggestionEngine {
                 return b_blast.cmp(&a_blast);
             }
 
-            // Finally: newest first
+            // Deterministic tie-breaks improve run-to-run ordering stability.
+            let file_cmp = a.file.cmp(&b.file);
+            if file_cmp != std::cmp::Ordering::Equal {
+                return file_cmp;
+            }
+            let line_cmp = a
+                .line
+                .unwrap_or(usize::MAX)
+                .cmp(&b.line.unwrap_or(usize::MAX));
+            if line_cmp != std::cmp::Ordering::Equal {
+                return line_cmp;
+            }
+            let summary_cmp = a.summary.cmp(&b.summary);
+            if summary_cmp != std::cmp::Ordering::Equal {
+                return summary_cmp;
+            }
+
+            // Final fallback for exact content ties.
             b.created_at.cmp(&a.created_at)
         });
     }

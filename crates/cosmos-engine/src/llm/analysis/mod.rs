@@ -26,7 +26,9 @@ mod context_limits;
 mod summary_normalization;
 
 use context_limits::AdaptiveLimits;
-use summary_normalization::{normalize_grounded_detail, normalize_grounded_summary};
+use summary_normalization::{
+    normalize_ethos_summary, normalize_grounded_detail, normalize_grounded_summary,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  THRESHOLDS AND CONSTANTS
@@ -50,18 +52,22 @@ const DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE: f32 = 0.30;
 const DEFAULT_MAX_SMART_REWRITES_PER_RUN: usize = 8;
 const ASK_ETHOS_MAX_CHARS: usize = 8_000;
 const HYBRID_CANDIDATE_POOL_SIZE: usize = 60;
-const HYBRID_CHURN_PERCENT: usize = 40;
-const HYBRID_SECURITY_PERCENT: usize = 30;
+const HYBRID_CHURN_PERCENT: usize = 30;
+const HYBRID_SECURITY_PERCENT: usize = 40;
 const HYBRID_COMPLEXITY_PERCENT: usize = 20;
 const HYBRID_DORMANT_PERCENT: usize = 10;
 const CHURN_COMMIT_WINDOW: usize = 200;
 const COVERAGE_CACHE_KEEP_LIMIT: usize = 4_000;
+const DETERMINISTIC_SUGGESTION_SOFT_TARGET_MIN: usize = 4;
+const DETERMINISTIC_SUGGESTION_SOFT_TARGET_MAX: usize = 6;
+const DETERMINISTIC_SUGGESTION_PER_FILE_MAX: usize = 2;
 
 const RELACE_BUG_HUNTER_SYSTEM: &str = r#"You are a bug-hunting search agent.
 
 Goals:
 - Find concrete runtime defects.
-- Prioritize high-value issues over quantity.
+- Inspect assigned files thoroughly before deciding no findings.
+- Report every DISTINCT verified issue you can prove with code evidence.
 - Never fabricate claims.
 
 When done, call report_back exactly once.
@@ -86,7 +92,8 @@ const RELACE_SECURITY_REVIEWER_SYSTEM: &str = r#"You are a security-review searc
 
 Goals:
 - Find concrete security vulnerabilities.
-- Prioritize high-value issues over quantity.
+- Inspect assigned files thoroughly before deciding no findings.
+- Report every DISTINCT verified issue you can prove with code evidence.
 - Never fabricate claims.
 
 When done, call report_back exactly once.
@@ -232,6 +239,18 @@ fn security_signal_score(path: &Path, file: &cosmos_core::index::FileIndex) -> u
         "encrypt",
         "decrypt",
         "key",
+        "keyring",
+        "credential",
+        "command",
+        "shell",
+        "exec",
+        "path",
+        "traversal",
+        "sandbox",
+        "quick_checks",
+        "tool",
+        "http",
+        "request",
     ];
 
     let mut score = 0usize;
@@ -250,6 +269,14 @@ fn security_signal_score(path: &Path, file: &cosmos_core::index::FileIndex) -> u
 
     if lower.contains("middleware") || lower.contains("guard") {
         score += 8;
+    }
+    if lower.contains("/llm/")
+        || lower.contains("/tools")
+        || lower.contains("quick_checks")
+        || lower.contains("sandbox")
+        || lower.contains("keyring")
+    {
+        score += 24;
     }
     score
 }
@@ -1319,6 +1346,202 @@ fn compute_suggestion_diversity_metrics(suggestions: &[Suggestion]) -> Suggestio
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct DeterministicSelectionOutcome {
+    suggestions: Vec<Suggestion>,
+    dedup_dropped_count: usize,
+    file_balance_dropped_count: usize,
+    speculative_dropped_count: usize,
+}
+
+fn deterministic_soft_target_count(config: &SuggestionQualityGateConfig) -> usize {
+    let hard_max = config.max_final_count.max(1);
+    let preferred = hard_max
+        .min(DETERMINISTIC_SUGGESTION_SOFT_TARGET_MAX)
+        .max(DETERMINISTIC_SUGGESTION_SOFT_TARGET_MIN.min(hard_max));
+    preferred.max(config.min_final_count.max(1)).min(hard_max)
+}
+
+fn deterministic_criticality_rank(criticality: Criticality) -> i64 {
+    match criticality {
+        Criticality::Critical => 40,
+        Criticality::High => 30,
+        Criticality::Medium => 20,
+        Criticality::Low => 10,
+    }
+}
+
+fn deterministic_category_rank(category: SuggestionCategory) -> i64 {
+    match category {
+        SuggestionCategory::Security => 8,
+        SuggestionCategory::Bug => 4,
+    }
+}
+
+fn deterministic_confidence_rank(confidence: cosmos_core::suggest::Confidence) -> i64 {
+    match confidence {
+        cosmos_core::suggest::Confidence::High => 8,
+        cosmos_core::suggest::Confidence::Medium => 5,
+        cosmos_core::suggest::Confidence::Low => 2,
+    }
+}
+
+fn deterministic_suggestion_score(suggestion: &Suggestion) -> i64 {
+    let readiness = suggestion
+        .implementation_readiness_score
+        .unwrap_or(DEFAULT_MIN_IMPLEMENTATION_READINESS_SCORE)
+        .clamp(0.0, 1.0);
+    let evidence_quality = suggestion
+        .validation_metadata
+        .evidence_quality_score
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let grounded_bonus = if suggestion_claim_is_grounded_for_acceptance(suggestion) {
+        6
+    } else {
+        0
+    };
+    let detail_bonus = suggestion
+        .detail
+        .as_deref()
+        .map(detail_is_concrete_enough)
+        .unwrap_or(false) as i64;
+
+    (deterministic_criticality_rank(suggestion.criticality) * 1_000)
+        + (deterministic_category_rank(suggestion.category) * 100)
+        + (deterministic_confidence_rank(suggestion.confidence) * 60)
+        + ((readiness * 100.0).round() as i64 * 8)
+        + ((evidence_quality * 100.0).round() as i64 * 5)
+        + (grounded_bonus * 12)
+        + (detail_bonus * 10)
+}
+
+fn deterministic_suggestion_dedup_key(suggestion: &Suggestion) -> String {
+    let snippet_key = suggestion
+        .evidence_refs
+        .first()
+        .map(|reference| format!("snippet:{}", reference.snippet_id))
+        .unwrap_or_else(|| "snippet:none".to_string());
+    let line = suggestion.line.unwrap_or(0);
+    let topic = suggestion_topic_key(suggestion);
+    format!(
+        "{:?}:{}:{}:{}:{}",
+        suggestion.category,
+        suggestion.file.display(),
+        line,
+        snippet_key,
+        topic
+    )
+}
+
+fn normalize_suggestion_language(mut suggestion: Suggestion) -> Suggestion {
+    let impact_class = suggestion.validation_metadata.claim_impact_class.as_deref();
+    let detail_seed = suggestion.detail.as_deref().unwrap_or("");
+    let rewritten_summary = normalize_ethos_summary(&suggestion.summary, detail_seed, impact_class);
+    if !rewritten_summary.is_empty() {
+        suggestion.summary = rewritten_summary;
+    }
+
+    let normalized_detail = normalize_grounded_detail(detail_seed, &suggestion.summary);
+    if !normalized_detail.trim().is_empty() {
+        suggestion.detail = Some(normalized_detail);
+    }
+
+    annotate_implementation_readiness(suggestion)
+}
+
+fn deterministic_select_suggestions(
+    candidates: &[Suggestion],
+    desired_count: usize,
+    hard_max: usize,
+) -> DeterministicSelectionOutcome {
+    let mut outcome = DeterministicSelectionOutcome::default();
+    if candidates.is_empty() {
+        return outcome;
+    }
+
+    let target_count = desired_count.max(1).min(hard_max.max(1));
+    let mut ranked = Vec::new();
+    for candidate in candidates.iter().cloned() {
+        let normalized = normalize_suggestion_language(candidate);
+        if !suggestion_is_verified_bug_or_security(&normalized) {
+            continue;
+        }
+        if !suggestion_has_usable_evidence_quality(&normalized) {
+            continue;
+        }
+        if !suggestion_claim_is_grounded_for_acceptance(&normalized) {
+            continue;
+        }
+        if has_speculative_impact_language(&normalized.summary) {
+            outcome.speculative_dropped_count = outcome.speculative_dropped_count.saturating_add(1);
+            continue;
+        }
+        if deterministic_prevalidation_ethos_reason(&normalized).is_some() {
+            continue;
+        }
+        ranked.push(normalized);
+    }
+
+    ranked.sort_by(|left, right| {
+        deterministic_suggestion_score(right)
+            .cmp(&deterministic_suggestion_score(left))
+            .then_with(|| right.criticality.cmp(&left.criticality))
+            .then_with(|| right.priority.cmp(&left.priority))
+            .then_with(|| right.confidence.cmp(&left.confidence))
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| {
+                left.line
+                    .unwrap_or(usize::MAX)
+                    .cmp(&right.line.unwrap_or(usize::MAX))
+            })
+            .then_with(|| left.summary.cmp(&right.summary))
+    });
+
+    let mut deduped = Vec::new();
+    let mut seen_keys = HashSet::new();
+    for suggestion in ranked {
+        let key = deterministic_suggestion_dedup_key(&suggestion);
+        if seen_keys.insert(key) {
+            deduped.push(suggestion);
+        } else {
+            outcome.dedup_dropped_count = outcome.dedup_dropped_count.saturating_add(1);
+        }
+    }
+
+    if deduped.is_empty() {
+        return outcome;
+    }
+    let target_count = target_count.min(deduped.len());
+    let mut selected = Vec::new();
+    let mut selected_ids = HashSet::new();
+    let mut per_file = HashMap::new();
+    let mut file_balance_skips = 0usize;
+
+    for per_file_limit in [1usize, DETERMINISTIC_SUGGESTION_PER_FILE_MAX, usize::MAX] {
+        for suggestion in &deduped {
+            if selected.len() >= target_count {
+                break;
+            }
+            if selected_ids.contains(&suggestion.id) {
+                continue;
+            }
+            let current = per_file.get(&suggestion.file).copied().unwrap_or(0usize);
+            if per_file_limit != usize::MAX && current >= per_file_limit {
+                file_balance_skips = file_balance_skips.saturating_add(1);
+                continue;
+            }
+            selected.push(suggestion.clone());
+            selected_ids.insert(suggestion.id);
+            *per_file.entry(suggestion.file.clone()).or_insert(0usize) += 1;
+        }
+    }
+
+    outcome.file_balance_dropped_count = file_balance_skips;
+    outcome.suggestions = selected;
+    outcome
+}
+
 fn evidence_strength_score(suggestion: &Suggestion) -> f32 {
     let mut score = 0.20f32;
     if !suggestion.evidence_refs.is_empty() {
@@ -1914,14 +2137,14 @@ fn map_agentic_suggestions(
             },
             &claim_summary,
         );
-        let summary = normalize_grounded_summary(
+        let summary = normalize_ethos_summary(
             if claim_summary.is_empty() {
                 summary_seed
             } else {
                 claim_summary.as_str()
             },
             &detail,
-            line,
+            Some(claim_impact_class.as_str()),
         );
         if summary.is_empty() {
             continue;
@@ -1945,6 +2168,12 @@ fn map_agentic_suggestions(
             "high" => cosmos_core::suggest::Confidence::High,
             _ => cosmos_core::suggest::Confidence::Medium,
         };
+        let category = if claim_impact_class == "security" {
+            SuggestionCategory::Security
+        } else {
+            SuggestionCategory::Bug
+        };
+
         let suggestion = Suggestion::new(
             kind,
             priority,
@@ -1952,6 +2181,7 @@ fn map_agentic_suggestions(
             summary,
             cosmos_core::suggest::SuggestionSource::LlmDeep,
         )
+        .with_category(category)
         .with_confidence(confidence)
         .with_line(line)
         .with_detail(detail)
@@ -1971,7 +2201,7 @@ fn map_agentic_suggestions(
         })
         .with_validation_state(SuggestionValidationState::Validated)
         .with_verification_state(VerificationState::Verified);
-        out.push(suggestion);
+        out.push(annotate_implementation_readiness(suggestion));
     }
     out
 }
@@ -2036,17 +2266,31 @@ fn map_report_findings_to_suggestions(
             line = line.min(file_loc);
         }
 
+        let impact_class = match category {
+            SuggestionCategory::Bug => "correctness".to_string(),
+            SuggestionCategory::Security => "security".to_string(),
+        };
         let raw_summary = if finding.summary.trim().is_empty() {
             finding.detail.as_str()
         } else {
             finding.summary.as_str()
         };
-        let mut summary = normalize_grounded_summary(raw_summary, &finding.detail, line);
+        let mut summary =
+            normalize_ethos_summary(raw_summary, &finding.detail, Some(impact_class.as_str()));
         if summary.is_empty() {
-            summary = match category {
-                SuggestionCategory::Security => "Potential security issue detected.".to_string(),
-                SuggestionCategory::Bug => "Potential runtime bug detected.".to_string(),
+            let fallback_seed = match category {
+                SuggestionCategory::Security => {
+                    "When someone uses this flow, unsafe access may be possible"
+                }
+                SuggestionCategory::Bug => {
+                    "When someone uses this flow, the action can fail unexpectedly"
+                }
             };
+            summary = normalize_ethos_summary(
+                fallback_seed,
+                &finding.detail,
+                Some(impact_class.as_str()),
+            );
         }
         let mut detail = normalize_grounded_detail(&finding.detail, &summary);
         if detail.trim().is_empty() {
@@ -2079,11 +2323,6 @@ fn map_report_findings_to_suggestions(
         if claim_observed_behavior.is_empty() {
             continue;
         }
-
-        let impact_class = match category {
-            SuggestionCategory::Bug => "correctness".to_string(),
-            SuggestionCategory::Security => "security".to_string(),
-        };
 
         let mut suggestion = Suggestion::new(
             SuggestionKind::BugFix,
@@ -2688,7 +2927,7 @@ Focus on these candidate files first (you may inspect related files as needed):\
     }
 
     prompt.push_str(
-        "\nTargets:\n- Find high-value, concrete issues only.\n- Prefer quality over quantity.\n- Dynamic volume: return as many strictly supported findings as you can validate.\n- Never fabricate evidence.\n- Finish only via report_back.\n- Do not stop early: inspect assigned files first before concluding.\n- If no verified findings remain after inspection, call report_back with findings: [] and files: [].\n",
+        "\nTargets:\n- Find high-value, concrete issues only.\n- Quality first, but report every DISTINCT issue you can verify.\n- Dynamic volume: return as many strictly supported findings as you can validate.\n- Aim for 2-3 findings per worker when evidence exists.\n- Never fabricate evidence.\n- Finish only via report_back.\n- Do not stop early: inspect assigned files first before concluding.\n- If no verified findings remain after inspection, call report_back with findings: [] and files: [].\n",
     );
 
     if role == "bug_hunter" {
@@ -2697,7 +2936,7 @@ Focus on these candidate files first (you may inspect related files as needed):\
         );
     } else if role == "security_reviewer" {
         prompt.push_str(
-            "\nSecurity checklist:\n- authn/authz bypasses across trust boundaries\n- injection risks (sql/shell/template)\n- unsafe deserialization/parsing of untrusted input\n- secret/token leakage paths\n- path traversal/file permission misuse\n- prefer externally reachable vulnerabilities over local-only hardening concerns\n- environment-variable/config-only concerns are hardening unless cross-boundary exploitability is concrete\n",
+        "\nSecurity checklist:\n- authn/authz bypasses across trust boundaries\n- injection risks (sql/shell/template)\n- unsafe deserialization/parsing of untrusted input\n- secret/token leakage paths\n- path traversal/file permission misuse\n- prefer externally reachable vulnerabilities over local-only hardening concerns\n- include env/config issues when they concretely enable unsafe filesystem writes, command execution, or credential exposure\n",
         );
     }
 
@@ -2839,6 +3078,29 @@ fn dual_role_worker_timeout_ms() -> u64 {
         .unwrap_or(DEFAULT_TIMEOUT_MS)
 }
 
+fn dual_role_worker_count() -> usize {
+    const DEFAULT_COUNT: usize = 2;
+    const MIN_COUNT: usize = 1;
+    const MAX_COUNT: usize = 3;
+
+    std::env::var("COSMOS_DUAL_WORKER_COUNT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(MIN_COUNT, MAX_COUNT))
+        .unwrap_or(DEFAULT_COUNT)
+}
+
+fn dual_role_max_inflight(worker_count: usize) -> usize {
+    const DEFAULT_MAX_INFLIGHT: usize = 2;
+    let max_allowed = worker_count.max(1);
+
+    std::env::var("COSMOS_DUAL_WORKER_MAX_INFLIGHT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(1, max_allowed))
+        .unwrap_or(DEFAULT_MAX_INFLIGHT.min(max_allowed))
+}
+
 pub async fn analyze_codebase_dual_agent_reviewed(
     repo_root: &Path,
     index: &CodebaseIndex,
@@ -2853,22 +3115,22 @@ pub async fn analyze_codebase_dual_agent_reviewed(
     let candidate_files = build_hybrid_candidate_pool(repo_root, index, context);
     // Keep fanout bounded, but wide enough that each attempt can inspect materially
     // different areas of the candidate pool.
-    let dual_iteration_budget = 6usize;
-    const DUAL_ROLE_WORKER_COUNT: usize = 1;
-    const DUAL_ROLE_MAX_INFLIGHT: usize = 1;
+    let dual_iteration_budget = 8usize;
     const DUAL_ROLE_WORKER_FILE_SPAN_MIN: usize = 8;
     const DUAL_ROLE_WORKER_FILE_SPAN_MAX: usize = 16;
+    let dual_role_worker_count = dual_role_worker_count();
+    let dual_role_max_inflight = dual_role_max_inflight(dual_role_worker_count);
     let dual_role_worker_timeout_ms = dual_role_worker_timeout_ms();
     let worker_file_span = if candidate_files.is_empty() {
         0
     } else {
-        ((candidate_files.len() + DUAL_ROLE_WORKER_COUNT - 1) / DUAL_ROLE_WORKER_COUNT).clamp(
+        ((candidate_files.len() + dual_role_worker_count - 1) / dual_role_worker_count).clamp(
             DUAL_ROLE_WORKER_FILE_SPAN_MIN,
             DUAL_ROLE_WORKER_FILE_SPAN_MAX,
         )
     };
     let rotation_stride = worker_file_span
-        .saturating_mul(DUAL_ROLE_WORKER_COUNT)
+        .saturating_mul(dual_role_worker_count)
         .max(1);
     let candidate_rotation_offset = if candidate_files.is_empty() {
         0
@@ -2890,8 +3152,8 @@ pub async fn analyze_codebase_dual_agent_reviewed(
             .collect::<Vec<_>>()
     };
 
-    let mut focus_batches = vec![Vec::new(); DUAL_ROLE_WORKER_COUNT];
-    for worker_idx in 0..DUAL_ROLE_WORKER_COUNT {
+    let mut focus_batches = vec![Vec::new(); dual_role_worker_count];
+    for worker_idx in 0..dual_role_worker_count {
         if rotated_candidates.is_empty() {
             continue;
         }
@@ -2914,7 +3176,7 @@ pub async fn analyze_codebase_dual_agent_reviewed(
         ("bug_hunter", RELACE_BUG_HUNTER_SYSTEM),
     ];
     let mut jobs: Vec<(String, usize, Vec<PathBuf>, String, String)> =
-        Vec::with_capacity(DUAL_ROLE_WORKER_COUNT * role_configs.len());
+        Vec::with_capacity(dual_role_worker_count * role_configs.len());
     for (batch_idx, files) in focus_batches.iter().enumerate() {
         for (role, system_prompt) in &role_configs {
             let prompt = build_dual_agent_user_prompt(
@@ -2937,7 +3199,7 @@ pub async fn analyze_codebase_dual_agent_reviewed(
 
     let dual_start = std::time::Instant::now();
     let mut dual_results = Vec::with_capacity(jobs.len());
-    for batch in jobs.chunks(DUAL_ROLE_MAX_INFLIGHT.max(1)) {
+    for batch in jobs.chunks(dual_role_max_inflight.max(1)) {
         let batch_results = join_all(batch.iter().cloned().map(
             |(role, batch_idx, files, system, prompt)| {
                 let stream_sink = stream_sink.clone();
@@ -3119,7 +3381,7 @@ pub async fn analyze_codebase_dual_agent_reviewed(
         format!("dual_agent_ms:{}", dual_elapsed_ms),
         format!("dual_role_count:{}", role_configs.len()),
         format!("dual_worker_total:{}", planned_worker_jobs),
-        format!("dual_worker_max_inflight:{}", DUAL_ROLE_MAX_INFLIGHT),
+        format!("dual_worker_max_inflight:{}", dual_role_max_inflight),
         format!("dual_worker_file_span:{}", worker_file_span),
         format!("dual_worker_success:{}", worker_success_count),
         format!("dual_worker_failures:{}", worker_failures.len()),
@@ -3296,12 +3558,14 @@ where
 {
     let total_start = std::time::Instant::now();
     let attempt_count = gate_config.max_attempts.max(2);
+    let deterministic_target_count = deterministic_soft_target_count(&gate_config);
 
     let mut merged_usage: Option<Usage> = None;
     let mut retry_feedback: Option<String> = None;
-    let mut best_failed_result: Option<GatedSuggestionRunResult> = None;
+    let mut best_result: Option<GatedSuggestionRunResult> = None;
     let mut last_error: Option<anyhow::Error> = None;
     let mut attempts_executed = 0usize;
+    let mut aggregate_candidates: Vec<Suggestion> = Vec::new();
 
     for attempt_index in 1..=attempt_count {
         attempts_executed = attempt_index;
@@ -3349,17 +3613,37 @@ where
                 continue;
             }
         };
-        let (suggestions, usage_b, mut diagnostics) = {
-            let mut diagnostics = diagnostics;
-            diagnostics.refinement_complete = true;
-            diagnostics.final_count = provisional.len();
-            diagnostics.validated_count = provisional
-                .iter()
-                .filter(|suggestion| suggestion_is_verified_bug_or_security(suggestion))
-                .count();
-            diagnostics.rejected_count = 0;
-            (provisional, None, diagnostics)
-        };
+        aggregate_candidates.extend(provisional);
+        let selection = deterministic_select_suggestions(
+            &aggregate_candidates,
+            deterministic_target_count,
+            gate_config.max_final_count,
+        );
+        let suggestions = selection.suggestions;
+        let usage_b = None;
+        let mut diagnostics = diagnostics;
+        diagnostics.refinement_complete = true;
+        diagnostics.final_count = suggestions.len();
+        diagnostics.validated_count = suggestions
+            .iter()
+            .filter(|suggestion| suggestion_is_verified_bug_or_security(suggestion))
+            .count();
+        diagnostics.rejected_count = aggregate_candidates.len().saturating_sub(suggestions.len());
+        diagnostics.semantic_dedup_dropped_count = selection.dedup_dropped_count;
+        diagnostics.file_balance_dropped_count = selection.file_balance_dropped_count;
+        diagnostics.speculative_impact_dropped_count = selection.speculative_dropped_count;
+        diagnostics.notes.push(format!(
+            "deterministic_target_count:{}",
+            deterministic_target_count
+        ));
+        diagnostics.notes.push(format!(
+            "deterministic_candidate_count:{}",
+            aggregate_candidates.len()
+        ));
+        diagnostics.notes.push(format!(
+            "deterministic_selected_count:{}",
+            suggestions.len()
+        ));
 
         merged_usage = merge_usage(merged_usage, merge_usage(usage_a, usage_b));
         let total_cost_usd = merged_usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
@@ -3427,8 +3711,51 @@ where
             diagnostics,
             gate,
         };
-        if attempt_result.gate.passed {
+        let should_replace_best = match &best_result {
+            None => true,
+            Some(current) => {
+                (attempt_result.gate.passed && !current.gate.passed)
+                    || (attempt_result.gate.passed == current.gate.passed
+                        && (attempt_result.suggestions.len() > current.suggestions.len()
+                            || (attempt_result.suggestions.len() == current.suggestions.len()
+                                && attempt_result.gate.displayed_valid_ratio
+                                    >= current.gate.displayed_valid_ratio)))
+            }
+        };
+        if should_replace_best {
+            best_result = Some(attempt_result.clone());
+        }
+
+        let reached_soft_target = attempt_result.suggestions.len() >= deterministic_target_count;
+        let elapsed_ms = total_start.elapsed().as_millis() as u64;
+        let budget_exhausted = elapsed_ms >= gate_config.max_suggest_ms;
+        if attempt_result.gate.passed && reached_soft_target {
             return Ok(attempt_result);
+        }
+        if budget_exhausted || attempt_index >= attempt_count {
+            break;
+        }
+        if attempt_result.gate.passed {
+            let distinct_files = attempt_result
+                .suggestions
+                .iter()
+                .map(|suggestion| suggestion.file.display().to_string())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join(", ");
+            retry_feedback = Some(format!(
+                "Current run has {} verified findings. Continue exploring different files and return additional DISTINCT verified bug/security findings until you reach at least {} when evidence exists. Prior files: {}",
+                attempt_result.suggestions.len(),
+                deterministic_target_count,
+                if distinct_files.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    distinct_files
+                }
+            ));
+            continue;
         }
 
         let gate_reasons = if attempt_result.gate.fail_reasons.is_empty() {
@@ -3445,13 +3772,6 @@ where
             .take(6)
             .collect::<Vec<_>>()
             .join(", ");
-        best_failed_result = Some(attempt_result);
-
-        let elapsed_ms = total_start.elapsed().as_millis() as u64;
-        let budget_exhausted = elapsed_ms >= gate_config.max_suggest_ms;
-        if budget_exhausted || attempt_index >= attempt_count {
-            break;
-        }
         retry_feedback = Some(format!(
             "Previous attempt failed quality gate: {}. Return more distinct bug/security findings with direct evidence from different files when possible. Do not repeat prior findings unless you have materially stronger evidence. Prior files: {}",
             gate_reasons,
@@ -3464,7 +3784,7 @@ where
         continue;
     }
 
-    if let Some(result) = best_failed_result {
+    if let Some(result) = best_result {
         return Ok(result);
     }
 

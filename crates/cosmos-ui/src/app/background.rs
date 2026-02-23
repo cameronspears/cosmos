@@ -79,8 +79,9 @@ fn spawn_suggestions_generation(
             },
         );
         let mut gate_config = cosmos_engine::llm::SuggestionQualityGateConfig::default();
-        gate_config.min_final_count = gate_config.min_final_count.max(1);
-        gate_config.max_attempts = gate_config.max_attempts.max(2);
+        // Keep UI output practical but avoid stopping at a single suggestion too early.
+        gate_config.min_final_count = gate_config.min_final_count.max(2);
+        gate_config.max_attempts = gate_config.max_attempts.max(3);
         gate_config.max_suggest_ms = gate_config.max_suggest_ms.max(suggestions_budget_ms());
         let run = cosmos_engine::llm::run_fast_grounded_with_gate_with_progress_and_stream(
             &repo_root,

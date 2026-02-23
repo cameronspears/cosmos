@@ -1379,9 +1379,9 @@ pub async fn call_llm_agentic_report_back_only(
     let max_total_iterations = max_iterations.saturating_add(REPORT_BACK_GRACE_ROUNDS);
     let mut forced_report_back_mode = false;
     let mut trace = AgenticTrace::default();
-    // Keep reasoning output opt-in; enabling it by default increases latency and can destabilize
-    // tool-call formatting under tight rate-limit conditions.
-    let mut stream_reasoning = stream_reasoning_output_enabled() && stream_sink.is_some();
+    // When a UI sink is attached, stream output by default so the suggestion pane can render
+    // live progress during normal `cargo run` usage.
+    let mut stream_reasoning = stream_sink.is_some() || stream_reasoning_output_enabled();
     let include_reasoning = include_reasoning_output();
     let mut stream_fallback_logged = false;
 

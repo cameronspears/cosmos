@@ -26,7 +26,7 @@ use cosmos_core::suggest::{Suggestion, SuggestionEngine};
 use helpers::lowercase_first;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tree::{build_file_tree, build_grouped_tree};
 
 pub fn provider_keys_shortcut_display() -> &'static str {
@@ -52,7 +52,10 @@ pub(crate) const ASK_STARTER_QUESTIONS: [&str; 3] = [
 ];
 const SUGGESTION_STREAM_LINE_CAP: usize = 120;
 const STREAM_REASONING_SEGMENT_MAX_CHARS: usize = 120;
-const STREAM_REASONING_VISIBLE_SEGMENTS_PER_WORKER: usize = 5;
+const STREAM_REASONING_VISIBLE_SEGMENTS_PER_WORKER: usize = 1;
+const STREAM_REASONING_PARTIAL_SEGMENT_MIN_CHARS: usize = 72;
+const STREAM_REASONING_REDRAW_BUCKET_CHARS: usize = 140;
+const STREAM_REASONING_REDRAW_MIN_INTERVAL_MS: u64 = 900;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  APP STATE
@@ -82,6 +85,7 @@ struct SuggestionWorkerTaskState {
     worker: String,
     reasoning: Option<String>,
     tools: Vec<String>,
+    tool_history: Vec<String>,
     report_back_called: bool,
     notice: Option<String>,
 }
@@ -132,6 +136,7 @@ pub struct App {
     pub session_tokens: u32,          // Total tokens used this session
     pub active_model: Option<String>, // Current/last model used
     pub suggestion_stream_lines: Vec<String>,
+    suggestion_stream_last_redraw_at: Option<Instant>,
 
     // Cached data for display
     pub file_tree: Vec<FlatTreeEntry>,
@@ -234,6 +239,7 @@ impl App {
             session_tokens: 0,
             active_model: None,
             suggestion_stream_lines: Vec::new(),
+            suggestion_stream_last_redraw_at: None,
             file_tree,
             filtered_tree_indices,
             flat_search_entries,
@@ -364,6 +370,7 @@ impl App {
 
     pub fn clear_suggestion_stream(&mut self) {
         self.suggestion_stream_lines.clear();
+        self.suggestion_stream_last_redraw_at = None;
         self.needs_redraw = true;
     }
 
@@ -373,7 +380,7 @@ impl App {
         }
         self.suggestion_stream_lines.push(line);
         self.enforce_suggestion_stream_line_cap();
-        self.needs_redraw = true;
+        self.mark_suggestion_stream_redraw();
     }
 
     pub fn push_suggestion_stream_event(
@@ -398,8 +405,15 @@ impl App {
                     .find(|line| line.starts_with(&prefix))
                 {
                     if !chunk.is_empty() {
+                        let prev_len = existing.chars().count();
                         existing.push_str(chunk);
-                        self.needs_redraw = true;
+                        let new_len = existing.chars().count();
+                        let boundary = chunk_has_reasoning_boundary(chunk);
+                        if should_redraw_reasoning_append(prev_len, new_len, chunk)
+                            && (boundary || self.can_suggestion_stream_redraw())
+                        {
+                            self.mark_suggestion_stream_redraw();
+                        }
                     }
                     return;
                 }
@@ -412,14 +426,16 @@ impl App {
                 line.push_str(chunk);
                 self.suggestion_stream_lines.push(line);
                 self.enforce_suggestion_stream_line_cap();
-                self.needs_redraw = true;
+                if chunk_has_reasoning_boundary(chunk) || self.can_suggestion_stream_redraw() {
+                    self.mark_suggestion_stream_redraw();
+                }
             }
             cosmos_engine::llm::AgenticStreamKind::Tool => {
                 let trimmed = chunk.trim();
                 if trimmed.is_empty() {
                     return;
                 }
-                self.upsert_suggestion_stream_line(&prefix, trimmed);
+                self.merge_tool_stream_line(&prefix, trimmed);
             }
             cosmos_engine::llm::AgenticStreamKind::Notice => {
                 let trimmed = chunk.trim();
@@ -427,12 +443,12 @@ impl App {
                 if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("reasoning-stream") {
                     return;
                 }
-                self.upsert_suggestion_stream_line(&prefix, trimmed);
+                self.upsert_suggestion_stream_line(&prefix, trimmed, true);
             }
         }
     }
 
-    fn upsert_suggestion_stream_line(&mut self, prefix: &str, value: &str) {
+    fn upsert_suggestion_stream_line(&mut self, prefix: &str, value: &str, force_redraw: bool) {
         if let Some(existing) = self
             .suggestion_stream_lines
             .iter_mut()
@@ -443,7 +459,9 @@ impl App {
             updated.push_str(value);
             if *existing != updated {
                 *existing = updated;
-                self.needs_redraw = true;
+                if force_redraw || self.can_suggestion_stream_redraw() {
+                    self.mark_suggestion_stream_redraw();
+                }
             }
             return;
         }
@@ -452,6 +470,42 @@ impl App {
         line.push_str(value);
         self.suggestion_stream_lines.push(line);
         self.enforce_suggestion_stream_line_cap();
+        if force_redraw || self.can_suggestion_stream_redraw() {
+            self.mark_suggestion_stream_redraw();
+        }
+    }
+
+    fn merge_tool_stream_line(&mut self, prefix: &str, value: &str) {
+        let mut merged = Vec::new();
+        if let Some(existing) = self
+            .suggestion_stream_lines
+            .iter()
+            .rev()
+            .find(|line| line.starts_with(prefix))
+            .and_then(|line| parse_stream_tagged_line(line))
+            .map(|(_, _, text)| parse_tool_names(text))
+        {
+            merged.extend(existing);
+        }
+        merged.extend(parse_tool_names(value));
+        if merged.len() > 4 {
+            let overflow = merged.len().saturating_sub(4);
+            merged.drain(..overflow);
+        }
+        let merged_text = merged.join(", ");
+        self.upsert_suggestion_stream_line(prefix, &merged_text, false);
+    }
+
+    fn can_suggestion_stream_redraw(&self) -> bool {
+        self.suggestion_stream_last_redraw_at
+            .map(|last| {
+                last.elapsed() >= Duration::from_millis(STREAM_REASONING_REDRAW_MIN_INTERVAL_MS)
+            })
+            .unwrap_or(true)
+    }
+
+    fn mark_suggestion_stream_redraw(&mut self) {
+        self.suggestion_stream_last_redraw_at = Some(Instant::now());
         self.needs_redraw = true;
     }
 
@@ -476,7 +530,27 @@ impl App {
             .collect::<Vec<_>>();
 
         if reasoning_entries.is_empty() {
-            return self.suggestion_stream_lines.clone();
+            return self
+                .suggestion_stream_lines
+                .iter()
+                .rev()
+                .filter_map(|line| parse_stream_tagged_line(line))
+                .take(2)
+                .map(|(worker, kind, text)| {
+                    format!(
+                        "{} {}",
+                        format_stream_worker_label(worker),
+                        match kind {
+                            "tool" => format!("used {}", text),
+                            "notice" => text.to_string(),
+                            _ => text.to_string(),
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
         }
 
         let mut formatted = Vec::new();
@@ -485,22 +559,6 @@ impl App {
             if idx + 1 < reasoning_entries.len() {
                 formatted.push(String::new());
             }
-        }
-
-        let hidden_updates = self
-            .suggestion_stream_lines
-            .len()
-            .saturating_sub(reasoning_entries.len());
-        if hidden_updates > 0 {
-            let noun = if hidden_updates == 1 {
-                "update"
-            } else {
-                "updates"
-            };
-            formatted.push(format!(
-                "[stream|notice] {} non-reasoning {} hidden",
-                hidden_updates, noun
-            ));
         }
         formatted
     }
@@ -534,6 +592,13 @@ impl App {
                             state.report_back_called = true;
                             continue;
                         }
+                        if state.tool_history.last() != Some(&tool) {
+                            state.tool_history.push(tool.clone());
+                            if state.tool_history.len() > 4 {
+                                let overflow = state.tool_history.len().saturating_sub(4);
+                                state.tool_history.drain(..overflow);
+                            }
+                        }
                         if !state.tools.iter().any(|existing| existing == &tool) {
                             state.tools.push(tool);
                         }
@@ -552,7 +617,8 @@ impl App {
             return self.suggestion_stream_lines_for_display();
         }
 
-        let mut lines = vec!["• Updated Plan".to_string()];
+        let mut lines = vec!["• Live Agent Activity".to_string()];
+        lines.push(format!("  {}", summarize_worker_overview(&workers)));
         for (idx, worker) in workers.iter().enumerate() {
             let branch = if idx + 1 == workers.len() {
                 "└"
@@ -565,46 +631,24 @@ impl App {
                 format_stream_worker_label(&worker.worker)
             ));
 
-            let planning_complete = worker.report_back_called || !worker.tools.is_empty();
-            let inspect_complete = worker.report_back_called;
+            let thought = latest_worker_thought(worker.reasoning.as_deref());
+            lines.push(format!("  now: {}", truncate_display_text(&thought, 92)));
 
-            if let Some(reasoning) = worker.reasoning.as_deref() {
-                let normalized = normalize_reasoning_stream_text(reasoning);
-                let segment = split_reasoning_segments(&normalized)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| "Outline investigation scope".to_string());
-                let marker = if planning_complete { "☑" } else { "☐" };
+            if let Some(recent_tools) = summarize_recent_tool_activity(&worker.tool_history) {
                 lines.push(format!(
-                    "  {} {}",
-                    marker,
-                    truncate_display_text(&segment, 92)
+                    "  recent: {}",
+                    truncate_display_text(&recent_tools, 92)
                 ));
-            } else {
-                let marker = if planning_complete { "☑" } else { "☐" };
-                lines.push(format!("  {} Outline investigation scope", marker));
             }
 
-            let inspect_summary = if worker.tools.is_empty() {
-                "Inspect code with search/read tools".to_string()
-            } else {
-                summarize_tool_activity(&worker.tools)
-            };
-            let inspect_marker = if inspect_complete { "☑" } else { "☐" };
-            lines.push(format!("  {} {}", inspect_marker, inspect_summary));
-
-            let report_back_status = if worker.report_back_called {
-                "☑"
-            } else {
-                "☐"
-            };
-            lines.push(format!(
-                "  {} Submit findings via report_back",
-                report_back_status
-            ));
+            let status = format!("status: {}", worker_status_label(worker));
+            lines.push(format!("  {}", status));
 
             if let Some(notice) = worker.notice.as_deref() {
-                lines.push(format!("  · {}", truncate_display_text(notice, 92)));
+                lines.push(format!(
+                    "  note: {}",
+                    truncate_display_text(&humanize_reasoning_segment(notice), 92)
+                ));
             }
         }
         lines
@@ -2023,31 +2067,100 @@ fn format_stream_worker_label(raw: &str) -> String {
     }
 }
 
-fn summarize_tool_activity(tools: &[String]) -> String {
+fn summarize_recent_tool_activity(history: &[String]) -> Option<String> {
+    if history.is_empty() {
+        return None;
+    }
+
     let mut labels: Vec<&str> = Vec::new();
-    for tool in tools {
+    for tool in history {
         let label = match tool.as_str() {
             "view_file" | "head" | "read_range" => "read files",
-            "view_directory" | "tree" => "map directories",
-            "search" | "grep_search" => "search patterns",
-            "shell" | "bash" => "run shell checks",
-            _ => "inspect context",
+            "view_directory" | "tree" => "mapped files",
+            "search" | "grep_search" => "searched code",
+            "shell" | "bash" => "ran checks",
+            _ => "inspected context",
         };
-        if !labels.contains(&label) {
+        if labels.last().copied() != Some(label) {
             labels.push(label);
         }
     }
 
     if labels.is_empty() {
-        return "Inspect code with search/read tools".to_string();
+        return None;
+    }
+    Some(labels.join(" -> "))
+}
+
+fn worker_status_label(worker: &SuggestionWorkerTaskState) -> &'static str {
+    if worker.report_back_called {
+        "report submitted"
+    } else if !worker.tool_history.is_empty() {
+        "investigating"
+    } else if worker.reasoning.is_some() {
+        "planning"
+    } else {
+        "warming up"
+    }
+}
+
+fn summarize_worker_overview(workers: &[SuggestionWorkerTaskState]) -> String {
+    let mut warming_up = 0usize;
+    let mut planning = 0usize;
+    let mut investigating = 0usize;
+    let mut submitted = 0usize;
+
+    for worker in workers {
+        match worker_status_label(worker) {
+            "report submitted" => submitted += 1,
+            "investigating" => investigating += 1,
+            "planning" => planning += 1,
+            _ => warming_up += 1,
+        }
     }
 
-    let summary = if labels.len() > 2 {
-        format!("{}, {}...", labels[0], labels[1])
+    let mut parts = Vec::new();
+    if investigating > 0 {
+        parts.push(format!("{} investigating", investigating));
+    }
+    if planning > 0 {
+        parts.push(format!("{} planning", planning));
+    }
+    if submitted > 0 {
+        parts.push(format!("{} submitted", submitted));
+    }
+    if warming_up > 0 || parts.is_empty() {
+        parts.push(format!("{} warming up", warming_up));
+    }
+
+    let noun = if workers.len() == 1 {
+        "worker"
     } else {
-        labels.join(", ")
+        "workers"
     };
-    format!("Inspect code with {}", summary)
+    format!("summary: {} {} ({})", workers.len(), noun, parts.join(", "))
+}
+
+fn latest_worker_thought(reasoning: Option<&str>) -> String {
+    let Some(reasoning) = reasoning else {
+        return "Waiting for first thought.".to_string();
+    };
+
+    let normalized = normalize_reasoning_stream_text(reasoning);
+    if normalized.is_empty() {
+        return "Waiting for first thought.".to_string();
+    }
+
+    let segment = split_reasoning_segments(&normalized)
+        .into_iter()
+        .last()
+        .unwrap_or(normalized);
+    let humanized = humanize_reasoning_segment(&segment);
+    if humanized.is_empty() {
+        "Analyzing code and gathering evidence.".to_string()
+    } else {
+        humanized
+    }
 }
 
 fn truncate_display_text(text: &str, max_chars: usize) -> String {
@@ -2062,6 +2175,21 @@ fn truncate_display_text(text: &str, max_chars: usize) -> String {
     let mut truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
     truncated.push('…');
     truncated
+}
+
+fn chunk_has_reasoning_boundary(chunk: &str) -> bool {
+    chunk
+        .chars()
+        .any(|ch| matches!(ch, '.' | '!' | '?' | ';' | ':' | '\n'))
+}
+
+fn should_redraw_reasoning_append(previous_len: usize, new_len: usize, chunk: &str) -> bool {
+    if chunk_has_reasoning_boundary(chunk) {
+        return true;
+    }
+    let prev_bucket = previous_len / STREAM_REASONING_REDRAW_BUCKET_CHARS;
+    let new_bucket = new_len / STREAM_REASONING_REDRAW_BUCKET_CHARS;
+    new_bucket > prev_bucket
 }
 
 fn normalize_reasoning_stream_text(text: &str) -> String {
@@ -2123,11 +2251,44 @@ fn split_reasoning_segments(text: &str) -> Vec<String> {
         }
     }
 
-    if !current.trim().is_empty() {
-        segments.push(current.trim().to_string());
+    let tail = current.trim();
+    if !tail.is_empty() && tail.chars().count() >= STREAM_REASONING_PARTIAL_SEGMENT_MIN_CHARS {
+        segments.push(tail.to_string());
     }
 
     segments
+}
+
+fn humanize_reasoning_segment(text: &str) -> String {
+    let mut cleaned = text.trim().trim_matches('"').trim_matches('\'').to_string();
+    let lower = cleaned.to_ascii_lowercase();
+    for prefix in [
+        "we need to ",
+        "need to ",
+        "let's ",
+        "lets ",
+        "we should ",
+        "i need to ",
+    ] {
+        if lower.starts_with(prefix) && cleaned.len() > prefix.len() {
+            cleaned = cleaned[prefix.len()..].trim_start().to_string();
+            break;
+        }
+    }
+
+    if cleaned.is_empty() {
+        return String::new();
+    }
+
+    let mut chars = cleaned.chars();
+    if let Some(first) = chars.next() {
+        cleaned = format!("{}{}", first.to_uppercase(), chars.as_str());
+    }
+
+    if !matches!(cleaned.chars().last(), Some('.' | '!' | '?')) {
+        cleaned.push('.');
+    }
+    cleaned
 }
 
 fn format_reasoning_stream_block(worker: &str, text: &str) -> Vec<String> {
@@ -2137,26 +2298,29 @@ fn format_reasoning_stream_block(worker: &str, text: &str) -> Vec<String> {
     }
 
     let segments = split_reasoning_segments(&normalized);
-    if segments.is_empty() {
-        return Vec::new();
-    }
-
-    let hidden = segments
-        .len()
-        .saturating_sub(STREAM_REASONING_VISIBLE_SEGMENTS_PER_WORKER);
-    let visible_segments = if hidden > 0 {
-        segments[hidden..].to_vec()
+    let visible_segments = if segments.is_empty() {
+        vec!["Analyzing code and gathering evidence.".to_string()]
     } else {
-        segments
+        let hidden = segments
+            .len()
+            .saturating_sub(STREAM_REASONING_VISIBLE_SEGMENTS_PER_WORKER);
+        if hidden > 0 {
+            segments[hidden..].to_vec()
+        } else {
+            segments
+        }
     };
 
-    let mut lines = Vec::with_capacity(visible_segments.len() + 2);
-    lines.push(format!("[{}|reasoning]", worker));
-    if hidden > 0 {
-        lines.push(format!("  … {} earlier thoughts hidden", hidden));
-    }
+    let mut lines = Vec::with_capacity(visible_segments.len() + 1);
+    lines.push(format!("{} thinking:", format_stream_worker_label(worker)));
     for segment in visible_segments {
-        lines.push(format!("  • {}", segment));
+        let humanized = humanize_reasoning_segment(&segment);
+        if !humanized.is_empty() {
+            lines.push(format!(
+                "  • {}",
+                truncate_display_text(&humanized, STREAM_REASONING_SEGMENT_MAX_CHARS)
+            ));
+        }
     }
     lines
 }
@@ -2299,7 +2463,7 @@ mod tests {
     }
 
     #[test]
-    fn suggestion_stream_tool_events_replace_per_worker() {
+    fn suggestion_stream_tool_events_keep_recent_per_worker() {
         let mut app = make_test_app();
 
         app.push_suggestion_stream_event(
@@ -2321,7 +2485,7 @@ mod tests {
         assert_eq!(app.suggestion_stream_lines.len(), 2);
         assert_eq!(
             app.suggestion_stream_lines[0],
-            "[bug_hunter#1|tool] read_range"
+            "[bug_hunter#1|tool] search, read_range"
         );
         assert_eq!(
             app.suggestion_stream_lines[1],
@@ -2367,10 +2531,9 @@ mod tests {
         );
 
         let visible = app.suggestion_stream_lines_for_display();
-        assert_eq!(visible.len(), 3);
-        assert_eq!(visible[0], "[bug_hunter#1|reasoning]");
-        assert_eq!(visible[1], "  • thinking");
-        assert_eq!(visible[2], "[stream|notice] 1 non-reasoning update hidden");
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0], "Bug Hunter #1 thinking:");
+        assert_eq!(visible[1], "  • Analyzing code and gathering evidence.");
     }
 
     #[test]
@@ -2384,12 +2547,26 @@ mod tests {
         );
 
         let visible = app.suggestion_stream_lines_for_display();
-        assert_eq!(visible[0], "[security_reviewer#1|reasoning]");
+        assert_eq!(visible[0], "Security Reviewer #1 thinking:");
         let bullet_count = visible
             .iter()
             .filter(|line| line.starts_with("  • "))
             .count();
-        assert!(bullet_count >= 2);
+        assert_eq!(bullet_count, 1);
+    }
+
+    #[test]
+    fn humanize_reasoning_segment_strips_filler_prefixes() {
+        let text = humanize_reasoning_segment("We need to inspect quick_checks for shell usage");
+        assert_eq!(text, "Inspect quick_checks for shell usage.");
+    }
+
+    #[test]
+    fn should_redraw_reasoning_append_throttles_small_chunks() {
+        assert!(!should_redraw_reasoning_append(0, 8, "analysis"));
+        assert!(!should_redraw_reasoning_append(35, 37, "ok"));
+        assert!(should_redraw_reasoning_append(139, 141, "ok"));
+        assert!(should_redraw_reasoning_append(3, 7, "done."));
     }
 
     #[test]
@@ -2419,11 +2596,16 @@ mod tests {
         );
 
         let visible = app.suggestion_task_lines_for_display();
-        assert!(visible.iter().any(|line| line == "• Updated Plan"));
-        assert!(visible.iter().any(|line| line.contains("Bug Hunter #1")));
+        assert!(visible.iter().any(|line| line == "• Live Agent Activity"));
         assert!(visible
             .iter()
-            .any(|line| line.contains("☑ Submit findings via report_back")));
+            .any(|line| line.contains("summary: 1 worker")));
+        assert!(visible.iter().any(|line| line.contains("Bug Hunter #1")));
+        assert!(visible.iter().any(|line| line.contains("now:")));
+        assert!(visible.iter().any(|line| line.contains("recent:")));
+        assert!(visible
+            .iter()
+            .any(|line| line.contains("status: report submitted")));
     }
 
     #[test]
@@ -2439,10 +2621,13 @@ mod tests {
         let visible = app.suggestion_task_lines_for_display();
         assert!(visible
             .iter()
+            .any(|line| line.contains("summary: 1 worker")));
+        assert!(visible
+            .iter()
             .any(|line| line.contains("Security Reviewer #1")));
         assert!(visible
             .iter()
-            .any(|line| line.contains("☐ Submit findings via report_back")));
+            .any(|line| line.contains("status: investigating")));
     }
 
     #[test]
@@ -2463,10 +2648,11 @@ mod tests {
         let visible = app.suggestion_task_lines_for_display();
         assert!(visible
             .iter()
-            .any(|line| line.contains("☐ Inspect code with")));
+            .any(|line| line.contains("summary: 1 worker")));
+        assert!(visible.iter().any(|line| line.contains("now:")));
         assert!(visible
             .iter()
-            .any(|line| line.contains("☐ Submit findings via report_back")));
+            .any(|line| line.contains("status: investigating")));
     }
 
     #[test]

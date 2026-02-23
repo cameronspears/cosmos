@@ -26,6 +26,165 @@ fn ensure_sentence_punctuation(mut text: String) -> String {
     text
 }
 
+fn lowercase_first_ascii(text: &str) -> String {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    format!(
+        "{}{}",
+        first.to_ascii_lowercase(),
+        chars.collect::<String>()
+    )
+}
+
+fn strip_summary_lead_in(summary: &str) -> String {
+    let lead_re = Regex::new(r"(?i)^(fix|bug|issue|risk|warning)\s*[:\-]\s*")
+        .expect("summary lead-in regex should compile");
+    let mut text = lead_re
+        .replace(summary.trim(), "")
+        .to_string()
+        .trim()
+        .to_string();
+
+    let weak_prefixes = [
+        "potential ",
+        "possible ",
+        "maybe ",
+        "might ",
+        "could ",
+        "likely ",
+        "probably ",
+    ];
+    let lower = text.to_ascii_lowercase();
+    for prefix in weak_prefixes {
+        if lower.starts_with(prefix) {
+            text = text[prefix.len()..].trim().to_string();
+            break;
+        }
+    }
+
+    collapse_whitespace(&text)
+}
+
+fn normalize_outcome_clause(outcome: &str) -> String {
+    let core = collapse_whitespace(
+        outcome
+            .trim()
+            .trim_end_matches(['.', '!', '?'])
+            .trim_matches(',')
+            .trim(),
+    );
+    if core.is_empty() {
+        return String::new();
+    }
+
+    let lower = core.to_ascii_lowercase();
+    if lower.starts_with("the action ")
+        || lower.starts_with("the app ")
+        || lower.starts_with("it ")
+        || lower.starts_with("this ")
+        || lower.starts_with("someone ")
+        || lower.starts_with("users ")
+        || lower.starts_with("user ")
+    {
+        return core;
+    }
+
+    if lower.starts_with("can ")
+        || lower.starts_with("may ")
+        || lower.starts_with("might ")
+        || lower.starts_with("will ")
+    {
+        return format!("the action {}", lower);
+    }
+
+    let noun_like_outcomes = [
+        "panic",
+        "crash",
+        "hang",
+        "timeout",
+        "time out",
+        "failure",
+        "fail",
+        "fails",
+        "error",
+        "errors",
+        "delete",
+        "deletion",
+        "overwrite",
+        "overwrites",
+        "leak",
+        "expose",
+        "bypass",
+        "stuck",
+        "drop",
+        "skip",
+        "duplicate",
+        "corrupt",
+        "lose",
+    ];
+    if noun_like_outcomes
+        .iter()
+        .any(|marker| lower.starts_with(marker))
+    {
+        return format!("the action can {}", lowercase_first_ascii(&core));
+    }
+
+    lowercase_first_ascii(&core)
+}
+
+fn rewrite_if_clause_to_when(summary: &str) -> Option<String> {
+    let lower = summary.to_ascii_lowercase();
+    let idx = lower.find(" if ")?;
+    let outcome = summary[..idx].trim().trim_matches(',');
+    let condition = summary[idx + 4..].trim().trim_end_matches(['.', '!', '?']);
+    if outcome.is_empty() || condition.is_empty() {
+        return None;
+    }
+
+    let outcome_clause = normalize_outcome_clause(outcome);
+    if outcome_clause.is_empty() {
+        return None;
+    }
+
+    Some(ensure_sentence_punctuation(format!(
+        "When {}, {}",
+        collapse_whitespace(condition),
+        outcome_clause
+    )))
+}
+
+fn impact_clause_for_class(impact_class: Option<&str>) -> Option<&'static str> {
+    match impact_class {
+        Some("correctness") => Some("which can give people incorrect results"),
+        Some("reliability") => Some("which can block normal use"),
+        Some("security") => Some("which can expose data or allow unsafe access"),
+        Some("data_integrity") => Some("which can leave saved data in an inconsistent state"),
+        _ => None,
+    }
+}
+
+fn add_impact_clause(summary: &str, impact_class: Option<&str>) -> String {
+    let core = collapse_whitespace(summary)
+        .trim_end_matches(['.', '!', '?'])
+        .trim()
+        .to_string();
+    if core.is_empty() {
+        return String::new();
+    }
+
+    let Some(clause) = impact_clause_for_class(impact_class) else {
+        return ensure_sentence_punctuation(core);
+    };
+    let lower = core.to_ascii_lowercase();
+    if lower.contains("which can") || lower.contains(clause) || core.len() > 180 {
+        return ensure_sentence_punctuation(core);
+    }
+
+    ensure_sentence_punctuation(format!("{core}, {clause}"))
+}
+
 fn is_fragment_sentence(summary: &str) -> bool {
     let normalized = summary
         .trim()
@@ -59,7 +218,20 @@ pub(super) fn scrub_user_summary(summary: &str) -> String {
     let evidence_re = Regex::new(r"(?i)\bevidence(?:\s*id)?\s*[:=]?\s*\d+\b")
         .expect("evidence regex should compile");
     let cleaned = evidence_re.replace_all(&without_ticks, "");
-    collapse_whitespace(cleaned.trim())
+
+    let path_like_re = Regex::new(
+        r"(?i)\b[a-z0-9_./-]+\.(rs|ts|tsx|js|jsx|py|go|java|rb|php|c|cpp|h|hpp|cs|swift|kt|toml|json|ya?ml)\b",
+    )
+    .expect("path-like regex should compile");
+    let source_path_re = Regex::new(r"(?i)\b(?:src|crates|apps|packages)/[a-z0-9_./-]+\b")
+        .expect("source path regex should compile");
+    let symbol_ref_re =
+        Regex::new(r"(?i)\b[a-z_][a-z0-9_]*::[a-z0-9_:]+\b").expect("symbol regex should compile");
+
+    let no_paths = path_like_re.replace_all(cleaned.as_ref(), "this flow");
+    let no_source_paths = source_path_re.replace_all(no_paths.as_ref(), "this flow");
+    let no_symbols = symbol_ref_re.replace_all(no_source_paths.as_ref(), "this code path");
+    collapse_whitespace(no_symbols.trim())
 }
 
 fn candidate_sentence(text: &str) -> Option<String> {
@@ -80,6 +252,44 @@ pub(super) fn normalize_grounded_summary(
     candidate_sentence(summary)
         .or_else(|| candidate_sentence(detail))
         .unwrap_or_default()
+}
+
+pub(super) fn normalize_ethos_summary(
+    summary: &str,
+    detail: &str,
+    impact_class: Option<&str>,
+) -> String {
+    let base = candidate_sentence(summary)
+        .or_else(|| candidate_sentence(detail))
+        .unwrap_or_default();
+    if base.is_empty() {
+        return String::new();
+    }
+
+    let stripped = strip_summary_lead_in(&base);
+    if stripped.is_empty() {
+        return String::new();
+    }
+
+    let lower = stripped.to_ascii_lowercase();
+    let shaped = if lower.starts_with("when ") {
+        ensure_sentence_punctuation(stripped)
+    } else if let Some(rewritten) = rewrite_if_clause_to_when(&stripped) {
+        rewritten
+    } else {
+        let outcome = normalize_outcome_clause(&stripped);
+        if outcome.is_empty() {
+            return String::new();
+        }
+        ensure_sentence_punctuation(format!("When someone uses this flow, {}", outcome))
+    };
+
+    let final_summary = add_impact_clause(&shaped, impact_class);
+    if is_valid_grounded_summary(&final_summary) {
+        final_summary
+    } else {
+        normalize_grounded_summary(summary, detail, 1)
+    }
 }
 
 pub(super) fn normalize_grounded_detail(detail: &str, summary: &str) -> String {
