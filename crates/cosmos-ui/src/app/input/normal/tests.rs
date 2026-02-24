@@ -182,6 +182,109 @@ fn k_opens_api_key_overlay() {
 }
 
 #[test]
+fn m_opens_suggestion_focus_overlay() {
+    let mut root = std::env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    root.push(format!("cosmos_mode_overlay_test_{}", nanos));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let index = CodebaseIndex {
+        root: root.clone(),
+        files: HashMap::new(),
+        index_errors: Vec::new(),
+        git_head: Some("deadbeef".to_string()),
+    };
+    let suggestions = SuggestionEngine::new(index.clone());
+    let context = WorkContext {
+        branch: "main".to_string(),
+        uncommitted_files: Vec::new(),
+        staged_files: Vec::new(),
+        untracked_files: Vec::new(),
+        inferred_focus: None,
+        modified_count: 0,
+        repo_root: root.clone(),
+    };
+    let mut app = App::new(index.clone(), suggestions, context);
+    app.workflow_step = WorkflowStep::Suggestions;
+
+    let (tx, _rx) = mpsc::channel();
+    let ctx = crate::app::RuntimeContext {
+        index: &index,
+        repo_path: &root,
+        tx: &tx,
+    };
+
+    handle_normal_mode(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        &ctx,
+    )
+    .unwrap();
+
+    match app.overlay {
+        Overlay::SuggestionFocus { selected } => {
+            assert_eq!(selected, cosmos_engine::llm::SuggestionReviewFocus::BugHunt);
+        }
+        _ => panic!("expected suggestion focus overlay"),
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn r_requires_mode_selection_before_running() {
+    let mut root = std::env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    root.push(format!("cosmos_mode_before_run_test_{}", nanos));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let index = CodebaseIndex {
+        root: root.clone(),
+        files: HashMap::new(),
+        index_errors: Vec::new(),
+        git_head: Some("deadbeef".to_string()),
+    };
+    let suggestions = SuggestionEngine::new(index.clone());
+    let context = WorkContext {
+        branch: "main".to_string(),
+        uncommitted_files: Vec::new(),
+        staged_files: Vec::new(),
+        untracked_files: Vec::new(),
+        inferred_focus: None,
+        modified_count: 0,
+        repo_root: root.clone(),
+    };
+    let mut app = App::new(index.clone(), suggestions, context);
+    app.workflow_step = WorkflowStep::Suggestions;
+    app.suggestion_focus_selected_once = false;
+
+    let (tx, _rx) = mpsc::channel();
+    let ctx = crate::app::RuntimeContext {
+        index: &index,
+        repo_path: &root,
+        tx: &tx,
+    };
+
+    handle_normal_mode(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        &ctx,
+    )
+    .unwrap();
+
+    assert!(matches!(app.overlay, Overlay::SuggestionFocus { .. }));
+    assert_eq!(app.loading, LoadingState::None);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn enter_opens_apply_plan_without_mutation() {
     std::env::set_var("CEREBRAS_API_KEY", "test-key");
     let mut root = std::env::temp_dir();

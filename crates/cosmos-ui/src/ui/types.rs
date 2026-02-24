@@ -110,6 +110,10 @@ pub enum Overlay {
         error: Option<String>,
         save_armed: bool,
     },
+    /// Suggestions review focus selector (bug hunt vs security review)
+    SuggestionFocus {
+        selected: cosmos_engine::llm::SuggestionReviewFocus,
+    },
     /// Apply plan preview - explicit scope/intent gate before mutation
     ApplyPlan {
         suggestion_id: uuid::Uuid,

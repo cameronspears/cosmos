@@ -417,14 +417,14 @@ fn build_lean_review_prompt(
         let diff = compute_compact_diff(old_content, new_content);
 
         if old_content.is_empty() {
-            // New file - show first 50 lines
-            let preview: String = new_content.lines().take(50).collect::<Vec<_>>().join("\n");
+            // New file - show first 30 lines
+            let preview: String = new_content.lines().take(30).collect::<Vec<_>>().join("\n");
             sections.push(format!(
                 "\n=== {} (NEW FILE, {} lines) ===\n{}{}",
                 file_name,
                 new_content.lines().count(),
                 add_line_numbers(&preview),
-                if new_content.lines().count() > 50 {
+                if new_content.lines().count() > 30 {
                     "\n... (use head/tail to see more)"
                 } else {
                     ""
@@ -447,13 +447,8 @@ fn build_lean_review_prompt(
     // Instructions
     sections.push(String::from(
         "\n\nREVIEW TASK:
-Find bugs, logic errors, and issues in the diff above.
-
-SURGICAL COMMANDS (if needed):
-• grep -n 'pattern' <file> → find related code
-• sed -n '50,80p' <file> → read around specific line
-
-MINIMIZE tool calls - most issues should be visible in the diff.
+Find concrete bugs/security/regressions in the diff above.
+Use tools only when diff context is insufficient.
 Return findings as JSON.",
     ));
 
@@ -510,7 +505,7 @@ fn compute_compact_diff(old: &str, new: &str) -> String {
             let lines: Vec<&str> = diff_output
                 .lines()
                 .skip_while(|l| !l.starts_with("@@"))
-                .take(150) // Limit to 150 lines
+                .take(120) // Limit prompt size
                 .collect();
 
             if !lines.is_empty() {
@@ -700,9 +695,9 @@ pub async fn fix_review_findings_with_model(
 
     let memory_section = format_repo_memory_section(repo_memory.as_deref(), "Repo conventions");
 
-    const MAX_REVIEW_FIX_EXCERPT_CHARS: usize = 18_000;
-    const MAX_REVIEW_FIX_EXPANDED_EXCERPT_CHARS: usize = 32_000;
-    const MAX_REVIEW_FIX_FULL_CONTEXT_CHARS: usize = 60_000;
+    const MAX_REVIEW_FIX_EXCERPT_CHARS: usize = 12_000;
+    const MAX_REVIEW_FIX_EXPANDED_EXCERPT_CHARS: usize = 20_000;
+    const MAX_REVIEW_FIX_FULL_CONTEXT_CHARS: usize = 36_000;
     let anchor_line = findings
         .iter()
         .filter_map(|f| f.line)
@@ -725,7 +720,7 @@ pub async fn fix_review_findings_with_model(
         let snippet = truncate_content_around_line(code, anchor_line, excerpt_chars)
             .unwrap_or_else(|| truncate_content(code, excerpt_chars));
         format!(
-            "\n\n{} (EXCERPT):\nNOTE: This file is large ({} chars). Showing an excerpt around line {} to keep the review-fix loop fast.\nIMPORTANT: Only an excerpt is shown. Your `old_string` values must still be unique in the full file, so include enough surrounding context.\n```\n{}\n```",
+            "\n\n{} (EXCERPT):\nNOTE: File is large ({} chars). Showing excerpt around line {}.\nOnly an excerpt is shown; keep `old_string` unique in the full file.\n```\n{}\n```",
             label, len, anchor_line, snippet
         )
     };
@@ -738,7 +733,7 @@ pub async fn fix_review_findings_with_model(
         allocate_attempt_time_slices_ms(timeout_ms, MAX_REVIEW_FIX_EDIT_REPAIR_ATTEMPTS.max(1));
     // Keep review-fix calls bounded; allowing full model max output here can consume most of the
     // attempt budget in a single loop and reduce multi-attempt recovery.
-    const MAX_REVIEW_FIX_RESPONSE_TOKENS_SPEED: u32 = 3072;
+    const MAX_REVIEW_FIX_RESPONSE_TOKENS_SPEED: u32 = 2304;
 
     for attempt in 1..=MAX_REVIEW_FIX_EDIT_REPAIR_ATTEMPTS.max(1) {
         let attempt_timeout_ms = slices
@@ -762,7 +757,7 @@ pub async fn fix_review_findings_with_model(
         let finding_context_section =
             review_fix_finding_context_section(content, findings).unwrap_or_default();
         let user_base = format!(
-            "File: {}\n\nFINDINGS TO FIX:\n{}\n\n{}\n{}{}\n{}\n\nFix all listed findings. Think carefully about edge cases.",
+            "File: {}\n\nFINDINGS TO FIX:\n{}\n\n{}\n{}{}\n{}\n\nFix all listed findings with minimal, safe edits.",
             path.display(),
             findings_text.join("\n\n"),
             finding_context_section,

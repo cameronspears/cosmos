@@ -135,6 +135,8 @@ pub struct App {
     pub session_cost: f64,            // Total USD spent this session
     pub session_tokens: u32,          // Total tokens used this session
     pub active_model: Option<String>, // Current/last model used
+    pub suggestion_review_focus: cosmos_engine::llm::SuggestionReviewFocus,
+    pub suggestion_focus_selected_once: bool,
     pub suggestion_stream_lines: Vec<String>,
     suggestion_stream_last_redraw_at: Option<Instant>,
 
@@ -238,6 +240,8 @@ impl App {
             session_cost: 0.0,
             session_tokens: 0,
             active_model: None,
+            suggestion_review_focus: cosmos_engine::llm::SuggestionReviewFocus::BugHunt,
+            suggestion_focus_selected_once: false,
             suggestion_stream_lines: Vec::new(),
             suggestion_stream_last_redraw_at: None,
             file_tree,
@@ -909,6 +913,30 @@ impl App {
         self.apply_filter();
     }
 
+    pub fn toggle_suggestion_review_focus(&mut self) {
+        self.suggestion_review_focus = self.suggestion_review_focus.toggle();
+        self.needs_redraw = true;
+    }
+
+    pub fn set_suggestion_review_focus(
+        &mut self,
+        focus: cosmos_engine::llm::SuggestionReviewFocus,
+    ) {
+        if self.suggestion_review_focus != focus {
+            self.suggestion_review_focus = focus;
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn confirm_suggestion_review_focus(
+        &mut self,
+        focus: cosmos_engine::llm::SuggestionReviewFocus,
+    ) {
+        self.set_suggestion_review_focus(focus);
+        self.suggestion_focus_selected_once = true;
+        self.needs_redraw = true;
+    }
+
     /// Toggle expand/collapse of the selected group in grouped view
     pub fn toggle_group_expand(&mut self) {
         if self.view_mode != ViewMode::Grouped {
@@ -1115,6 +1143,42 @@ impl App {
             error,
             save_armed: false,
         };
+    }
+
+    pub fn open_suggestion_focus_overlay(&mut self) {
+        self.overlay = Overlay::SuggestionFocus {
+            selected: self.suggestion_review_focus,
+        };
+    }
+
+    pub fn suggestion_focus_set_selected(
+        &mut self,
+        selected: cosmos_engine::llm::SuggestionReviewFocus,
+    ) {
+        if let Overlay::SuggestionFocus {
+            selected: overlay_selected,
+        } = &mut self.overlay
+        {
+            *overlay_selected = selected;
+        }
+    }
+
+    pub fn suggestion_focus_navigate(&mut self, delta: isize) {
+        if let Overlay::SuggestionFocus {
+            selected: overlay_selected,
+        } = &mut self.overlay
+        {
+            if delta != 0 {
+                *overlay_selected = overlay_selected.toggle();
+            }
+        }
+    }
+
+    pub fn suggestion_focus_selected(&self) -> Option<cosmos_engine::llm::SuggestionReviewFocus> {
+        match self.overlay {
+            Overlay::SuggestionFocus { selected } => Some(selected),
+            _ => None,
+        }
     }
 
     /// Open pre-apply plan overlay with explicit scope and intent.
@@ -2720,6 +2784,44 @@ mod tests {
         assert_eq!(app.active_panel, ActivePanel::Ask);
         assert_eq!(app.input_mode, InputMode::Question);
         assert!(app.question_input.is_empty());
+    }
+
+    #[test]
+    fn suggestion_review_focus_defaults_to_bug_hunt() {
+        let app = make_test_app();
+        assert_eq!(
+            app.suggestion_review_focus,
+            cosmos_engine::llm::SuggestionReviewFocus::BugHunt
+        );
+        assert!(!app.suggestion_focus_selected_once);
+    }
+
+    #[test]
+    fn toggle_suggestion_review_focus_switches_modes() {
+        let mut app = make_test_app();
+        app.toggle_suggestion_review_focus();
+        assert_eq!(
+            app.suggestion_review_focus,
+            cosmos_engine::llm::SuggestionReviewFocus::SecurityReview
+        );
+        app.toggle_suggestion_review_focus();
+        assert_eq!(
+            app.suggestion_review_focus,
+            cosmos_engine::llm::SuggestionReviewFocus::BugHunt
+        );
+    }
+
+    #[test]
+    fn confirm_suggestion_review_focus_marks_selection() {
+        let mut app = make_test_app();
+        app.confirm_suggestion_review_focus(
+            cosmos_engine::llm::SuggestionReviewFocus::SecurityReview,
+        );
+        assert_eq!(
+            app.suggestion_review_focus,
+            cosmos_engine::llm::SuggestionReviewFocus::SecurityReview
+        );
+        assert!(app.suggestion_focus_selected_once);
     }
 
     #[test]

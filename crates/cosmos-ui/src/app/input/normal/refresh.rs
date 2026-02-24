@@ -16,6 +16,10 @@ pub(super) fn prompt_api_key_setup(app: &mut App, reason: &str) {
 }
 
 pub(super) fn refresh_suggestions_now(app: &mut App, ctx: &RuntimeContext, reason: &str) {
+    if !app.suggestion_focus_selected_once {
+        app.open_suggestion_focus_overlay();
+        return;
+    }
     if !crate::app::background::request_suggestions_refresh(
         app,
         ctx.tx.clone(),

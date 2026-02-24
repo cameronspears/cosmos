@@ -182,6 +182,23 @@ fn render_suggestions_content<'a>(
 
     // Top padding for breathing room
     lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("    Focus: ", Style::default().fg(Theme::GREY_500)),
+        Span::styled(
+            app.suggestion_review_focus.label(),
+            Style::default().fg(Theme::GREY_300),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            if app.suggestion_focus_selected_once {
+                "(press m to change)"
+            } else {
+                "(press m to choose before first run)"
+            },
+            Style::default().fg(Theme::GREY_500),
+        ),
+    ]));
+    lines.push(Line::from(""));
 
     // Check for loading states relevant to suggestions panel
     let loading_message: Option<String> = match app.loading {
@@ -300,11 +317,11 @@ fn render_suggestions_content<'a>(
                     ),
                     Span::styled(" │", border_style),
                 ]));
-            } else {
+            } else if !app.suggestion_focus_selected_once {
                 lines.push(Line::from(vec![
                     Span::styled("    │ ", border_style),
                     Span::styled(
-                        center_row("No issues found"),
+                        center_row("Choose review mode first"),
                         Style::default().fg(Theme::GREY_300),
                     ),
                     Span::styled(" │", border_style),
@@ -312,7 +329,24 @@ fn render_suggestions_content<'a>(
                 lines.push(Line::from(vec![
                     Span::styled("    │ ", border_style),
                     Span::styled(
-                        center_row("Nothing to suggest"),
+                        center_row("Press m, then press r to run"),
+                        Style::default().fg(Theme::GREY_500),
+                    ),
+                    Span::styled(" │", border_style),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("    │ ", border_style),
+                    Span::styled(
+                        center_row("Ready to run suggestions"),
+                        Style::default().fg(Theme::GREY_300),
+                    ),
+                    Span::styled(" │", border_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("    │ ", border_style),
+                    Span::styled(
+                        center_row("Press r to start"),
                         Style::default().fg(Theme::GREY_500),
                     ),
                     Span::styled(" │", border_style),

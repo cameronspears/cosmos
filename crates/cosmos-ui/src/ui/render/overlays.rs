@@ -1,6 +1,7 @@
 use crate::ui::helpers::{centered_rect, wrap_text};
 use crate::ui::theme::Theme;
 use crate::ui::{StartupAction, StartupMode};
+use cosmos_engine::llm::SuggestionReviewFocus;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -188,6 +189,7 @@ pub(super) fn render_help(frame: &mut Frame, scroll: usize) {
     help_text.push(section_spacer());
     help_text.push(key_row("↵", "Open apply plan / confirm"));
     help_text.push(key_row("r", "Refresh suggestions"));
+    help_text.push(key_row("m", "Choose bug/security mode"));
     help_text.push(key_row("k", "Open Cerebras setup guide"));
     help_text.push(key_row("?", "Show help"));
     help_text.push(key_row("q", "Quit"));
@@ -518,6 +520,125 @@ pub(super) fn render_api_key_overlay(
             .style(Style::default().bg(Theme::GREY_900)),
     );
     frame.render_widget(block, area);
+}
+
+pub(super) fn render_suggestion_focus_overlay(frame: &mut Frame, selected: SuggestionReviewFocus) {
+    let area = centered_rect(44, 38, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Suggestion Mode ")
+        .title_style(Style::default().fg(Theme::GREY_100))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::GREY_400))
+        .style(Style::default().bg(Theme::GREY_900));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(2)])
+        .split(inner);
+    let body_area = chunks[0];
+    let footer_area = chunks[1];
+
+    let render_option =
+        |focus: SuggestionReviewFocus, title: &str, description: &str, is_selected: bool| {
+            let indicator = if is_selected { "▸" } else { " " };
+            let option_style = if is_selected {
+                Style::default()
+                    .fg(Theme::WHITE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Theme::GREY_300)
+            };
+            let mut lines = vec![Line::from(vec![
+                Span::styled(
+                    format!("  {} ", indicator),
+                    Style::default().fg(if is_selected {
+                        Theme::GREEN
+                    } else {
+                        Theme::GREY_600
+                    }),
+                ),
+                Span::styled(title.to_string(), option_style),
+                Span::styled(
+                    if focus == selected {
+                        "  (selected)"
+                    } else {
+                        ""
+                    }
+                    .to_string(),
+                    Style::default().fg(Theme::GREY_500),
+                ),
+            ])];
+            for wrapped in wrap_text(description, body_area.width.saturating_sub(6) as usize) {
+                lines.push(Line::from(vec![
+                    Span::styled("      ", Style::default()),
+                    Span::styled(wrapped, Style::default().fg(Theme::GREY_500)),
+                ]));
+            }
+            lines
+        };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Pick exactly one review focus:",
+            Style::default().fg(Theme::GREY_300),
+        )]),
+        Line::from(""),
+    ];
+
+    lines.extend(render_option(
+        SuggestionReviewFocus::BugHunt,
+        "Bug Hunt",
+        "Prioritize runtime defects, logic errors, and reliability bugs.",
+        selected == SuggestionReviewFocus::BugHunt,
+    ));
+    lines.push(Line::from(""));
+    lines.extend(render_option(
+        SuggestionReviewFocus::SecurityReview,
+        "Security Review",
+        "Prioritize vulnerabilities, auth/authz flaws, and unsafe data handling.",
+        selected == SuggestionReviewFocus::SecurityReview,
+    ));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(Theme::GREY_900))
+            .wrap(Wrap { trim: false }),
+        body_area,
+    );
+
+    let footer = Paragraph::new(vec![Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            "↑↓",
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+        ),
+        Span::styled(" choose  ", Style::default().fg(Theme::GREY_400)),
+        Span::styled(
+            "b/s",
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+        ),
+        Span::styled(" quick pick  ", Style::default().fg(Theme::GREY_400)),
+        Span::styled(
+            "Enter",
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREEN),
+        ),
+        Span::styled(" apply  ", Style::default().fg(Theme::GREY_400)),
+        Span::styled(
+            "then press r to run  ",
+            Style::default().fg(Theme::GREY_500),
+        ),
+        Span::styled(
+            "Esc",
+            Style::default().fg(Theme::GREY_900).bg(Theme::GREY_400),
+        ),
+        Span::styled(" cancel", Style::default().fg(Theme::GREY_400)),
+    ])])
+    .style(Style::default().bg(Theme::GREY_900));
+    frame.render_widget(footer, footer_area);
 }
 
 pub(super) fn render_apply_plan(

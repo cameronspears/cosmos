@@ -84,7 +84,7 @@ pub async fn classify_grouping_candidates(
 
     let user = format!(
         "Classify these files into architectural layers.\n\nFILES:\n{}",
-        serde_json::to_string_pretty(&file_contexts)?
+        serde_json::to_string(&file_contexts)?
     );
 
     let StructuredResponse {

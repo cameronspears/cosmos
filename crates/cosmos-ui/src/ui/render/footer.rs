@@ -406,6 +406,7 @@ fn get_hint_buttons(app: &App) -> Vec<FooterButton> {
         && app.workflow_step == WorkflowStep::Suggestions
     {
         hints.push(hint_button("r", "refresh"));
+        hints.push(hint_button("m", "mode"));
     }
 
     if !cosmos_engine::llm::is_available() {

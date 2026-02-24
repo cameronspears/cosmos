@@ -48,13 +48,11 @@ fn maybe_prompt_api_key_overlay(app: &mut App, message: &str) -> bool {
 }
 
 fn suggestions_budget_ms() -> u64 {
-    const DEFAULT_MS: u64 = 180_000;
-    const MIN_MS: u64 = 120_000;
-    const MAX_MS: u64 = 600_000;
+    // 0 means unbounded.
+    const DEFAULT_MS: u64 = 0;
     std::env::var("COSMOS_SUGGEST_MAX_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|value| value.clamp(MIN_MS, MAX_MS))
         .unwrap_or(DEFAULT_MS)
 }
 
@@ -64,6 +62,7 @@ fn spawn_suggestions_generation(
     index: cosmos_core::index::CodebaseIndex,
     context: cosmos_core::context::WorkContext,
     repo_memory_context: String,
+    review_focus: cosmos_engine::llm::SuggestionReviewFocus,
 ) {
     let tx_suggestions = tx.clone();
     spawn_background(tx.clone(), "suggestions_generation", async move {
@@ -79,10 +78,10 @@ fn spawn_suggestions_generation(
             },
         );
         let mut gate_config = cosmos_engine::llm::SuggestionQualityGateConfig::default();
-        // Keep UI output practical but avoid stopping at a single suggestion too early.
-        gate_config.min_final_count = gate_config.min_final_count.max(2);
-        gate_config.max_attempts = gate_config.max_attempts.max(3);
-        gate_config.max_suggest_ms = gate_config.max_suggest_ms.max(suggestions_budget_ms());
+        gate_config.min_final_count = 1;
+        gate_config.max_attempts = 1;
+        gate_config.max_suggest_ms = suggestions_budget_ms();
+        gate_config.review_focus = review_focus;
         let run = cosmos_engine::llm::run_fast_grounded_with_gate_with_progress_and_stream(
             &repo_root,
             &index,
@@ -153,7 +152,14 @@ pub fn request_suggestions_refresh(
     let index = app.index.clone();
     let context = app.context.clone();
     let repo_memory_context = app.repo_memory.to_prompt_context(12, 900);
-    spawn_suggestions_generation(tx, repo_root, index, context, repo_memory_context);
+    spawn_suggestions_generation(
+        tx,
+        repo_root,
+        index,
+        context,
+        repo_memory_context,
+        app.suggestion_review_focus,
+    );
     true
 }
 

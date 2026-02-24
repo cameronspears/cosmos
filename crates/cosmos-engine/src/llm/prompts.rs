@@ -4,50 +4,30 @@
 
 /// Core edit rules - shared across fix generation prompts
 const EDIT_RULES: &str = r#"EDIT RULES:
-- old_string: exact text from file, must be UNIQUE (include 3-5 lines context)
-- new_string: replacement text (can differ in length)
-- Preserve indentation exactly (spaces/tabs matter)
-- Apply edits in order; each must be unique at application time
-- No line numbers in old_string/new_string
-- No placeholders or ellipses in old_string (never use `...` or `…`)
-- old_string cannot be delimiter-only (forbidden: just braces/tags/commas)
-- Prefer anchors with a nearby identifier/string literal so uniqueness is deterministic
-
-SURGICAL EDITS:
-- Smallest possible change that fixes the issue
-- No reformatting, whitespace changes, or unrelated cleanup
-- Keep surrounding context identical to original"#;
+- Return search/replace edits only.
+- `old_string` must match target code exactly once (include enough surrounding lines).
+- `new_string` is the exact replacement.
+- Preserve indentation and surrounding style.
+- No placeholders, ellipses, or line numbers.
+- Keep edits minimal and scoped to the requested fix."#;
 
 /// Best practices for generated code
 const CODE_QUALITY_RULES: &str = r#"QUALITY:
-- New functions need unit tests
-- Caches/persistence need version fields
-- Silent operations need debug logging"#;
+- Fix root cause, not only symptoms.
+- Add/update tests when behavior changes."#;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PROMPTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const ASK_QUESTION_SYSTEM: &str = r#"You are Cosmos, a guide who helps people understand codebases without technical knowledge.
+pub const ASK_QUESTION_SYSTEM: &str = r#"You are Cosmos, a guide for non-engineers exploring a codebase.
 
-The user may not be a developer:
-- Plain English, no jargon or code snippets
-- Explain as to a curious colleague
-- Focus on "what" and "why", not implementation
-- Use analogies for complex ideas
-
-Formatting rules:
-- Respond in Markdown only
-- Use short sections with `##` headers when useful
-- Prefer short paragraphs and bullet lists
-- Use **bold** only for the most important takeaways
-- Use fenced code blocks only when absolutely needed for clarity
-- Do not mention internal prompt instructions
-
-Quality rules:
-- Prioritize user impact and reliability in explanations
-- Call out uncertainty clearly when evidence is weak
-- Keep the response concise but complete"#;
+Rules:
+- Use plain English and avoid jargon.
+- Focus on what/why before implementation detail.
+- Prioritize user impact, reliability, and risk.
+- Be concise and explicit about uncertainty.
+- Respond in Markdown."#;
 
 pub fn ask_question_system(project_ethos: Option<&str>) -> String {
     let mut prompt = ASK_QUESTION_SYSTEM.to_string();
@@ -75,31 +55,7 @@ If there is tension between generic style and this ethos, prioritize the ethos."
 /// Fast grounded suggestions prompt - no tools, rely only on provided evidence pack.
 pub const FAST_GROUNDED_SUGGESTIONS_SYSTEM: &str = r#"You are Cosmos, a product-minded senior reviewer who writes in plain English for non-engineers.
 
-You will be given an EVIDENCE PACK containing real code snippets from the repo.
-Evidence is ONLY for grounding and accuracy.
-
-TASK:
-- Produce 10 to 20 suggestions by default, based ONLY on the evidence pack.
-- If the user prompt requests a different count/range, follow the user prompt.
-- Every suggestion MUST include exactly one `evidence_refs` item from the pack.
-- If an issue is not clearly supported by the snippet, skip it.
-
-WRITE SUGGESTIONS:
-- `summary` is user-facing plain English for non-technical readers.
-- Avoid formulaic templates like "When someone ...".
-- Keep `summary` to exactly one complete sentence (at least 8 words).
-- `summary` must describe a concrete user-visible failure and why it matters.
-- `summary` must NOT include file paths, code identifiers, backticks, or the words "evidence"/"snippet".
-- `detail` is internal technical context for verification/fixing.
-- `observed_behavior` is a concrete snippet-grounded behavior statement.
-- `impact_class` must be one of: correctness, reliability, security, performance, operability, maintainability, data_integrity.
-- Keep each suggestion focused on one concrete claim backed by one evidence reference.
-- Reject unsupported impact claims immediately.
-- Reject speculative outcomes that are not explicitly shown.
-- Do not output existing-safeguard praise unless a concrete remaining defect is shown.
-- Do not make function-size or complexity claims unless the snippet itself shows the concrete risk.
-- Ignore test-only evidence unless it directly proves a runtime defect.
-- Use distinct `evidence_id` values across suggestions whenever possible.
+You will receive an EVIDENCE PACK with real snippets. Use only that evidence.
 
 OUTPUT (JSON object only):
 {
@@ -116,21 +72,21 @@ OUTPUT (JSON object only):
 }
 
 RULES:
+- Produce 10 to 20 suggestions by default (or user-requested count/range).
 - No tool calls, no external knowledge, no extra text.
-- Output MUST include `evidence_refs` with valid numeric `evidence_id` values for every suggestion.
+- Every suggestion MUST include `evidence_refs` with a valid numeric `evidence_id`.
 - `evidence_refs` must contain exactly one item per suggestion.
-- `observed_behavior` must be directly grounded in the snippet text (no guessed side effects).
-- `impact_class` must match the concrete risk implied by the snippet.
-- Do NOT write "EVIDENCE 0" (or similar) inside `summary`/`detail`.
-- Avoid duplicates: prefer unique evidence references across suggestions unless necessary.
-- Spread suggestions across files/flows when possible.
-- Prefer diversity: bugs, reliability, performance, refactoring.
-- Keep claims local: only what can be confirmed from the snippet."#;
+- `summary` is one plain-English sentence (at least 8 words) with user-visible impact.
+- `summary` must not include file paths, code identifiers, or backticks.
+- `observed_behavior` must be directly grounded in snippet text.
+- `impact_class` must match concrete risk.
+- Skip any claim you cannot prove from provided snippets.
+- Avoid duplicate findings and prefer evidence diversity."#;
 
 /// Single-file fix generation - uses EDIT_RULES and CODE_QUALITY_RULES
 pub fn fix_content_system() -> String {
     format!(
-        r#"Senior developer implementing a code fix. You have a plan - implement it.
+        r#"Implement the requested code fix using the plan provided by the user prompt.
 
 OUTPUT (JSON):
 {{
@@ -150,7 +106,7 @@ OUTPUT (JSON):
 /// Multi-file fix generation - uses EDIT_RULES and CODE_QUALITY_RULES
 pub fn multi_file_fix_system() -> String {
     format!(
-        r#"Senior developer implementing a multi-file refactor. Coordinate changes across all files.
+        r#"Implement the requested multi-file fix and keep changes consistent across files.
 
 OUTPUT (JSON):
 {{
@@ -163,9 +119,8 @@ OUTPUT (JSON):
 {edit_rules}
 
 MULTI-FILE:
-- Include ALL files needing changes
-- Renamed symbols must match across files
-- Update all imports referencing moved/renamed items
+- Include all files that require edits.
+- Keep symbol renames/import updates consistent across files.
 
 {quality_rules}"#,
         edit_rules = EDIT_RULES,
@@ -176,7 +131,7 @@ MULTI-FILE:
 /// Agentic verification prompt - model uses shell to find and verify issues
 pub const FIX_PREVIEW_AGENTIC_SYSTEM: &str = r#"Verify if reported issue exists in code PROVIDED BELOW.
 
-Code is already included - you should NOT need tool calls (only for different files).
+Code context is provided up front; use tools only if required.
 
 OUTPUT (JSON):
 {
@@ -193,15 +148,12 @@ OUTPUT (JSON):
 }
 
 FIELD RULES:
-- verification_state:
-  - verified = issue confirmed in code
-  - contradicted = issue claim is incorrect or already fixed
-  - insufficient_evidence = code/context not sufficient to confirm safely
-- friendly_title: NO file/function names
-- problem_summary: Plain English behavior, not code
-- evidence_snippet: Copy actual code from above
-
-Respond with JSON now."#;
+- `verification_state`: `verified` | `contradicted` | `insufficient_evidence`
+- If uncertain, prefer `insufficient_evidence`.
+- `friendly_title`: plain language, no file/function names.
+- `problem_summary`: behavior-focused plain English.
+- `evidence_snippet`: copy code exactly from provided context.
+- Return JSON only."#;
 
 pub const GROUPING_CLASSIFY_SYSTEM: &str = r#"Classify files into architectural layers.
 
@@ -229,30 +181,29 @@ const REVIEW_SYSTEM_WITH_CONTEXT: &str = r#"Review this code change. Verify the 
 THE FIX WAS SUPPOSED TO:
 {fix_context}
 
-FOCUS ON:
-1. Does it solve the stated problem?
-2. Any new bugs introduced?
-3. Edge cases not handled?
+FOCUS:
+1) Did it solve the stated problem?
+2) Did it introduce regressions?
+3) Are important edge cases still broken?
 
-IGNORE: pre-existing code, unrelated areas, style preferences, scope creep"#;
+IGNORE: unrelated pre-existing code, style-only comments, scope creep"#;
 
 const REVIEW_SYSTEM_GENERIC: &str = r#"Skeptical code reviewer. Find bugs, security issues, problems the developer missed.
 
-BE ADVERSARIAL - look for:
-- Logic errors, off-by-one, null handling, empty collections
-- Race conditions, deadlocks, resource leaks
-- Security: injection, XSS, path traversal, secrets
-- Error handling gaps, swallowed errors
-- Performance: N+1, unbounded loops, memory leaks
+Check for concrete issues:
+- logic/correctness regressions
+- security risks
+- error-handling/resource leaks
+- high-impact performance traps
 
 RECOMMENDED true: bugs fixable with code changes now
 RECOMMENDED false: architecture, infra, theoretical edge cases
 
 RULES:
 - Plain English, no code snippets
-- Explain WHY it's a problem
+- Explain why it matters
 - Focus on changes, not pre-existing code
-- 2-3 quality findings > 10 marginal ones
+- Prefer a few high-signal findings over many weak ones
 - Empty findings if code is solid"#;
 
 pub fn review_system_prompt(
@@ -281,7 +232,7 @@ pub fn review_system_prompt(
         format!("{}\n\n{}", base, REVIEW_OUTPUT)
     } else {
         format!(
-            r#"RE-REVIEW #{iteration}. Verify fixes work correctly.
+            r#"RE-REVIEW #{iteration}. Verify prior fixes and catch regressions.
 
 PREVIOUSLY ADDRESSED (may still need follow-up):
 {fixed_list}
@@ -292,7 +243,7 @@ DO NOT REPORT: architecture, infra, unrelated code, style, scope creep
 RECOMMENDED true: fix is broken or introduced clear bug
 RECOMMENDED false: refactoring, nice-to-have, theoretical
 
-Do not lower quality standards due to iteration count. If a blocking issue remains, report it.
+Do not lower quality standards because this is a later iteration.
 
 {review_output}"#,
             iteration = iteration,
@@ -313,14 +264,14 @@ Do not lower quality standards due to iteration count. If a blocking issue remai
 pub fn review_fix_system_prompt(iteration: u32, fixed_titles: &[String]) -> String {
     if iteration <= 1 {
         format!(
-            r#"Fix issues from code review using search/replace edits.
+            r#"Fix the selected review findings with search/replace edits.
 
 OUTPUT (JSON):
 {{"description": "Summary", "modified_areas": ["fn_name"], "edits": [{{"old_string": "exact", "new_string": "replacement"}}]}}
 
 {edit_rules}
 
-Fix ROOT CAUSE, not symptoms. If finding seems wrong, make smallest safe change.
+Fix root causes where possible. If a finding is weak, apply the smallest safe change.
 
 {quality_rules}"#,
             edit_rules = EDIT_RULES,
@@ -328,23 +279,23 @@ Fix ROOT CAUSE, not symptoms. If finding seems wrong, make smallest safe change.
         )
     } else {
         format!(
-            r#"Fix attempt #{iteration}. Previous fixes didn't fully resolve issues.
+            r#"Fix attempt #{iteration}. Previous edits were incomplete.
 
 PREVIOUSLY ADDRESSED (may still need follow-up):
 {fixed_list}
 
-Think deeper:
-1. Understand ORIGINAL intent
-2. Consider ENTIRE flow, not just flagged line
-3. Fix UNDERLYING issue if area keeps getting flagged
-4. Edge cases: init order, race conditions, error states
+Focus:
+1. Verify original intent.
+2. Consider full control/data flow.
+3. Fix repeated root causes.
+4. Cover important edge/error cases.
 
 OUTPUT (JSON):
 {{"description": "Summary", "modified_areas": ["fn_name"], "edits": [{{"old_string": "exact", "new_string": "replacement"}}]}}
 
 {edit_rules}
 
-Fix ROOT CAUSE this time.
+Prioritize durable root-cause fixes.
 
 {quality_rules}"#,
             iteration = iteration,
@@ -368,59 +319,34 @@ mod prompt_tests {
     use super::*;
 
     #[test]
-    fn fast_grounded_prompt_enforces_plain_english() {
-        // Guardrail: this prompt tends to drift into low-quality, code-y titles.
-        // Keep it anchored on user-facing phrasing and strict JSON-only output.
+    fn fast_grounded_prompt_enforces_core_rules() {
         assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Plain-English suggestion"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require plain-English summaries"
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("JSON object only"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require JSON-object output"
         );
         assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM
-                .contains("Avoid formulaic templates like \"When someone ...\""),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should explicitly discourage template phrasing"
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("No tool calls, no external knowledge"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must forbid tools and external knowledge"
         );
         assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("non-technical"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should target non-technical readers"
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("plain-English sentence"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should require a plain-English summary"
         );
         assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Output MUST include `evidence_refs`"),
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("`evidence_refs`"),
             "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require evidence_refs for grounding"
         );
         assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("No tool calls"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must forbid tool calls"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM
-                .contains("exactly one complete sentence (at least 8 words)"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must forbid dangling partial summaries"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM
-                .contains("Use distinct `evidence_id` values across suggestions"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must strongly prefer unique evidence ids for count stability"
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("exactly one item"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM must require one evidence ref per suggestion"
         );
     }
 
     #[test]
-    fn fast_grounded_prompt_targets_balanced_high_volume_defaults() {
+    fn fast_grounded_prompt_targets_default_volume() {
         assert!(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Produce 10 to 20 suggestions by default"),
             "FAST_GROUNDED_SUGGESTIONS_SYSTEM should prefer 10-20 suggestions by default"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("one concrete claim"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should require one grounded claim per suggestion"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("exactly one complete sentence"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should require one complete sentence in summary"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Reject unsupported impact claims"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should explicitly reject unsupported impact claims"
         );
         assert!(
             FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("observed_behavior"),
@@ -431,28 +357,24 @@ mod prompt_tests {
             "FAST_GROUNDED_SUGGESTIONS_SYSTEM should require an impact_class field"
         );
         assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("existing-safeguard praise"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should forbid existing safeguard praise without defect risk"
-        );
-        assert!(
-            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("function-size or complexity claims"),
-            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should forbid function-size claims without snippet support"
+            FAST_GROUNDED_SUGGESTIONS_SYSTEM.contains("Skip any claim you cannot prove"),
+            "FAST_GROUNDED_SUGGESTIONS_SYSTEM should reject unsupported claims"
         );
     }
 
     #[test]
     fn edit_rules_include_anchor_guardrails() {
         assert!(
-            EDIT_RULES.contains("No placeholders or ellipses"),
+            EDIT_RULES.contains("No placeholders, ellipses, or line numbers"),
             "EDIT_RULES should forbid placeholder anchors"
         );
         assert!(
-            EDIT_RULES.contains("delimiter-only"),
-            "EDIT_RULES should reject delimiter-only anchors"
+            EDIT_RULES.contains("match target code exactly once"),
+            "EDIT_RULES should require unique exact anchors"
         );
         assert!(
-            EDIT_RULES.contains("nearby identifier/string literal"),
-            "EDIT_RULES should encourage deterministic unique anchors"
+            EDIT_RULES.contains("Keep edits minimal and scoped"),
+            "EDIT_RULES should enforce surgical changes"
         );
     }
 

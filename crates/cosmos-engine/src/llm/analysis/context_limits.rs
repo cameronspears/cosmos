@@ -11,23 +11,23 @@ impl AdaptiveLimits {
         // Scale limits based on codebase size.
         if file_count < 50 {
             Self {
-                file_list_limit: file_count.min(56),
-                symbol_limit: 170,
+                file_list_limit: file_count.min(32),
+                symbol_limit: 96,
             }
         } else if file_count < 200 {
             Self {
-                file_list_limit: 56,
-                symbol_limit: 120,
+                file_list_limit: 28,
+                symbol_limit: 72,
             }
         } else if file_count < 500 {
             Self {
-                file_list_limit: 48,
-                symbol_limit: 95,
+                file_list_limit: 24,
+                symbol_limit: 56,
             }
         } else {
             Self {
-                file_list_limit: 40,
-                symbol_limit: 75,
+                file_list_limit: 20,
+                symbol_limit: 44,
             }
         }
     }
@@ -39,8 +39,8 @@ impl AdaptiveLimits {
     ) -> Self {
         let mut limits = Self::for_codebase(file_count, total_loc);
         if is_complex_question(question) {
-            limits.file_list_limit = limits.file_list_limit.saturating_add(14).min(80);
-            limits.symbol_limit = limits.symbol_limit.saturating_add(45).min(220);
+            limits.file_list_limit = limits.file_list_limit.saturating_add(8).min(44);
+            limits.symbol_limit = limits.symbol_limit.saturating_add(24).min(140);
         }
         limits
     }
@@ -101,7 +101,7 @@ mod tests {
             "Deep architecture and security tradeoffs across the whole stack",
         );
 
-        assert!(limits.file_list_limit <= 80);
-        assert!(limits.symbol_limit <= 220);
+        assert!(limits.file_list_limit <= 44);
+        assert!(limits.symbol_limit <= 140);
     }
 }

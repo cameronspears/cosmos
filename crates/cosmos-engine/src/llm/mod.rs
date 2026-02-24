@@ -13,11 +13,11 @@ pub mod tools;
 
 pub use agentic::AgenticStreamKind;
 pub use analysis::{
-    analyze_codebase_dual_agent_reviewed, analyze_codebase_fast_grounded, ask_question,
+    analyze_codebase_fast_grounded, analyze_codebase_single_agent_reviewed, ask_question,
     run_fast_grounded_with_gate, run_fast_grounded_with_gate_with_progress,
     run_fast_grounded_with_gate_with_progress_and_stream, GatedSuggestionRunResult,
     SuggestionDiagnostics, SuggestionGateSnapshot, SuggestionQualityGateConfig,
-    SuggestionStreamSink,
+    SuggestionReviewFocus, SuggestionStreamSink,
 };
 pub use client::is_available;
 pub use fix::{

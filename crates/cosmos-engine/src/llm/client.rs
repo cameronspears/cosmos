@@ -250,18 +250,15 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    include_reasoning: Option<bool>,
+    disable_reasoning: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_format: Option<String>,
+    clear_thinking: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ReasoningRequestFields {
-    include_reasoning: Option<bool>,
-    reasoning_effort: Option<String>,
-    reasoning_format: Option<String>,
+    disable_reasoning: Option<bool>,
+    clear_thinking: Option<bool>,
 }
 
 /// Response format configuration for structured output parsing.
@@ -453,7 +450,8 @@ where
             Err(anyhow::Error::new(SpeedFailoverError {
                 diagnostics,
                 message: format!(
-                    "Cerebras call failed for gpt-oss-120b: {}",
+                    "Cerebras call failed for {}: {}",
+                    model_id_for_backend_impl(Model::Speed),
                     sanitize_api_response(&err_text)
                 ),
             }))
@@ -461,12 +459,15 @@ where
     }
 }
 
-fn reasoning_fields_for_model(model: Model, include_output: bool) -> ReasoningRequestFields {
+fn reasoning_fields_for_model(model: Model, enable_reasoning: bool) -> ReasoningRequestFields {
     let _ = model;
-    let _ = include_output;
-    // Cerebras chat completions currently rejects provider-specific reasoning fields such as
-    // `include_reasoning` and `reasoning_effort` (422 wrong_api_format). Keep them omitted.
-    ReasoningRequestFields::default()
+    ReasoningRequestFields {
+        // GLM reasoning is enabled by default on Cerebras; this explicit toggle keeps
+        // "no reasoning" paths deterministic and lower latency.
+        disable_reasoning: Some(!enable_reasoning),
+        // Preserve thinking across turns for coding/agentic workflows.
+        clear_thinking: Some(false),
+    }
 }
 
 /// Generic provider error envelope (can arrive with HTTP 200 from proxy layers).
@@ -634,7 +635,7 @@ pub(crate) async fn call_llm_with_usage(
     };
 
     let stream = false;
-    let reasoning = reasoning_fields_for_model(model, false);
+    let reasoning = reasoning_fields_for_model(model, true);
 
     let request = ChatRequest {
         model: model_id_for_backend(model),
@@ -652,9 +653,8 @@ pub(crate) async fn call_llm_with_usage(
         max_completion_tokens: model.max_tokens(),
         stream,
         response_format,
-        include_reasoning: reasoning.include_reasoning,
-        reasoning_effort: reasoning.reasoning_effort,
-        reasoning_format: reasoning.reasoning_format,
+        disable_reasoning: reasoning.disable_reasoning,
+        clear_thinking: reasoning.clear_thinking,
     };
 
     let text = send_with_retry(&client, &api_key, &request).await?;
@@ -705,7 +705,7 @@ pub struct StructuredResponse<T> {
     pub speed_failover: Option<SpeedFailoverDiagnostics>,
 }
 
-/// Diagnostics for Speed tier provider failover (gpt-oss-120b).
+/// Diagnostics for Speed tier provider failover.
 ///
 /// This is used by the apply harness for transparency: when something fails, we want
 /// to know which providers were tried, with which timeouts, and what each returned.
@@ -778,7 +778,7 @@ where
     });
 
     let stream = false;
-    let reasoning = reasoning_fields_for_model(model, false);
+    let reasoning = reasoning_fields_for_model(model, true);
 
     let request = ChatRequest {
         model: model_id_for_backend(model),
@@ -796,9 +796,8 @@ where
         max_completion_tokens: model.max_tokens(),
         stream,
         response_format,
-        include_reasoning: reasoning.include_reasoning,
-        reasoning_effort: reasoning.reasoning_effort,
-        reasoning_format: reasoning.reasoning_format,
+        disable_reasoning: reasoning.disable_reasoning,
+        clear_thinking: reasoning.clear_thinking,
     };
 
     let text = send_with_retry(&client, &api_key, &request).await?;
@@ -882,7 +881,7 @@ async fn call_llm_structured_limited_with_reasoning<T>(
     schema: serde_json::Value,
     max_tokens: u32,
     timeout_ms: u64,
-    include_reasoning: bool,
+    enable_reasoning: bool,
 ) -> anyhow::Result<StructuredResponse<T>>
 where
     T: serde::de::DeserializeOwned,
@@ -908,7 +907,7 @@ where
     });
 
     let stream = false;
-    let reasoning = reasoning_fields_for_model(model, include_reasoning);
+    let reasoning = reasoning_fields_for_model(model, enable_reasoning);
 
     let request = ChatRequest {
         model: model_id_for_backend(model),
@@ -926,9 +925,8 @@ where
         max_completion_tokens: max_tokens,
         stream,
         response_format,
-        include_reasoning: reasoning.include_reasoning,
-        reasoning_effort: reasoning.reasoning_effort,
-        reasoning_format: reasoning.reasoning_format,
+        disable_reasoning: reasoning.disable_reasoning,
+        clear_thinking: reasoning.clear_thinking,
     };
 
     let text = timeout(
@@ -1032,22 +1030,20 @@ mod tests {
     #[test]
     fn test_model_id_normalization_for_cerebras_backend_and_smart_model() {
         let cerebras_id = model_id_for_backend_impl(Model::Speed);
-        assert_eq!(cerebras_id, "gpt-oss-120b");
+        assert_eq!(cerebras_id, "zai-glm-4.7");
         let smart_id = model_id_for_backend_impl(Model::Smart);
-        assert_eq!(smart_id, "gpt-oss-120b");
+        assert_eq!(smart_id, "zai-glm-4.7");
     }
 
     #[test]
-    fn test_reasoning_fields_are_omitted_for_cerebras() {
+    fn test_reasoning_fields_map_to_glm_controls() {
         let speed = reasoning_fields_for_model(Model::Speed, false);
-        assert!(speed.include_reasoning.is_none());
-        assert!(speed.reasoning_effort.is_none());
-        assert!(speed.reasoning_format.is_none());
+        assert_eq!(speed.disable_reasoning, Some(true));
+        assert_eq!(speed.clear_thinking, Some(false));
 
         let smart = reasoning_fields_for_model(Model::Smart, true);
-        assert!(smart.include_reasoning.is_none());
-        assert!(smart.reasoning_effort.is_none());
-        assert!(smart.reasoning_format.is_none());
+        assert_eq!(smart.disable_reasoning, Some(false));
+        assert_eq!(smart.clear_thinking, Some(false));
     }
 
     #[test]

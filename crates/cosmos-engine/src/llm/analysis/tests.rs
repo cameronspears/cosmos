@@ -1,17 +1,13 @@
 use super::*;
 use chrono::Utc;
-use cosmos_adapters::cache::{Cache, SuggestionCoverageCache};
 use cosmos_core::context::WorkContext;
-use cosmos_core::index::{
-    CodebaseIndex, FileIndex, FileSummary, Language, Pattern, Symbol, SymbolKind, Visibility,
-};
+use cosmos_core::index::{CodebaseIndex, FileIndex, FileSummary, Language, Pattern, Symbol};
 use cosmos_core::suggest::{
     Priority, SuggestionKind, SuggestionSource, SuggestionValidationMetadata, VerificationState,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn test_suggestion(summary: &str) -> Suggestion {
@@ -149,42 +145,6 @@ fn empty_context(root: &Path) -> WorkContext {
     }
 }
 
-fn run_git(root: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .current_dir(root)
-        .args(args)
-        .status()
-        .expect("git command should start");
-    assert!(
-        status.success(),
-        "git command failed: git {}",
-        args.join(" ")
-    );
-}
-
-fn init_git_repo(root: &Path) {
-    run_git(root, &["init"]);
-    run_git(root, &["config", "user.name", "Cosmos Tests"]);
-    run_git(root, &["config", "user.email", "cosmos-tests@example.com"]);
-}
-
-fn commit_all(root: &Path, message: &str) {
-    run_git(root, &["add", "."]);
-    run_git(root, &["commit", "-m", message, "--quiet"]);
-}
-
-fn security_symbol(path: &Path, name: &str) -> Symbol {
-    Symbol {
-        name: name.to_string(),
-        kind: SymbolKind::Function,
-        file: path.to_path_buf(),
-        line: 1,
-        end_line: 2,
-        complexity: 1.0,
-        visibility: Visibility::Public,
-    }
-}
-
 #[test]
 fn rank_top_churn_files_falls_back_to_risk_scoring_when_history_unavailable() {
     let root = temp_root("churn_fallback");
@@ -230,270 +190,6 @@ fn shard_subagent_focus_files_balances_and_backfills_empty_shards() {
     assert_eq!(shards[1][0], PathBuf::from("src/b.rs"));
     assert_eq!(shards[2][0], PathBuf::from("src/c.rs"));
     assert_eq!(shards[3][0], PathBuf::from("src/a.rs"));
-}
-
-#[test]
-fn hybrid_candidate_pool_respects_40_30_20_10_mix_with_disjoint_inputs() {
-    let root = temp_root("hybrid_mix");
-    init_git_repo(&root);
-
-    let churn_paths = (0..12)
-        .map(|idx| format!("src/churn/file_{idx}.rs"))
-        .collect::<Vec<_>>();
-    let security_paths = (0..9)
-        .map(|idx| format!("src/security/auth_token_{idx}.rs"))
-        .collect::<Vec<_>>();
-    let complexity_paths = (0..6)
-        .map(|idx| format!("src/complex/hotspot_{idx}.rs"))
-        .collect::<Vec<_>>();
-    let dormant_paths = (0..3)
-        .map(|idx| format!("src/dormant/legacy_{idx}.rs"))
-        .collect::<Vec<_>>();
-    let filler_paths = (0..6)
-        .map(|idx| format!("src/filler/file_{idx}.rs"))
-        .collect::<Vec<_>>();
-
-    for rel in churn_paths
-        .iter()
-        .chain(security_paths.iter())
-        .chain(complexity_paths.iter())
-        .chain(dormant_paths.iter())
-        .chain(filler_paths.iter())
-    {
-        write_fixture_file(&root, rel, 40);
-    }
-    commit_all(&root, "initial");
-
-    for round in 0..4 {
-        for rel in &churn_paths {
-            let full = root.join(rel);
-            let mut existing = fs::read_to_string(&full).unwrap();
-            existing.push_str(&format!("// churn round {round}\n"));
-            fs::write(full, existing).unwrap();
-        }
-        commit_all(&root, &format!("churn-{round}"));
-    }
-
-    let mut files = HashMap::new();
-    for rel in &churn_paths {
-        let (path, index) = mk_file_index(rel, 120, 4.0, Vec::new(), Vec::new(), 0);
-        files.insert(path, index);
-    }
-    for rel in &security_paths {
-        let path_buf = PathBuf::from(rel);
-        let symbols = vec![security_symbol(&path_buf, "validate_auth_token")];
-        let (path, index) = mk_file_index(rel, 120, 6.0, Vec::new(), symbols, 0);
-        files.insert(path, index);
-    }
-    for rel in &complexity_paths {
-        let (path, index) = mk_file_index(rel, 200, 140.0, Vec::new(), Vec::new(), 0);
-        files.insert(path, index);
-    }
-    for rel in &dormant_paths {
-        let (path, index) = mk_file_index(rel, 60, 3.0, Vec::new(), Vec::new(), 0);
-        files.insert(path, index);
-    }
-    for rel in &filler_paths {
-        let (path, index) = mk_file_index(rel, 80, 1.0, Vec::new(), Vec::new(), 0);
-        files.insert(path, index);
-    }
-
-    let index = CodebaseIndex {
-        root: root.clone(),
-        files,
-        index_errors: Vec::new(),
-        git_head: None,
-    };
-    let context = empty_context(&root);
-
-    let mut coverage = SuggestionCoverageCache::new();
-    let previously_scanned = churn_paths
-        .iter()
-        .chain(security_paths.iter())
-        .chain(complexity_paths.iter())
-        .chain(filler_paths.iter())
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    coverage.record_scan(previously_scanned);
-    Cache::new(&root)
-        .save_suggestion_coverage_cache(&coverage)
-        .unwrap();
-
-    let pool = build_hybrid_candidate_pool(&root, &index, &context);
-    let expected_pool_size = HYBRID_CANDIDATE_POOL_SIZE.min(index.files.len());
-    assert_eq!(pool.len(), expected_pool_size);
-
-    let churn_count = pool
-        .iter()
-        .filter(|path| path.to_string_lossy().contains("src/churn/"))
-        .count();
-    let security_count = pool
-        .iter()
-        .filter(|path| path.to_string_lossy().contains("src/security/"))
-        .count();
-    let complexity_count = pool
-        .iter()
-        .filter(|path| path.to_string_lossy().contains("src/complex/"))
-        .count();
-    let dormant_count = pool
-        .iter()
-        .filter(|path| path.to_string_lossy().contains("src/dormant/"))
-        .count();
-
-    assert_eq!(churn_count, 12);
-    assert_eq!(security_count, 9);
-    assert_eq!(complexity_count, 6);
-    assert_eq!(dormant_count, 3);
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn hybrid_candidate_pool_dormant_rotation_persists_across_runs() {
-    let root = temp_root("dormant_rotation");
-    init_git_repo(&root);
-
-    let churn_paths = (0..12)
-        .map(|idx| format!("src/churn/file_{idx}.rs"))
-        .collect::<Vec<_>>();
-    let security_paths = (0..9)
-        .map(|idx| format!("src/security/auth_{idx}.rs"))
-        .collect::<Vec<_>>();
-    let complexity_paths = (0..6)
-        .map(|idx| format!("src/complex/hot_{idx}.rs"))
-        .collect::<Vec<_>>();
-    let dormant_paths = (0..12)
-        .map(|idx| format!("src/dormant/legacy_{idx}.rs"))
-        .collect::<Vec<_>>();
-    let filler_paths = (0..48)
-        .map(|idx| format!("src/filler/extra_{idx}.rs"))
-        .collect::<Vec<_>>();
-
-    for rel in churn_paths
-        .iter()
-        .chain(security_paths.iter())
-        .chain(complexity_paths.iter())
-        .chain(dormant_paths.iter())
-        .chain(filler_paths.iter())
-    {
-        write_fixture_file(&root, rel, 40);
-    }
-    commit_all(&root, "initial");
-
-    for round in 0..3 {
-        for rel in &churn_paths {
-            let full = root.join(rel);
-            let mut existing = fs::read_to_string(&full).unwrap();
-            existing.push_str(&format!("// churn {round}\n"));
-            fs::write(full, existing).unwrap();
-        }
-        commit_all(&root, &format!("churn-{round}"));
-    }
-
-    let mut files = HashMap::new();
-    for rel in &churn_paths {
-        let (path, index) = mk_file_index(rel, 120, 4.0, Vec::new(), Vec::new(), 0);
-        files.insert(path, index);
-    }
-    for rel in &security_paths {
-        let path_buf = PathBuf::from(rel);
-        let symbols = vec![security_symbol(&path_buf, "check_authz")];
-        let (path, index) = mk_file_index(rel, 120, 6.0, Vec::new(), symbols, 0);
-        files.insert(path, index);
-    }
-    for rel in &complexity_paths {
-        let (path, index) = mk_file_index(rel, 220, 130.0, Vec::new(), Vec::new(), 0);
-        files.insert(path, index);
-    }
-    for rel in &dormant_paths {
-        let (path, index) = mk_file_index(rel, 60, 3.0, Vec::new(), Vec::new(), 0);
-        files.insert(path, index);
-    }
-    for rel in &filler_paths {
-        let (path, index) = mk_file_index(rel, 40, 1.0, Vec::new(), Vec::new(), 0);
-        files.insert(path, index);
-    }
-
-    let index = CodebaseIndex {
-        root: root.clone(),
-        files,
-        index_errors: Vec::new(),
-        git_head: None,
-    };
-    let context = empty_context(&root);
-    let mut coverage = SuggestionCoverageCache::new();
-    let non_dormant = churn_paths
-        .iter()
-        .chain(security_paths.iter())
-        .chain(complexity_paths.iter())
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    coverage.record_scan(non_dormant);
-    Cache::new(&root)
-        .save_suggestion_coverage_cache(&coverage)
-        .unwrap();
-
-    let first = build_hybrid_candidate_pool(&root, &index, &context);
-    let first_dormant = first
-        .iter()
-        .filter(|path| path.to_string_lossy().contains("src/dormant/"))
-        .cloned()
-        .collect::<HashSet<_>>();
-    let expected_dormant =
-        (HYBRID_CANDIDATE_POOL_SIZE * HYBRID_DORMANT_PERCENT / 100).min(dormant_paths.len());
-    assert!(first_dormant.len() >= expected_dormant);
-
-    let second = build_hybrid_candidate_pool(&root, &index, &context);
-    let second_dormant = second
-        .iter()
-        .filter(|path| path.to_string_lossy().contains("src/dormant/"))
-        .cloned()
-        .collect::<HashSet<_>>();
-    assert!(second_dormant.len() >= expected_dormant);
-
-    let persisted = Cache::new(&root)
-        .load_suggestion_coverage_cache()
-        .expect("coverage cache should persist");
-    for path in first_dormant.iter().chain(second_dormant.iter()) {
-        assert!(
-            persisted.recently_scanned.contains_key(path),
-            "coverage cache should include {}",
-            path.display()
-        );
-    }
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn retryable_generation_error_matches_expected_provider_failures() {
-    assert!(is_retryable_generation_error(&anyhow::anyhow!(
-        "API returned empty response."
-    )));
-    assert!(is_retryable_generation_error(&anyhow::anyhow!(
-        "Timed out after 18000ms."
-    )));
-    assert!(is_retryable_generation_error(&anyhow::anyhow!(
-        "429 rate limited by upstream provider."
-    )));
-    assert!(is_retryable_generation_error(&anyhow::anyhow!(
-        "Agent did not call report_back within iteration/time budget."
-    )));
-    assert!(is_retryable_generation_error(&anyhow::anyhow!(
-        "Model returned text instead of calling report_back."
-    )));
-    assert!(is_retryable_generation_error(&anyhow::anyhow!(
-        "Invalid agent explanation JSON: expected value at line 1 column 1"
-    )));
-    assert!(is_retryable_generation_error(&anyhow::anyhow!(
-        "Invalid reviewer explanation JSON: expected value at line 1 column 1"
-    )));
-    assert!(is_retryable_generation_error(&anyhow::anyhow!(
-        "Invalid report_back payload: report_back.explanation must be valid JSON object"
-    )));
-    assert!(!is_retryable_generation_error(&anyhow::anyhow!(
-        "Failed to parse structured response."
-    )));
 }
 
 #[test]
@@ -543,9 +239,54 @@ fn default_gate_config_is_balanced_high_volume() {
     let config = SuggestionQualityGateConfig::default();
     assert_eq!(config.min_final_count, 1);
     assert_eq!(config.max_final_count, 12);
-    assert_eq!(config.max_suggest_cost_usd, 0.20);
-    assert_eq!(config.max_suggest_ms, 180_000);
-    assert_eq!(config.max_attempts, 4);
+    assert_eq!(config.max_suggest_cost_usd, 0.0);
+    assert_eq!(config.max_suggest_ms, 0);
+    assert_eq!(config.max_attempts, 1);
+    assert_eq!(config.review_focus, SuggestionReviewFocus::BugHunt);
+}
+
+#[test]
+fn suggestion_review_focus_round_trips() {
+    assert_eq!(
+        SuggestionReviewFocus::BugHunt.toggle(),
+        SuggestionReviewFocus::SecurityReview
+    );
+    assert_eq!(
+        SuggestionReviewFocus::SecurityReview.toggle(),
+        SuggestionReviewFocus::BugHunt
+    );
+    assert_eq!(SuggestionReviewFocus::BugHunt.as_str(), "bug_hunt");
+    assert_eq!(
+        SuggestionReviewFocus::SecurityReview.as_str(),
+        "security_review"
+    );
+}
+
+#[test]
+fn role_config_tracks_review_focus() {
+    let (bug_role, _) = role_config_for_focus(SuggestionReviewFocus::BugHunt);
+    let (security_role, _) = role_config_for_focus(SuggestionReviewFocus::SecurityReview);
+    assert_eq!(bug_role, "bug_hunter");
+    assert_eq!(security_role, "security_reviewer");
+}
+
+#[test]
+fn dual_agent_prompt_uses_autonomous_exploration_without_assigned_files() {
+    let prompt = build_review_agent_user_prompt("bug_hunter", None, None, None);
+    assert!(!prompt.contains("Assigned files"));
+    assert!(prompt.contains("Do not wait for assigned files"));
+    assert!(prompt.contains("Role: bug_hunter"));
+}
+
+#[test]
+fn dual_agent_prompt_keeps_role_specific_checklists() {
+    let bug_prompt = build_review_agent_user_prompt("bug_hunter", None, None, None);
+    assert!(bug_prompt.contains("Bug checklist"));
+    assert!(!bug_prompt.contains("Security checklist"));
+
+    let security_prompt = build_review_agent_user_prompt("security_reviewer", None, None, None);
+    assert!(security_prompt.contains("Security checklist"));
+    assert!(!security_prompt.contains("Bug checklist"));
 }
 
 #[test]
@@ -553,7 +294,7 @@ fn gate_default_mapping_matches_expected_ranges() {
     let gate = SuggestionQualityGateConfig::default();
     assert_eq!(gate.min_final_count, 1);
     assert_eq!(gate.max_final_count, 12);
-    assert_eq!(gate.max_attempts, 4);
+    assert_eq!(gate.max_attempts, 1);
 }
 
 #[test]
@@ -607,6 +348,7 @@ fn gate_snapshot_is_best_effort_when_ethos_actionable_is_below_final_count() {
 fn gate_snapshot_reports_fail_reasons_for_count_and_time() {
     let config = SuggestionQualityGateConfig {
         min_final_count: 3,
+        max_suggest_ms: 10_000,
         ..Default::default()
     };
     let suggestions = vec![

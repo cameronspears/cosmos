@@ -23,8 +23,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
-/// Overall timeout for the agentic loop to prevent indefinite hangs
-const LOOP_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_PARALLEL_TOOL_EXECUTIONS: usize = 4;
 /// Extra turns reserved to nudge the model to finalize with `report_back`.
 const REPORT_BACK_GRACE_ROUNDS: usize = 2;
@@ -42,6 +40,33 @@ const STREAM_REASONING_PRINT_MAX_CHARS: usize = 8_000;
 const TOOL_CALL_TEMPERATURE: f32 = 0.2;
 /// Retry once colder when tool-call generation fails validation.
 const TOOL_CALL_RETRY_TEMPERATURE: f32 = 0.0;
+
+fn agent_loop_timeout() -> Option<Duration> {
+    std::env::var("COSMOS_AGENT_LOOP_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .and_then(|value| {
+            if value == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(value))
+            }
+        })
+}
+
+fn loop_timeout_exceeded(start: Instant, timeout: Option<Duration>) -> bool {
+    timeout
+        .map(|limit| start.elapsed() > limit)
+        .unwrap_or(false)
+}
+
+fn within_loop_timeout(start: Instant, timeout: Option<Duration>) -> bool {
+    timeout.map(|limit| start.elapsed() < limit).unwrap_or(true)
+}
+
+fn iteration_limit_exceeded(iteration: usize, max_iterations: usize) -> bool {
+    max_iterations > 0 && iteration > max_iterations
+}
 
 /// Response from an agentic LLM call
 #[derive(Debug)]
@@ -248,11 +273,9 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    include_reasoning: Option<bool>,
+    disable_reasoning: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_format: Option<String>,
+    clear_thinking: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plugins: Option<Vec<PluginConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -342,9 +365,8 @@ struct ProviderConfig {
 
 #[derive(Clone, Default)]
 struct ReasoningRequestFields {
-    include_reasoning: Option<bool>,
-    reasoning_effort: Option<String>,
-    reasoning_format: Option<String>,
+    disable_reasoning: Option<bool>,
+    clear_thinking: Option<bool>,
 }
 
 /// Create a ResponseFormat from a JSON schema value
@@ -360,10 +382,14 @@ pub fn schema_to_response_format(name: &str, schema: serde_json::Value) -> Respo
     }
 }
 
-fn reasoning_config_for_model(_model: Model, _include_output: bool) -> ReasoningRequestFields {
-    // Cerebras chat completions currently rejects provider-specific reasoning request fields.
-    // Omit them to keep agent/tool calls compatible.
-    ReasoningRequestFields::default()
+fn reasoning_config_for_model(_model: Model, include_output: bool) -> ReasoningRequestFields {
+    ReasoningRequestFields {
+        // Tool-calling loops run at lower temperature for stability. Disable reasoning by default
+        // unless explicitly requested via env for trace visibility.
+        disable_reasoning: Some(!include_output),
+        // Preserve prior turn thinking in multi-turn coding/tool workflows.
+        clear_thinking: Some(false),
+    }
 }
 
 fn reasoning_config(model: Model) -> ReasoningRequestFields {
@@ -995,9 +1021,8 @@ async fn maybe_format_agentic_content(
         stream: false,
         temperature: Some(TOOL_CALL_RETRY_TEMPERATURE),
         response_format: Some(response_format),
-        include_reasoning: reasoning.include_reasoning,
-        reasoning_effort: reasoning.reasoning_effort,
-        reasoning_format: reasoning.reasoning_format,
+        disable_reasoning: reasoning.disable_reasoning,
+        clear_thinking: reasoning.clear_thinking,
         plugins: None,
         tools: None,
         tool_choice: None,
@@ -1078,6 +1103,7 @@ pub async fn call_llm_agentic(
 
     let mut iteration = 0;
     let start = Instant::now();
+    let loop_timeout = agent_loop_timeout();
     let mut total_usage: Option<Usage> = None;
     let mut empty_response_retries: u32 = 0;
 
@@ -1085,7 +1111,9 @@ pub async fn call_llm_agentic(
         iteration += 1;
 
         // Check both iteration limit and wall-clock timeout
-        if iteration > max_iterations || start.elapsed() > LOOP_TIMEOUT {
+        if iteration_limit_exceeded(iteration, max_iterations)
+            || loop_timeout_exceeded(start, loop_timeout)
+        {
             // Force the model to respond with what it has
             break;
         }
@@ -1100,9 +1128,8 @@ pub async fn call_llm_agentic(
             stream: false,
             temperature: Some(TOOL_CALL_TEMPERATURE),
             response_format: None,
-            include_reasoning: reasoning.include_reasoning,
-            reasoning_effort: reasoning.reasoning_effort,
-            reasoning_format: reasoning.reasoning_format,
+            disable_reasoning: reasoning.disable_reasoning,
+            clear_thinking: reasoning.clear_thinking,
             plugins: None,
             tools: Some(tools.clone()),
             tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
@@ -1200,7 +1227,8 @@ pub async fn call_llm_agentic(
 
         // Validate we got actual content
         if content.trim().is_empty() {
-            if empty_response_retries < EMPTY_RESPONSE_MAX_RETRIES && start.elapsed() < LOOP_TIMEOUT
+            if empty_response_retries < EMPTY_RESPONSE_MAX_RETRIES
+                && within_loop_timeout(start, loop_timeout)
             {
                 empty_response_retries += 1;
                 // Don't count empty response against iteration budget.
@@ -1247,9 +1275,8 @@ pub async fn call_llm_agentic(
         stream: false,
         temperature: None,
         response_format: None,
-        include_reasoning: reasoning.include_reasoning,
-        reasoning_effort: reasoning.reasoning_effort,
-        reasoning_format: reasoning.reasoning_format,
+        disable_reasoning: reasoning.disable_reasoning,
+        clear_thinking: reasoning.clear_thinking,
         plugins: None,
         tools: None,
         tool_choice: None,
@@ -1279,7 +1306,9 @@ pub async fn call_llm_agentic(
                 }
                 let content = choice.message.content.clone().unwrap_or_default();
                 if content.trim().is_empty() {
-                    if attempt < EMPTY_RESPONSE_MAX_RETRIES && start.elapsed() < LOOP_TIMEOUT {
+                    if attempt < EMPTY_RESPONSE_MAX_RETRIES
+                        && within_loop_timeout(start, loop_timeout)
+                    {
                         let delay_ms = 250u64 * (1 << attempt);
                         tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                         continue;
@@ -1293,7 +1322,8 @@ pub async fn call_llm_agentic(
             }
             Err(e) => {
                 last_error = Some(e);
-                if attempt < EMPTY_RESPONSE_MAX_RETRIES && start.elapsed() < LOOP_TIMEOUT {
+                if attempt < EMPTY_RESPONSE_MAX_RETRIES && within_loop_timeout(start, loop_timeout)
+                {
                     let delay_ms = 250u64 * (1 << attempt);
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                     continue;
@@ -1368,6 +1398,7 @@ pub async fn call_llm_agentic_report_back_only(
 
     let mut iteration = 0usize;
     let start = Instant::now();
+    let loop_timeout = agent_loop_timeout();
     let fallback_role = infer_report_back_role(system, user);
     let mut total_usage: Option<Usage> = None;
     let mut empty_response_retries: u32 = 0;
@@ -1376,7 +1407,11 @@ pub async fn call_llm_agentic_report_back_only(
     let mut first_invalid_report_back_error: Option<String> = None;
     let mut finalization_non_report_back_retries: u32 = 0;
     let mut tool_error_loop_tracker = ToolErrorLoopTracker::default();
-    let max_total_iterations = max_iterations.saturating_add(REPORT_BACK_GRACE_ROUNDS);
+    let max_total_iterations = if max_iterations == 0 {
+        0
+    } else {
+        max_iterations.saturating_add(REPORT_BACK_GRACE_ROUNDS)
+    };
     let mut forced_report_back_mode = false;
     let mut trace = AgenticTrace::default();
     // When a UI sink is attached, stream output by default so the suggestion pane can render
@@ -1387,7 +1422,9 @@ pub async fn call_llm_agentic_report_back_only(
 
     loop {
         iteration += 1;
-        if iteration > max_total_iterations || start.elapsed() > LOOP_TIMEOUT {
+        if iteration_limit_exceeded(iteration, max_total_iterations)
+            || loop_timeout_exceeded(start, loop_timeout)
+        {
             if forced_report_back_mode {
                 trace.termination_reason = Some("timeout_fallback_empty_report_back".to_string());
                 trace.repeated_tool_error_count = trace
@@ -1405,13 +1442,18 @@ pub async fn call_llm_agentic_report_back_only(
             ));
         }
 
-        let elapsed_ms = start.elapsed().as_millis();
-        let timeout_ms = LOOP_TIMEOUT.as_millis();
-        let near_timeout = elapsed_ms.saturating_mul(100) >= timeout_ms.saturating_mul(75);
+        let near_timeout = loop_timeout
+            .map(|timeout| {
+                let elapsed_ms = start.elapsed().as_millis();
+                let timeout_ms = timeout.as_millis().max(1);
+                elapsed_ms.saturating_mul(100) >= timeout_ms.saturating_mul(75)
+            })
+            .unwrap_or(false);
         // Reserve the configured grace rounds for finalization *after* the normal
         // exploration budget has been used. The previous threshold entered
         // finalization too early for small iteration budgets (for example, budget=2).
-        let finalization_round = near_timeout || iteration > max_iterations;
+        let finalization_round =
+            near_timeout || iteration_limit_exceeded(iteration, max_iterations);
         if finalization_round && !forced_report_back_mode {
             forced_report_back_mode = true;
             messages.push(Message {
@@ -1443,9 +1485,8 @@ pub async fn call_llm_agentic_report_back_only(
             stream: stream_reasoning,
             temperature: Some(TOOL_CALL_TEMPERATURE),
             response_format: None,
-            include_reasoning: reasoning.include_reasoning,
-            reasoning_effort: reasoning.reasoning_effort,
-            reasoning_format: reasoning.reasoning_format,
+            disable_reasoning: reasoning.disable_reasoning,
+            clear_thinking: reasoning.clear_thinking,
             plugins: None,
             tools: Some(tools.clone()),
             tool_choice,
@@ -1475,9 +1516,8 @@ pub async fn call_llm_agentic_report_back_only(
                     stream_reasoning = false;
                     request.stream = false;
                     let reasoning = reasoning_config_for_model(model, include_reasoning);
-                    request.include_reasoning = reasoning.include_reasoning;
-                    request.reasoning_effort = reasoning.reasoning_effort;
-                    request.reasoning_format = reasoning.reasoning_format;
+                    request.disable_reasoning = reasoning.disable_reasoning;
+                    request.clear_thinking = reasoning.clear_thinking;
                     let text =
                         send_report_back_text_with_speed_fallback(&client, &api_key, &mut request)
                             .await?;
@@ -1554,7 +1594,7 @@ pub async fn call_llm_agentic_report_back_only(
                         Err(err) => {
                             let action = invalid_report_back_action(
                                 invalid_report_back_retries,
-                                start.elapsed() < LOOP_TIMEOUT,
+                                within_loop_timeout(start, loop_timeout),
                             );
                             invalid_report_back_retries =
                                 invalid_report_back_retries.saturating_add(1);
@@ -1732,7 +1772,8 @@ pub async fn call_llm_agentic_report_back_only(
             report_back_called: false,
         });
         if content.trim().is_empty() {
-            if empty_response_retries < EMPTY_RESPONSE_MAX_RETRIES && start.elapsed() < LOOP_TIMEOUT
+            if empty_response_retries < EMPTY_RESPONSE_MAX_RETRIES
+                && within_loop_timeout(start, loop_timeout)
             {
                 empty_response_retries += 1;
                 let delay_ms = 250u64 * (1 << empty_response_retries);
@@ -1768,7 +1809,7 @@ pub async fn call_llm_agentic_report_back_only(
         }
         if !finalization_round
             && text_response_retries < TEXT_INSTEAD_OF_REPORT_BACK_MAX_RETRIES
-            && start.elapsed() < LOOP_TIMEOUT
+            && within_loop_timeout(start, loop_timeout)
         {
             text_response_retries += 1;
             messages.push(Message {
@@ -1910,9 +1951,8 @@ mod tests {
             stream: false,
             temperature: Some(TOOL_CALL_TEMPERATURE),
             response_format: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            reasoning_format: None,
+            disable_reasoning: None,
+            clear_thinking: None,
             plugins: None,
             tools: Some(tools),
             tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
@@ -1943,9 +1983,8 @@ mod tests {
             stream: false,
             temperature: Some(TOOL_CALL_TEMPERATURE),
             response_format: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            reasoning_format: None,
+            disable_reasoning: None,
+            clear_thinking: None,
             plugins: None,
             tools: Some(get_relace_search_tool_definitions()),
             tool_choice: Some(ToolChoice::Function(ToolChoiceFunctionSelection {
@@ -1966,17 +2005,15 @@ mod tests {
     }
 
     #[test]
-    fn test_reasoning_config_omits_reasoning_fields_for_cerebras() {
+    fn test_reasoning_config_maps_to_glm_controls() {
         use super::Model;
         let speed = reasoning_config(Model::Speed);
-        assert!(speed.include_reasoning.is_none());
-        assert!(speed.reasoning_effort.is_none());
-        assert!(speed.reasoning_format.is_none());
+        assert_eq!(speed.disable_reasoning, Some(true));
+        assert_eq!(speed.clear_thinking, Some(false));
 
-        let smart = reasoning_config(Model::Smart);
-        assert!(smart.include_reasoning.is_none());
-        assert!(smart.reasoning_effort.is_none());
-        assert!(smart.reasoning_format.is_none());
+        let smart = reasoning_config_for_model(Model::Smart, true);
+        assert_eq!(smart.disable_reasoning, Some(false));
+        assert_eq!(smart.clear_thinking, Some(false));
     }
 
     #[test]
@@ -1994,9 +2031,8 @@ mod tests {
             stream: false,
             temperature: None,
             response_format: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            reasoning_format: None,
+            disable_reasoning: None,
+            clear_thinking: None,
             plugins: None,
             tools: None,
             tool_choice: None,

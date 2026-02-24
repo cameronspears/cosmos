@@ -17,7 +17,8 @@ use header::render_header;
 use main::render_main;
 use overlays::{
     render_alert, render_api_key_overlay, render_apply_plan, render_file_detail, render_help,
-    render_reset_overlay, render_startup_check, render_update_overlay, render_welcome,
+    render_reset_overlay, render_startup_check, render_suggestion_focus_overlay,
+    render_update_overlay, render_welcome,
 };
 
 /// Main render function
@@ -62,6 +63,9 @@ pub fn render(frame: &mut Frame, app: &App) {
             save_armed,
         } => {
             render_api_key_overlay(frame, input, error.as_deref(), *save_armed);
+        }
+        Overlay::SuggestionFocus { selected } => {
+            render_suggestion_focus_overlay(frame, *selected);
         }
         Overlay::ApplyPlan {
             preview,

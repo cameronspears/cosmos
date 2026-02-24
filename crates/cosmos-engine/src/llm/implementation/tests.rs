@@ -31,7 +31,7 @@ diff --git a/a.rs b/a.rs
 
 #[test]
 fn model_policy_uses_smart_tier() {
-    assert_eq!(IMPLEMENTATION_MODEL.id(), "gpt-oss-120b");
+    assert_eq!(IMPLEMENTATION_MODEL.id(), "zai-glm-4.7");
 }
 
 #[test]

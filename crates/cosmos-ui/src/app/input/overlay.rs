@@ -108,7 +108,7 @@ fn handle_alert_overlay_input(app: &mut App, key: &KeyEvent) {
     }
 }
 
-fn handle_api_key_overlay_input(app: &mut App, key: &KeyEvent, ctx: &RuntimeContext) {
+fn handle_api_key_overlay_input(app: &mut App, key: &KeyEvent, _ctx: &RuntimeContext) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.close_overlay();
@@ -174,11 +174,9 @@ fn handle_api_key_overlay_input(app: &mut App, key: &KeyEvent, ctx: &RuntimeCont
             match cfg.set_api_key(&candidate) {
                 Ok(()) => {
                     app.close_overlay();
-                    let _ = crate::app::background::request_suggestions_refresh(
-                        app,
-                        ctx.tx.clone(),
-                        ctx.repo_path.clone(),
+                    app.open_alert(
                         "API key saved",
+                        "Select suggestion mode with m, then press r to run suggestions.",
                     );
                 }
                 Err(e) => {
@@ -191,6 +189,33 @@ fn handle_api_key_overlay_input(app: &mut App, key: &KeyEvent, ctx: &RuntimeCont
                     }
                 }
             }
+        }
+        _ => {}
+    }
+}
+
+fn handle_suggestion_focus_overlay_input(app: &mut App, key: &KeyEvent, _ctx: &RuntimeContext) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.close_overlay();
+        }
+        KeyCode::Left | KeyCode::Up => app.suggestion_focus_navigate(-1),
+        KeyCode::Right | KeyCode::Down => app.suggestion_focus_navigate(1),
+        KeyCode::Char('b') => {
+            app.suggestion_focus_set_selected(cosmos_engine::llm::SuggestionReviewFocus::BugHunt);
+        }
+        KeyCode::Char('s') => {
+            app.suggestion_focus_set_selected(
+                cosmos_engine::llm::SuggestionReviewFocus::SecurityReview,
+            );
+        }
+        KeyCode::Enter | KeyCode::Char('y') => {
+            let selected = match app.suggestion_focus_selected() {
+                Some(selected) => selected,
+                None => return,
+            };
+            app.confirm_suggestion_review_focus(selected);
+            app.close_overlay();
         }
         _ => {}
     }
@@ -415,6 +440,7 @@ pub(super) fn handle_overlay_input(
         Overlay::None => {}
         Overlay::Alert { .. } => handle_alert_overlay_input(app, &key),
         Overlay::ApiKeySetup { .. } => handle_api_key_overlay_input(app, &key, ctx),
+        Overlay::SuggestionFocus { .. } => handle_suggestion_focus_overlay_input(app, &key, ctx),
         Overlay::ApplyPlan { .. } => handle_apply_plan_overlay_input(app, &key, ctx),
         Overlay::Reset { .. } => handle_reset_overlay_input(app, &key, ctx),
         Overlay::StartupCheck { .. } => handle_startup_check_overlay_input(app, &key, ctx),

@@ -3,17 +3,17 @@ use serde::Deserialize;
 /// Models available for suggestions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Model {
-    /// Speed tier - fast/cheap profile on GPT-OSS 120B.
+    /// Speed tier profile on GLM 4.7.
     Speed,
-    /// Smart tier - high-quality profile on GPT-OSS 120B.
+    /// Smart tier profile on GLM 4.7.
     Smart,
 }
 
 /// Maximum tokens for all model tiers
-const MODEL_MAX_TOKENS: u32 = 16384;
+const MODEL_MAX_TOKENS: u32 = 40_000;
 
 /// Models we allow to use JSON formatting / structured outputs.
-const JSON_FORMAT_MODELS: [&str; 1] = ["gpt-oss-120b"];
+const JSON_FORMAT_MODELS: [&str; 1] = ["zai-glm-4.7"];
 
 fn supports_json_format(model_id: &str) -> bool {
     JSON_FORMAT_MODELS.contains(&model_id)
@@ -22,8 +22,8 @@ fn supports_json_format(model_id: &str) -> bool {
 impl Model {
     pub fn id(&self) -> &'static str {
         match self {
-            Model::Speed => "gpt-oss-120b",
-            Model::Smart => "gpt-oss-120b",
+            Model::Speed => "zai-glm-4.7",
+            Model::Smart => "zai-glm-4.7",
         }
     }
 
@@ -39,14 +39,6 @@ impl Model {
     /// Whether this model supports structured outputs with JSON schema.
     pub fn supports_structured_outputs(&self) -> bool {
         supports_json_format(self.id())
-    }
-
-    /// Reasoning effort level to use, if supported.
-    pub fn reasoning_effort(&self) -> Option<&'static str> {
-        match self {
-            Model::Speed => Some("medium"),
-            Model::Smart => Some("high"),
-        }
     }
 }
 
@@ -100,8 +92,8 @@ mod tests {
 
     #[test]
     fn test_model_ids() {
-        assert!(Model::Speed.id().contains("gpt"));
-        assert!(Model::Smart.id().contains("gpt"));
+        assert_eq!(Model::Speed.id(), "zai-glm-4.7");
+        assert_eq!(Model::Smart.id(), "zai-glm-4.7");
     }
 
     #[test]
@@ -118,14 +110,8 @@ mod tests {
 
     #[test]
     fn test_supports_json_format_allowlist() {
-        assert!(supports_json_format("gpt-oss-120b"));
+        assert!(supports_json_format("zai-glm-4.7"));
         assert!(!supports_json_format("gpt-4o"));
-    }
-
-    #[test]
-    fn test_reasoning_effort_by_model() {
-        assert_eq!(Model::Speed.reasoning_effort(), Some("medium"));
-        assert_eq!(Model::Smart.reasoning_effort(), Some("high"));
     }
 
     #[test]

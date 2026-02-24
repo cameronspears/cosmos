@@ -60,15 +60,15 @@ Python guardrails:
 
 // Context limits - tuned for low cost and reliability.
 // We intentionally prefer focused excerpts over full-file dumps to keep token usage bounded.
-const MAX_FIX_EXCERPT_CHARS: usize = 20000;
-const MAX_MULTI_FILE_EXCERPT_CHARS: usize = 60000;
+const MAX_FIX_EXCERPT_CHARS: usize = 12000;
+const MAX_MULTI_FILE_EXCERPT_CHARS: usize = 36000;
 // Keep internal edit-apply retries bounded and cheap. The harness itself already retries
 // whole attempts with feedback and strict gates, so large internal loops here can bypass
 // practical per-attempt budget expectations.
-const MAX_EDIT_REPAIR_ATTEMPTS: usize = 5;
+const MAX_EDIT_REPAIR_ATTEMPTS: usize = 4;
 
-const MAX_FIX_RESPONSE_TOKENS_SPEED: u32 = 3072;
-const MAX_MULTI_FILE_FIX_RESPONSE_TOKENS_SPEED: u32 = 6144;
+const MAX_FIX_RESPONSE_TOKENS_SPEED: u32 = 2304;
+const MAX_MULTI_FILE_FIX_RESPONSE_TOKENS_SPEED: u32 = 4096;
 
 struct PromptContent {
     content: String,
@@ -241,7 +241,7 @@ fn build_fix_prompt_content(
         return PromptContent {
             content: truncate_content(content, max_chars),
             note: Some(format!(
-                "NOTE: This file is large ({} chars). Showing a shortened excerpt to fit model input limits.",
+                "NOTE: File is large ({} chars). Showing a shortened excerpt.",
                 content_len
             )),
         };
@@ -280,7 +280,7 @@ fn build_fix_prompt_content(
     PromptContent {
         content: snippet,
         note: Some(format!(
-            "NOTE: This file is large ({} chars). Showing an excerpt around line {} to fit model input limits.",
+            "NOTE: File is large ({} chars). Showing excerpt around line {}.",
             content_len, anchor_line
         )),
     }
@@ -289,7 +289,7 @@ fn build_fix_prompt_content(
 fn format_excerpt_guidance(note: Option<&str>) -> String {
     note.map(|note| {
         format!(
-            "{}\nIMPORTANT: Only a focused excerpt is shown. Use search/replace edits anchored in the excerpt, but make old_string unique in the full file by including enough surrounding context.\n",
+            "{}\nOnly an excerpt is shown. Make `old_string` unique in the full file by including enough surrounding lines.\n",
             note
         )
     })
@@ -306,7 +306,7 @@ fn build_fix_user_prompt(
     content: &str,
 ) -> String {
     format!(
-        "File: {}\n{}\n\nOriginal Issue: {}\n{}\n{}\n\n{}\n{}\nCurrent Code:\n```\n{}\n```\n\nImplement the fix using search/replace edits. Be precise with old_string - it must match exactly.",
+        "File: {}\n{}\n\nIssue: {}\n{}\n{}\n\n{}\n{}\nCODE:\n```\n{}\n```\n\nReturn search/replace edits that implement the fix plan.",
         path.display(),
         new_file_note,
         suggestion.summary,
@@ -325,7 +325,7 @@ fn build_multi_file_user_prompt(
     files_section: &str,
 ) -> String {
     format!(
-        "Original Issue: {}\n{}\n{}\n\n{}\n\nFILES TO MODIFY:\n\n{}\n\nImplement the fix using search/replace edits for each file. For new files, use old_string=\"\" to insert full content. Ensure consistency across all files.",
+        "Issue: {}\n{}\n{}\n\n{}\n\nFILES:\n\n{}\n\nReturn search/replace edits for each required file. For new files, use old_string=\"\" and provide full file content in new_string. Keep cross-file changes consistent.",
         suggestion.summary,
         suggestion.detail.as_deref().unwrap_or(""),
         memory_section,
@@ -378,31 +378,25 @@ pub(crate) fn format_edit_apply_repair_guidance(message: &str, code_block_label:
     let mut bullets: Vec<&str> = Vec::new();
 
     if msg.contains("no edits provided") || msg.contains("no file edits provided") {
-        bullets.push("Your response did not include any edits.");
-        bullets.push("Return at least one edit that changes the code to address the request.");
-        bullets.push("Keep the diff minimal and scoped. Avoid unrelated reformatting.");
-        bullets.push("Use exact `old_string` anchors copied verbatim from the code block.");
+        bullets.push("Return at least one edit.");
+        bullets.push("Keep changes minimal and scoped.");
+        bullets.push("Copy `old_string` verbatim from the code block.");
     } else if msg.contains("matches") || msg.contains("must be unique") {
-        bullets.push("Your `old_string` was too generic and matched multiple places.");
-        bullets.push("Use the provided match contexts in the error details: choose the occurrence closest to the target line, then expand the anchor with surrounding lines to make it unique.");
-        bullets.push("Pick a larger anchor: include 3-10 surrounding lines and at least one unique identifier (function name, component name, string literal, or nearby props).");
-        bullets
-            .push("Avoid anchors like `</div>`, `</motion.div>`, `{}` blocks, or single braces.");
-        bullets.push("If you need to change multiple occurrences, return multiple edits with different unique `old_string` values.");
+        bullets.push("Your `old_string` matched multiple locations.");
+        bullets.push("Expand anchors with nearby unique lines/identifiers.");
+        bullets.push("Use separate edits for separate locations.");
     } else if msg.contains("placeholder") || msg.contains("ellipsis") {
-        bullets.push("Your `old_string` contained placeholder text and cannot match real code.");
-        bullets.push("Do not use ellipses (`...` or `…`) or shortened snippets in `old_string`.");
-        bullets.push("Copy `old_string` verbatim from the code block with exact indentation.");
+        bullets.push("Do not use placeholders or ellipses.");
+        bullets.push("Copy `old_string` exactly, including indentation.");
     } else if msg.contains("not found") {
-        bullets.push("Your `old_string` does not exist verbatim in the code block.");
-        bullets.push("Copy/paste the exact text from the code block, including indentation and line endings.");
-        bullets.push("If the error includes a target-window excerpt, copy your anchor from that excerpt and keep it to the closest relevant function or block.");
-        bullets.push("Do not use placeholders, summaries, or ellipses. The match must be exact.");
+        bullets.push("Your `old_string` was not found exactly.");
+        bullets.push("Copy exact text from the provided code block.");
+        bullets.push("Anchor near the target function/block.");
     } else if msg.contains("empty for non-empty") {
-        bullets.push("Do not use an empty `old_string` when the file already has content.");
-        bullets.push("Choose an exact anchor from the code block that appears exactly once.");
+        bullets.push("Do not use empty `old_string` for non-empty files.");
+        bullets.push("Choose a unique exact anchor from the code block.");
     } else {
-        bullets.push("Fix your `old_string` values so they match verbatim text from the code block exactly once.");
+        bullets.push("Make `old_string` match verbatim code exactly once.");
     }
 
     let searched_for = searched_for_fragment(message);
@@ -418,7 +412,7 @@ pub(crate) fn format_edit_apply_repair_guidance(message: &str, code_block_label:
         .join("\n");
 
     format!(
-        "\n\nIMPORTANT: Your previous edits could not be applied safely.\nError:\n{}\n\nWhen regenerating edits, use the {} and follow these rules:\n{}\n{}",
+        "\n\nPrevious edits failed to apply.\nError:\n{}\n\nRegenerate edits using the {} and these rules:\n{}\n{}",
         message, code_block_label, bullet_text, searched_for
     )
 }
@@ -2256,7 +2250,7 @@ pub async fn generate_fix_preview_agentic(
 
     let evidence_context = {
         let mut block = String::new();
-        for (idx, reference) in suggestion.evidence_refs.iter().take(3).enumerate() {
+        for (idx, reference) in suggestion.evidence_refs.iter().take(2).enumerate() {
             block.push_str(&format!(
                 "- Evidence {}: {}:{} (id={})\n",
                 idx + 1,
@@ -2288,11 +2282,9 @@ CODE (lines {}-{}):
 {}
 
 VERIFY:
-1. Does this issue exist in the code above?
-2. If you need more context:
-   • grep -n 'pattern' {} → find related code
-   • sed -n 'X,Yp' {} → read specific lines
-3. Return JSON immediately (minimize tool calls).{}"#,
+1. Does this issue exist in the shown code?
+2. Use tools only if needed for missing context.
+3. Return JSON immediately.{}"#,
             suggestion.file.display(),
             target_line,
             suggestion.summary,
@@ -2303,8 +2295,6 @@ VERIFY:
             start,
             end,
             code_section,
-            suggestion.file.display(),
-            suggestion.file.display(),
             if fallback {
                 " If uncertain, prefer insufficient_evidence over contradicted."
             } else {

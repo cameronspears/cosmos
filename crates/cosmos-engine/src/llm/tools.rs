@@ -3,7 +3,9 @@
 //! Philosophy: Support top-down exploration that's naturally token-efficient.
 //! Specialized tools enforce efficient patterns; shell is fallback for edge cases.
 
-use cosmos_adapters::util::{resolve_repo_path_allow_new, run_command_with_timeout};
+use cosmos_adapters::util::{
+    resolve_repo_path_allow_new, run_command_with_timeout, CommandRunResult,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -11,10 +13,37 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-/// Timeout for shell and search commands (prevents hangs)
-const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
 const RELACE_PATH_GUIDANCE: &str =
     "Use repo-relative paths like `crates/...` or `.`; do not use absolute filesystem paths.";
+
+fn tool_timeout() -> Option<Duration> {
+    std::env::var("COSMOS_TOOL_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .and_then(|value| {
+            if value == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(value))
+            }
+        })
+}
+
+fn run_command_with_optional_timeout(command: &mut Command) -> Result<CommandRunResult, String> {
+    if let Some(timeout) = tool_timeout() {
+        run_command_with_timeout(command, timeout)
+    } else {
+        let output = command
+            .output()
+            .map_err(|err| format!("Failed to run command: {err}"))?;
+        Ok(CommandRunResult {
+            status: Some(output.status),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            timed_out: false,
+        })
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  TOOL DEFINITIONS
@@ -1385,10 +1414,10 @@ fn execute_search(root: &Path, args_json: &str) -> String {
         .arg(&target)
         .current_dir(root);
 
-    match run_command_with_timeout(&mut cmd, TOOL_TIMEOUT) {
+    match run_command_with_optional_timeout(&mut cmd) {
         Ok(result) => {
             if result.timed_out {
-                return "Search timed out after 10 seconds. Try a more specific pattern or path."
+                return "Search timed out. Try a more specific pattern or path, or raise COSMOS_TOOL_TIMEOUT_MS."
                     .to_string();
             }
             if result.stdout.is_empty() {
@@ -1407,10 +1436,10 @@ fn execute_search(root: &Path, args_json: &str) -> String {
                 .arg(&target)
                 .current_dir(root);
 
-            match run_command_with_timeout(&mut cmd, TOOL_TIMEOUT) {
+            match run_command_with_optional_timeout(&mut cmd) {
                 Ok(result) => {
                     if result.timed_out {
-                        return "Search timed out after 10 seconds. Try a more specific pattern or path.".to_string();
+                        return "Search timed out. Try a more specific pattern or path, or raise COSMOS_TOOL_TIMEOUT_MS.".to_string();
                     }
                     if result.stdout.is_empty() {
                         format!("No matches found for pattern: {}", args.pattern)
@@ -1782,10 +1811,10 @@ fn execute_grep_search(root: &Path, args_json: &str) -> String {
 
     cmd.arg(query).arg(&search_root).current_dir(root);
 
-    match run_command_with_timeout(&mut cmd, TOOL_TIMEOUT) {
+    match run_command_with_optional_timeout(&mut cmd) {
         Ok(result) => {
             if result.timed_out {
-                return "Search timed out after 10 seconds. Try a more specific pattern."
+                return "Search timed out. Try a more specific pattern, or raise COSMOS_TOOL_TIMEOUT_MS."
                     .to_string();
             }
             if result.stdout.trim().is_empty() {
@@ -1980,10 +2009,11 @@ fn execute_shell(root: &Path, args_json: &str) -> String {
     let mut cmd = Command::new("sh");
     cmd.args(["-c", command]).current_dir(root);
 
-    match run_command_with_timeout(&mut cmd, TOOL_TIMEOUT) {
+    match run_command_with_optional_timeout(&mut cmd) {
         Ok(run_result) => {
             if run_result.timed_out {
-                return "Command timed out after 10 seconds".to_string();
+                return "Command timed out. Raise COSMOS_TOOL_TIMEOUT_MS or set it to 0 for no timeout."
+                    .to_string();
             }
 
             let exit_code = run_result

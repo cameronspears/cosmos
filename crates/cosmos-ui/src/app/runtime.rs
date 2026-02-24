@@ -231,18 +231,6 @@ pub async fn run_tui(
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  SUGGESTION GENERATION: Always generate fresh suggestions on startup
-    // ═══════════════════════════════════════════════════════════════════════
-    if ai_enabled {
-        let _ = background::request_suggestions_refresh(
-            &mut app,
-            tx.clone(),
-            repo_path.clone(),
-            "Startup",
-        );
-    }
-
     // Main loop with async event handling
     let result = run_loop(&mut terminal, &mut app, rx, tx, repo_path, startup_index);
 

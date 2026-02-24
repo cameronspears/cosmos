@@ -1076,6 +1076,14 @@ pub(super) fn handle_normal_mode(app: &mut App, key: KeyEvent, ctx: &RuntimeCont
                 refresh_suggestions_now(app, ctx, "Manual refresh");
             }
         }
+        KeyCode::Char('m') => {
+            if app.active_panel == ActivePanel::Suggestions
+                && app.workflow_step == WorkflowStep::Suggestions
+                && app.loading != LoadingState::GeneratingSuggestions
+            {
+                app.open_suggestion_focus_overlay();
+            }
+        }
         KeyCode::Char('R') => app.open_reset_overlay(),
         KeyCode::Char('U') => {
             if let Some(target_version) = app.update_available.clone() {

@@ -136,7 +136,6 @@ async fn run_suggestion_audit(
 
     for run_index in 1..=runs {
         println!("Run {}/{}...", run_index, runs);
-        let run_timeout_ms = gate_config.max_suggest_ms.saturating_add(30_000);
         let stream_sink: Option<llm::SuggestionStreamSink> = if stream_reasoning {
             Some(Arc::new(move |worker, kind, line| {
                 println!("[{}][{:?}] {}", worker, kind, line);
@@ -144,53 +143,103 @@ async fn run_suggestion_audit(
         } else {
             None
         };
-        let run_result = tokio::time::timeout(
-            std::time::Duration::from_millis(run_timeout_ms),
-            llm::run_fast_grounded_with_gate_with_progress_and_stream(
-                path,
-                index,
-                context,
-                None,
-                gate_config.clone(),
-                stream_sink,
-                |attempt_index, attempt_count, gate, diagnostics| {
-                    let prevalidation = diagnostics
-                        .validation_rejection_histogram
-                        .get("prevalidation")
-                        .copied()
-                        .unwrap_or(0);
-                    let insufficient = diagnostics
-                        .validation_rejection_histogram
-                        .get("validator_insufficient_evidence")
-                        .copied()
-                        .unwrap_or(0);
-                    println!(
-                        "    attempt {}/{} final_count={} ethos_actionable_count={} pending={} provisional={} validated={} rejected={} prevalidation={} insufficient={} readiness_filtered={} semantic_dropped={} file_dropped={} strategy={}",
-                        attempt_index,
-                        attempt_count,
-                        gate.final_count,
-                        gate.ethos_actionable_count,
-                        gate.pending_count,
-                        diagnostics.provisional_count,
-                        diagnostics.validated_count,
-                        diagnostics.rejected_count,
-                        prevalidation,
-                        insufficient,
-                        diagnostics.readiness_filtered_count,
-                        diagnostics.semantic_dedup_dropped_count,
-                        diagnostics.file_balance_dropped_count,
-                        diagnostics.parse_strategy
-                    );
-                    if print_trace && !diagnostics.gate_fail_reasons.is_empty() {
+        let run_result = if gate_config.max_suggest_ms == 0 {
+            Ok(
+                llm::run_fast_grounded_with_gate_with_progress_and_stream(
+                    path,
+                    index,
+                    context,
+                    None,
+                    gate_config.clone(),
+                    stream_sink,
+                    |attempt_index, attempt_count, gate, diagnostics| {
+                        let prevalidation = diagnostics
+                            .validation_rejection_histogram
+                            .get("prevalidation")
+                            .copied()
+                            .unwrap_or(0);
+                        let insufficient = diagnostics
+                            .validation_rejection_histogram
+                            .get("validator_insufficient_evidence")
+                            .copied()
+                            .unwrap_or(0);
                         println!(
-                            "      gate_fail_reasons={}",
-                            diagnostics.gate_fail_reasons.join("; ")
+                            "    attempt {}/{} final_count={} ethos_actionable_count={} pending={} provisional={} validated={} rejected={} prevalidation={} insufficient={} readiness_filtered={} semantic_dropped={} file_dropped={} strategy={}",
+                            attempt_index,
+                            attempt_count,
+                            gate.final_count,
+                            gate.ethos_actionable_count,
+                            gate.pending_count,
+                            diagnostics.provisional_count,
+                            diagnostics.validated_count,
+                            diagnostics.rejected_count,
+                            prevalidation,
+                            insufficient,
+                            diagnostics.readiness_filtered_count,
+                            diagnostics.semantic_dedup_dropped_count,
+                            diagnostics.file_balance_dropped_count,
+                            diagnostics.parse_strategy
                         );
-                    }
-                },
-            ),
-        )
-        .await;
+                        if print_trace && !diagnostics.gate_fail_reasons.is_empty() {
+                            println!(
+                                "      gate_fail_reasons={}",
+                                diagnostics.gate_fail_reasons.join("; ")
+                            );
+                        }
+                    },
+                )
+                .await,
+            )
+        } else {
+            let run_timeout_ms = gate_config.max_suggest_ms.saturating_add(30_000);
+            tokio::time::timeout(
+                std::time::Duration::from_millis(run_timeout_ms),
+                llm::run_fast_grounded_with_gate_with_progress_and_stream(
+                    path,
+                    index,
+                    context,
+                    None,
+                    gate_config.clone(),
+                    stream_sink,
+                    |attempt_index, attempt_count, gate, diagnostics| {
+                        let prevalidation = diagnostics
+                            .validation_rejection_histogram
+                            .get("prevalidation")
+                            .copied()
+                            .unwrap_or(0);
+                        let insufficient = diagnostics
+                            .validation_rejection_histogram
+                            .get("validator_insufficient_evidence")
+                            .copied()
+                            .unwrap_or(0);
+                        println!(
+                            "    attempt {}/{} final_count={} ethos_actionable_count={} pending={} provisional={} validated={} rejected={} prevalidation={} insufficient={} readiness_filtered={} semantic_dropped={} file_dropped={} strategy={}",
+                            attempt_index,
+                            attempt_count,
+                            gate.final_count,
+                            gate.ethos_actionable_count,
+                            gate.pending_count,
+                            diagnostics.provisional_count,
+                            diagnostics.validated_count,
+                            diagnostics.rejected_count,
+                            prevalidation,
+                            insufficient,
+                            diagnostics.readiness_filtered_count,
+                            diagnostics.semantic_dedup_dropped_count,
+                            diagnostics.file_balance_dropped_count,
+                            diagnostics.parse_strategy
+                        );
+                        if print_trace && !diagnostics.gate_fail_reasons.is_empty() {
+                            println!(
+                                "      gate_fail_reasons={}",
+                                diagnostics.gate_fail_reasons.join("; ")
+                            );
+                        }
+                    },
+                ),
+            )
+            .await
+        };
 
         match run_result {
             Ok(Ok(result)) => {
@@ -240,7 +289,10 @@ async fn run_suggestion_audit(
                 last_error = Some(text);
             }
             Err(_) => {
-                let text = format!("run timed out after {}ms", run_timeout_ms);
+                let text = format!(
+                    "run timed out after {}ms",
+                    gate_config.max_suggest_ms.saturating_add(30_000)
+                );
                 println!("  FAIL {}", text);
                 last_error = Some(text);
             }
