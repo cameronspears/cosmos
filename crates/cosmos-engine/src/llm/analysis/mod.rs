@@ -52,6 +52,9 @@ const ASK_ETHOS_MAX_CHARS: usize = 2_500;
 const REVIEW_AGENT_ETHOS_MAX_CHARS: usize = 800;
 const REVIEW_AGENT_MEMORY_MAX_CHARS: usize = 600;
 const REVIEW_AGENT_RETRY_FEEDBACK_MAX_CHARS: usize = 500;
+const DEFAULT_REVIEW_AGENT_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_REVIEW_AGENT_MAX_ITERATIONS: usize = 8;
+const MAX_SUGGESTION_ATTEMPTS_HARD_CAP: usize = 3;
 const DETERMINISTIC_SUGGESTION_SOFT_TARGET_MIN: usize = 4;
 const DETERMINISTIC_SUGGESTION_SOFT_TARGET_MAX: usize = 6;
 const DETERMINISTIC_SUGGESTION_PER_FILE_MAX: usize = 2;
@@ -1114,6 +1117,24 @@ fn deterministic_soft_target_count(config: &SuggestionQualityGateConfig) -> usiz
         .min(DETERMINISTIC_SUGGESTION_SOFT_TARGET_MAX)
         .max(DETERMINISTIC_SUGGESTION_SOFT_TARGET_MIN.min(hard_max));
     preferred.max(config.min_final_count.max(1)).min(hard_max)
+}
+
+fn bounded_suggestion_attempt_count(config: &SuggestionQualityGateConfig) -> usize {
+    config
+        .max_attempts
+        .max(1)
+        .min(MAX_SUGGESTION_ATTEMPTS_HARD_CAP)
+}
+
+fn review_focus_for_attempt(
+    base_focus: SuggestionReviewFocus,
+    attempt_index: usize,
+) -> SuggestionReviewFocus {
+    if attempt_index % 2 == 1 {
+        base_focus
+    } else {
+        base_focus.toggle()
+    }
 }
 
 fn deterministic_criticality_rank(criticality: Criticality) -> i64 {
@@ -2794,18 +2815,26 @@ fn trace_response_preview(trace: &AgenticTrace) -> Option<String> {
 }
 
 fn review_agent_timeout_ms() -> Option<u64> {
-    std::env::var("COSMOS_DUAL_WORKER_TIMEOUT_MS")
+    // Keep a bounded default so bug/security review workers cannot run forever.
+    // Set COSMOS_DUAL_WORKER_TIMEOUT_MS=0 to opt into unbounded workers.
+    let timeout_ms = std::env::var("COSMOS_DUAL_WORKER_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .and_then(|value| if value == 0 { None } else { Some(value) })
+        .unwrap_or(DEFAULT_REVIEW_AGENT_TIMEOUT_MS);
+    if timeout_ms == 0 {
+        None
+    } else {
+        Some(timeout_ms)
+    }
 }
 
 fn review_agent_iteration_budget() -> usize {
-    // 0 means unbounded.
+    // Default to a bounded but generous exploration budget to avoid runaway TPM spikes.
+    // Set COSMOS_DUAL_WORKER_MAX_ITERATIONS=0 to explicitly allow unbounded loops.
     std::env::var("COSMOS_DUAL_WORKER_MAX_ITERATIONS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+        .unwrap_or(DEFAULT_REVIEW_AGENT_MAX_ITERATIONS)
 }
 
 fn role_config_for_focus(review_focus: SuggestionReviewFocus) -> (&'static str, &'static str) {
@@ -3181,99 +3210,157 @@ where
     F: FnMut(usize, usize, &SuggestionGateSnapshot, &SuggestionDiagnostics),
 {
     let total_start = std::time::Instant::now();
-    let analyze_result = if gate_config.max_suggest_ms == 0 {
-        analyze_codebase_single_agent_reviewed(
-            repo_root,
-            index,
-            context,
-            repo_memory,
-            gate_config.review_focus,
-            1,
-            None,
-            stream_sink,
-        )
-        .await
-    } else {
-        let remaining_budget_ms = gate_config.max_suggest_ms;
-        tokio::time::timeout(
-            std::time::Duration::from_millis(remaining_budget_ms),
+    let attempt_count = bounded_suggestion_attempt_count(&gate_config);
+    let deterministic_target_count = deterministic_soft_target_count(&gate_config);
+    let mut aggregate_usage: Option<Usage> = None;
+    let mut retry_feedback: Option<String> = None;
+    let mut last_error: Option<String> = None;
+
+    for attempt_index in 1..=attempt_count {
+        let attempt_focus = review_focus_for_attempt(gate_config.review_focus, attempt_index);
+        let elapsed_before_attempt_ms = total_start.elapsed().as_millis() as u64;
+        if gate_config.max_suggest_ms > 0 && elapsed_before_attempt_ms >= gate_config.max_suggest_ms
+        {
+            last_error = Some(format!(
+                "Suggestion generation timed out after {}ms",
+                gate_config.max_suggest_ms
+            ));
+            break;
+        }
+
+        let remaining_budget_ms = if gate_config.max_suggest_ms == 0 {
+            None
+        } else {
+            Some(
+                gate_config
+                    .max_suggest_ms
+                    .saturating_sub(elapsed_before_attempt_ms),
+            )
+        };
+
+        let analyze_result = if let Some(remaining_budget_ms) = remaining_budget_ms {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(remaining_budget_ms.max(1)),
+                analyze_codebase_single_agent_reviewed(
+                    repo_root,
+                    index,
+                    context,
+                    repo_memory.clone(),
+                    attempt_focus,
+                    attempt_index,
+                    retry_feedback.as_deref(),
+                    stream_sink.clone(),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Suggestion generation timed out after {}ms",
+                    gate_config.max_suggest_ms
+                )
+            })
+            .and_then(|result| result)
+        } else {
             analyze_codebase_single_agent_reviewed(
                 repo_root,
                 index,
                 context,
-                repo_memory,
-                gate_config.review_focus,
-                1,
-                None,
-                stream_sink,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Suggestion generation timed out after {}ms",
-                remaining_budget_ms
+                repo_memory.clone(),
+                attempt_focus,
+                attempt_index,
+                retry_feedback.as_deref(),
+                stream_sink.clone(),
             )
-        })
-        .and_then(|result| result)
+            .await
+        };
+
+        let (provisional, attempt_usage, mut diagnostics) = match analyze_result {
+            Ok(value) => value,
+            Err(err) => {
+                let err_text = format!(
+                    "Suggestion generation failed: {}",
+                    truncate_str(&err.to_string(), 220)
+                );
+                last_error = Some(err_text);
+                if attempt_index < attempt_count {
+                    retry_feedback = Some(format!(
+                        "Attempt {} failed (focus: {}). Re-scan different areas and prioritize directly verifiable findings with concrete code evidence.",
+                        attempt_index,
+                        attempt_focus.as_str()
+                    ));
+                    continue;
+                }
+                break;
+            }
+        };
+
+        aggregate_usage = merge_usage(aggregate_usage, attempt_usage.clone());
+        let selection = deterministic_select_suggestions(
+            &provisional,
+            deterministic_target_count,
+            gate_config.max_final_count,
+        );
+        let suggestions = selection.suggestions;
+
+        diagnostics.refinement_complete = true;
+        diagnostics.final_count = suggestions.len();
+        diagnostics.validated_count = suggestions
+            .iter()
+            .filter(|suggestion| suggestion_is_verified_bug_or_security(suggestion))
+            .count();
+        diagnostics.rejected_count = provisional.len().saturating_sub(suggestions.len());
+        diagnostics.semantic_dedup_dropped_count = selection.dedup_dropped_count;
+        diagnostics.file_balance_dropped_count = selection.file_balance_dropped_count;
+        diagnostics.speculative_impact_dropped_count = selection.speculative_dropped_count;
+        diagnostics
+            .notes
+            .push(format!("single_pass_target:{}", deterministic_target_count));
+        diagnostics
+            .notes
+            .push(format!("single_pass_selected:{}", suggestions.len()));
+        diagnostics
+            .notes
+            .push(format!("attempt_review_focus:{}", attempt_focus.as_str()));
+
+        let total_cost_usd = aggregate_usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+        let total_ms = total_start.elapsed().as_millis() as u64;
+        let gate = build_gate_snapshot(&gate_config, &suggestions, total_ms, total_cost_usd);
+
+        diagnostics.attempt_index = attempt_index;
+        diagnostics.attempt_count = attempt_count;
+        diagnostics.gate_passed = gate.passed;
+        diagnostics.gate_fail_reasons = gate.fail_reasons.clone();
+        diagnostics.attempt_cost_usd = attempt_usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
+        diagnostics.regeneration_attempts = attempt_index.saturating_sub(1);
+
+        on_progress(attempt_index, attempt_count, &gate, &diagnostics);
+
+        if !suggestions.is_empty() {
+            return Ok(GatedSuggestionRunResult {
+                suggestions,
+                usage: aggregate_usage,
+                diagnostics,
+                gate,
+            });
+        }
+
+        if attempt_index < attempt_count {
+            retry_feedback = Some(format!(
+                "Attempt {} returned zero verified findings (focus: {}). Expand coverage and prioritize likely defect hotspots such as panic/error paths, bounds checks, auth boundaries, and unsafe input handling.",
+                attempt_index,
+                attempt_focus.as_str()
+            ));
+        }
     }
-    .map_err(|err| {
-        anyhow::anyhow!(
-            "Suggestion generation failed: {}",
-            truncate_str(&err.to_string(), 220)
-        )
-    })?;
 
-    let (provisional, usage, mut diagnostics) = analyze_result;
-    let deterministic_target_count = deterministic_soft_target_count(&gate_config);
-    let selection = deterministic_select_suggestions(
-        &provisional,
-        deterministic_target_count,
-        gate_config.max_final_count,
-    );
-    let suggestions = selection.suggestions;
-
-    diagnostics.refinement_complete = true;
-    diagnostics.final_count = suggestions.len();
-    diagnostics.validated_count = suggestions
-        .iter()
-        .filter(|suggestion| suggestion_is_verified_bug_or_security(suggestion))
-        .count();
-    diagnostics.rejected_count = provisional.len().saturating_sub(suggestions.len());
-    diagnostics.semantic_dedup_dropped_count = selection.dedup_dropped_count;
-    diagnostics.file_balance_dropped_count = selection.file_balance_dropped_count;
-    diagnostics.speculative_impact_dropped_count = selection.speculative_dropped_count;
-    diagnostics
-        .notes
-        .push(format!("single_pass_target:{}", deterministic_target_count));
-    diagnostics
-        .notes
-        .push(format!("single_pass_selected:{}", suggestions.len()));
-
-    let total_cost_usd = usage.as_ref().map(|u| u.cost()).unwrap_or(0.0);
-    let total_ms = total_start.elapsed().as_millis() as u64;
-    let gate = build_gate_snapshot(&gate_config, &suggestions, total_ms, total_cost_usd);
-
-    diagnostics.attempt_index = 1;
-    diagnostics.attempt_count = 1;
-    diagnostics.gate_passed = gate.passed;
-    diagnostics.gate_fail_reasons = gate.fail_reasons.clone();
-    diagnostics.attempt_cost_usd = total_cost_usd;
-    diagnostics.attempt_ms = total_ms;
-
-    if suggestions.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No verified findings were produced in this pass."
-        ));
+    if let Some(error) = last_error {
+        return Err(anyhow::anyhow!("{}", error));
     }
 
-    on_progress(1, 1, &gate, &diagnostics);
-    Ok(GatedSuggestionRunResult {
-        suggestions,
-        usage,
-        diagnostics,
-        gate,
-    })
+    Err(anyhow::anyhow!(
+        "No verified findings were produced after {} attempt(s).",
+        attempt_count
+    ))
 }
 
 #[cfg(test)]

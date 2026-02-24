@@ -298,6 +298,38 @@ fn gate_default_mapping_matches_expected_ranges() {
 }
 
 #[test]
+fn bounded_attempt_count_respects_floor_and_hard_cap() {
+    let mut config = SuggestionQualityGateConfig::default();
+    config.max_attempts = 0;
+    assert_eq!(bounded_suggestion_attempt_count(&config), 1);
+
+    config.max_attempts = 2;
+    assert_eq!(bounded_suggestion_attempt_count(&config), 2);
+
+    config.max_attempts = 99;
+    assert_eq!(
+        bounded_suggestion_attempt_count(&config),
+        MAX_SUGGESTION_ATTEMPTS_HARD_CAP
+    );
+}
+
+#[test]
+fn review_focus_for_attempt_alternates_after_first_attempt() {
+    assert_eq!(
+        review_focus_for_attempt(SuggestionReviewFocus::BugHunt, 1),
+        SuggestionReviewFocus::BugHunt
+    );
+    assert_eq!(
+        review_focus_for_attempt(SuggestionReviewFocus::BugHunt, 2),
+        SuggestionReviewFocus::SecurityReview
+    );
+    assert_eq!(
+        review_focus_for_attempt(SuggestionReviewFocus::BugHunt, 3),
+        SuggestionReviewFocus::BugHunt
+    );
+}
+
+#[test]
 fn deterministic_soft_target_defaults_to_six() {
     let gate = SuggestionQualityGateConfig::default();
     assert_eq!(deterministic_soft_target_count(&gate), 6);

@@ -24,8 +24,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 const MAX_PARALLEL_TOOL_EXECUTIONS: usize = 4;
-/// Extra turns reserved to nudge the model to finalize with `report_back`.
-const REPORT_BACK_GRACE_ROUNDS: usize = 2;
 
 /// Some providers occasionally return a response with no content and no tool calls.
 /// Treat this as transient and retry a few times with backoff.
@@ -36,22 +34,29 @@ const REPEATED_TOOL_ERROR_THRESHOLD: u32 = 3;
 const TOOL_ERROR_LOOP_EXTRA_RETRIES: u32 = 2;
 const FINALIZATION_NON_REPORT_BACK_MAX_RETRIES: u32 = 3;
 const STREAM_REASONING_PRINT_MAX_CHARS: usize = 8_000;
+const DEFAULT_AGENT_TOOL_TURN_MAX_TOKENS: u32 = 2_048;
+const DEFAULT_AGENT_FINAL_RESPONSE_MAX_TOKENS: u32 = 4_096;
+const DEFAULT_AGENT_FORMAT_MAX_TOKENS: u32 = 2_048;
+const DEFAULT_MIN_TOOL_ROUNDS_BEFORE_EMPTY_REPORT_BACK: usize = 3;
+const DEFAULT_MIN_EMPTY_REPORT_BACK_MS: u64 = 60_000;
+const DEFAULT_AGENT_LOOP_TIMEOUT_MS: u64 = 120_000;
 /// Use low temperatures for reliable tool calling with Cerebras tool-use.
 const TOOL_CALL_TEMPERATURE: f32 = 0.2;
 /// Retry once colder when tool-call generation fails validation.
 const TOOL_CALL_RETRY_TEMPERATURE: f32 = 0.0;
 
 fn agent_loop_timeout() -> Option<Duration> {
-    std::env::var("COSMOS_AGENT_LOOP_TIMEOUT_MS")
+    // Keep loops bounded by default so tool-calling sessions cannot stall forever.
+    // Set COSMOS_AGENT_LOOP_TIMEOUT_MS=0 to opt into unbounded loops.
+    let timeout_ms = std::env::var("COSMOS_AGENT_LOOP_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .and_then(|value| {
-            if value == 0 {
-                None
-            } else {
-                Some(Duration::from_millis(value))
-            }
-        })
+        .unwrap_or(DEFAULT_AGENT_LOOP_TIMEOUT_MS);
+    if timeout_ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(timeout_ms))
+    }
 }
 
 fn loop_timeout_exceeded(start: Instant, timeout: Option<Duration>) -> bool {
@@ -235,6 +240,60 @@ where
     results
 }
 
+async fn execute_tool_calls_and_append_messages(
+    messages: &mut Vec<Message>,
+    repo_root: &Path,
+    tool_calls: &[ToolCallMessage],
+) {
+    if tool_calls.is_empty() {
+        return;
+    }
+
+    let repo_root_buf = repo_root.to_path_buf();
+    let inputs: Vec<(PathBuf, ToolCall)> = tool_calls
+        .iter()
+        .map(|tc| {
+            let tool_call_id = tc.id.clone();
+            let tool_call = ToolCall {
+                id: tool_call_id,
+                function: super::tools::FunctionCall {
+                    name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                },
+            };
+            (repo_root_buf.clone(), tool_call)
+        })
+        .collect();
+
+    let results = run_parallel_ordered_blocking(
+        inputs,
+        MAX_PARALLEL_TOOL_EXECUTIONS,
+        Arc::new(|(repo_root, tool_call): (PathBuf, ToolCall)| {
+            execute_tool(&repo_root, &tool_call)
+        }),
+    )
+    .await;
+
+    for (idx, tc) in tool_calls.iter().enumerate() {
+        let tc_id = tc.id.clone();
+        let result = results
+            .get(idx)
+            .and_then(|r| r.as_ref())
+            .cloned()
+            .unwrap_or_else(|| super::tools::ToolResult {
+                tool_call_id: tc_id.clone(),
+                content: "Tool execution failed. Please try again. (no tool result returned)"
+                    .to_string(),
+            });
+        messages.push(Message {
+            role: "tool".to_string(),
+            content: Some(result.content),
+            tool_calls: None,
+            tool_call_id: Some(tc_id),
+        });
+    }
+}
+
 /// A message in the conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -416,6 +475,56 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_u32(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn bounded_max_completion_tokens(model: Model, configured: u32) -> u32 {
+    let cap = model.max_tokens();
+    configured.max(256).min(cap)
+}
+
+fn tool_turn_max_completion_tokens(model: Model) -> u32 {
+    let configured =
+        env_u32("COSMOS_AGENT_TOOL_MAX_TOKENS").unwrap_or(DEFAULT_AGENT_TOOL_TURN_MAX_TOKENS);
+    bounded_max_completion_tokens(model, configured)
+}
+
+fn final_response_max_completion_tokens(model: Model) -> u32 {
+    let configured =
+        env_u32("COSMOS_AGENT_FINAL_MAX_TOKENS").unwrap_or(DEFAULT_AGENT_FINAL_RESPONSE_MAX_TOKENS);
+    bounded_max_completion_tokens(model, configured)
+}
+
+fn formatting_max_completion_tokens(model: Model) -> u32 {
+    let configured =
+        env_u32("COSMOS_AGENT_FORMAT_MAX_TOKENS").unwrap_or(DEFAULT_AGENT_FORMAT_MAX_TOKENS);
+    bounded_max_completion_tokens(model, configured)
+}
+
+fn min_tool_rounds_before_empty_report_back() -> usize {
+    env_usize("COSMOS_MIN_TOOL_ROUNDS_BEFORE_EMPTY_REPORT_BACK")
+        .unwrap_or(DEFAULT_MIN_TOOL_ROUNDS_BEFORE_EMPTY_REPORT_BACK)
+}
+
+fn min_elapsed_ms_before_empty_report_back() -> u64 {
+    env_u64("COSMOS_MIN_EMPTY_REPORT_BACK_MS").unwrap_or(DEFAULT_MIN_EMPTY_REPORT_BACK_MS)
+}
+
 fn stream_reasoning_output_enabled() -> bool {
     if cfg!(test) {
         return false;
@@ -546,6 +655,10 @@ Return only a valid report_back call."
 
 fn is_report_back_tool_name(name: &str) -> bool {
     matches!(name, "report_back" | "repo_browser.report_back")
+}
+
+fn report_back_has_findings(payload: &ReportBackPayload) -> bool {
+    !payload.explanation.findings.is_empty() || !payload.explanation.verified_findings.is_empty()
 }
 
 fn infer_report_back_role(system: &str, user: &str) -> &'static str {
@@ -1060,7 +1173,7 @@ async fn maybe_format_agentic_content(
             },
         ],
         user: None,
-        max_completion_tokens: model.max_tokens(),
+        max_completion_tokens: formatting_max_completion_tokens(model),
         stream: false,
         temperature: Some(TOOL_CALL_RETRY_TEMPERATURE),
         response_format: Some(response_format),
@@ -1167,7 +1280,7 @@ pub async fn call_llm_agentic(
             model: model_id_for_backend(model),
             messages: messages.clone(),
             user: None,
-            max_completion_tokens: model.max_tokens(),
+            max_completion_tokens: tool_turn_max_completion_tokens(model),
             stream: false,
             temperature: Some(TOOL_CALL_TEMPERATURE),
             response_format: None,
@@ -1314,7 +1427,7 @@ pub async fn call_llm_agentic(
         model: model_id_for_backend(model),
         messages: messages.clone(),
         user: None,
-        max_completion_tokens: model.max_tokens(),
+        max_completion_tokens: final_response_max_completion_tokens(model),
         stream: false,
         temperature: None,
         response_format: None,
@@ -1450,11 +1563,9 @@ pub async fn call_llm_agentic_report_back_only(
     let mut first_invalid_report_back_error: Option<String> = None;
     let mut finalization_non_report_back_retries: u32 = 0;
     let mut tool_error_loop_tracker = ToolErrorLoopTracker::default();
-    let max_total_iterations = if max_iterations == 0 {
-        0
-    } else {
-        max_iterations.saturating_add(REPORT_BACK_GRACE_ROUNDS)
-    };
+    let mut non_report_tool_rounds = 0usize;
+    let min_tool_rounds_for_empty_report = min_tool_rounds_before_empty_report_back();
+    let min_elapsed_for_empty_report_ms = min_elapsed_ms_before_empty_report_back();
     let mut forced_report_back_mode = false;
     let mut trace = AgenticTrace::default();
     // When a UI sink is attached, stream output by default so the suggestion pane can render
@@ -1465,9 +1576,14 @@ pub async fn call_llm_agentic_report_back_only(
 
     loop {
         iteration += 1;
-        if iteration_limit_exceeded(iteration, max_total_iterations)
-            || loop_timeout_exceeded(start, loop_timeout)
-        {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let needs_more_rounds_for_empty_report = min_tool_rounds_for_empty_report > 0
+            && non_report_tool_rounds < min_tool_rounds_for_empty_report;
+        let needs_more_time_for_empty_report =
+            min_elapsed_for_empty_report_ms > 0 && elapsed_ms < min_elapsed_for_empty_report_ms;
+        let keep_exploring_for_empty_report =
+            needs_more_rounds_for_empty_report || needs_more_time_for_empty_report;
+        if loop_timeout_exceeded(start, loop_timeout) {
             if forced_report_back_mode {
                 trace.termination_reason = Some("timeout_fallback_empty_report_back".to_string());
                 trace.repeated_tool_error_count = trace
@@ -1492,11 +1608,10 @@ pub async fn call_llm_agentic_report_back_only(
                 elapsed_ms.saturating_mul(100) >= timeout_ms.saturating_mul(75)
             })
             .unwrap_or(false);
-        // Reserve the configured grace rounds for finalization *after* the normal
-        // exploration budget has been used. The previous threshold entered
-        // finalization too early for small iteration budgets (for example, budget=2).
-        let finalization_round =
-            near_timeout || iteration_limit_exceeded(iteration, max_iterations);
+        let finalization_round = near_timeout
+            || forced_report_back_mode
+            || (iteration_limit_exceeded(iteration, max_iterations)
+                && !keep_exploring_for_empty_report);
         if finalization_round && !forced_report_back_mode {
             forced_report_back_mode = true;
             messages.push(Message {
@@ -1524,7 +1639,11 @@ pub async fn call_llm_agentic_report_back_only(
             model: model_id_for_backend(model),
             messages: messages.clone(),
             user: None,
-            max_completion_tokens: model.max_tokens(),
+            max_completion_tokens: if finalization_round {
+                final_response_max_completion_tokens(model)
+            } else {
+                tool_turn_max_completion_tokens(model)
+            },
             stream: stream_reasoning,
             temperature: Some(TOOL_CALL_TEMPERATURE),
             response_format: None,
@@ -1597,6 +1716,12 @@ pub async fn call_llm_agentic_report_back_only(
                     .iter()
                     .map(|tool_call| tool_call.function.name.clone())
                     .collect::<Vec<_>>();
+                let has_non_report_tool = tool_calls
+                    .iter()
+                    .any(|tool_call| !is_report_back_tool_name(&tool_call.function.name));
+                if has_non_report_tool {
+                    non_report_tool_rounds = non_report_tool_rounds.saturating_add(1);
+                }
                 let report_back_called = tool_calls
                     .iter()
                     .any(|tool_call| is_report_back_tool_name(&tool_call.function.name));
@@ -1622,6 +1747,55 @@ pub async fn call_llm_agentic_report_back_only(
                 {
                     match parse_report_back_payload(&report_call.function.arguments) {
                         Ok(payload) => {
+                            let elapsed_ms = start.elapsed().as_millis() as u64;
+                            let needs_more_rounds_for_empty_report =
+                                min_tool_rounds_for_empty_report > 0
+                                    && non_report_tool_rounds < min_tool_rounds_for_empty_report;
+                            let needs_more_time_for_empty_report = min_elapsed_for_empty_report_ms
+                                > 0
+                                && elapsed_ms < min_elapsed_for_empty_report_ms;
+                            if !report_back_has_findings(&payload)
+                                && (needs_more_rounds_for_empty_report
+                                    || needs_more_time_for_empty_report)
+                                && within_loop_timeout(start, loop_timeout)
+                                && !near_timeout
+                            {
+                                execute_tool_calls_and_append_messages(
+                                    &mut messages,
+                                    repo_root,
+                                    tool_calls,
+                                )
+                                .await;
+                                let mut requirements = Vec::new();
+                                if needs_more_rounds_for_empty_report {
+                                    let remaining_rounds = min_tool_rounds_for_empty_report
+                                        .saturating_sub(non_report_tool_rounds);
+                                    requirements.push(format!(
+                                        "Need at least {} additional exploration round(s)",
+                                        remaining_rounds
+                                    ));
+                                }
+                                if needs_more_time_for_empty_report {
+                                    let remaining_ms =
+                                        min_elapsed_for_empty_report_ms.saturating_sub(elapsed_ms);
+                                    let remaining_secs = remaining_ms.saturating_add(999) / 1_000;
+                                    requirements.push(format!(
+                                        "keep exploring for about {} more second(s)",
+                                        remaining_secs
+                                    ));
+                                }
+                                messages.push(Message {
+                                    role: "user".to_string(),
+                                    content: Some(format!(
+                                        "Do not finish with an empty report yet. Explore more code with tools before calling report_back. \
+{} unless you find verified issues sooner.",
+                                        requirements.join(" and ")
+                                    )),
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                });
+                                continue;
+                            }
                             trace.finalized_with_report_back = true;
                             trace.termination_reason = Some("report_back_ok".to_string());
                             trace.repeated_tool_error_count = trace
@@ -1647,6 +1821,12 @@ pub async fn call_llm_agentic_report_back_only(
                             }
                             match action {
                                 InvalidReportBackAction::Retry => {
+                                    execute_tool_calls_and_append_messages(
+                                        &mut messages,
+                                        repo_root,
+                                        tool_calls,
+                                    )
+                                    .await;
                                     let first_error = first_invalid_report_back_error
                                         .as_deref()
                                         .unwrap_or(err.as_str());
@@ -1691,6 +1871,12 @@ pub async fn call_llm_agentic_report_back_only(
                         finalization_non_report_back_retries.saturating_add(1);
                     match action {
                         FinalizationNonReportBackAction::Retry => {
+                            execute_tool_calls_and_append_messages(
+                                &mut messages,
+                                repo_root,
+                                tool_calls,
+                            )
+                            .await;
                             messages.push(Message {
                                 role: "user".to_string(),
                                 content: Some(
@@ -2057,6 +2243,46 @@ mod tests {
         let smart = reasoning_config_for_model(Model::Smart, true);
         assert_eq!(smart.disable_reasoning, Some(false));
         assert_eq!(smart.clear_thinking, Some(false));
+    }
+
+    #[test]
+    fn test_bounded_max_completion_tokens_clamps_bounds() {
+        assert_eq!(bounded_max_completion_tokens(Model::Speed, 64), 256);
+        assert_eq!(
+            bounded_max_completion_tokens(Model::Speed, 100_000),
+            Model::Speed.max_tokens()
+        );
+    }
+
+    #[test]
+    fn test_report_back_has_findings_when_any_present() {
+        let empty = ReportBackPayload {
+            explanation: ReportBackExplanation {
+                role: "bug_hunter".to_string(),
+                findings: Vec::new(),
+                verified_findings: Vec::new(),
+            },
+            files: std::collections::HashMap::new(),
+        };
+        assert!(!report_back_has_findings(&empty));
+
+        let with_findings = ReportBackPayload {
+            explanation: ReportBackExplanation {
+                role: "bug_hunter".to_string(),
+                findings: vec![crate::llm::tools::ReportBackFinding {
+                    file: "src/lib.rs".to_string(),
+                    line: 1,
+                    category: "bug".to_string(),
+                    criticality: "low".to_string(),
+                    summary: "s".to_string(),
+                    detail: "d".to_string(),
+                    evidence_quote: "e".to_string(),
+                }],
+                verified_findings: Vec::new(),
+            },
+            files: std::collections::HashMap::new(),
+        };
+        assert!(report_back_has_findings(&with_findings));
     }
 
     #[test]

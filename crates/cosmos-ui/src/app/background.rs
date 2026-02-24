@@ -48,8 +48,9 @@ fn maybe_prompt_api_key_overlay(app: &mut App, message: &str) -> bool {
 }
 
 fn suggestions_budget_ms() -> u64 {
-    // 0 means unbounded.
-    const DEFAULT_MS: u64 = 0;
+    // Keep a bounded default so stalled suggestion runs eventually unwind.
+    // Set COSMOS_SUGGEST_MAX_MS=0 to opt into unbounded runs.
+    const DEFAULT_MS: u64 = 180_000;
     std::env::var("COSMOS_SUGGEST_MAX_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -79,7 +80,8 @@ fn spawn_suggestions_generation(
         );
         let mut gate_config = cosmos_engine::llm::SuggestionQualityGateConfig::default();
         gate_config.min_final_count = 1;
-        gate_config.max_attempts = 1;
+        // Make one bounded retry when a pass returns zero verified findings.
+        gate_config.max_attempts = 2;
         gate_config.max_suggest_ms = suggestions_budget_ms();
         gate_config.review_focus = review_focus;
         let run = cosmos_engine::llm::run_fast_grounded_with_gate_with_progress_and_stream(
