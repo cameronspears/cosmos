@@ -4,9 +4,9 @@
 //! in a loop until they have enough context to complete their task.
 
 use super::client::{
-    api_key, apply_backend_headers, chat_completions_url, create_http_client,
-    missing_api_key_message, model_id_for_backend, send_with_retry,
-    supports_parallel_tool_calls_for_backend, REQUEST_TIMEOUT_SECS,
+    api_key, apply_backend_headers, backoff_secs, chat_completions_url, create_http_client,
+    is_retryable_network_error, missing_api_key_message, model_id_for_backend, parse_retry_after,
+    send_with_retry, supports_parallel_tool_calls_for_backend, MAX_RETRIES, REQUEST_TIMEOUT_SECS,
 };
 use super::models::{merge_usage, Model, Usage};
 #[cfg(test)]
@@ -806,17 +806,60 @@ async fn send_streaming_chat_request(
     request: &ChatRequest,
     stream_sink: Option<&AgenticStreamSink>,
 ) -> anyhow::Result<ChatResponse> {
-    let request_builder = client.post(chat_completions_url()).json(request);
-    let response = apply_backend_headers(request_builder, api_key)
-        .send()
-        .await?;
+    let mut retry_count = 0;
 
-    let status = response.status();
-    if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("Streaming API error {}: {}", status, text));
+    loop {
+        let request_builder = client.post(chat_completions_url()).json(request);
+        let response = match apply_backend_headers(request_builder, api_key).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                if is_retryable_network_error(&err) && retry_count < MAX_RETRIES {
+                    retry_count += 1;
+                    let retry_after = backoff_secs(retry_count);
+                    tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                    continue;
+                }
+                return Err(err.into());
+            }
+        };
+
+        let status = response.status();
+        let retry_after_hint = parse_retry_after_header(response.headers());
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            if status.as_u16() == 429 && retry_count < MAX_RETRIES {
+                retry_count += 1;
+                let retry_after = retry_after_hint
+                    .or_else(|| parse_retry_after(&text))
+                    .unwrap_or_else(|| backoff_secs(retry_count));
+                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                continue;
+            }
+            if status.is_server_error() && retry_count < MAX_RETRIES {
+                retry_count += 1;
+                let retry_after = backoff_secs(retry_count);
+                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                continue;
+            }
+            return Err(anyhow::anyhow!("Streaming API error {}: {}", status, text));
+        }
+
+        return consume_streaming_chat_response(response, stream_sink).await;
     }
+}
 
+fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0 && *secs < 300)
+}
+
+async fn consume_streaming_chat_response(
+    response: reqwest::Response,
+    stream_sink: Option<&AgenticStreamSink>,
+) -> anyhow::Result<ChatResponse> {
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut event_data = String::new();
@@ -2123,6 +2166,39 @@ mod tests {
 
         let second = format_streamed_reasoning_chunk("still more", &mut state);
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn test_parse_retry_after_header_accepts_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("7"),
+        );
+
+        assert_eq!(parse_retry_after_header(&headers), Some(7));
+    }
+
+    #[test]
+    fn test_parse_retry_after_header_rejects_invalid_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("later"),
+        );
+        assert_eq!(parse_retry_after_header(&headers), None);
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("0"),
+        );
+        assert_eq!(parse_retry_after_header(&headers), None);
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("600"),
+        );
+        assert_eq!(parse_retry_after_header(&headers), None);
     }
 
     #[test]

@@ -322,7 +322,7 @@ pub(crate) const BACKOFF_MULTIPLIER: u64 = 2; // Exponential backoff
 pub(crate) const REQUEST_TIMEOUT_SECS: u64 = 60;
 
 /// Extract retry-after hint from provider response text (if present).
-fn parse_retry_after(text: &str) -> Option<u64> {
+pub(crate) fn parse_retry_after(text: &str) -> Option<u64> {
     // Look for patterns like "retry after X seconds" or "wait X seconds".
     let text_lower = text.to_lowercase();
     if let Some(pos) = text_lower.find("retry") {
